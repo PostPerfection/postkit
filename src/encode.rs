@@ -664,6 +664,269 @@ fn kill_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+// ─── In-process stream encode (video → ffmpeg pipe → Grok FFI) ─────────────
+
+/// Stream-encode a video file to J2K using in-process Grok FFI.
+///
+/// Uses ffmpeg to decode the video to raw 16-bit RGB frames, then compresses
+/// each frame in-process via the bounded-queue pipeline in `grok_encoder`.
+/// This eliminates per-frame subprocess overhead.
+pub fn stream_encode_inprocess<F>(
+    opts: &StreamEncodeOptions,
+    cancel: &Arc<AtomicBool>,
+    mut on_progress: F,
+) -> EncodeResult
+where
+    F: FnMut(StreamProgress),
+{
+    use crate::grok_encoder::{self, CompressParams, RawFrame};
+
+    let (width, height, total_frames) = probe_video(&opts.input);
+    if width == 0 || height == 0 {
+        return EncodeResult {
+            success: false,
+            error: "Could not determine video dimensions".to_string(),
+            ..Default::default()
+        };
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
+        return EncodeResult {
+            success: false,
+            error: format!("Failed to create output directory: {e}"),
+            ..Default::default()
+        };
+    }
+
+    let frame_size = (width as usize) * (height as usize) * 3 * 2; // 16-bit RGB
+
+    // Start ffmpeg: decode to raw 16-bit big-endian RGB
+    let fps_filter = format!("fps={}", opts.fps);
+    let mut ffmpeg = match std::process::Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(&opts.input)
+        .args([
+            "-vf",
+            &fps_filter,
+            "-pix_fmt",
+            "rgb48be",
+            "-f",
+            "rawvideo",
+            "-an",
+            "pipe:1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return EncodeResult {
+                success: false,
+                error: format!("Failed to start ffmpeg: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+
+    let mut ffmpeg_stdout = match ffmpeg.stdout.take() {
+        Some(s) => s,
+        None => {
+            return EncodeResult {
+                success: false,
+                error: "Failed to capture ffmpeg stdout".to_string(),
+                ..Default::default()
+            };
+        }
+    };
+
+    let params = CompressParams {
+        compression_ratio: opts.compression_ratio,
+        num_resolutions: opts.num_resolutions as u8,
+        codeblock_size: opts.codeblock_size,
+        frame_rate: opts.fps as u16,
+        apply_xyz_transform: true,
+        ..CompressParams::default()
+    };
+
+    grok_encoder::initialize(0);
+
+    let mut frame_buf = vec![0u8; frame_size];
+    let mut frame_index: u64 = 0;
+    let encode_start = std::time::Instant::now();
+
+    let result = grok_encoder::encode_pipeline(
+        &opts.output_dir,
+        &params,
+        total_frames,
+        cancel,
+        || {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            match read_exact_or_eof(&mut ffmpeg_stdout, &mut frame_buf) {
+                ReadResult::Ok => {}
+                ReadResult::Eof => return None,
+                ReadResult::Err(_) => return None,
+            }
+
+            let idx = frame_index;
+            frame_index += 1;
+
+            // Pass packed bytes directly — encoder threads will deinterleave
+            // into Grok's component buffers (avoids 21MB intermediate alloc)
+            Some(RawFrame::Packed {
+                data: frame_buf.clone(),
+                width,
+                height,
+                precision: 16,
+                index: idx,
+            })
+        },
+        |progress| {
+            let elapsed = encode_start.elapsed().as_secs_f64();
+            on_progress(StreamProgress {
+                frame: progress.frames_encoded,
+                total_frames: progress.total_frames,
+                fps: progress.fps,
+                elapsed_secs: elapsed,
+            });
+        },
+    );
+
+    kill_child(&mut ffmpeg);
+    grok_encoder::deinitialize();
+
+    EncodeResult {
+        success: result.success,
+        error: result.error,
+        frames_encoded: result.frames_encoded,
+        output_dir: opts.output_dir.clone(),
+    }
+}
+
+/// Stream-encode using subprocess pool (ffmpeg → raw frames → grk_compress subprocesses).
+///
+/// This achieves higher throughput than the FFI path because each subprocess
+/// gets its own independent Grok thread pool. Temporary frames are written to
+/// /dev/shm (ramdisk) to avoid disk I/O bottleneck.
+pub fn stream_encode_subprocess<F>(
+    opts: &StreamEncodeOptions,
+    cancel: &Arc<AtomicBool>,
+    mut on_progress: F,
+) -> EncodeResult
+where
+    F: FnMut(StreamProgress),
+{
+    use crate::grok_encoder;
+
+    let (width, height, total_frames) = probe_video(&opts.input);
+    if width == 0 || height == 0 {
+        return EncodeResult {
+            success: false,
+            error: "Could not determine video dimensions".to_string(),
+            ..Default::default()
+        };
+    }
+
+    if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
+        return EncodeResult {
+            success: false,
+            error: format!("Failed to create output directory: {e}"),
+            ..Default::default()
+        };
+    }
+
+    let frame_size = (width as usize) * (height as usize) * 3 * 2;
+
+    // Start ffmpeg
+    let fps_filter = format!("fps={}", opts.fps);
+    let mut ffmpeg = match std::process::Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(&opts.input)
+        .args([
+            "-vf",
+            &fps_filter,
+            "-pix_fmt",
+            "rgb48be",
+            "-f",
+            "rawvideo",
+            "-an",
+            "pipe:1",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            return EncodeResult {
+                success: false,
+                error: format!("Failed to launch ffmpeg: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+
+    let mut ffmpeg_stdout = match ffmpeg.stdout.take() {
+        Some(s) => s,
+        None => {
+            return EncodeResult {
+                success: false,
+                error: "Failed to capture ffmpeg stdout".to_string(),
+                ..Default::default()
+            };
+        }
+    };
+
+    let params = grok_encoder::CompressParams {
+        compression_ratio: opts.compression_ratio,
+        num_resolutions: opts.num_resolutions as u8,
+        codeblock_size: opts.codeblock_size,
+        frame_rate: opts.fps as u16,
+        apply_xyz_transform: true,
+        ..grok_encoder::CompressParams::default()
+    };
+
+    let grk_bin = if opts.compressor_path.as_os_str().is_empty() {
+        PathBuf::from("grk_compress")
+    } else {
+        opts.compressor_path.clone()
+    };
+
+    let encode_start = std::time::Instant::now();
+
+    let result = grok_encoder::encode_pipeline_subprocess(
+        &opts.output_dir,
+        &params,
+        &grk_bin,
+        total_frames,
+        width,
+        height,
+        frame_size,
+        &mut ffmpeg_stdout,
+        cancel,
+        |progress| {
+            let elapsed = encode_start.elapsed().as_secs_f64();
+            on_progress(StreamProgress {
+                frame: progress.frames_encoded,
+                total_frames: progress.total_frames,
+                fps: progress.fps,
+                elapsed_secs: elapsed,
+            });
+        },
+    );
+
+    kill_child(&mut ffmpeg);
+
+    EncodeResult {
+        success: result.success,
+        error: result.error,
+        frames_encoded: result.frames_encoded,
+        output_dir: opts.output_dir.clone(),
+    }
+}
+
 // ─── Parallel encode (image sequence → parallel grk_compress subprocesses) ─
 
 /// Progress callback for parallel encode.

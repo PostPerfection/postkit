@@ -27,10 +27,12 @@ pub fn load_tiff(path: &Path) -> Result<TiffFrame, String> {
         .dimensions()
         .map_err(|e| format!("TIFF dimensions error: {e}"))?;
 
-    // Read bits per sample
+    // Read bits per sample (may be stored as a vector, one per component)
     let bits_per_sample = decoder
-        .get_tag_u32(Tag::BitsPerSample)
-        .map_err(|e| format!("Cannot read BitsPerSample: {e}"))? as u8;
+        .get_tag_u32_vec(Tag::BitsPerSample)
+        .map(|v| v[0] as u8)
+        .or_else(|_| decoder.get_tag_u32(Tag::BitsPerSample).map(|v| v as u8))
+        .map_err(|e| format!("Cannot read BitsPerSample: {e}"))?;
 
     // Read samples per pixel
     let samples_per_pixel = decoder.get_tag_u32(Tag::SamplesPerPixel).unwrap_or(3) as u8;

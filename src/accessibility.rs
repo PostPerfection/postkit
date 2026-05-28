@@ -275,6 +275,17 @@ fn requirement_details(
     }
 }
 
+/// Check accessibility compliance against multiple standards.
+pub fn check_accessibility_multi(
+    package_dir: &std::path::Path,
+    standards: &[AccessibilityStandard],
+) -> Vec<AccessibilityResult> {
+    standards
+        .iter()
+        .map(|&s| check_accessibility(package_dir, s))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,15 +319,4 @@ mod tests {
         let ofcom = required_tracks(AccessibilityStandard::Ofcom);
         assert!(ofcom.contains(&AccessibilityTrack::SignLanguage));
     }
-}
-
-/// Check accessibility compliance against multiple standards.
-pub fn check_accessibility_multi(
-    package_dir: &std::path::Path,
-    standards: &[AccessibilityStandard],
-) -> Vec<AccessibilityResult> {
-    standards
-        .iter()
-        .map(|&s| check_accessibility(package_dir, s))
-        .collect()
 }
