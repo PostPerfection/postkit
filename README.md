@@ -8,7 +8,9 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 
 | Module | Purpose |
 |--------|---------|
-| `encode` | JPEG 2000 encoding (grok / OpenJPEG) |
+| `encode` | JPEG 2000 encoding pipeline (stream subprocess via grok) |
+| `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
+| `openjpeg_encoder` | OpenJPEG J2K encoder (multi-instance, CPU-only, no GPU dependency) |
 | `transcode` | Video format conversion (via ffmpeg) |
 | `hash` | SHA-1 / SHA-256 file hashing |
 | `mxf_wrap` | MXF track file wrapping |
