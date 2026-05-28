@@ -3,6 +3,11 @@
 //! Unlike Grok's shared thread pool, each OpenJPEG codec instance is fully
 //! independent. This allows linear scaling with N encoder threads — the same
 //! architecture dcpomatic uses to achieve ~26fps on 16 cores.
+//!
+//! Performance optimisations:
+//! - `opj_codec_set_threads(1)` prevents internal OpenJPEG multi-threading
+//! - Planar pixel format from ffmpeg eliminates interleaved→planar conversion
+//! - Buffer pool recycles frame allocations to avoid malloc/free churn
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,6 +16,45 @@ use std::sync::{Arc, Mutex};
 use crate::grok_encoder::{
     BoundedQueue, CompressParams, EncodeProgress, EncodedFrame, PipelineResult, RawFrame,
 };
+
+// ─── Buffer pool ───────────────────────────────────────────────────────────────
+
+/// Pool of pre-allocated frame buffers to avoid per-frame allocation.
+struct FramePool {
+    buffers: Mutex<Vec<[Vec<i32>; 3]>>,
+    npixels: usize,
+}
+
+impl FramePool {
+    fn new(capacity: usize, npixels: usize) -> Self {
+        let mut buffers = Vec::with_capacity(capacity);
+        for _ in 0..capacity {
+            buffers.push([
+                vec![0i32; npixels],
+                vec![0i32; npixels],
+                vec![0i32; npixels],
+            ]);
+        }
+        Self {
+            buffers: Mutex::new(buffers),
+            npixels,
+        }
+    }
+
+    fn acquire(&self) -> [Vec<i32>; 3] {
+        self.buffers.lock().unwrap().pop().unwrap_or_else(|| {
+            [
+                vec![0i32; self.npixels],
+                vec![0i32; self.npixels],
+                vec![0i32; self.npixels],
+            ]
+        })
+    }
+
+    fn release(&self, buf: [Vec<i32>; 3]) {
+        self.buffers.lock().unwrap().push(buf);
+    }
+}
 
 /// Encode a sequence of raw frames using OpenJPEG with N independent threads.
 ///
@@ -177,7 +221,172 @@ where
     }
 }
 
+/// Variant of `encode_pipeline_opj` that returns consumed Planar frame buffers
+/// to a pool for reuse, avoiding per-frame allocation.
+fn encode_pipeline_opj_pooled<F, P>(
+    output_dir: &Path,
+    params: &CompressParams,
+    total_frames: u64,
+    cancel: &Arc<AtomicBool>,
+    pool: &Arc<FramePool>,
+    mut frame_producer: F,
+    mut on_progress: P,
+) -> PipelineResult
+where
+    F: FnMut() -> Option<RawFrame>,
+    P: FnMut(EncodeProgress),
+{
+    if let Err(e) = std::fs::create_dir_all(output_dir) {
+        return PipelineResult {
+            success: false,
+            error: format!("Failed to create output directory: {e}"),
+            frames_encoded: 0,
+            output_dir: output_dir.to_path_buf(),
+        };
+    }
+
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    let num_encoder_threads = num_threads;
+    let queue_capacity = (num_encoder_threads * 2).clamp(4, 32);
+    let input_queue: Arc<BoundedQueue<RawFrame>> = Arc::new(BoundedQueue::new(queue_capacity));
+
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel::<EncodedFrame>();
+
+    let frames_encoded = Arc::new(AtomicU64::new(0));
+    let error_flag = Arc::new(AtomicBool::new(false));
+    let first_error = Arc::new(Mutex::new(String::new()));
+
+    let encode_start = std::time::Instant::now();
+
+    // Writer thread
+    let writer_output_dir = output_dir.to_path_buf();
+    let writer_encoded_count = frames_encoded.clone();
+    let writer_error_flag = error_flag.clone();
+    let writer_first_error = first_error.clone();
+    let writer_handle = std::thread::spawn(move || {
+        for frame in writer_rx {
+            let path = writer_output_dir.join(format!("frame_{:08}.j2c", frame.index));
+            if let Err(e) = std::fs::write(&path, &frame.data) {
+                writer_error_flag.store(true, Ordering::Relaxed);
+                let mut err = writer_first_error.lock().unwrap();
+                if err.is_empty() {
+                    *err = format!("Write error frame {}: {e}", frame.index);
+                }
+                break;
+            }
+            writer_encoded_count.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    // Encoder threads with pool return
+    let params = params.clone();
+    std::thread::scope(|s| {
+        let encoder_handles: Vec<_> = (0..num_encoder_threads)
+            .map(|_| {
+                let input_queue = input_queue.clone();
+                let writer_tx = writer_tx.clone();
+                let error_flag = error_flag.clone();
+                let first_error = first_error.clone();
+                let cancel = cancel.clone();
+                let params = params.clone();
+                let pool = pool.clone();
+
+                s.spawn(move || {
+                    opj_encoder_thread_pooled(
+                        &input_queue,
+                        &writer_tx,
+                        &error_flag,
+                        &first_error,
+                        &cancel,
+                        &params,
+                        &pool,
+                    );
+                })
+            })
+            .collect();
+
+        drop(writer_tx);
+
+        // Producer loop
+        loop {
+            if cancel.load(Ordering::Relaxed) || error_flag.load(Ordering::Relaxed) {
+                break;
+            }
+            match frame_producer() {
+                Some(frame) => {
+                    if !input_queue.push(frame) {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+
+        input_queue.close();
+
+        // Progress reporting
+        loop {
+            let done = frames_encoded.load(Ordering::Relaxed);
+            let elapsed = encode_start.elapsed().as_secs_f64();
+            on_progress(EncodeProgress {
+                frames_encoded: done,
+                total_frames,
+                fps: if elapsed > 0.0 {
+                    done as f64 / elapsed
+                } else {
+                    0.0
+                },
+                elapsed_secs: elapsed,
+            });
+
+            if done >= total_frames
+                || error_flag.load(Ordering::Relaxed)
+                || cancel.load(Ordering::Relaxed)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        drop(encoder_handles);
+    });
+
+    let _ = writer_handle.join();
+
+    if cancel.load(Ordering::Relaxed) {
+        return PipelineResult {
+            success: false,
+            error: "Cancelled".to_string(),
+            frames_encoded: frames_encoded.load(Ordering::Relaxed),
+            output_dir: output_dir.to_path_buf(),
+        };
+    }
+
+    let err = first_error.lock().unwrap();
+    if !err.is_empty() {
+        return PipelineResult {
+            success: false,
+            error: err.clone(),
+            frames_encoded: frames_encoded.load(Ordering::Relaxed),
+            output_dir: output_dir.to_path_buf(),
+        };
+    }
+
+    PipelineResult {
+        success: true,
+        error: String::new(),
+        frames_encoded: frames_encoded.load(Ordering::Relaxed),
+        output_dir: output_dir.to_path_buf(),
+    }
+}
+
 /// Video-to-J2K pipeline using OpenJPEG (ffmpeg decode → N independent encode threads).
+///
+/// Uses planar pixel output from ffmpeg (`gbrp12le`) to eliminate interleaved→planar
+/// conversion, and a buffer pool to avoid per-frame allocation churn.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_video_pipeline_opj<P>(
     input_video: &Path,
@@ -204,12 +413,15 @@ where
         };
     }
 
+    // Use planar 12-bit output from ffmpeg — each plane is sequential u16le
+    // values. This eliminates the expensive interleaved→planar deinterleave.
+    // Plane order from ffmpeg gbrp12le: G, B, R.
     let mut child = match Command::new("ffmpeg")
         .arg("-y")
         .arg("-i")
         .arg(input_video)
         .arg("-pix_fmt")
-        .arg("rgb48be")
+        .arg("gbrp12le")
         .arg("-f")
         .arg("rawvideo")
         .arg("pipe:1")
@@ -228,34 +440,67 @@ where
         }
     };
 
-    let frame_size = (width as usize) * (height as usize) * 6;
+    let npixels = (width as usize) * (height as usize);
+    // gbrp12le: 3 planes × 2 bytes per pixel
+    let plane_bytes = npixels * 2;
+    let frame_bytes = plane_bytes * 3;
     let mut stdout = child.stdout.take().unwrap();
 
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let queue_capacity = (num_threads * 2).clamp(4, 32);
+
+    // Pre-allocate buffer pool: queue_capacity + num_threads buffers in flight
+    let pool = Arc::new(FramePool::new(queue_capacity + num_threads, npixels));
+
     let mut frame_index: u64 = 0;
-    let result = encode_pipeline_opj(
+    let mut read_buf = vec![0u8; frame_bytes];
+
+    let result = encode_pipeline_opj_pooled(
         output_dir,
         params,
         total_frames,
         cancel,
+        &pool,
         || {
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            let mut buf = vec![0u8; frame_size];
-            match stdout.read_exact(&mut buf) {
-                Ok(()) => {
-                    let idx = frame_index;
-                    frame_index += 1;
-                    Some(RawFrame::Packed {
-                        data: buf,
-                        width,
-                        height,
-                        precision: 12,
-                        index: idx,
-                    })
-                }
-                Err(_) => None,
+            if stdout.read_exact(&mut read_buf).is_err() {
+                return None;
             }
+
+            // Convert gbrp12le planes → planar i32 using pooled buffers.
+            // Plane layout: [G plane][B plane][R plane], each u16le.
+            let mut components = pool.acquire();
+
+            let g_plane = &read_buf[..plane_bytes];
+            let b_plane = &read_buf[plane_bytes..plane_bytes * 2];
+            let r_plane = &read_buf[plane_bytes * 2..];
+
+            // R component (index 0) ← R plane (3rd from ffmpeg)
+            for (i, chunk) in r_plane.chunks_exact(2).enumerate() {
+                components[0][i] = u16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+            }
+            // G component (index 1) ← G plane (1st from ffmpeg)
+            for (i, chunk) in g_plane.chunks_exact(2).enumerate() {
+                components[1][i] = u16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+            }
+            // B component (index 2) ← B plane (2nd from ffmpeg)
+            for (i, chunk) in b_plane.chunks_exact(2).enumerate() {
+                components[2][i] = u16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+            }
+
+            let idx = frame_index;
+            frame_index += 1;
+            Some(RawFrame::Planar {
+                components,
+                width,
+                height,
+                precision: 12,
+                index: idx,
+            })
         },
         &mut on_progress,
     );
@@ -303,14 +548,58 @@ fn opj_encoder_thread(
     }
 }
 
+/// Encoder thread variant that returns Planar frame buffers to the pool after use.
+fn opj_encoder_thread_pooled(
+    input_queue: &BoundedQueue<RawFrame>,
+    writer_tx: &std::sync::mpsc::Sender<EncodedFrame>,
+    error_flag: &AtomicBool,
+    first_error: &Mutex<String>,
+    cancel: &AtomicBool,
+    params: &CompressParams,
+    pool: &FramePool,
+) {
+    while !cancel.load(Ordering::Relaxed) && !error_flag.load(Ordering::Relaxed) {
+        let Some(frame) = input_queue.pop() else {
+            break;
+        };
+
+        let index = frame.index();
+        let result = compress_frame_opj(&frame, params);
+
+        // Return buffer to pool
+        if let RawFrame::Planar { components, .. } = frame {
+            pool.release(components);
+        }
+
+        match result {
+            Ok(data) => {
+                let encoded = EncodedFrame { data, index };
+                if writer_tx.send(encoded).is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                error_flag.store(true, Ordering::Relaxed);
+                let mut err = first_error.lock().unwrap();
+                if err.is_empty() {
+                    *err = format!("OpenJPEG encode failed frame {index}: {e}");
+                }
+                break;
+            }
+        }
+    }
+}
+
 // ─── OpenJPEG FFI compression ──────────────────────────────────────────────────
 
 /// Thread-local write buffer for OpenJPEG stream callbacks.
+#[cfg(feature = "openjpeg")]
 struct WriteBuffer {
     data: Vec<u8>,
     offset: usize,
 }
 
+#[cfg(feature = "openjpeg")]
 impl WriteBuffer {
     fn new() -> Self {
         // Pre-allocate ~1.5MB (typical DCI frame is ~1.3MB)
@@ -321,6 +610,7 @@ impl WriteBuffer {
     }
 }
 
+#[cfg(feature = "openjpeg")]
 unsafe extern "C" fn stream_write(
     buffer: *mut std::ffi::c_void,
     nb_bytes: usize,
@@ -342,6 +632,7 @@ unsafe extern "C" fn stream_write(
     }
 }
 
+#[cfg(feature = "openjpeg")]
 unsafe extern "C" fn stream_seek(nb_bytes: i64, user_data: *mut std::ffi::c_void) -> i32 {
     unsafe {
         let wb = &mut *(user_data as *mut WriteBuffer);
@@ -350,6 +641,7 @@ unsafe extern "C" fn stream_seek(nb_bytes: i64, user_data: *mut std::ffi::c_void
     }
 }
 
+#[cfg(feature = "openjpeg")]
 unsafe extern "C" fn error_callback(
     msg: *const std::ffi::c_char,
     _client_data: *mut std::ffi::c_void,
@@ -487,6 +779,11 @@ fn compress_frame_opj(frame: &RawFrame, params: &CompressParams) -> Result<Vec<u
             opj_image_destroy(image);
             return Err("opj_setup_encoder failed".to_string());
         }
+
+        // Force single-threaded T1 encoding per codec instance.
+        // We achieve parallelism via N independent codec instances, so internal
+        // threading would cause N×M thread oversubscription.
+        opj_codec_set_threads(encoder, 1);
 
         // Set GUARD_BITS via extra options (available in OpenJPEG 2.5+)
         opj_encoder_set_extra_options(encoder, extra_options.as_ptr() as *mut *const i8);
