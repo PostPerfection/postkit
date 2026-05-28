@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>postkit &mdash; Shared Post-Production Library</title>
+    <meta name="description" content="Shared Rust library for DCP Wizard, IMF Wizard, and DCP Doctor. Common post-production functionality for digital cinema workflows.">
+    <style>
+        :root {
+            --bg: #0D0D0D;
+            --bg-card: #1A1A1A;
+            --border: #2A2A2A;
+            --text: #E5E5E5;
+            --text-muted: #999;
+            --accent: #A78BFA;
+        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            padding: 2rem;
+        }
+        .container { max-width: 800px; margin: 0 auto; }
+        h1 { font-size: 2.5rem; margin-bottom: 0.5rem; }
+        h1 span { color: var(--accent); }
+        .subtitle { color: var(--text-muted); font-size: 1.1rem; margin-bottom: 2rem; }
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+        }
+        .card h2 { font-size: 1.2rem; margin-bottom: 0.5rem; }
+        .card p { color: var(--text-muted); }
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        code {
+            background: #222;
+            padding: 0.2em 0.4em;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        .modules { columns: 2; column-gap: 1rem; }
+        .modules li { margin-bottom: 0.3rem; list-style: none; }
+        .modules li::before { content: "▸ "; color: var(--accent); }
+        @media (max-width: 600px) { .modules { columns: 1; } }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1><span>postkit</span></h1>
+        <p class="subtitle">Shared Rust library for DCP Wizard, IMF Wizard, and DCP Doctor &mdash; common post-production functionality.</p>
+
+        <div class="card">
+            <h2>About</h2>
+            <p>postkit provides the core building blocks for digital cinema post-production tools. MXF wrapping uses <a href="https://github.com/PostPerfection/asdcplib-rs">asdcplib-rs</a> FFI bindings.</p>
+        </div>
+
+        <div class="card">
+            <h2>Modules</h2>
+            <ul class="modules">
+                <li>encode &mdash; JPEG 2000 encoding</li>
+                <li>mxf_wrap &mdash; MXF track wrapping</li>
+                <li>hash &mdash; SHA-1/SHA-256 hashing</li>
+                <li>colour &mdash; Colour space conversion</li>
+                <li>loudness &mdash; EBU R128 measurement</li>
+                <li>job_queue &mdash; Background jobs</li>
+                <li>preferences &mdash; JSON preferences</li>
+                <li>profiles &mdash; Delivery presets</li>
+                <li>burnin &mdash; Subtitle burn-in</li>
+                <li>report &mdash; QC reports</li>
+                <li>watch &mdash; Watch folder automation</li>
+                <li>preview &mdash; DCP/IMF playback</li>
+                <li>ingest &mdash; Camera raw ingest</li>
+                <li>conform &mdash; Timeline import</li>
+                <li>certificate &mdash; X.509 management</li>
+                <li>dolby_vision &mdash; HDR metadata</li>
+                <li>watermark &mdash; Forensic watermarking</li>
+                <li>dcdm &mdash; DCDM creation</li>
+                <li>accessibility &mdash; Compliance checking</li>
+                <li>trailer &mdash; Trailer packaging</li>
+            </ul>
+        </div>
+
+        <div class="card">
+            <h2>Usage</h2>
+            <p>Add to your <code>Cargo.toml</code>:</p>
+            <pre style="margin-top:0.5rem;background:#222;padding:1rem;border-radius:4px;overflow-x:auto"><code>[dependencies]
+postkit = { git = "https://github.com/PostPerfection/postkit.git", branch = "master" }</code></pre>
+        </div>
+
+        <div class="card">
+            <h2>Links</h2>
+            <p>
+                <a href="https://github.com/PostPerfection/postkit">GitHub Repository</a> &middot;
+                <a href="https://github.com/PostPerfection/dcpwizard">DCP Wizard</a> &middot;
+                <a href="https://github.com/PostPerfection/imfwizard">IMF Wizard</a> &middot;
+                <a href="https://github.com/PostPerfection/dcpdoctor">DCP Doctor</a>
+            </p>
+        </div>
+
+        <p style="margin-top:2rem;color:var(--text-muted);font-size:0.85rem;">Licensed under GPL-3.0</p>
+    </div>
+</body>
+</html>
