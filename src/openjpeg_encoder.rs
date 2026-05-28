@@ -42,7 +42,8 @@ where
         .unwrap_or(4);
 
     // Each thread gets its own independent OpenJPEG codec — no shared pool.
-    // Scale to available CPUs. Slight oversubscription (like dcpomatic's 1.5x) can help.
+    // Tested: 1.5x oversubscription is slower due to context switching.
+    // 1:1 ratio with CPU count is optimal for this workload.
     let num_encoder_threads = num_threads;
 
     let queue_capacity = (num_encoder_threads * 2).clamp(4, 32);
