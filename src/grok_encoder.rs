@@ -230,10 +230,9 @@ where
         .map(|n| n.get())
         .unwrap_or(4);
 
-    // Grok's CompressScheduler always uses the full TFSingleton pool regardless
-    // of per-codec cparams.num_threads. With N encoder threads, N taskflows
-    // compete on the shared pool. Empirically: 1 encoder→7.1fps, 16→8.9fps.
-    // Try a middle ground to balance pipeline depth vs contention.
+    // Grok's CompressScheduler uses the global TFSingleton pool for T1 block
+    // encoding. With N encoder threads, N taskflows compete on the shared pool.
+    // Using fewer encoder threads gives each frame more pool bandwidth.
     let threads_per_codec = 1;
     let num_encoder_threads = num_threads.min(4);
 

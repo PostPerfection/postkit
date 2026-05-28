@@ -9,7 +9,7 @@ description = "Shared library for DCP Wizard, IMF Wizard, and DCP Doctor"
 asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", branch = "master" }
 base64 = "0.22"
 dirs = "6"
-grokj2k-sys = { path = "/home/aaron/src/grok/bindings/rust", optional = true }
+grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", optional = true }
 hex = "0.4"
 notify = "8"
 openjpeg-sys = { version = "1.0", optional = true }

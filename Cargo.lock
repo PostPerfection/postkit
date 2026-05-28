@@ -434,6 +434,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "grokj2k-sys"
 version = "1.0.0"
+source = "git+https://github.com/GrokImageCompression/grok.git#f274e89cd47a83a73276b401df428eb6e3e0c8ee"
 dependencies = [
  "bindgen",
  "libc",
