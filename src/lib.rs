@@ -18,6 +18,7 @@ pub mod metadata_edit;
 pub mod mpv;
 pub mod mxf_wrap;
 pub mod openjpeg_encoder;
+pub mod pipeline;
 pub mod preferences;
 pub mod preview;
 pub mod profiles;
