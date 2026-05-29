@@ -38,7 +38,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "asdcplib"
 version = "0.1.0"
-source = "git+https://github.com/PostPerfection/asdcplib-rs.git?branch=master#711712f555048eed1edee7ab636eea4210a104ec"
+source = "git+https://github.com/PostPerfection/asdcplib-rs.git?tag=v1.0.0#711712f555048eed1edee7ab636eea4210a104ec"
 dependencies = [
  "asdcplib-sys",
  "thiserror 2.0.18",
@@ -47,7 +47,7 @@ dependencies = [
 [[package]]
 name = "asdcplib-sys"
 version = "0.1.0"
-source = "git+https://github.com/PostPerfection/asdcplib-rs.git?branch=master#711712f555048eed1edee7ab636eea4210a104ec"
+source = "git+https://github.com/PostPerfection/asdcplib-rs.git?tag=v1.0.0#711712f555048eed1edee7ab636eea4210a104ec"
 dependencies = [
  "cc",
  "cmake",
@@ -797,7 +797,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "postkit"
-version = "0.5.0"
+version = "1.0.0"
 dependencies = [
  "asdcplib",
  "base64",

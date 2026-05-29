@@ -15,6 +15,7 @@ pub mod j2k;
 pub mod job_queue;
 pub mod loudness;
 pub mod metadata_edit;
+pub mod mpv;
 pub mod mxf_wrap;
 pub mod openjpeg_encoder;
 pub mod preferences;
