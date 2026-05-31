@@ -8,36 +8,44 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 
 | Module | Purpose |
 |--------|---------|
-| `encode` | JPEG 2000 encoding pipeline (stream subprocess via grok) |
-| `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
-| `openjpeg_encoder` | OpenJPEG J2K encoder (multi-instance, CPU-only, no GPU dependency) |
-| `transcode` | Video format conversion (via ffmpeg) |
-| `hash` | SHA-1 / SHA-256 file hashing |
-| `mxf_wrap` | MXF track file wrapping |
-| `colour` | Colour space conversion (Rec.709, P3, XYZ) |
-| `loudness` | Audio loudness measurement (EBU R128) |
-| `atmos` | Dolby Atmos IAB packaging |
-| `job_queue` | Background job scheduling |
-| `preferences` | JSON preferences (XDG/AppData) |
-| `rest_api` | HTTP REST API server |
-| `profiles` | Delivery profile presets |
-| `burnin` | Subtitle/watermark burn-in |
-| `report` | HTML/JSON QC report generation |
-| `watch` | Watch folder automation |
-| `shell_completion` | Bash/Zsh/Fish completion |
-| `portable` | Portable/USB deployment |
-| `preview` | Frame-accurate DCP/IMF playback and frame extraction |
-| `ingest` | Camera raw ingest (ARRI, RED, Sony, Canon, BRAW) |
-| `conform` | EDL/AAF/XML timeline import and reel assembly |
-| `metadata_edit` | CPL/OPL metadata editor |
-| `certificate` | X.509 certificate generation and trust management |
-| `dolby_vision` | Dolby Vision RPU, HDR10, HLG metadata handling |
-| `dashboard` | Real-time job monitoring and analytics dashboard |
-| `watermark` | Forensic watermarking (NexGuard, Civolution, internal) |
-| `dcdm` | Digital Cinema Distribution Master creation and export |
-| `version_tracker` | Content versioning database (delivery history) |
-| `trailer` | Theatrical trailer packaging (ratings cards, leaders) |
 | `accessibility` | Accessibility compliance checking (CVAA, EAA, AODA, Ofcom) |
+| `burnin` | Subtitle/watermark burn-in |
+| `certificate` | X.509 certificate generation and trust management |
+| `colour` | Colour space conversion (Rec.709, P3, XYZ) |
+| `conform` | EDL/AAF/XML timeline import and reel assembly |
+| `cpl_annotation` | CPL annotation and revision metadata |
+| `dashboard` | Real-time job monitoring and analytics dashboard |
+| `dcdm` | Digital Cinema Distribution Master creation and export |
+| `dolby_vision` | Dolby Vision RPU, HDR10, HLG metadata handling |
+| `edl_import` | EDL/FCP XML timeline parsing and import |
+| `encode` | JPEG 2000 encoding pipeline (stream subprocess via grok) |
+| `grok` | Grok codec detection and configuration |
+| `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
+| `hash` | SHA-1 / SHA-256 file hashing |
+| `ingest` | Camera raw ingest and transcoding (ARRI, RED, Sony, Canon, BRAW) |
+| `j2k` | JPEG 2000 codestream utilities |
+| `job_queue` | Background job scheduling |
+| `loudness` | Audio loudness measurement (EBU R128) |
+| `mca` | SMPTE ST 377-4 Multi-Channel Audio label generation |
+| `metadata_edit` | CPL/OPL metadata editor |
+| `mpv` | mpv IPC player integration for preview |
+| `mxf_wrap` | MXF track file wrapping (picture, audio, Atmos) |
+| `openjpeg_encoder` | OpenJPEG J2K encoder (multi-instance, CPU-only, no GPU dependency) |
+| `otioz_import` | OpenTimelineIO zip bundle import |
+| `pipeline` | Full video-to-DCP streaming pipeline |
+| `plugin` | Python plugin system with pre/post hooks |
+| `preferences` | JSON preferences (XDG/AppData) |
+| `preview` | Frame-accurate DCP/IMF playback and frame extraction |
+| `probe` | Media file probing (resolution, codec, duration) |
+| `profiles` | Delivery profile presets |
+| `prores` | ProRes detection and transcoding |
+| `report` | HTML/JSON QC report generation |
+| `subtitle_retime` | Subtitle timing conversion between framerates |
+| `trailer` | Theatrical trailer packaging (ratings cards, leaders) |
+| `version_tracker` | Content versioning database (delivery history) |
+| `watch` | Watch folder automation |
+| `watermark` | Forensic watermarking (NexGuard, Civolution, internal) |
+| `webhook` | HTTP webhook notifications on job completion/failure |
 
 ## Building
 
