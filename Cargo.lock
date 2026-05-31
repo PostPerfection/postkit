@@ -38,7 +38,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "asdcplib"
 version = "0.1.0"
-source = "git+https://github.com/PostPerfection/asdcplib-rs.git?tag=v1.0.0#711712f555048eed1edee7ab636eea4210a104ec"
+source = "git+https://github.com/PostPerfection/asdcplib-rs.git?tag=v0.1.0#1750b97c7608de8e318976abfc51d6b612a5e990"
 dependencies = [
  "asdcplib-sys",
  "thiserror 2.0.18",
@@ -47,7 +47,7 @@ dependencies = [
 [[package]]
 name = "asdcplib-sys"
 version = "0.1.0"
-source = "git+https://github.com/PostPerfection/asdcplib-rs.git?tag=v1.0.0#711712f555048eed1edee7ab636eea4210a104ec"
+source = "git+https://github.com/PostPerfection/asdcplib-rs.git?tag=v0.1.0#1750b97c7608de8e318976abfc51d6b612a5e990"
 dependencies = [
  "cc",
  "cmake",

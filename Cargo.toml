@@ -6,7 +6,7 @@ license = "GPL-3.0-or-later"
 description = "Shared library for DCP Wizard, IMF Wizard, and DCP Doctor"
 
 [dependencies]
-asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", tag = "v1.0.0" }
+asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", tag = "v0.1.0" }
 base64 = "0.22"
 dirs = "6"
 grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", optional = true }
