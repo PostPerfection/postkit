@@ -310,7 +310,21 @@ impl DvMode {
     }
 }
 
-/// Extract Dolby Vision RPU using dovi_tool.
+impl From<DvMode> for dolby_vision::rpu::ConversionMode {
+    fn from(mode: DvMode) -> Self {
+        match mode {
+            DvMode::Mode0 => dolby_vision::rpu::ConversionMode::Lossless,
+            DvMode::Mode1 => dolby_vision::rpu::ConversionMode::ToMel,
+            DvMode::Mode2 => dolby_vision::rpu::ConversionMode::To81,
+            DvMode::Mode4 => dolby_vision::rpu::ConversionMode::To81MappingPreserved,
+            DvMode::Mode5 => dolby_vision::rpu::ConversionMode::To84,
+        }
+    }
+}
+
+/// Extract Dolby Vision RPU from HEVC stream using dovi_tool.
+///
+/// This requires full HEVC bitstream parsing, so it delegates to the dovi_tool CLI.
 pub fn extract_rpu(input: &Path, output: &Path) -> Result<(), String> {
     let out = std::process::Command::new("dovi_tool")
         .arg("extract-rpu")
@@ -327,26 +341,131 @@ pub fn extract_rpu(input: &Path, output: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Convert Dolby Vision mode using dovi_tool.
+/// Convert Dolby Vision RPU mode natively using the dolby_vision crate.
+///
+/// Reads raw RPU binary data, converts each RPU to the target mode, writes the result.
+/// For profile conversion on .bin RPU files (not full HEVC streams).
 pub fn convert_dv_mode(input: &Path, output: &Path, mode: DvMode) -> Result<(), String> {
-    let out = std::process::Command::new("dovi_tool")
-        .arg("convert")
-        .arg("--mode")
-        .arg(mode.as_str())
-        .arg("-i")
-        .arg(input)
-        .arg("-o")
-        .arg(output)
-        .output()
-        .map_err(|e| format!("Failed to run dovi_tool: {e}"))?;
+    use dolby_vision::rpu::dovi_rpu::DoviRpu;
 
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    let data = std::fs::read(input).map_err(|e| format!("Failed to read RPU file: {e}"))?;
+
+    // RPU .bin files contain concatenated RPU NALUs separated by start codes
+    let rpus = parse_rpu_bin_file(&data)?;
+    let conversion_mode: dolby_vision::rpu::ConversionMode = mode.into();
+
+    let mut out_buf = Vec::new();
+    for rpu_data in &rpus {
+        let mut rpu =
+            DoviRpu::parse_rpu(rpu_data).map_err(|e| format!("Failed to parse RPU: {e}"))?;
+        rpu.convert_with_mode(conversion_mode)
+            .map_err(|e| format!("Failed to convert RPU: {e}"))?;
+        let converted = rpu
+            .write_rpu()
+            .map_err(|e| format!("Failed to write RPU: {e}"))?;
+        // Write start code + NALU
+        out_buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+        out_buf.extend_from_slice(&converted);
     }
+
+    std::fs::write(output, &out_buf).map_err(|e| format!("Failed to write output: {e}"))?;
+
+    tracing::info!(
+        "Converted {} RPU(s) to mode {} → {}",
+        rpus.len(),
+        mode.as_str(),
+        output.display()
+    );
     Ok(())
 }
 
+/// Parse a single RPU NALU from raw bytes (no start code prefix).
+pub fn parse_single_rpu(data: &[u8]) -> Result<dolby_vision::rpu::dovi_rpu::DoviRpu, String> {
+    dolby_vision::rpu::dovi_rpu::DoviRpu::parse_rpu(data)
+        .map_err(|e| format!("RPU parse error: {e}"))
+}
+
+/// Convert a single RPU in-memory to the target profile/mode.
+pub fn convert_rpu(data: &[u8], mode: DvMode) -> Result<Vec<u8>, String> {
+    use dolby_vision::rpu::dovi_rpu::DoviRpu;
+
+    let mut rpu = DoviRpu::parse_rpu(data).map_err(|e| format!("RPU parse error: {e}"))?;
+    let conversion_mode: dolby_vision::rpu::ConversionMode = mode.into();
+    rpu.convert_with_mode(conversion_mode)
+        .map_err(|e| format!("RPU conversion error: {e}"))?;
+    rpu.write_rpu().map_err(|e| format!("RPU write error: {e}"))
+}
+
+/// Generate a default Dolby Vision profile 8.1 RPU.
+pub fn generate_profile81_rpu() -> Result<Vec<u8>, String> {
+    use dolby_vision::rpu::dovi_rpu::DoviRpu;
+    use dolby_vision::rpu::generate::GenerateConfig;
+
+    let config = GenerateConfig::default();
+    let rpu = DoviRpu::profile81_config(&config)
+        .map_err(|e| format!("Failed to generate profile 8.1 RPU: {e}"))?;
+    rpu.write_rpu()
+        .map_err(|e| format!("Failed to write RPU: {e}"))
+}
+
+/// Generate a default Dolby Vision profile 8.4 RPU.
+pub fn generate_profile84_rpu() -> Result<Vec<u8>, String> {
+    use dolby_vision::rpu::dovi_rpu::DoviRpu;
+    use dolby_vision::rpu::generate::GenerateConfig;
+
+    let config = GenerateConfig::default();
+    let rpu = DoviRpu::profile84_config(&config)
+        .map_err(|e| format!("Failed to generate profile 8.4 RPU: {e}"))?;
+    rpu.write_rpu()
+        .map_err(|e| format!("Failed to write RPU: {e}"))
+}
+
+/// Parse a .bin RPU file into individual RPU NALUs.
+fn parse_rpu_bin_file(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    let mut rpus = Vec::new();
+    let mut i = 0;
+
+    while i < data.len() {
+        // Find start code (0x000001 or 0x00000001)
+        let start = if i + 4 <= data.len() && data[i..i + 4] == [0, 0, 0, 1] {
+            i + 4
+        } else if i + 3 <= data.len() && data[i..i + 3] == [0, 0, 1] {
+            i + 3
+        } else {
+            // If no start code at beginning, treat the whole thing as a single RPU
+            if rpus.is_empty() {
+                rpus.push(data.to_vec());
+            }
+            break;
+        };
+
+        // Find next start code
+        let mut end = start;
+        while end < data.len() {
+            if end + 4 <= data.len() && data[end..end + 4] == [0, 0, 0, 1] {
+                break;
+            }
+            if end + 3 <= data.len() && data[end..end + 3] == [0, 0, 1] {
+                break;
+            }
+            end += 1;
+        }
+
+        if start < end {
+            rpus.push(data[start..end].to_vec());
+        }
+        i = end;
+    }
+
+    if rpus.is_empty() {
+        return Err("No RPU NALUs found in file".to_string());
+    }
+    Ok(rpus)
+}
+
 /// Inject RPU into HEVC stream using dovi_tool.
+///
+/// This requires full HEVC bitstream manipulation, so it delegates to the dovi_tool CLI.
 pub fn inject_rpu(hevc: &Path, rpu: &Path, output: &Path) -> Result<(), String> {
     let out = std::process::Command::new("dovi_tool")
         .arg("inject-rpu")
