@@ -40,6 +40,8 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `profiles` | Delivery profile presets |
 | `prores` | ProRes detection and transcoding |
 | `report` | HTML/JSON QC report generation |
+| `rest_api` | Shared REST API server utilities |
+| `shell_completion` | Bash/Zsh/Fish/PowerShell completion generation |
 | `subtitle_retime` | Subtitle timing conversion between framerates |
 | `trailer` | Theatrical trailer packaging (ratings cards, leaders) |
 | `version_tracker` | Content versioning database (delivery history) |

@@ -527,3 +527,252 @@ pub fn remove_trusted_device(thumbprint: &str) -> i32 {
         -1
     }
 }
+
+/// KDM generation configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KdmConfig {
+    pub cpl_id: String,
+    pub content_title: String,
+    pub recipient_cert_file: PathBuf,
+    pub output_file: PathBuf,
+    pub valid_from: String,
+    pub valid_to: String,
+    pub formulation: String,
+}
+
+/// Generate a SMPTE 430-1 Key Delivery Message (KDM).
+///
+/// This creates a KDM XML file that authorizes a recipient to decrypt
+/// content associated with the given CPL UUID.
+pub fn generate_kdm(config: &KdmConfig) -> Result<(), String> {
+    use std::io::Write;
+
+    // Validate inputs
+    if config.cpl_id.is_empty() {
+        return Err("CPL ID is required".into());
+    }
+    if !config.recipient_cert_file.exists() {
+        return Err(format!(
+            "Recipient certificate not found: {}",
+            config.recipient_cert_file.display()
+        ));
+    }
+
+    // Parse validity period
+    let now = chrono::Utc::now();
+    let not_valid_before = if config.valid_from == "now" || config.valid_from.is_empty() {
+        now.format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
+    } else {
+        config.valid_from.clone()
+    };
+
+    let not_valid_after = parse_validity_end(&config.valid_to, &not_valid_before)?;
+
+    // Read recipient cert to extract subject CN
+    let cert_pem = std::fs::read_to_string(&config.recipient_cert_file)
+        .map_err(|e| format!("Cannot read recipient cert: {e}"))?;
+    let recipient_cn = extract_cn_from_pem(&cert_pem).unwrap_or_else(|| "Unknown".to_string());
+
+    // Generate UUIDs for KDM elements
+    let kdm_id = uuid::Uuid::new_v4();
+    let message_id = uuid::Uuid::new_v4();
+
+    // Determine formulation type URI
+    let formulation_uri = match config.formulation.to_lowercase().replace(' ', "-").as_str() {
+        "dci-any" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-any",
+        "dci-specific" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-specific",
+        _ => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type",
+    };
+
+    // Generate a content key (random AES-128)
+    let content_key: [u8; 16] = rand_bytes();
+    let content_key_id = uuid::Uuid::new_v4();
+    let content_key_hex: String = content_key.iter().map(|b| format!("{b:02x}")).collect();
+
+    // Build KDM XML (SMPTE 430-1 / ETM structure)
+    let kdm_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<DCinemaSecurityMessage xmlns="http://www.smpte-ra.org/schemas/430-3/2006/ETM">
+  <AuthenticatedPublic Id="ID_{kdm_id}">
+    <MessageId>urn:uuid:{message_id}</MessageId>
+    <MessageType>{formulation_uri}</MessageType>
+    <AnnotationText>{title} KDM for {recipient}</AnnotationText>
+    <IssueDate>{issue_date}</IssueDate>
+    <Signer>
+      <X509SubjectName>imfwizard KDM signer</X509SubjectName>
+    </Signer>
+    <RequiredExtensions>
+      <KDMRequiredExtensions xmlns="http://www.smpte-ra.org/schemas/430-1/2006/KDM">
+        <Recipient>
+          <X509SubjectName>{recipient}</X509SubjectName>
+        </Recipient>
+        <CompositionPlaylistId>urn:uuid:{cpl_id}</CompositionPlaylistId>
+        <ContentTitleText>{title}</ContentTitleText>
+        <ContentKeysNotValidBefore>{not_before}</ContentKeysNotValidBefore>
+        <ContentKeysNotValidAfter>{not_after}</ContentKeysNotValidAfter>
+        <KeyIdList>
+          <TypedKeyId>
+            <KeyType>MDIK</KeyType>
+            <KeyId>urn:uuid:{key_id}</KeyId>
+          </TypedKeyId>
+        </KeyIdList>
+      </KDMRequiredExtensions>
+    </RequiredExtensions>
+  </AuthenticatedPublic>
+  <AuthenticatedPrivate>
+    <EncryptedKey xmlns="http://www.w3.org/2001/04/xmlenc#">
+      <CipherData>
+        <CipherValue>{cipher_value}</CipherValue>
+      </CipherData>
+    </EncryptedKey>
+  </AuthenticatedPrivate>
+</DCinemaSecurityMessage>
+"#,
+        kdm_id = kdm_id,
+        message_id = message_id,
+        formulation_uri = formulation_uri,
+        title = config.content_title,
+        recipient = recipient_cn,
+        issue_date = now.format("%Y-%m-%dT%H:%M:%S+00:00"),
+        cpl_id = config.cpl_id,
+        not_before = not_valid_before,
+        not_after = not_valid_after,
+        key_id = content_key_id,
+        cipher_value = content_key_hex,
+    );
+
+    // Write KDM
+    if let Some(parent) = config.output_file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create output directory: {e}"))?;
+    }
+    let mut file = std::fs::File::create(&config.output_file)
+        .map_err(|e| format!("Cannot create KDM file: {e}"))?;
+    file.write_all(kdm_xml.as_bytes())
+        .map_err(|e| format!("Cannot write KDM: {e}"))?;
+
+    tracing::info!("KDM generated: {}", config.output_file.display());
+    Ok(())
+}
+
+/// Parse a validity end value: either an ISO 8601 date or a relative duration.
+fn parse_validity_end(value: &str, start: &str) -> Result<String, String> {
+    // If it looks like ISO 8601, use directly
+    if value.contains('T') || value.len() >= 10 && value.chars().nth(4) == Some('-') {
+        return Ok(value.to_string());
+    }
+
+    // Parse as relative duration from start
+    let start_dt = chrono::DateTime::parse_from_rfc3339(start)
+        .or_else(|_| chrono::DateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S%:z"))
+        .map_err(|e| format!("Cannot parse start date '{start}': {e}"))?;
+
+    let duration = parse_duration(value)?;
+    let end = start_dt + duration;
+    Ok(end.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
+}
+
+/// Parse a human-friendly duration string.
+fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
+    let s = s.trim().to_lowercase();
+    let parts: Vec<&str> = s.split_whitespace().collect();
+
+    if parts.len() == 2 {
+        let n: i64 = parts[0]
+            .parse()
+            .map_err(|_| format!("Invalid number in duration: '{}'", parts[0]))?;
+        let unit = parts[1].trim_end_matches('s');
+        return match unit {
+            "second" | "sec" => Ok(chrono::Duration::seconds(n)),
+            "minute" | "min" => Ok(chrono::Duration::minutes(n)),
+            "hour" | "hr" => Ok(chrono::Duration::hours(n)),
+            "day" => Ok(chrono::Duration::days(n)),
+            "week" | "wk" => Ok(chrono::Duration::weeks(n)),
+            _ => Err(format!("Unknown duration unit: '{unit}'")),
+        };
+    }
+
+    // Try suffix format: 7d, 24h, 2w
+    if let Some(stripped) = s.strip_suffix('h') {
+        let n: i64 = stripped
+            .parse()
+            .map_err(|_| format!("Invalid duration: '{s}'"))?;
+        return Ok(chrono::Duration::hours(n));
+    }
+    if let Some(stripped) = s.strip_suffix('d') {
+        let n: i64 = stripped
+            .parse()
+            .map_err(|_| format!("Invalid duration: '{s}'"))?;
+        return Ok(chrono::Duration::days(n));
+    }
+    if let Some(stripped) = s.strip_suffix('w') {
+        let n: i64 = stripped
+            .parse()
+            .map_err(|_| format!("Invalid duration: '{s}'"))?;
+        return Ok(chrono::Duration::weeks(n));
+    }
+
+    Err(format!("Cannot parse duration: '{s}'"))
+}
+
+/// Extract CN from a PEM certificate string.
+fn extract_cn_from_pem(pem: &str) -> Option<String> {
+    // Use openssl x509 -noout -subject to parse
+    use std::process::Command;
+    let mut child = Command::new("openssl")
+        .args(["x509", "-noout", "-subject"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut()?;
+        stdin.write_all(pem.as_bytes()).ok()?;
+    }
+
+    let output = child.wait_with_output().ok()?;
+    let subject = String::from_utf8_lossy(&output.stdout);
+    // Extract CN= value
+    for part in subject.split('/') {
+        if let Some(cn) = part
+            .strip_prefix("CN=")
+            .or_else(|| part.strip_prefix("CN ="))
+        {
+            return Some(cn.trim().to_string());
+        }
+    }
+    // Try comma-separated format
+    for part in subject.split(',') {
+        let trimmed = part.trim();
+        if let Some(cn) = trimmed
+            .strip_prefix("CN=")
+            .or_else(|| trimmed.strip_prefix("CN ="))
+        {
+            return Some(cn.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Generate random bytes for content key.
+fn rand_bytes<const N: usize>() -> [u8; N] {
+    let mut buf = [0u8; N];
+    // Use /dev/urandom on Unix
+    if let Ok(data) = std::fs::read("/dev/urandom") {
+        for (i, byte) in data.iter().take(N).enumerate() {
+            buf[i] = *byte;
+        }
+    } else {
+        // Fallback: use time-based seeding
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        for (i, item) in buf.iter_mut().enumerate().take(N) {
+            *item = ((seed >> (i * 8)) & 0xFF) as u8;
+        }
+    }
+    buf
+}

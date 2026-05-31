@@ -30,6 +30,8 @@ pub mod probe;
 pub mod profiles;
 pub mod prores;
 pub mod report;
+pub mod rest_api;
+pub mod shell_completion;
 pub mod subtitle_retime;
 pub mod trailer;
 pub mod version_tracker;
