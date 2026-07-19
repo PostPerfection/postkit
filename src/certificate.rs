@@ -2065,6 +2065,13 @@ mod tests {
     /// title). If this drifts from libxml2 the signature stops verifying.
     #[test]
     fn c14n_matches_xmllint_for_each_fragment_shape() {
+        // Windows xmllint writes stdout in text mode (LF -> CRLF), so a raw byte
+        // comparison against its output is meaningless there. The xmlsec1 tests
+        // prove byte-exact correctness on Windows instead.
+        if cfg!(windows) {
+            eprintln!("skipping on windows: xmllint stdout is crlf-translated");
+            return;
+        }
         if !xmllint_available() {
             eprintln!("skipping: xmllint not installed");
             return;
