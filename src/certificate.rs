@@ -764,24 +764,11 @@ impl std::fmt::Debug for GeneratedKdm {
 /// and AuthenticatedPrivate elements; it will not build if the signature cannot
 /// be produced.
 pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
-    use base64::Engine;
-
     if config.cpl_id.is_empty() {
         return Err("CPL ID is required".into());
     }
 
-    // Accept either a bare UUID or the urn:uuid: form, and reject anything
-    // else: the key block needs the 16 raw bytes, not a free-text string.
-    let cpl_uuid = {
-        let trimmed = config
-            .cpl_id
-            .trim()
-            .strip_prefix("urn:uuid:")
-            .unwrap_or(config.cpl_id.trim());
-        uuid::Uuid::parse_str(trimmed)
-            .map_err(|e| format!("CPL ID '{}' is not a UUID: {e}", config.cpl_id))?
-    };
-
+    let cpl_uuid = parse_cpl_id(&config.cpl_id)?;
     let recipient = parse_recipient(&config.recipient_cert_file)?;
 
     // The signer thumbprint is a required field of the key block, so a missing
@@ -793,40 +780,142 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
     }
     let signer = parse_signer(&config.signer_cert_file)?;
 
-    let now = chrono::Utc::now();
-    let not_valid_before = if config.valid_from == "now" || config.valid_from.is_empty() {
-        now.format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
-    } else {
-        config.valid_from.clone()
-    };
+    let not_valid_before = resolve_valid_from(&config.valid_from);
     let not_valid_after = parse_validity_end(&config.valid_to, &not_valid_before)?;
-
-    let message_id = uuid::Uuid::new_v4();
-
-    let formulation_uri = match config.formulation.to_lowercase().replace(' ', "-").as_str() {
-        "dci-any" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-any",
-        "dci-specific" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-specific",
-        _ => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type",
-    };
 
     let content_key: [u8; 16] = rand_bytes()?;
     let content_key_id = uuid::Uuid::new_v4();
 
     // MDIK: image essence key, ST 430-1 6.3.9.3 Table 1.
-    let key_block = build_kdm_key_block(
-        &signer.thumbprint,
+    let keys = [KdmKey {
+        key_type: *b"MDIK",
+        key_id: content_key_id,
+        content_key,
+    }];
+
+    let xml = build_kdm_xml(
+        config,
         &cpl_uuid,
-        b"MDIK",
-        &content_key_id,
+        &config.content_title,
+        formulation_to_uri(&config.formulation),
         &not_valid_before,
         &not_valid_after,
-        &content_key,
+        &recipient,
+        &signer,
+        &keys,
     )?;
 
-    let ciphertext = encrypt_key_block(&recipient.public_key, &key_block)?;
-    let cipher_value = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+    Ok(GeneratedKdm {
+        xml,
+        content_key,
+        key_id: content_key_id,
+    })
+}
 
-    let title = xml_escape(&config.content_title);
+/// One content key carried by a KDM: its type (MDIK, MDAK, ...), id and value.
+struct KdmKey {
+    key_type: [u8; 4],
+    key_id: uuid::Uuid,
+    content_key: [u8; 16],
+}
+
+/// Accept either a bare UUID or the urn:uuid: form for a CPL id, rejecting
+/// anything else: the key block needs the 16 raw bytes, not a free-text string.
+fn parse_cpl_id(cpl_id: &str) -> Result<uuid::Uuid, String> {
+    let trimmed = cpl_id
+        .trim()
+        .strip_prefix("urn:uuid:")
+        .unwrap_or(cpl_id.trim());
+    uuid::Uuid::parse_str(trimmed).map_err(|e| format!("CPL ID '{cpl_id}' is not a UUID: {e}"))
+}
+
+/// Resolve the not-valid-before value: "now"/empty means the current UTC time.
+fn resolve_valid_from(valid_from: &str) -> String {
+    if valid_from == "now" || valid_from.is_empty() {
+        chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string()
+    } else {
+        valid_from.to_string()
+    }
+}
+
+/// Map a formulation name to its SMPTE MessageType URI.
+fn formulation_to_uri(formulation: &str) -> &'static str {
+    match formulation.to_lowercase().replace(' ', "-").as_str() {
+        "dci-any" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-any",
+        "dci-specific" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-specific",
+        _ => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type",
+    }
+}
+
+/// Assemble a signed SMPTE 430-1 KDM carrying `keys`, encrypting each key block
+/// to `recipient` with `signer`'s thumbprint embedded.
+///
+/// `config` is used only for the signer identity handed to `build_signature`
+/// (its cert, key and chain); every other field of the KDM comes from the
+/// explicit arguments so this core serves both fresh generation and re-wrap.
+#[allow(clippy::too_many_arguments)]
+fn build_kdm_xml(
+    config: &KdmConfig,
+    cpl_uuid: &uuid::Uuid,
+    content_title: &str,
+    formulation_uri: &str,
+    not_valid_before: &str,
+    not_valid_after: &str,
+    recipient: &Recipient,
+    signer: &Signer,
+    keys: &[KdmKey],
+) -> Result<String, String> {
+    use base64::Engine;
+
+    if keys.is_empty() {
+        return Err("a KDM must carry at least one content key".into());
+    }
+
+    let now = chrono::Utc::now();
+    let message_id = uuid::Uuid::new_v4();
+
+    // One TypedKeyId in KeyIdList and one EncryptedKey in AuthenticatedPrivate
+    // per key, built in the same loop so their order stays paired.
+    let mut typed_key_ids = String::new();
+    let mut encrypted_keys = String::new();
+    for key in keys {
+        let key_type =
+            std::str::from_utf8(&key.key_type).map_err(|_| "key type is not ASCII".to_string())?;
+
+        let key_block = build_kdm_key_block(
+            &signer.thumbprint,
+            cpl_uuid,
+            &key.key_type,
+            &key.key_id,
+            not_valid_before,
+            not_valid_after,
+            &key.content_key,
+        )?;
+        let ciphertext = encrypt_key_block(&recipient.public_key, &key_block)?;
+        let cipher_value = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+
+        typed_key_ids.push_str(&format!(
+            r#"          <TypedKeyId>
+            <KeyType>{key_type}</KeyType>
+            <KeyId>urn:uuid:{key_id}</KeyId>
+          </TypedKeyId>
+"#,
+            key_id = key.key_id,
+        ));
+        encrypted_keys.push_str(&format!(
+            r#"    <EncryptedKey xmlns="{ENC_NS}">
+      <EncryptionMethod Algorithm="{KDM_ENCRYPTION_METHOD}"/>
+      <CipherData>
+        <CipherValue>{cipher_value}</CipherValue>
+      </CipherData>
+    </EncryptedKey>
+"#,
+        ));
+    }
+
+    let title = xml_escape(content_title);
     let recipient_subject = xml_escape(&recipient.subject_dn);
     let recipient_issuer = xml_escape(&recipient.issuer_dn);
     let recipient_serial = xml_escape(&recipient.serial);
@@ -863,36 +952,22 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
         <ContentKeysNotValidBefore>{not_before}</ContentKeysNotValidBefore>
         <ContentKeysNotValidAfter>{not_after}</ContentKeysNotValidAfter>
         <KeyIdList>
-          <TypedKeyId>
-            <KeyType>MDIK</KeyType>
-            <KeyId>urn:uuid:{key_id}</KeyId>
-          </TypedKeyId>
-        </KeyIdList>
+{typed_key_ids}        </KeyIdList>
       </KDMRequiredExtensions>
     </RequiredExtensions>
   "#,
         issue_date = now.format("%Y-%m-%dT%H:%M:%S+00:00"),
         not_before = not_valid_before,
         not_after = not_valid_after,
-        key_id = content_key_id,
     );
 
-    let auth_private_inner = format!(
-        r#"
-    <EncryptedKey xmlns="{ENC_NS}">
-      <EncryptionMethod Algorithm="{KDM_ENCRYPTION_METHOD}"/>
-      <CipherData>
-        <CipherValue>{cipher_value}</CipherValue>
-      </CipherData>
-    </EncryptedKey>
-  "#,
-    );
+    let auth_private_inner = format!("\n{encrypted_keys}  ");
 
     let signature = build_signature(config, &auth_public_inner, &auth_private_inner)?;
 
     // The root declares the ETM default namespace plus xmlns:ds, exactly the
     // set the standalone fragments in build_signature reproduce.
-    let xml = format!(
+    Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <DCinemaSecurityMessage xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}">
   <AuthenticatedPublic Id="{AUTH_PUBLIC_ID}">{auth_public_inner}</AuthenticatedPublic>
@@ -900,13 +975,7 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
 {signature}
 </DCinemaSecurityMessage>
 "#,
-    );
-
-    Ok(GeneratedKdm {
-        xml,
-        content_key,
-        key_id: content_key_id,
-    })
+    ))
 }
 
 /// Build the ETM ds:Signature block (indented as the last child of
@@ -1177,6 +1246,327 @@ pub fn generate_kdm(config: &KdmConfig) -> Result<(), String> {
 
     tracing::info!("KDM generated: {}", config.output_file.display());
     Ok(())
+}
+
+/// Configuration for re-wrapping a DKDM to a new recipient.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RewrapConfig {
+    /// Source distribution KDM (DKDM) XML, addressed to `dkdm_recipient_key`.
+    pub dkdm_file: PathBuf,
+    /// RSA private key of the DKDM's recipient, used to decrypt its key blocks.
+    pub dkdm_recipient_key_file: PathBuf,
+    /// Certificate of the new recipient the content keys are re-encrypted to.
+    pub recipient_cert_file: PathBuf,
+    /// Leaf certificate of the entity re-issuing this KDM. Its thumbprint goes
+    /// into the new key blocks and its key signs the ETM ds:Signature.
+    pub signer_cert_file: PathBuf,
+    pub signer_key_file: PathBuf,
+    pub signer_chain_files: Vec<PathBuf>,
+    pub output_file: PathBuf,
+    /// Empty to preserve the DKDM's ContentKeysNotValidBefore.
+    pub valid_from: String,
+    /// Empty to preserve the DKDM's ContentKeysNotValidAfter.
+    pub valid_to: String,
+}
+
+/// Re-wrap a DKDM: decrypt its content keys with the DKDM recipient's private
+/// key and re-encrypt them to a new recipient, then sign the result.
+///
+/// This is the cryptographically correct alternative to copying the source
+/// CipherValue verbatim: the source bytes are RSA-encrypted to the DKDM
+/// recipient, so a new recipient could never decrypt them. The recovered
+/// content keys, key ids, types and CPL id are preserved; per libdcp
+/// (decrypted_kdm.cc `DecryptedKDM::encrypt`) the new key blocks carry the
+/// re-issuing signer's leaf thumbprint, and validity is preserved from the
+/// source unless overridden. The returned GeneratedKdm surfaces the first
+/// content key; every re-wrapped key lives in the returned XML.
+pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
+    let recipient = parse_recipient(&config.recipient_cert_file)?;
+
+    if config.signer_cert_file.as_os_str().is_empty() {
+        return Err("signer certificate is required: its thumbprint is part of \
+                    the SMPTE 430-1 key block"
+            .into());
+    }
+    let signer = parse_signer(&config.signer_cert_file)?;
+
+    let dkdm_xml = std::fs::read_to_string(&config.dkdm_file)
+        .map_err(|e| format!("cannot read DKDM {}: {e}", config.dkdm_file.display()))?;
+    let parsed = parse_dkdm(&dkdm_xml)?;
+    if parsed.cipher_values.is_empty() {
+        return Err("DKDM has no EncryptedKey CipherValue in AuthenticatedPrivate".into());
+    }
+
+    let dkdm_key = load_rsa_private_key(&config.dkdm_recipient_key_file)?;
+
+    let mut keys = Vec::with_capacity(parsed.cipher_values.len());
+    let mut cpl_uuid: Option<uuid::Uuid> = None;
+    let mut src_not_before: Option<String> = None;
+    let mut src_not_after: Option<String> = None;
+    for ciphertext in &parsed.cipher_values {
+        let block = decrypt_key_block(&dkdm_key, ciphertext)?;
+        let recovered = parse_kdm_key_block(&block)?;
+
+        // Every key in a KDM shares one CPL and one validity window.
+        match cpl_uuid {
+            Some(existing) if existing != recovered.cpl_id => {
+                return Err("DKDM key blocks reference more than one CPL id".into());
+            }
+            None => cpl_uuid = Some(recovered.cpl_id),
+            _ => {}
+        }
+        src_not_before.get_or_insert_with(|| recovered.not_before.clone());
+        src_not_after.get_or_insert_with(|| recovered.not_after.clone());
+
+        keys.push(KdmKey {
+            key_type: recovered.key_type,
+            key_id: recovered.key_id,
+            content_key: recovered.content_key,
+        });
+    }
+    let cpl_uuid = cpl_uuid.expect("at least one key block was decrypted");
+    let src_not_before = src_not_before.expect("at least one key block was decrypted");
+    let src_not_after = src_not_after.expect("at least one key block was decrypted");
+
+    let not_valid_before = if config.valid_from.is_empty() {
+        src_not_before
+    } else {
+        resolve_valid_from(&config.valid_from)
+    };
+    let not_valid_after = if config.valid_to.is_empty() {
+        src_not_after
+    } else {
+        parse_validity_end(&config.valid_to, &not_valid_before)?
+    };
+
+    // Preserve the source MessageType (formulation) and title.
+    let formulation_uri = parsed
+        .message_type
+        .as_deref()
+        .unwrap_or("http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type");
+    let content_title = parsed.content_title.as_deref().unwrap_or("");
+
+    // build_kdm_xml reads only the signer identity from the config.
+    let signer_config = KdmConfig {
+        signer_cert_file: config.signer_cert_file.clone(),
+        signer_key_file: config.signer_key_file.clone(),
+        signer_chain_files: config.signer_chain_files.clone(),
+        ..Default::default()
+    };
+
+    let xml = build_kdm_xml(
+        &signer_config,
+        &cpl_uuid,
+        content_title,
+        formulation_uri,
+        &not_valid_before,
+        &not_valid_after,
+        &recipient,
+        &signer,
+        &keys,
+    )?;
+
+    let first = &keys[0];
+    Ok(GeneratedKdm {
+        xml,
+        content_key: first.content_key,
+        key_id: first.key_id,
+    })
+}
+
+/// Re-wrap a DKDM and write the resulting KDM to disk.
+pub fn rewrap_dkdm_to_file(config: &RewrapConfig) -> Result<(), String> {
+    use std::io::Write;
+
+    let kdm = rewrap_dkdm(config)?;
+
+    if let Some(parent) = config.output_file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("Cannot create output directory: {e}"))?;
+    }
+    let mut file = std::fs::File::create(&config.output_file)
+        .map_err(|e| format!("Cannot create KDM file: {e}"))?;
+    file.write_all(kdm.xml.as_bytes())
+        .map_err(|e| format!("Cannot write KDM: {e}"))?;
+
+    tracing::info!("re-wrapped KDM written: {}", config.output_file.display());
+    Ok(())
+}
+
+/// The fields recovered from a DKDM's XML needed to re-issue it.
+struct ParsedDkdm {
+    /// Base64-decoded ciphertext of every EncryptedKey under AuthenticatedPrivate.
+    cipher_values: Vec<Vec<u8>>,
+    content_title: Option<String>,
+    message_type: Option<String>,
+}
+
+/// Extract the encrypted key blocks and public metadata from a DKDM.
+///
+/// CipherValues are collected only from within AuthenticatedPrivate so nothing
+/// outside the private block can be mistaken for a content key.
+fn parse_dkdm(xml: &str) -> Result<ParsedDkdm, String> {
+    use base64::Engine;
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut in_auth_private = false;
+    // Set while text is being gathered for the named field.
+    let mut collecting: Option<&'static str> = None;
+    let mut buffer = String::new();
+
+    let mut cipher_values = Vec::new();
+    let mut content_title = None;
+    let mut message_type = None;
+
+    loop {
+        match reader
+            .read_event()
+            .map_err(|e| format!("DKDM is not valid XML: {e}"))?
+        {
+            Event::Start(e) => match e.local_name().as_ref() {
+                b"AuthenticatedPrivate" => in_auth_private = true,
+                b"CipherValue" if in_auth_private => {
+                    collecting = Some("cipher");
+                    buffer.clear();
+                }
+                b"ContentTitleText" => {
+                    collecting = Some("title");
+                    buffer.clear();
+                }
+                b"MessageType" => {
+                    collecting = Some("message_type");
+                    buffer.clear();
+                }
+                _ => {}
+            },
+            Event::Text(e) if collecting.is_some() => {
+                let text = e
+                    .unescape()
+                    .map_err(|err| format!("DKDM text is not valid XML: {err}"))?;
+                buffer.push_str(&text);
+            }
+            Event::End(e) => match e.local_name().as_ref() {
+                b"AuthenticatedPrivate" => in_auth_private = false,
+                b"CipherValue" if collecting == Some("cipher") => {
+                    let stripped: String = buffer.split_whitespace().collect();
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(stripped.as_bytes())
+                        .map_err(|e| format!("DKDM CipherValue is not valid base64: {e}"))?;
+                    cipher_values.push(bytes);
+                    collecting = None;
+                }
+                b"ContentTitleText" if collecting == Some("title") => {
+                    content_title = Some(buffer.trim().to_string());
+                    collecting = None;
+                }
+                b"MessageType" if collecting == Some("message_type") => {
+                    message_type = Some(buffer.trim().to_string());
+                    collecting = None;
+                }
+                _ => {}
+            },
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    Ok(ParsedDkdm {
+        cipher_values,
+        content_title,
+        message_type,
+    })
+}
+
+/// A content key recovered from a decrypted DKDM key block.
+struct RecoveredKey {
+    cpl_id: uuid::Uuid,
+    key_type: [u8; 4],
+    key_id: uuid::Uuid,
+    not_before: String,
+    not_after: String,
+    content_key: [u8; 16],
+}
+
+/// Parse a decrypted 138-byte SMPTE key block back into its fields.
+///
+/// The layout mirrors `build_kdm_key_block`. A wrong length or a bad structure
+/// id means the wrong recipient key was used or the DKDM is corrupt; either is
+/// fatal. The signer thumbprint at [16..36] is the original issuer's and is
+/// discarded: on re-wrap the new key block carries the re-issuer's thumbprint.
+fn parse_kdm_key_block(block: &[u8]) -> Result<RecoveredKey, String> {
+    if block.len() != KDM_KEY_BLOCK_LEN {
+        return Err(format!(
+            "decrypted DKDM key block is {} bytes, expected {KDM_KEY_BLOCK_LEN} \
+             (wrong recipient key or corrupt DKDM)",
+            block.len()
+        ));
+    }
+    if block[..16] != KDM_STRUCTURE_ID {
+        return Err("decrypted DKDM key block has a bad structure id \
+                    (wrong recipient key or corrupt DKDM)"
+            .into());
+    }
+
+    let cpl_id = uuid::Uuid::from_slice(&block[36..52])
+        .map_err(|e| format!("DKDM key block has a malformed CPL id: {e}"))?;
+    let mut key_type = [0u8; 4];
+    key_type.copy_from_slice(&block[52..56]);
+    let key_id = uuid::Uuid::from_slice(&block[56..72])
+        .map_err(|e| format!("DKDM key block has a malformed key id: {e}"))?;
+    let not_before = std::str::from_utf8(&block[72..97])
+        .map_err(|_| "DKDM key block not-valid-before is not ASCII".to_string())?
+        .to_string();
+    let not_after = std::str::from_utf8(&block[97..122])
+        .map_err(|_| "DKDM key block not-valid-after is not ASCII".to_string())?
+        .to_string();
+    let mut content_key = [0u8; 16];
+    content_key.copy_from_slice(&block[122..138]);
+
+    Ok(RecoveredKey {
+        cpl_id,
+        key_type,
+        key_id,
+        not_before,
+        not_after,
+        content_key,
+    })
+}
+
+/// Decrypt one RSA-OAEP-SHA1 key block with a recipient private key.
+///
+/// This is the inverse of `encrypt_key_block`; the SHA-1 digest matches the
+/// `rsa-oaep-mgf1p` algorithm URI KDMs are fixed to.
+fn decrypt_key_block(
+    private_key: &rsa::RsaPrivateKey,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, String> {
+    private_key
+        .decrypt(rsa::Oaep::new::<sha1::Sha1>(), ciphertext)
+        .map_err(|e| {
+            format!(
+                "RSA-OAEP decryption of a DKDM key block failed \
+                 (wrong recipient key or corrupt DKDM): {e}"
+            )
+        })
+}
+
+/// Load an RSA private key (PKCS#8 or PKCS#1 PEM) without matching it to a cert.
+fn load_rsa_private_key(key_path: &Path) -> Result<rsa::RsaPrivateKey, String> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
+
+    let pem = std::fs::read_to_string(key_path)
+        .map_err(|e| format!("cannot read private key {}: {e}", key_path.display()))?;
+    rsa::RsaPrivateKey::from_pkcs8_pem(&pem)
+        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(&pem))
+        .map_err(|e| {
+            format!(
+                "private key {} is not a valid RSA private key (PKCS#8 or PKCS#1 PEM): {e}",
+                key_path.display()
+            )
+        })
 }
 
 /// Parse a validity end value: either an ISO 8601 date or a relative duration.
@@ -1796,6 +2186,220 @@ mod tests {
     #[test]
     fn empty_chain_is_rejected() {
         assert_eq!(validate_chain(&[]), -1);
+    }
+
+    /// Build a signed multi-key KDM to `recipient_cert`, signed by the root, to
+    /// stand in as a DKDM in re-wrap tests. Content keys are caller-chosen so a
+    /// round-trip can assert on exact bytes.
+    fn build_stand_in_dkdm(f: &Fixtures, recipient_cert: &Path, keys: &[KdmKey]) -> String {
+        let recipient = parse_recipient(recipient_cert).expect("recipient");
+        let signer = parse_signer(&f.root).expect("signer");
+        let config = KdmConfig {
+            signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            ..Default::default()
+        };
+        let cpl = uuid::Uuid::parse_str("8a2b1c3d-4e5f-6071-8293-a4b5c6d7e8f9").unwrap();
+        build_kdm_xml(
+            &config,
+            &cpl,
+            "Multi Key Feature",
+            "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-any",
+            "2020-01-01T00:00:00+00:00",
+            "2030-01-01T00:00:00+00:00",
+            &recipient,
+            &signer,
+            keys,
+        )
+        .expect("build stand-in dkdm")
+    }
+
+    fn load_private_key(path: &Path) -> rsa::RsaPrivateKey {
+        use rsa::pkcs8::DecodePrivateKey;
+        rsa::RsaPrivateKey::from_pkcs8_pem(&std::fs::read_to_string(path).unwrap())
+            .expect("parse private key")
+    }
+
+    #[test]
+    fn rewrap_roundtrip_recovers_multiple_content_keys() {
+        let f = fixtures();
+
+        // Stand-in DKDM addressed to recipient A (the signer leaf, whose key is
+        // signer_key). Two keys so the N-key path is exercised.
+        let mdik_id = uuid::Uuid::new_v4();
+        let mdak_id = uuid::Uuid::new_v4();
+        let mdik_key = [0x11u8; 16];
+        let mdak_key = [0x22u8; 16];
+        let src_keys = vec![
+            KdmKey {
+                key_type: *b"MDIK",
+                key_id: mdik_id,
+                content_key: mdik_key,
+            },
+            KdmKey {
+                key_type: *b"MDAK",
+                key_id: mdak_id,
+                content_key: mdak_key,
+            },
+        ];
+        let dkdm_xml = build_stand_in_dkdm(f, &f.signer, &src_keys);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        std::fs::write(&dkdm_path, &dkdm_xml).unwrap();
+        let out = dir.path().join("rewrapped.kdm.xml");
+
+        // Re-wrap to recipient B (the root cert, whose key is root_key).
+        let config = RewrapConfig {
+            dkdm_file: dkdm_path,
+            dkdm_recipient_key_file: f.signer_key.clone(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            signer_chain_files: vec![],
+            output_file: out.clone(),
+            valid_from: String::new(),
+            valid_to: String::new(),
+        };
+        rewrap_dkdm_to_file(&config).expect("rewrap");
+
+        // Decrypt B's CipherValues and confirm the content keys survived.
+        let xml = std::fs::read_to_string(&out).unwrap();
+        let b_key = load_private_key(&f.root_key);
+        let cvs = parse_dkdm(&xml).expect("parse rewrapped").cipher_values;
+        assert_eq!(cvs.len(), 2, "both keys must be re-wrapped");
+
+        let mut recovered = std::collections::HashMap::new();
+        for ct in cvs {
+            let block = b_key
+                .decrypt(rsa::Oaep::new::<sha1::Sha1>(), &ct)
+                .expect("recipient B must decrypt the re-wrapped key");
+            let rk = parse_kdm_key_block(&block).expect("valid key block");
+            recovered.insert(rk.key_id, (rk.key_type, rk.content_key));
+        }
+        assert_eq!(
+            recovered.get(&mdik_id),
+            Some(&(*b"MDIK", mdik_key)),
+            "MDIK key id/type/value must round-trip"
+        );
+        assert_eq!(
+            recovered.get(&mdak_id),
+            Some(&(*b"MDAK", mdak_key)),
+            "MDAK key id/type/value must round-trip"
+        );
+    }
+
+    #[test]
+    fn rewrapped_cipher_differs_from_source() {
+        // The whole point of re-wrap: the new CipherValue is not the source's.
+        let f = fixtures();
+        let src_keys = vec![KdmKey {
+            key_type: *b"MDIK",
+            key_id: uuid::Uuid::new_v4(),
+            content_key: [0x33u8; 16],
+        }];
+        let dkdm_xml = build_stand_in_dkdm(f, &f.signer, &src_keys);
+        let src_ct = parse_dkdm(&dkdm_xml).unwrap().cipher_values.remove(0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        std::fs::write(&dkdm_path, &dkdm_xml).unwrap();
+        let out = dir.path().join("rewrapped.kdm.xml");
+        let config = RewrapConfig {
+            dkdm_file: dkdm_path,
+            dkdm_recipient_key_file: f.signer_key.clone(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            signer_chain_files: vec![],
+            output_file: out.clone(),
+            valid_from: String::new(),
+            valid_to: String::new(),
+        };
+        rewrap_dkdm_to_file(&config).expect("rewrap");
+        let new_ct = parse_dkdm(&std::fs::read_to_string(&out).unwrap())
+            .unwrap()
+            .cipher_values
+            .remove(0);
+        assert_ne!(src_ct, new_ct, "re-wrap must re-encrypt, not copy");
+    }
+
+    #[test]
+    fn rewrap_with_wrong_dkdm_key_errors() {
+        let f = fixtures();
+        let src_keys = vec![KdmKey {
+            key_type: *b"MDIK",
+            key_id: uuid::Uuid::new_v4(),
+            content_key: [0x44u8; 16],
+        }];
+        // DKDM addressed to A (signer leaf).
+        let dkdm_xml = build_stand_in_dkdm(f, &f.signer, &src_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        std::fs::write(&dkdm_path, &dkdm_xml).unwrap();
+
+        // Attempt to decrypt with B's key: must fail, not silently mis-wrap.
+        let config = RewrapConfig {
+            dkdm_file: dkdm_path,
+            dkdm_recipient_key_file: f.root_key.clone(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            signer_chain_files: vec![],
+            output_file: dir.path().join("out.xml"),
+            valid_from: String::new(),
+            valid_to: String::new(),
+        };
+        let err = rewrap_dkdm(&config).expect_err("wrong recipient key must fail");
+        assert!(
+            err.contains("wrong recipient key") || err.contains("decryption"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rewrapped_kdm_verifies_with_xmlsec1() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let f = fixtures();
+        let src_keys = vec![
+            KdmKey {
+                key_type: *b"MDIK",
+                key_id: uuid::Uuid::new_v4(),
+                content_key: [0x55u8; 16],
+            },
+            KdmKey {
+                key_type: *b"MDAK",
+                key_id: uuid::Uuid::new_v4(),
+                content_key: [0x66u8; 16],
+            },
+        ];
+        // DKDM to A (signer leaf).
+        let dkdm_xml = build_stand_in_dkdm(f, &f.signer, &src_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        std::fs::write(&dkdm_path, &dkdm_xml).unwrap();
+        let out = dir.path().join("rewrapped.kdm.xml");
+
+        // Re-issue signed by the leaf chain, recipient B = root.
+        let config = RewrapConfig {
+            dkdm_file: dkdm_path,
+            dkdm_recipient_key_file: f.signer_key.clone(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.signer.clone(),
+            signer_key_file: f.signer_key.clone(),
+            signer_chain_files: vec![f.intermediate.clone(), f.root.clone()],
+            output_file: out.clone(),
+            valid_from: String::new(),
+            valid_to: String::new(),
+        };
+        rewrap_dkdm_to_file(&config).expect("rewrap");
+        assert!(
+            xmlsec1_verify(&out, &f.root),
+            "xmlsec1 must verify the re-wrapped KDM against the trusted root"
+        );
     }
 
     #[test]
