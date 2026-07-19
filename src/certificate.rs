@@ -981,10 +981,11 @@ fn build_kdm_xml(
 /// Build the ETM ds:Signature block (indented as the last child of
 /// DCinemaSecurityMessage), signing over the two authenticated elements.
 ///
-/// Canonicalization uses `xmllint --c14n` (libxml2, the same engine xmlsec1
-/// verifies with) so the digested bytes match to the byte. Signing itself uses
-/// the `rsa` crate. Every failure is fatal: a KDM must never be written with an
-/// absent, empty or placeholder signature.
+/// Canonicalization is the pure-Rust `c14n` below (inclusive Canonical XML 1.0,
+/// matching libxml2, the engine xmlsec1 verifies with) so the digested bytes
+/// match to the byte. Signing itself uses the `rsa` crate. Every failure is
+/// fatal: a KDM must never be written with an absent, empty or placeholder
+/// signature.
 fn build_signature(
     config: &KdmConfig,
     auth_public_inner: &str,
@@ -1082,44 +1083,202 @@ fn sha256(data: &[u8]) -> Vec<u8> {
     sha2::Sha256::digest(data).to_vec()
 }
 
-/// Inclusive Canonical XML 1.0 of a fragment, via `xmllint`.
+/// Inclusive Canonical XML 1.0 (WithComments) of a fragment, pure Rust.
 ///
-/// libxml2 is the engine xmlsec1 canonicalizes with, so its output matches to
-/// the byte. Missing or failing xmllint is fatal: without correct c14n the
-/// signature cannot be made verifiable, and a KDM must never be emitted with a
-/// signature that only looks valid.
+/// libxml2 is the engine xmlsec1 canonicalizes with; this matches its output
+/// byte-for-byte for the fragments `build_signature` emits. Scope is narrowed to
+/// exactly that input: elements, text, comments, namespace declarations (the
+/// default and prefixed, including a descendant that redefines the default, as
+/// KDMRequiredExtensions and EncryptedKey do) and unprefixed attributes. A
+/// DOCTYPE, processing instruction, CDATA section, XML declaration, entity
+/// beyond the standard five, or namespaced attribute is a hard error: none can
+/// occur here, and canonicalizing one silently could yield a wrong digest.
 fn c14n(fragment: &str) -> Result<Vec<u8>, String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
+    use quick_xml::escape::unescape;
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
 
-    let mut child = Command::new("xmllint")
-        .arg("--c14n")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "cannot run xmllint (libxml2) for XML canonicalization, required to sign the KDM: {e}"
-            )
-        })?;
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(fragment.as_bytes())
-        .map_err(|e| format!("failed to send XML to xmllint: {e}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("xmllint did not complete: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "xmllint canonicalization failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+    let mut reader = Reader::from_str(fragment);
+    let mut out = String::with_capacity(fragment.len());
+
+    // One frame per open element holding the (prefix, uri) declarations that
+    // element rendered, so its End tag can drop them from scope. The default
+    // namespace uses the empty prefix.
+    let mut ns_stack: Vec<Vec<(String, String)>> = Vec::new();
+
+    loop {
+        match reader
+            .read_event()
+            .map_err(|e| format!("fragment is not valid XML for c14n: {e}"))?
+        {
+            Event::Start(e) => out.push_str(&c14n_start_tag(&e, &mut ns_stack)?),
+            Event::End(e) => {
+                out.push_str(&c14n_end_tag(e.name().as_ref())?);
+                ns_stack.pop();
+            }
+            Event::Empty(e) => {
+                // c14n forbids self-closing tags: emit an explicit start + end.
+                out.push_str(&c14n_start_tag(&e, &mut ns_stack)?);
+                out.push_str(&c14n_end_tag(e.name().as_ref())?);
+                ns_stack.pop();
+            }
+            Event::Text(e) => {
+                let raw = std::str::from_utf8(&e)
+                    .map_err(|err| format!("c14n text is not UTF-8: {err}"))?;
+                let normalized = normalize_line_endings(raw);
+                let text = unescape(&normalized)
+                    .map_err(|err| format!("c14n cannot unescape text: {err}"))?;
+                out.push_str(&escape_text(&text));
+            }
+            Event::Comment(e) => {
+                let raw = std::str::from_utf8(&e)
+                    .map_err(|err| format!("c14n comment is not UTF-8: {err}"))?;
+                out.push_str("<!--");
+                out.push_str(&normalize_line_endings(raw));
+                out.push_str("-->");
+            }
+            Event::Eof => break,
+            other => {
+                return Err(format!(
+                    "c14n input has an unsupported node ({other:?}); only elements, \
+                     text and comments are canonicalized here"
+                ));
+            }
+        }
     }
-    Ok(output.stdout)
+
+    Ok(out.into_bytes())
+}
+
+/// Current in-scope URI of `prefix` ("" is the default), searching innermost
+/// frame first. Only rendered (changed) declarations live in the stack, so the
+/// innermost hit is the value in force.
+fn inscope_uri(ns_stack: &[Vec<(String, String)>], prefix: &str) -> Option<String> {
+    ns_stack
+        .iter()
+        .rev()
+        .flat_map(|frame| frame.iter().rev())
+        .find(|(p, _)| p == prefix)
+        .map(|(_, uri)| uri.clone())
+}
+
+/// Serialize one start tag in canonical form and push its rendered namespaces.
+fn c14n_start_tag(
+    e: &quick_xml::events::BytesStart,
+    ns_stack: &mut Vec<Vec<(String, String)>>,
+) -> Result<String, String> {
+    let qname = std::str::from_utf8(e.name().as_ref())
+        .map_err(|err| format!("c14n element name is not UTF-8: {err}"))?
+        .to_string();
+
+    // Split attributes into namespace declarations and ordinary attributes.
+    let mut decls: Vec<(String, String)> = Vec::new(); // (prefix, uri), "" = default
+    let mut attrs: Vec<(String, String)> = Vec::new(); // (name, value)
+    for attr in e.attributes() {
+        let attr = attr.map_err(|err| format!("c14n cannot read an attribute: {err}"))?;
+        let key = std::str::from_utf8(attr.key.as_ref())
+            .map_err(|err| format!("c14n attribute name is not UTF-8: {err}"))?;
+        let value = attr
+            .unescape_value()
+            .map_err(|err| format!("c14n cannot unescape an attribute value: {err}"))?
+            .into_owned();
+        if key == "xmlns" {
+            decls.push((String::new(), value));
+        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
+            decls.push((prefix.to_string(), value));
+        } else if key.contains(':') {
+            return Err(format!(
+                "c14n does not support namespaced attribute '{key}'; build_signature emits none"
+            ));
+        } else {
+            attrs.push((key.to_string(), value));
+        }
+    }
+
+    // Inclusive c14n renders a namespace only where its in-scope value differs
+    // from the ancestor context. An empty default matches an absent one, so
+    // xmlns="" renders only when it overrides a non-empty ancestor default.
+    let mut rendered: Vec<(String, String)> = Vec::new();
+    for (prefix, uri) in decls {
+        if inscope_uri(ns_stack, &prefix).as_deref().unwrap_or("") != uri {
+            rendered.push((prefix, uri));
+        }
+    }
+    ns_stack.push(rendered.clone());
+
+    // Namespaces sort by prefix (empty default first); attributes by name (all
+    // are unprefixed here, so no namespace-uri key participates in the sort).
+    rendered.sort_by(|a, b| a.0.cmp(&b.0));
+    attrs.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut tag = String::new();
+    tag.push('<');
+    tag.push_str(&qname);
+    for (prefix, uri) in &rendered {
+        if prefix.is_empty() {
+            tag.push_str(" xmlns=\"");
+        } else {
+            tag.push_str(" xmlns:");
+            tag.push_str(prefix);
+            tag.push_str("=\"");
+        }
+        tag.push_str(&escape_attr(uri));
+        tag.push('"');
+    }
+    for (name, value) in &attrs {
+        tag.push(' ');
+        tag.push_str(name);
+        tag.push_str("=\"");
+        tag.push_str(&escape_attr(value));
+        tag.push('"');
+    }
+    tag.push('>');
+    Ok(tag)
+}
+
+fn c14n_end_tag(name: &[u8]) -> Result<String, String> {
+    let qname = std::str::from_utf8(name)
+        .map_err(|err| format!("c14n element name is not UTF-8: {err}"))?;
+    Ok(format!("</{qname}>"))
+}
+
+/// C14N text-node escaping: `&` `<` `>` and CR.
+fn escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '\r' => out.push_str("&#xD;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// C14N attribute-value escaping: `&` `<` `"` and tab, LF, CR.
+fn escape_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
+            '\t' => out.push_str("&#x9;"),
+            '\n' => out.push_str("&#xA;"),
+            '\r' => out.push_str("&#xD;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// XML line-ending normalization: CRLF and lone CR become LF. Character
+/// references such as `&#xD;` are still literal text here and untouched, so a
+/// real CR one later decodes to is preserved and escaped on output.
+fn normalize_line_endings(s: &str) -> String {
+    s.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 /// Load an RSA private key (PKCS#8 or PKCS#1 PEM) and confirm it matches the
@@ -1861,6 +2020,112 @@ mod tests {
             .expect("run xmlsec1")
             .status
             .success()
+    }
+
+    fn xmllint_available() -> bool {
+        std::process::Command::new("xmllint")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Reference inclusive c14n via libxml2, the same engine xmlsec1 uses.
+    fn xmllint_c14n(fragment: &str) -> Vec<u8> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("xmllint")
+            .arg("--c14n")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn xmllint");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(fragment.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().expect("run xmllint");
+        assert!(
+            out.status.success(),
+            "xmllint --c14n failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    }
+
+    /// The pure-Rust c14n must equal libxml2 byte-for-byte for each fragment
+    /// shape build_signature emits. Covers: the default namespace redefined on a
+    /// descendant (KDMRequiredExtensions, EncryptedKey), the ds: prefix, an
+    /// unused-but-declared default on ds:SignedInfo, self-closing tags expanded
+    /// to explicit start+end, and &/</" escaping in element text (a DN and a
+    /// title). If this drifts from libxml2 the signature stops verifying.
+    #[test]
+    fn c14n_matches_xmllint_for_each_fragment_shape() {
+        if !xmllint_available() {
+            eprintln!("skipping: xmllint not installed");
+            return;
+        }
+
+        let public = format!(
+            r#"<AuthenticatedPublic xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}" Id="{AUTH_PUBLIC_ID}">
+    <MessageId>urn:uuid:11111111-2222-3333-4444-555555555555</MessageId>
+    <AnnotationText>Acme &amp; Co &quot;Feature&quot; &lt;draft&gt; KDM</AnnotationText>
+    <RequiredExtensions>
+      <KDMRequiredExtensions xmlns="{KDM_NS}">
+        <Recipient>
+          <X509SubjectName>CN=A &amp; B,O=&quot;X&lt;Y&quot;,C=US</X509SubjectName>
+        </Recipient>
+        <KeyIdList>
+          <TypedKeyId>
+            <KeyType>MDIK</KeyType>
+          </TypedKeyId>
+        </KeyIdList>
+      </KDMRequiredExtensions>
+    </RequiredExtensions>
+  </AuthenticatedPublic>"#
+        );
+
+        let private = format!(
+            r#"<AuthenticatedPrivate xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}" Id="{AUTH_PRIVATE_ID}">
+    <EncryptedKey xmlns="{ENC_NS}">
+      <EncryptionMethod Algorithm="{KDM_ENCRYPTION_METHOD}"/>
+      <CipherData>
+        <CipherValue>YWJjZGVm</CipherValue>
+      </CipherData>
+    </EncryptedKey>
+  </AuthenticatedPrivate>"#
+        );
+
+        let signed_info = format!(
+            r##"<ds:SignedInfo xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}">
+      <ds:CanonicalizationMethod Algorithm="{C14N_METHOD}"/>
+      <ds:SignatureMethod Algorithm="{SIG_METHOD}"/>
+      <ds:Reference URI="#{AUTH_PUBLIC_ID}">
+        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
+        <ds:DigestValue>3q2+7w==</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>"##
+        );
+
+        for (label, fragment) in [
+            ("AuthenticatedPublic", &public),
+            ("AuthenticatedPrivate", &private),
+            ("ds:SignedInfo", &signed_info),
+        ] {
+            let ours = c14n(fragment).expect("pure-Rust c14n");
+            let reference = xmllint_c14n(fragment);
+            assert_eq!(
+                ours,
+                reference,
+                "{label} c14n differs from xmllint\nours:      {}\nreference: {}",
+                String::from_utf8_lossy(&ours),
+                String::from_utf8_lossy(&reference)
+            );
+        }
     }
 
     fn cipher_value(xml: &str) -> Vec<u8> {
