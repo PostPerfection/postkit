@@ -86,6 +86,26 @@ fn sha1_thumbprint(der_bytes: &[u8]) -> String {
     hash.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Generate an RSA key pair for rcgen to sign with.
+///
+/// rcgen signs via ring, which cannot *generate* RSA keys, so the key comes
+/// from the `rsa` crate and is handed over as PKCS#8.
+fn generate_rsa_keypair(bits: u32) -> Result<rcgen::KeyPair, String> {
+    use rsa::pkcs8::EncodePrivateKey;
+
+    // DCI DCSS 9.7.6 requires 2048-bit RSA throughout the digital cinema chain.
+    if bits < 2048 {
+        return Err(format!("RSA key size {bits} is below the 2048-bit minimum"));
+    }
+
+    let key = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, bits as usize)
+        .map_err(|e| format!("RSA key generation failed: {e}"))?;
+    let pem = key
+        .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+        .map_err(|e| format!("cannot encode RSA key as PKCS#8: {e}"))?;
+    rcgen::KeyPair::from_pem(&pem).map_err(|e| format!("rcgen rejected the RSA key: {e}"))
+}
+
 /// Generate a new X.509 certificate + private key.
 pub fn generate_certificate(opts: &CertOptions) -> i32 {
     use rcgen::{
@@ -138,7 +158,7 @@ pub fn generate_certificate(opts: &CertOptions) -> i32 {
         }
     }
 
-    let key_pair = match KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256) {
+    let key_pair = match generate_rsa_keypair(opts.key_bits) {
         Ok(kp) => kp,
         Err(e) => {
             tracing::error!("failed to generate RSA key pair: {e}");
@@ -333,7 +353,8 @@ pub fn read_certificate(cert_path: &Path) -> CertInfo {
         .parsed()
         .ok()
         .map(|pk| match pk {
-            x509_parser::public_key::PublicKey::RSA(rsa) => (rsa.key_size() * 8) as u32,
+            // key_size() is already in bits
+            x509_parser::public_key::PublicKey::RSA(rsa) => rsa.key_size() as u32,
             _ => 0,
         })
         .unwrap_or(0);
@@ -358,77 +379,94 @@ pub fn read_certificate(cert_path: &Path) -> CertInfo {
     }
 }
 
-/// Validate a certificate chain.
+/// Validate a certificate chain, leaf first, root last.
 ///
-/// Checks that each certificate in the chain is valid and properly linked.
+/// Verifies the issuer signature on every certificate cryptographically. A
+/// signature algorithm that x509-parser/ring cannot check is reported as a
+/// failure, never as a pass.
 pub fn validate_chain(chain: &[PathBuf]) -> i32 {
+    match validate_chain_inner(chain) {
+        Ok(n) => {
+            tracing::info!("certificate chain valid ({n} certificates)");
+            0
+        }
+        Err(e) => {
+            tracing::error!("{e}");
+            -1
+        }
+    }
+}
+
+fn validate_chain_inner(chain: &[PathBuf]) -> Result<usize, String> {
+    use x509_parser::prelude::*;
+
     if chain.is_empty() {
-        tracing::error!("empty certificate chain");
-        return -1;
+        return Err("empty certificate chain".into());
     }
 
-    // Read and validate each certificate individually, collecting key info
-    struct ChainEntry {
-        subject: String,
-        issuer: String,
-        expired: bool,
-        not_yet_valid: bool,
-    }
-
-    let mut entries = Vec::new();
+    // Pem owns its contents, so parsed certs below can borrow from this vec.
+    let mut pems = Vec::new();
     for path in chain {
-        let info = read_certificate(path);
-        if info.subject_cn.is_empty() && info.serial.is_empty() {
-            tracing::error!("failed to parse certificate: {}", path.display());
-            return -1;
-        }
-        entries.push(ChainEntry {
-            subject: info.subject_cn.clone(),
-            issuer: info.issuer_cn.clone(),
-            expired: info.is_expired,
-            not_yet_valid: false, // read_certificate doesn't check not_yet_valid but that's rare
-        });
+        let data = std::fs::read(path)
+            .map_err(|e| format!("failed to read certificate {}: {e}", path.display()))?;
+        let (_, pem) = parse_x509_pem(&data)
+            .map_err(|e| format!("failed to parse PEM {}: {e}", path.display()))?;
+        pems.push(pem);
     }
 
-    // Check expiry
-    for (i, entry) in entries.iter().enumerate() {
-        if entry.expired {
-            tracing::error!("certificate expired: {}", chain[i].display());
-            return -1;
-        }
-        if entry.not_yet_valid {
-            tracing::error!("certificate not yet valid: {}", chain[i].display());
-            return -1;
-        }
+    let mut certs = Vec::new();
+    for (pem, path) in pems.iter().zip(chain) {
+        let cert = pem
+            .parse_x509()
+            .map_err(|e| format!("failed to parse X.509 {}: {e}", path.display()))?;
+        certs.push(cert);
     }
 
-    // Check issuer/subject chain
-    for i in 0..entries.len().saturating_sub(1) {
-        if entries[i].issuer != entries[i + 1].subject {
-            tracing::error!(
-                "chain broken: '{}' issuer '{}' does not match '{}' subject '{}'",
-                entries[i].subject,
-                entries[i].issuer,
-                entries[i + 1].subject,
-                entries[i + 1].subject,
-            );
-            return -1;
+    let now = ASN1Time::now();
+    for (cert, path) in certs.iter().zip(chain) {
+        if cert.validity().not_after < now {
+            return Err(format!("certificate expired: {}", path.display()));
+        }
+        if cert.validity().not_before > now {
+            return Err(format!("certificate not yet valid: {}", path.display()));
         }
     }
 
-    // Root should be self-signed
-    let last = &entries[entries.len() - 1];
-    if last.issuer != last.subject {
-        tracing::error!(
-            "root cert is not self-signed: subject='{}', issuer='{}'",
-            last.subject,
-            last.issuer,
-        );
-        return -1;
+    // Each cert must be signed by the next one up; the last must be self-signed.
+    for i in 0..certs.len() {
+        let issuer = certs.get(i + 1).unwrap_or(&certs[i]);
+        let is_root = i + 1 == certs.len();
+
+        if certs[i].issuer() != issuer.subject() {
+            return Err(if is_root {
+                format!(
+                    "root cert is not self-issued: {} (subject '{}', issuer '{}')",
+                    chain[i].display(),
+                    certs[i].subject(),
+                    certs[i].issuer()
+                )
+            } else {
+                format!(
+                    "chain broken: issuer of {} ('{}') does not match subject of {} ('{}')",
+                    chain[i].display(),
+                    certs[i].issuer(),
+                    chain[i + 1].display(),
+                    issuer.subject()
+                )
+            });
+        }
+
+        certs[i]
+            .verify_signature(Some(issuer.public_key()))
+            .map_err(|e| {
+                format!(
+                    "signature verification failed for {}: {e}",
+                    chain[i].display()
+                )
+            })?;
     }
 
-    tracing::info!("certificate chain valid ({} certificates)", entries.len());
-    0
+    Ok(certs.len())
 }
 
 /// Add a trusted device.
@@ -534,79 +572,265 @@ pub struct KdmConfig {
     pub cpl_id: String,
     pub content_title: String,
     pub recipient_cert_file: PathBuf,
+    /// Certificate of the entity issuing this KDM. Its thumbprint is part of
+    /// the encrypted key block, so a KDM cannot be built without it.
+    pub signer_cert_file: PathBuf,
     pub output_file: PathBuf,
     pub valid_from: String,
     pub valid_to: String,
     pub formulation: String,
 }
 
-/// Generate a SMPTE 430-1 Key Delivery Message (KDM).
-///
-/// This creates a KDM XML file that authorizes a recipient to decrypt
-/// content associated with the given CPL UUID.
-pub fn generate_kdm(config: &KdmConfig) -> Result<(), String> {
-    use std::io::Write;
+/// SMPTE ST 430-1 Table 6: identifies the KDM cipher block layout.
+/// DCI CTP 3.4.16 fails any KDM carrying a different value.
+const KDM_STRUCTURE_ID: [u8; 16] = [
+    0xf1, 0xdc, 0x12, 0x44, 0x60, 0x16, 0x9a, 0x0e, 0x85, 0xbc, 0x30, 0x06, 0x42, 0xf8, 0x66, 0xab,
+];
 
-    // Validate inputs
-    if config.cpl_id.is_empty() {
-        return Err("CPL ID is required".into());
+/// Total size of the SMPTE key block, per ST 430-1 Table 6.
+const KDM_KEY_BLOCK_LEN: usize = 138;
+
+/// ST 430-1 6.3.7/6.3.8: timestamps are exactly 25 ASCII characters.
+const KDM_TIMESTAMP_LEN: usize = 25;
+
+/// XML Encryption 1.0 5.4.2, mandated by DCI CTP 3.4.12.
+const KDM_ENCRYPTION_METHOD: &str = "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p";
+
+/// Escape text before it goes into the KDM XML.
+///
+/// Content titles come from user input, so without this a title containing
+/// markup could rewrite the surrounding KDM elements.
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
     }
-    if !config.recipient_cert_file.exists() {
+    out
+}
+
+/// Check a validity timestamp is the exact 25-byte form ST 430-1 requires.
+///
+/// The key block has no room for anything else, so a bad value has to be an
+/// error rather than something silently padded or truncated.
+fn check_kdm_timestamp(label: &str, value: &str) -> Result<(), String> {
+    if value.len() != KDM_TIMESTAMP_LEN || !value.is_ascii() {
         return Err(format!(
-            "Recipient certificate not found: {}",
-            config.recipient_cert_file.display()
+            "{label} must be exactly {KDM_TIMESTAMP_LEN} ASCII characters \
+             (RFC 3339, e.g. 2004-05-01T13:20:00+00:00), got {} in '{value}'",
+            value.len()
+        ));
+    }
+    // ST 430-1 6.3.7: no 'Z' offset, no fractional seconds.
+    if value.ends_with('Z') || value.contains('.') {
+        return Err(format!(
+            "{label} must use a numeric UTC offset and no fractional seconds, got '{value}'"
+        ));
+    }
+    chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|e| format!("{label} is not a valid RFC 3339 timestamp ('{value}'): {e}"))?;
+    Ok(())
+}
+
+/// Build the 138-byte plaintext key block defined by SMPTE ST 430-1 Table 6.
+///
+/// Field order and lengths are fixed by the standard: structure id (16),
+/// signer thumbprint (20), CPL id (16), key type (4), key id (16),
+/// not-valid-before (25), not-valid-after (25), content key (16).
+fn build_kdm_key_block(
+    signer_thumbprint: &[u8; 20],
+    cpl_id: &uuid::Uuid,
+    key_type: &[u8; 4],
+    key_id: &uuid::Uuid,
+    not_before: &str,
+    not_after: &str,
+    content_key: &[u8; 16],
+) -> Result<Vec<u8>, String> {
+    check_kdm_timestamp("ContentKeysNotValidBefore", not_before)?;
+    check_kdm_timestamp("ContentKeysNotValidAfter", not_after)?;
+
+    let mut block = Vec::with_capacity(KDM_KEY_BLOCK_LEN);
+    block.extend_from_slice(&KDM_STRUCTURE_ID);
+    block.extend_from_slice(signer_thumbprint);
+    block.extend_from_slice(cpl_id.as_bytes());
+    block.extend_from_slice(key_type);
+    block.extend_from_slice(key_id.as_bytes());
+    block.extend_from_slice(not_before.as_bytes());
+    block.extend_from_slice(not_after.as_bytes());
+    block.extend_from_slice(content_key);
+
+    // The layout is fixed; a mismatch means the code above drifted from the spec.
+    if block.len() != KDM_KEY_BLOCK_LEN {
+        return Err(format!(
+            "internal error: key block is {} bytes, expected {KDM_KEY_BLOCK_LEN}",
+            block.len()
+        ));
+    }
+    Ok(block)
+}
+
+/// Encrypt the key block to the recipient's public key.
+///
+/// RSAES-OAEP with MGF1, matching the `rsa-oaep-mgf1p` algorithm URI that DCI
+/// CTP 3.4.12 requires. SHA-1 is the digest here because that URI fixes MGF1 to
+/// SHA-1 and KDMs carry no ds:DigestMethod, so the OpenSSL default is what
+/// every deployed implementation uses.
+fn encrypt_key_block(public_key: &rsa::RsaPublicKey, block: &[u8]) -> Result<Vec<u8>, String> {
+    use rsa::traits::PublicKeyParts;
+
+    // DCI DCSS 9.7.6 requires 2048-bit RSA. A shorter key is a hard error, not
+    // a warning, since it would still produce a plausible-looking KDM.
+    let modulus_bits = public_key.n().bits();
+    if modulus_bits != 2048 {
+        return Err(format!(
+            "recipient RSA key is {modulus_bits} bits; DCI requires exactly 2048"
         ));
     }
 
-    // Parse validity period
+    let ciphertext = public_key
+        .encrypt(
+            &mut rsa::rand_core::OsRng,
+            rsa::Oaep::new::<sha1::Sha1>(),
+            block,
+        )
+        .map_err(|e| format!("RSA-OAEP encryption of the key block failed: {e}"))?;
+
+    if ciphertext.len() != modulus_bits / 8 {
+        return Err(format!(
+            "internal error: ciphertext is {} bytes, expected {}",
+            ciphertext.len(),
+            modulus_bits / 8
+        ));
+    }
+    Ok(ciphertext)
+}
+
+/// A generated KDM plus the content key it carries.
+///
+/// The key is returned so callers can hand it to the MXF writer; it is never
+/// written into the KDM itself.
+pub struct GeneratedKdm {
+    pub xml: String,
+    pub content_key: [u8; 16],
+    pub key_id: uuid::Uuid,
+}
+
+/// Redacts the content key so it cannot reach a log through a stray debug print.
+impl std::fmt::Debug for GeneratedKdm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeneratedKdm")
+            .field("xml_len", &self.xml.len())
+            .field("content_key", &"<redacted>")
+            .field("key_id", &self.key_id)
+            .finish()
+    }
+}
+
+/// Build a SMPTE 430-1 KDM in memory, encrypting a fresh content key to the
+/// recipient certificate.
+///
+/// NOTE: the result carries no XML signature. See `generate_kdm`.
+pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
+    use base64::Engine;
+
+    if config.cpl_id.is_empty() {
+        return Err("CPL ID is required".into());
+    }
+
+    // Accept either a bare UUID or the urn:uuid: form, and reject anything
+    // else: the key block needs the 16 raw bytes, not a free-text string.
+    let cpl_uuid = {
+        let trimmed = config
+            .cpl_id
+            .trim()
+            .strip_prefix("urn:uuid:")
+            .unwrap_or(config.cpl_id.trim());
+        uuid::Uuid::parse_str(trimmed)
+            .map_err(|e| format!("CPL ID '{}' is not a UUID: {e}", config.cpl_id))?
+    };
+
+    let recipient = parse_recipient(&config.recipient_cert_file)?;
+
+    // The signer thumbprint is a required field of the key block, so a missing
+    // signer certificate has to stop generation rather than be zero-filled.
+    if config.signer_cert_file.as_os_str().is_empty() {
+        return Err("signer certificate is required: its thumbprint is part of \
+                    the SMPTE 430-1 key block"
+            .into());
+    }
+    let signer = parse_signer(&config.signer_cert_file)?;
+
     let now = chrono::Utc::now();
     let not_valid_before = if config.valid_from == "now" || config.valid_from.is_empty() {
         now.format("%Y-%m-%dT%H:%M:%S+00:00").to_string()
     } else {
         config.valid_from.clone()
     };
-
     let not_valid_after = parse_validity_end(&config.valid_to, &not_valid_before)?;
 
-    // Read recipient cert to extract subject CN
-    let cert_pem = std::fs::read_to_string(&config.recipient_cert_file)
-        .map_err(|e| format!("Cannot read recipient cert: {e}"))?;
-    let recipient_cn = extract_cn_from_pem(&cert_pem).unwrap_or_else(|| "Unknown".to_string());
-
-    // Generate UUIDs for KDM elements
     let kdm_id = uuid::Uuid::new_v4();
     let message_id = uuid::Uuid::new_v4();
 
-    // Determine formulation type URI
     let formulation_uri = match config.formulation.to_lowercase().replace(' ', "-").as_str() {
         "dci-any" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-any",
         "dci-specific" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-specific",
         _ => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type",
     };
 
-    // Generate a content key (random AES-128)
-    let content_key: [u8; 16] = rand_bytes();
+    let content_key: [u8; 16] = rand_bytes()?;
     let content_key_id = uuid::Uuid::new_v4();
-    let content_key_hex: String = content_key.iter().map(|b| format!("{b:02x}")).collect();
 
-    // Build KDM XML (SMPTE 430-1 / ETM structure)
-    let kdm_xml = format!(
+    // MDIK: image essence key, ST 430-1 6.3.9.3 Table 1.
+    let key_block = build_kdm_key_block(
+        &signer.thumbprint,
+        &cpl_uuid,
+        b"MDIK",
+        &content_key_id,
+        &not_valid_before,
+        &not_valid_after,
+        &content_key,
+    )?;
+
+    let ciphertext = encrypt_key_block(&recipient.public_key, &key_block)?;
+    let cipher_value = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
+
+    let title = xml_escape(&config.content_title);
+    let recipient_subject = xml_escape(&recipient.subject_dn);
+    let recipient_issuer = xml_escape(&recipient.issuer_dn);
+    let recipient_serial = xml_escape(&recipient.serial);
+    let signer_subject = xml_escape(&signer.subject_dn);
+    let signer_issuer = xml_escape(&signer.issuer_dn);
+    let signer_serial = xml_escape(&signer.serial);
+
+    let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <DCinemaSecurityMessage xmlns="http://www.smpte-ra.org/schemas/430-3/2006/ETM">
   <AuthenticatedPublic Id="ID_{kdm_id}">
     <MessageId>urn:uuid:{message_id}</MessageId>
     <MessageType>{formulation_uri}</MessageType>
-    <AnnotationText>{title} KDM for {recipient}</AnnotationText>
+    <AnnotationText>{title} KDM for {recipient_subject}</AnnotationText>
     <IssueDate>{issue_date}</IssueDate>
     <Signer>
-      <X509SubjectName>imfwizard KDM signer</X509SubjectName>
+      <X509IssuerName>{signer_issuer}</X509IssuerName>
+      <X509SerialNumber>{signer_serial}</X509SerialNumber>
+      <X509SubjectName>{signer_subject}</X509SubjectName>
     </Signer>
     <RequiredExtensions>
       <KDMRequiredExtensions xmlns="http://www.smpte-ra.org/schemas/430-1/2006/KDM">
         <Recipient>
-          <X509SubjectName>{recipient}</X509SubjectName>
+          <X509IssuerSerial>
+            <X509IssuerName>{recipient_issuer}</X509IssuerName>
+            <X509SerialNumber>{recipient_serial}</X509SerialNumber>
+          </X509IssuerSerial>
+          <X509SubjectName>{recipient_subject}</X509SubjectName>
         </Recipient>
-        <CompositionPlaylistId>urn:uuid:{cpl_id}</CompositionPlaylistId>
+        <CompositionPlaylistId>urn:uuid:{cpl_uuid}</CompositionPlaylistId>
         <ContentTitleText>{title}</ContentTitleText>
         <ContentKeysNotValidBefore>{not_before}</ContentKeysNotValidBefore>
         <ContentKeysNotValidAfter>{not_after}</ContentKeysNotValidAfter>
@@ -621,6 +845,7 @@ pub fn generate_kdm(config: &KdmConfig) -> Result<(), String> {
   </AuthenticatedPublic>
   <AuthenticatedPrivate>
     <EncryptedKey xmlns="http://www.w3.org/2001/04/xmlenc#">
+      <EncryptionMethod Algorithm="{encryption_method}"/>
       <CipherData>
         <CipherValue>{cipher_value}</CipherValue>
       </CipherData>
@@ -628,20 +853,33 @@ pub fn generate_kdm(config: &KdmConfig) -> Result<(), String> {
   </AuthenticatedPrivate>
 </DCinemaSecurityMessage>
 "#,
-        kdm_id = kdm_id,
-        message_id = message_id,
-        formulation_uri = formulation_uri,
-        title = config.content_title,
-        recipient = recipient_cn,
         issue_date = now.format("%Y-%m-%dT%H:%M:%S+00:00"),
-        cpl_id = config.cpl_id,
         not_before = not_valid_before,
         not_after = not_valid_after,
         key_id = content_key_id,
-        cipher_value = content_key_hex,
+        encryption_method = KDM_ENCRYPTION_METHOD,
     );
 
-    // Write KDM
+    Ok(GeneratedKdm {
+        xml,
+        content_key,
+        key_id: content_key_id,
+    })
+}
+
+/// Generate a SMPTE 430-1 Key Delivery Message (KDM) and write it to disk.
+///
+/// The content key is encrypted to the recipient certificate, but the message
+/// is NOT XML-signed: SMPTE 430-3 requires a ds:Signature over the
+/// authenticated elements and that is not implemented here. Playback equipment
+/// will reject the result. It is deliberately emitted without a Signature
+/// element rather than with a placeholder one.
+pub fn generate_kdm(config: &KdmConfig) -> Result<(), String> {
+    use std::io::Write;
+
+    let kdm = build_kdm(config)?;
+    let kdm_xml = kdm.xml;
+
     if let Some(parent) = config.output_file.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("Cannot create output directory: {e}"))?;
@@ -715,64 +953,428 @@ fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
     Err(format!("Cannot parse duration: '{s}'"))
 }
 
-/// Extract CN from a PEM certificate string.
-fn extract_cn_from_pem(pem: &str) -> Option<String> {
-    // Use openssl x509 -noout -subject to parse
-    use std::process::Command;
-    let mut child = Command::new("openssl")
-        .args(["x509", "-noout", "-subject"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .ok()?;
-
-    {
-        use std::io::Write;
-        let stdin = child.stdin.as_mut()?;
-        stdin.write_all(pem.as_bytes()).ok()?;
-    }
-
-    let output = child.wait_with_output().ok()?;
-    let subject = String::from_utf8_lossy(&output.stdout);
-    // Extract CN= value
-    for part in subject.split('/') {
-        if let Some(cn) = part
-            .strip_prefix("CN=")
-            .or_else(|| part.strip_prefix("CN ="))
-        {
-            return Some(cn.trim().to_string());
-        }
-    }
-    // Try comma-separated format
-    for part in subject.split(',') {
-        let trimmed = part.trim();
-        if let Some(cn) = trimmed
-            .strip_prefix("CN=")
-            .or_else(|| trimmed.strip_prefix("CN ="))
-        {
-            return Some(cn.trim().to_string());
-        }
-    }
-    None
+/// Certificate thumbprint per SMPTE ST 430-2: SHA-1 over the DER-encoded
+/// TBSCertificate (the signed portion), not the whole certificate.
+///
+/// Matches libdcp's `Certificate::thumbprint()`, which hashes
+/// `i2d_re_X509_tbs` output.
+fn cert_thumbprint(tbs_der: &[u8]) -> [u8; 20] {
+    use sha1::Digest;
+    sha1::Sha1::digest(tbs_der).into()
 }
 
-/// Generate random bytes for content key.
-fn rand_bytes<const N: usize>() -> [u8; N] {
-    let mut buf = [0u8; N];
-    // Use /dev/urandom on Unix
-    if let Ok(data) = std::fs::read("/dev/urandom") {
-        for (i, byte) in data.iter().take(N).enumerate() {
-            buf[i] = *byte;
+/// Identity of the entity issuing a KDM.
+struct Signer {
+    subject_dn: String,
+    issuer_dn: String,
+    serial: String,
+    thumbprint: [u8; 20],
+}
+
+/// Parse the signer certificate for the identity and thumbprint the key block needs.
+fn parse_signer(cert_path: &Path) -> Result<Signer, String> {
+    use x509_parser::prelude::*;
+
+    let data = std::fs::read(cert_path)
+        .map_err(|e| format!("cannot read signer cert {}: {e}", cert_path.display()))?;
+    let (_, pem) = parse_x509_pem(&data)
+        .map_err(|e| format!("signer cert {} is not valid PEM: {e}", cert_path.display()))?;
+    let cert = pem.parse_x509().map_err(|e| {
+        format!(
+            "signer cert {} is not valid X.509: {e}",
+            cert_path.display()
+        )
+    })?;
+
+    Ok(Signer {
+        subject_dn: cert.subject().to_string(),
+        issuer_dn: cert.issuer().to_string(),
+        serial: cert.serial.to_str_radix(10),
+        thumbprint: cert_thumbprint(cert.tbs_certificate.as_ref()),
+    })
+}
+
+/// Identity and public key of a KDM recipient, parsed from its certificate.
+struct Recipient {
+    /// Subject DN in RFC 2253 form, as SMPTE 430-1 expects for X509SubjectName.
+    subject_dn: String,
+    /// Issuer DN in RFC 2253 form, for the X509IssuerSerial recipient reference.
+    issuer_dn: String,
+    serial: String,
+    public_key: rsa::RsaPublicKey,
+}
+
+/// Parse a recipient certificate: identity plus the RSA key the content key is wrapped to.
+///
+/// Every failure here is fatal. Falling back to a placeholder identity or a
+/// missing key would mean emitting a KDM nobody can use, or worse, an
+/// unencrypted one.
+fn parse_recipient(cert_path: &Path) -> Result<Recipient, String> {
+    use rsa::pkcs8::DecodePublicKey;
+    use x509_parser::prelude::*;
+
+    let data = std::fs::read(cert_path)
+        .map_err(|e| format!("cannot read recipient cert {}: {e}", cert_path.display()))?;
+    let (_, pem) = parse_x509_pem(&data).map_err(|e| {
+        format!(
+            "recipient cert {} is not valid PEM: {e}",
+            cert_path.display()
+        )
+    })?;
+    let cert = pem.parse_x509().map_err(|e| {
+        format!(
+            "recipient cert {} is not valid X.509: {e}",
+            cert_path.display()
+        )
+    })?;
+
+    let spki = cert.public_key();
+    // Reject non-RSA up front so the OAEP step can't be reached with a key it cannot use.
+    match spki.parsed() {
+        Ok(x509_parser::public_key::PublicKey::RSA(_)) => {}
+        Ok(_) => {
+            return Err(format!(
+                "recipient cert {} does not hold an RSA key; SMPTE 430-1 KDMs require RSA",
+                cert_path.display()
+            ));
         }
-    } else {
-        // Fallback: use time-based seeding
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        for (i, item) in buf.iter_mut().enumerate().take(N) {
-            *item = ((seed >> (i * 8)) & 0xFF) as u8;
+        Err(e) => {
+            return Err(format!(
+                "cannot parse public key from {}: {e}",
+                cert_path.display()
+            ));
         }
     }
-    buf
+
+    let public_key = rsa::RsaPublicKey::from_public_key_der(spki.raw).map_err(|e| {
+        format!(
+            "cannot load RSA public key from {}: {e}",
+            cert_path.display()
+        )
+    })?;
+
+    Ok(Recipient {
+        subject_dn: cert.subject().to_string(),
+        issuer_dn: cert.issuer().to_string(),
+        // X509SerialNumber is a decimal integer in XML-DSig
+        serial: cert.serial.to_str_radix(10),
+        public_key,
+    })
+}
+
+/// Fill a buffer from the OS CSPRNG.
+///
+/// There is deliberately no fallback: anything other than a real CSPRNG here
+/// yields a guessable content key, so RNG failure has to be fatal.
+fn rand_bytes<const N: usize>() -> Result<[u8; N], String> {
+    use ring::rand::SecureRandom;
+
+    let mut buf = [0u8; N];
+    ring::rand::SystemRandom::new()
+        .fill(&mut buf)
+        .map_err(|_| "CSPRNG unavailable, refusing to generate a content key".to_string())?;
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine;
+    use std::sync::OnceLock;
+
+    /// A real certificate chain plus a second root that shares the real root's
+    /// CN but has a different key. Generated once, RSA keygen is expensive.
+    struct Fixtures {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        intermediate: PathBuf,
+        signer: PathBuf,
+        signer_key: PathBuf,
+        /// Same subject CN as `root`, different key. Used to prove chain
+        /// validation checks signatures and not just names.
+        impostor_root: PathBuf,
+    }
+
+    fn fixtures() -> &'static Fixtures {
+        static FIXTURES: OnceLock<Fixtures> = OnceLock::new();
+        FIXTURES.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let p = dir.path();
+            assert_eq!(generate_chain("Acme", p), 0, "chain generation failed");
+
+            let impostor_root = p.join("impostor_root.pem");
+            let opts = CertOptions {
+                cert_type: CertType::Root,
+                // identical CN to the genuine root
+                common_name: "Acme Root CA".to_string(),
+                organization: "Acme".to_string(),
+                organizational_unit: "Digital Cinema".to_string(),
+                output_cert: impostor_root.clone(),
+                output_key: p.join("impostor_root.key"),
+                ..Default::default()
+            };
+            assert_eq!(generate_certificate(&opts), 0, "impostor root failed");
+
+            Fixtures {
+                root: p.join("root.pem"),
+                intermediate: p.join("intermediate.pem"),
+                signer: p.join("signer.pem"),
+                signer_key: p.join("signer.key"),
+                impostor_root,
+                _dir: dir,
+            }
+        })
+    }
+
+    fn test_config(f: &Fixtures, out: PathBuf) -> KdmConfig {
+        KdmConfig {
+            cpl_id: "8a2b1c3d-4e5f-6071-8293-a4b5c6d7e8f9".to_string(),
+            content_title: "Test Feature".to_string(),
+            recipient_cert_file: f.signer.clone(),
+            signer_cert_file: f.root.clone(),
+            output_file: out,
+            valid_from: "now".to_string(),
+            valid_to: "7 days".to_string(),
+            formulation: "dci-any".to_string(),
+        }
+    }
+
+    fn cipher_value(xml: &str) -> Vec<u8> {
+        let start = xml.find("<CipherValue>").expect("no CipherValue") + "<CipherValue>".len();
+        let end = xml.find("</CipherValue>").expect("no closing CipherValue");
+        base64::engine::general_purpose::STANDARD
+            .decode(xml[start..end].trim())
+            .expect("CipherValue is not base64")
+    }
+
+    fn recipient_private_key(f: &Fixtures) -> rsa::RsaPrivateKey {
+        use rsa::pkcs8::DecodePrivateKey;
+        let pem = std::fs::read_to_string(&f.signer_key).expect("read signer key");
+        rsa::RsaPrivateKey::from_pkcs8_pem(&pem).expect("parse signer key")
+    }
+
+    #[test]
+    fn cipher_value_is_not_the_plaintext_key() {
+        let f = fixtures();
+        let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build kdm");
+
+        let ct = cipher_value(&kdm.xml);
+        assert_eq!(ct.len(), 256, "2048-bit RSA must give a 256-byte block");
+        assert_ne!(
+            ct.as_slice(),
+            kdm.content_key.as_slice(),
+            "CipherValue is the raw content key"
+        );
+
+        // The old bug wrote the key as hex into the XML. Make sure neither the
+        // hex nor the raw bytes appear anywhere in the message.
+        let hex_key: String = kdm.content_key.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(
+            !kdm.xml.contains(&hex_key),
+            "content key leaked into the KDM as hex"
+        );
+        assert!(
+            !ct.windows(16).any(|w| w == kdm.content_key),
+            "content key appears verbatim inside the ciphertext"
+        );
+    }
+
+    #[test]
+    fn key_block_decrypts_to_the_original_key_and_matches_smpte_layout() {
+        let f = fixtures();
+        let config = test_config(f, PathBuf::from("unused"));
+        let kdm = build_kdm(&config).expect("build kdm");
+
+        let block = recipient_private_key(f)
+            .decrypt(rsa::Oaep::new::<sha1::Sha1>(), &cipher_value(&kdm.xml))
+            .expect("recipient private key must decrypt the CipherValue");
+
+        // SMPTE ST 430-1 Table 6 offsets.
+        assert_eq!(block.len(), KDM_KEY_BLOCK_LEN);
+        assert_eq!(&block[0..16], &KDM_STRUCTURE_ID, "structure id");
+
+        let signer = parse_signer(&f.root).expect("parse signer");
+        assert_eq!(&block[16..36], &signer.thumbprint, "signer thumbprint");
+
+        let cpl = uuid::Uuid::parse_str(&config.cpl_id).unwrap();
+        assert_eq!(&block[36..52], cpl.as_bytes(), "cpl id");
+        assert_eq!(&block[52..56], b"MDIK", "key type");
+        assert_eq!(&block[56..72], kdm.key_id.as_bytes(), "key id");
+
+        let not_before = std::str::from_utf8(&block[72..97]).expect("not-before ascii");
+        let not_after = std::str::from_utf8(&block[97..122]).expect("not-after ascii");
+        check_kdm_timestamp("not_before", not_before).expect("valid not-before");
+        check_kdm_timestamp("not_after", not_after).expect("valid not-after");
+        assert!(not_before < not_after);
+
+        assert_eq!(&block[122..138], &kdm.content_key, "content key roundtrip");
+    }
+
+    #[test]
+    fn each_kdm_gets_a_fresh_content_key() {
+        let f = fixtures();
+        let a = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("a");
+        let b = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("b");
+        assert_ne!(a.content_key, b.content_key, "content key is not random");
+    }
+
+    #[test]
+    fn missing_recipient_cert_errors() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.recipient_cert_file = PathBuf::from("/nonexistent/recipient.pem");
+        let err = build_kdm(&config).expect_err("must not build without a recipient cert");
+        assert!(err.contains("cannot read recipient cert"), "got: {err}");
+    }
+
+    #[test]
+    fn signer_thumbprint_is_sha1_over_tbs_not_full_cert() {
+        use sha1::Digest;
+        use x509_parser::prelude::*;
+
+        let f = fixtures();
+        let signer = parse_signer(&f.root).expect("parse signer");
+
+        let data = std::fs::read(&f.root).unwrap();
+        let (_, pem) = parse_x509_pem(&data).unwrap();
+        let cert = pem.parse_x509().unwrap();
+
+        let over_tbs: [u8; 20] = sha1::Sha1::digest(cert.tbs_certificate.as_ref()).into();
+        let over_full: [u8; 20] = sha1::Sha1::digest(&pem.contents).into();
+
+        assert_eq!(signer.thumbprint, over_tbs, "thumbprint must be over TBS");
+        assert_ne!(
+            over_tbs, over_full,
+            "TBS and full-cert hashes must differ, else the test proves nothing"
+        );
+    }
+
+    #[test]
+    fn invalid_recipient_cert_errors() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("bogus.pem");
+        std::fs::write(&bogus, b"not a certificate at all").unwrap();
+
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.recipient_cert_file = bogus;
+        let err = build_kdm(&config).expect_err("must not build from a non-certificate");
+        assert!(err.contains("not valid PEM"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_signer_cert_errors() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.signer_cert_file = PathBuf::new();
+        let err = build_kdm(&config).expect_err("must not build without a signer cert");
+        assert!(err.contains("signer certificate is required"), "got: {err}");
+    }
+
+    #[test]
+    fn non_uuid_cpl_id_errors() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.cpl_id = "not-a-uuid".to_string();
+        let err = build_kdm(&config).expect_err("must reject a non-UUID CPL id");
+        assert!(err.contains("is not a UUID"), "got: {err}");
+    }
+
+    #[test]
+    fn undersized_rsa_key_is_rejected() {
+        // DCI mandates 2048-bit RSA; a smaller key must not produce a KDM.
+        let weak = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).expect("gen 1024");
+        let err = encrypt_key_block(&weak.to_public_key(), &[0u8; KDM_KEY_BLOCK_LEN])
+            .expect_err("1024-bit key must be rejected");
+        assert!(err.contains("1024"), "got: {err}");
+    }
+
+    #[test]
+    fn malformed_timestamps_are_rejected() {
+        // Wrong length, 'Z' offset and fractional seconds all break the fixed
+        // 25-byte key block fields.
+        assert!(check_kdm_timestamp("t", "2024-01-01T00:00:00Z").is_err());
+        assert!(check_kdm_timestamp("t", "2024-01-01T00:00:00.5+00:00").is_err());
+        assert!(check_kdm_timestamp("t", "2024-01-01").is_err());
+        check_kdm_timestamp("t", "2004-05-01T13:20:00+00:00").expect("spec example is valid");
+    }
+
+    #[test]
+    fn content_title_cannot_inject_xml() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.content_title = "</ContentTitleText><Evil>x</Evil>".to_string();
+        let kdm = build_kdm(&config).expect("build kdm");
+        assert!(
+            !kdm.xml.contains("<Evil>"),
+            "content title injected raw XML"
+        );
+        assert!(kdm.xml.contains("&lt;/ContentTitleText&gt;"));
+    }
+
+    #[test]
+    fn generate_kdm_writes_a_file_with_the_required_algorithm() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("nested").join("test.kdm.xml");
+        generate_kdm(&test_config(f, out.clone())).expect("generate kdm");
+
+        let xml = std::fs::read_to_string(&out).expect("kdm written");
+        assert!(
+            xml.contains(&format!("Algorithm=\"{KDM_ENCRYPTION_METHOD}\"")),
+            "missing the rsa-oaep-mgf1p algorithm URI required by DCI CTP 3.4.12"
+        );
+    }
+
+    #[test]
+    fn valid_chain_passes() {
+        let f = fixtures();
+        let chain = vec![f.signer.clone(), f.intermediate.clone(), f.root.clone()];
+        assert_eq!(validate_chain(&chain), 0, "genuine chain must validate");
+    }
+
+    #[test]
+    fn chain_with_impostor_root_is_rejected() {
+        // The impostor shares the real root's CN, so the old name-comparison
+        // check passed this. Signature verification must reject it.
+        let f = fixtures();
+        let chain = vec![
+            f.signer.clone(),
+            f.intermediate.clone(),
+            f.impostor_root.clone(),
+        ];
+        assert_eq!(
+            validate_chain(&chain),
+            -1,
+            "a root that did not sign the intermediate must be rejected"
+        );
+    }
+
+    #[test]
+    fn out_of_order_chain_is_rejected() {
+        let f = fixtures();
+        let chain = vec![f.root.clone(), f.intermediate.clone(), f.signer.clone()];
+        assert_eq!(
+            validate_chain(&chain),
+            -1,
+            "reversed chain must be rejected"
+        );
+    }
+
+    #[test]
+    fn empty_chain_is_rejected() {
+        assert_eq!(validate_chain(&[]), -1);
+    }
+
+    #[test]
+    fn read_certificate_reports_the_real_key_size() {
+        let f = fixtures();
+        let info = read_certificate(&f.root);
+        assert_eq!(
+            info.key_bits, 2048,
+            "key size must be in bits, not bits * 8"
+        );
+        assert!(info.is_ca);
+        assert!(!info.is_expired);
+    }
 }
