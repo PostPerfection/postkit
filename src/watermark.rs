@@ -100,7 +100,7 @@ fn embed_internal(opts: &WatermarkOptions) -> WatermarkResult {
     let input_pattern = opts.input_dir.join(format!("*.{ext}"));
     let output_pattern = opts.output_dir.join(format!("%06d.{ext}"));
 
-    let watermark_text = format!("{}:{}", &payload_hash[..8], &opts.session_id);
+    let watermark_text = format!("{}:{}", &payload_hash[..8], opts.session_id);
     let filter = format!(
         "drawtext=text='{}':fontsize=10:fontcolor=white@0.{:02}:x=10:y=h-20",
         watermark_text.replace('\'', "\\'"),
