@@ -1009,6 +1009,7 @@ mod tests {
         assert_eq!(params.profile, 0x0003);
     }
 
+    #[cfg(feature = "grok-ffi")]
     #[test]
     fn test_single_frame_compress_speed() {
         // Load a real TIFF frame and benchmark single-frame compress
@@ -1048,5 +1049,22 @@ mod tests {
             elapsed.as_secs_f64() / n as f64 * 1000.0
         );
         deinitialize();
+    }
+
+    #[cfg(not(feature = "grok-ffi"))]
+    #[test]
+    fn test_compress_requires_grok_ffi() {
+        let frame = RawFrame::Packed {
+            data: vec![0; 6],
+            width: 1,
+            height: 1,
+            precision: 16,
+            index: 0,
+        };
+        let mut output = Vec::new();
+
+        let error = compress_frame_grok(&frame, &CompressParams::default(), &mut output)
+            .expect_err("compression should require grok-ffi");
+        assert!(error.contains("grok-ffi feature not enabled"));
     }
 }

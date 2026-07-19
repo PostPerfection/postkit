@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>postkit &mdash; Shared Post-Production Library</title>
+    <title>postkit: Shared Post-Production Library</title>
     <meta name="description" content="Shared Rust library for DCP Wizard, IMF Wizard, and DCP Doctor. Common post-production functionality for digital cinema workflows.">
     <style>
         :root {
@@ -52,7 +52,7 @@
 <body>
     <div class="container">
         <h1><span>postkit</span></h1>
-        <p class="subtitle">Shared Rust library for DCP Wizard, IMF Wizard, and DCP Doctor &mdash; common post-production functionality.</p>
+        <p class="subtitle">Version 0.5 shared Rust library for DCP Wizard, IMF Wizard, and DCP Doctor.</p>
 
         <div class="card">
             <h2>About</h2>
@@ -62,26 +62,26 @@
         <div class="card">
             <h2>Modules</h2>
             <ul class="modules">
-                <li>encode &mdash; JPEG 2000 encoding (grok + OpenJPEG)</li>
-                <li>mxf_wrap &mdash; MXF track wrapping</li>
-                <li>hash &mdash; SHA-1/SHA-256 hashing</li>
-                <li>colour &mdash; Colour space conversion</li>
-                <li>loudness &mdash; EBU R128 measurement</li>
-                <li>job_queue &mdash; Background jobs</li>
-                <li>preferences &mdash; JSON preferences</li>
-                <li>profiles &mdash; Delivery presets</li>
-                <li>burnin &mdash; Subtitle burn-in</li>
-                <li>report &mdash; QC reports</li>
-                <li>watch &mdash; Watch folder automation</li>
-                <li>preview &mdash; DCP/IMF playback</li>
-                <li>ingest &mdash; Camera raw ingest</li>
-                <li>conform &mdash; Timeline import</li>
-                <li>certificate &mdash; X.509 management</li>
-                <li>dolby_vision &mdash; HDR metadata</li>
-                <li>watermark &mdash; Forensic watermarking</li>
-                <li>dcdm &mdash; DCDM creation</li>
-                <li>accessibility &mdash; Compliance checking</li>
-                <li>trailer &mdash; Trailer packaging</li>
+                <li>encode: JPEG 2000 encoding with OpenJPEG and optional Grok</li>
+                <li>mxf_wrap: MXF track wrapping</li>
+                <li>hash: SHA-1/SHA-256 hashing</li>
+                <li>colour: Colour space conversion</li>
+                <li>loudness: EBU R128 measurement</li>
+                <li>job_queue: Background jobs</li>
+                <li>preferences: JSON preferences</li>
+                <li>profiles: Delivery presets</li>
+                <li>burnin: Subtitle burn-in</li>
+                <li>report: QC reports</li>
+                <li>watch: Watch folder automation</li>
+                <li>preview: DCP/IMF playback</li>
+                <li>ingest: Camera raw ingest</li>
+                <li>conform: Timeline import</li>
+                <li>certificate: X.509 management</li>
+                <li>dolby_vision: HDR metadata</li>
+                <li>watermark: Forensic watermarking</li>
+                <li>dcdm: DCDM creation</li>
+                <li>accessibility: Compliance checking</li>
+                <li>trailer: Trailer packaging</li>
             </ul>
         </div>
 
@@ -89,7 +89,7 @@
             <h2>Usage</h2>
             <p>Add to your <code>Cargo.toml</code>:</p>
             <pre style="margin-top:0.5rem;background:#222;padding:1rem;border-radius:4px;overflow-x:auto"><code>[dependencies]
-postkit = { git = "https://github.com/PostPerfection/postkit.git", branch = "master" }</code></pre>
+postkit = { git = "https://github.com/PostPerfection/postkit.git", tag = "v0.5.0" }</code></pre>
         </div>
 
         <div class="card">

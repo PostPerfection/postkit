@@ -1,6 +1,10 @@
 # postkit
 
-Shared library for DCP Wizard, IMF Wizard, and DCP Doctor — common post-production functionality.
+[![CI](https://github.com/PostPerfection/postkit/actions/workflows/ci.yml/badge.svg)](https://github.com/PostPerfection/postkit/actions/workflows/ci.yml)
+
+Version 0.5 supports OpenJPEG and optional Grok FFI. Tests without `grok-ffi` use the real disabled-feature path and do not require developer-local media.
+
+Shared library for DCP Wizard, IMF Wizard, and DCP Doctor, common post-production functionality.
 
 Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfection/asdcplib-rs) FFI bindings.
 
@@ -62,7 +66,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-postkit = { git = "https://github.com/PostPerfection/postkit.git", branch = "master" }
+postkit = { git = "https://github.com/PostPerfection/postkit.git", tag = "v0.5.0" }
 ```
 
 ## License
