@@ -572,9 +572,16 @@ pub struct KdmConfig {
     pub cpl_id: String,
     pub content_title: String,
     pub recipient_cert_file: PathBuf,
-    /// Certificate of the entity issuing this KDM. Its thumbprint is part of
-    /// the encrypted key block, so a KDM cannot be built without it.
+    /// Leaf certificate of the entity issuing this KDM. Its thumbprint is part
+    /// of the encrypted key block and it is the certificate whose key signs the
+    /// ETM ds:Signature, so a KDM cannot be built without it.
     pub signer_cert_file: PathBuf,
+    /// RSA private key matching `signer_cert_file`, used to sign the message.
+    pub signer_key_file: PathBuf,
+    /// CA certificates above the signer leaf (intermediate(s) then root), in
+    /// that order. Embedded in ds:KeyInfo after the leaf so a verifier can
+    /// build the chain to a trust anchor. A self-signed signer needs none.
+    pub signer_chain_files: Vec<PathBuf>,
     pub output_file: PathBuf,
     pub valid_from: String,
     pub valid_to: String,
@@ -595,6 +602,24 @@ const KDM_TIMESTAMP_LEN: usize = 25;
 
 /// XML Encryption 1.0 5.4.2, mandated by DCI CTP 3.4.12.
 const KDM_ENCRYPTION_METHOD: &str = "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p";
+
+// SMPTE 430-3 ETM ds:Signature profile. Every URI below is what libdcp emits
+// in src/encrypted_kdm.cc / src/certificate_chain.cc for a KDM (distinct from
+// the CPL/PKL signer), and is what DCI-compliant playback gear checks.
+const ETM_NS: &str = "http://www.smpte-ra.org/schemas/430-3/2006/ETM";
+const KDM_NS: &str = "http://www.smpte-ra.org/schemas/430-1/2006/KDM";
+const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+const ENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
+/// Inclusive Canonical XML 1.0, WithComments. libdcp KDM uses exactly this URI
+/// (not exclusive c14n, not the plain variant the CPL signer uses).
+const C14N_METHOD: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
+/// RSASSA-PKCS1-v1_5 over SHA-256.
+const SIG_METHOD: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+const DIGEST_METHOD: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+/// Id attribute values on the two authenticated elements. The ds:Reference
+/// URIs point at these, and a verifier resolves them via the Id attribute.
+const AUTH_PUBLIC_ID: &str = "ID_AuthenticatedPublic";
+const AUTH_PRIVATE_ID: &str = "ID_AuthenticatedPrivate";
 
 /// Escape text before it goes into the KDM XML.
 ///
@@ -733,9 +758,11 @@ impl std::fmt::Debug for GeneratedKdm {
 }
 
 /// Build a SMPTE 430-1 KDM in memory, encrypting a fresh content key to the
-/// recipient certificate.
+/// recipient certificate and signing the message per SMPTE 430-3.
 ///
-/// NOTE: the result carries no XML signature. See `generate_kdm`.
+/// The returned XML carries a full ds:Signature over the AuthenticatedPublic
+/// and AuthenticatedPrivate elements; it will not build if the signature cannot
+/// be produced.
 pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
     use base64::Engine;
 
@@ -774,7 +801,6 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
     };
     let not_valid_after = parse_validity_end(&config.valid_to, &not_valid_before)?;
 
-    let kdm_id = uuid::Uuid::new_v4();
     let message_id = uuid::Uuid::new_v4();
 
     let formulation_uri = match config.formulation.to_lowercase().replace(' ', "-").as_str() {
@@ -808,10 +834,12 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
     let signer_issuer = xml_escape(&signer.issuer_dn);
     let signer_serial = xml_escape(&signer.serial);
 
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<DCinemaSecurityMessage xmlns="http://www.smpte-ra.org/schemas/430-3/2006/ETM">
-  <AuthenticatedPublic Id="ID_{kdm_id}">
+    // Inner content of the two authenticated elements. Each is reused twice:
+    // once inside the document, and once (in build_signature) inside a
+    // standalone fragment that carries the document root's namespaces so its
+    // canonical form is byte-identical to the subtree the verifier digests.
+    let auth_public_inner = format!(
+        r#"
     <MessageId>urn:uuid:{message_id}</MessageId>
     <MessageType>{formulation_uri}</MessageType>
     <AnnotationText>{title} KDM for {recipient_subject}</AnnotationText>
@@ -822,7 +850,7 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
       <X509SubjectName>{signer_subject}</X509SubjectName>
     </Signer>
     <RequiredExtensions>
-      <KDMRequiredExtensions xmlns="http://www.smpte-ra.org/schemas/430-1/2006/KDM">
+      <KDMRequiredExtensions xmlns="{KDM_NS}">
         <Recipient>
           <X509IssuerSerial>
             <X509IssuerName>{recipient_issuer}</X509IssuerName>
@@ -842,22 +870,36 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
         </KeyIdList>
       </KDMRequiredExtensions>
     </RequiredExtensions>
-  </AuthenticatedPublic>
-  <AuthenticatedPrivate>
-    <EncryptedKey xmlns="http://www.w3.org/2001/04/xmlenc#">
-      <EncryptionMethod Algorithm="{encryption_method}"/>
-      <CipherData>
-        <CipherValue>{cipher_value}</CipherValue>
-      </CipherData>
-    </EncryptedKey>
-  </AuthenticatedPrivate>
-</DCinemaSecurityMessage>
-"#,
+  "#,
         issue_date = now.format("%Y-%m-%dT%H:%M:%S+00:00"),
         not_before = not_valid_before,
         not_after = not_valid_after,
         key_id = content_key_id,
-        encryption_method = KDM_ENCRYPTION_METHOD,
+    );
+
+    let auth_private_inner = format!(
+        r#"
+    <EncryptedKey xmlns="{ENC_NS}">
+      <EncryptionMethod Algorithm="{KDM_ENCRYPTION_METHOD}"/>
+      <CipherData>
+        <CipherValue>{cipher_value}</CipherValue>
+      </CipherData>
+    </EncryptedKey>
+  "#,
+    );
+
+    let signature = build_signature(config, &auth_public_inner, &auth_private_inner)?;
+
+    // The root declares the ETM default namespace plus xmlns:ds, exactly the
+    // set the standalone fragments in build_signature reproduce.
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<DCinemaSecurityMessage xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}">
+  <AuthenticatedPublic Id="{AUTH_PUBLIC_ID}">{auth_public_inner}</AuthenticatedPublic>
+  <AuthenticatedPrivate Id="{AUTH_PRIVATE_ID}">{auth_private_inner}</AuthenticatedPrivate>
+{signature}
+</DCinemaSecurityMessage>
+"#,
     );
 
     Ok(GeneratedKdm {
@@ -867,13 +909,257 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
     })
 }
 
+/// Build the ETM ds:Signature block (indented as the last child of
+/// DCinemaSecurityMessage), signing over the two authenticated elements.
+///
+/// Canonicalization uses `xmllint --c14n` (libxml2, the same engine xmlsec1
+/// verifies with) so the digested bytes match to the byte. Signing itself uses
+/// the `rsa` crate. Every failure is fatal: a KDM must never be written with an
+/// absent, empty or placeholder signature.
+fn build_signature(
+    config: &KdmConfig,
+    auth_public_inner: &str,
+    auth_private_inner: &str,
+) -> Result<String, String> {
+    use base64::Engine;
+
+    if config.signer_key_file.as_os_str().is_empty() {
+        return Err("signer private key is required to sign the KDM".into());
+    }
+
+    // Load the signing key and prove it belongs to the signer certificate.
+    let leaf_public_key = cert_rsa_public_key(&config.signer_cert_file)?;
+    let private_key = load_signer_key(&config.signer_key_file, &leaf_public_key)?;
+
+    // Digest each authenticated element over its canonical form. The fragment
+    // apex carries the root's in-scope namespaces (ETM default + ds); under
+    // inclusive c14n those are rendered on the apex of every digested subtree,
+    // so this matches what the verifier computes in place.
+    let auth_public_fragment = format!(
+        r#"<AuthenticatedPublic xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}" Id="{AUTH_PUBLIC_ID}">{auth_public_inner}</AuthenticatedPublic>"#,
+    );
+    let auth_private_fragment = format!(
+        r#"<AuthenticatedPrivate xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}" Id="{AUTH_PRIVATE_ID}">{auth_private_inner}</AuthenticatedPrivate>"#,
+    );
+    let public_digest =
+        base64::engine::general_purpose::STANDARD.encode(sha256(&c14n(&auth_public_fragment)?));
+    let private_digest =
+        base64::engine::general_purpose::STANDARD.encode(sha256(&c14n(&auth_private_fragment)?));
+
+    // SignedInfo inner content, reused for the digest input and the document.
+    let signed_info_inner = format!(
+        r##"
+      <ds:CanonicalizationMethod Algorithm="{C14N_METHOD}"/>
+      <ds:SignatureMethod Algorithm="{SIG_METHOD}"/>
+      <ds:Reference URI="#{AUTH_PUBLIC_ID}">
+        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
+        <ds:DigestValue>{public_digest}</ds:DigestValue>
+      </ds:Reference>
+      <ds:Reference URI="#{AUTH_PRIVATE_ID}">
+        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
+        <ds:DigestValue>{private_digest}</ds:DigestValue>
+      </ds:Reference>
+    "##,
+    );
+
+    // Canonicalize SignedInfo in its in-scope namespace context and sign it.
+    let signed_info_fragment = format!(
+        r#"<ds:SignedInfo xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}">{signed_info_inner}</ds:SignedInfo>"#,
+    );
+    let signed_info_c14n = c14n(&signed_info_fragment)?;
+    let signature_bytes = private_key
+        .sign(
+            rsa::Pkcs1v15Sign::new::<sha2::Sha256>(),
+            &sha256(&signed_info_c14n),
+        )
+        .map_err(|e| format!("RSA signing of SignedInfo failed: {e}"))?;
+    let signature_value = base64::engine::general_purpose::STANDARD.encode(&signature_bytes);
+
+    // KeyInfo: one X509Data per certificate, leaf first up to the root, each
+    // carrying both the issuer/serial reference and the certificate itself.
+    let mut chain = vec![config.signer_cert_file.clone()];
+    chain.extend(config.signer_chain_files.iter().cloned());
+    let mut key_info = String::new();
+    for cert_path in &chain {
+        let meta = cert_key_info(cert_path)?;
+        key_info.push_str(&format!(
+            r#"
+      <ds:X509Data>
+        <ds:X509IssuerSerial>
+          <ds:X509IssuerName>{issuer}</ds:X509IssuerName>
+          <ds:X509SerialNumber>{serial}</ds:X509SerialNumber>
+        </ds:X509IssuerSerial>
+        <ds:X509Certificate>{cert}</ds:X509Certificate>
+      </ds:X509Data>"#,
+            issuer = xml_escape(&meta.issuer_dn),
+            serial = meta.serial,
+            cert = meta.der_base64,
+        ));
+    }
+
+    Ok(format!(
+        r#"  <ds:Signature>
+    <ds:SignedInfo>{signed_info_inner}</ds:SignedInfo>
+    <ds:SignatureValue>{signature_value}</ds:SignatureValue>
+    <ds:KeyInfo>{key_info}
+    </ds:KeyInfo>
+  </ds:Signature>"#,
+    ))
+}
+
+/// SHA-256 digest.
+fn sha256(data: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(data).to_vec()
+}
+
+/// Inclusive Canonical XML 1.0 of a fragment, via `xmllint`.
+///
+/// libxml2 is the engine xmlsec1 canonicalizes with, so its output matches to
+/// the byte. Missing or failing xmllint is fatal: without correct c14n the
+/// signature cannot be made verifiable, and a KDM must never be emitted with a
+/// signature that only looks valid.
+fn c14n(fragment: &str) -> Result<Vec<u8>, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("xmllint")
+        .arg("--c14n")
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            format!(
+                "cannot run xmllint (libxml2) for XML canonicalization, required to sign the KDM: {e}"
+            )
+        })?;
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(fragment.as_bytes())
+        .map_err(|e| format!("failed to send XML to xmllint: {e}"))?;
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("xmllint did not complete: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "xmllint canonicalization failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+/// Load an RSA private key (PKCS#8 or PKCS#1 PEM) and confirm it matches the
+/// signer certificate's public key.
+///
+/// A key that is missing, unreadable, not RSA, or belonging to a different
+/// certificate is fatal: signing with the wrong key yields a KDM that no
+/// verifier will accept.
+fn load_signer_key(
+    key_path: &Path,
+    cert_public_key: &rsa::RsaPublicKey,
+) -> Result<rsa::RsaPrivateKey, String> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+    use rsa::pkcs8::DecodePrivateKey;
+
+    let pem = std::fs::read_to_string(key_path)
+        .map_err(|e| format!("cannot read signer private key {}: {e}", key_path.display()))?;
+    let key = rsa::RsaPrivateKey::from_pkcs8_pem(&pem)
+        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(&pem))
+        .map_err(|e| {
+            format!(
+                "signer private key {} is not a valid RSA private key (PKCS#8 or PKCS#1 PEM): {e}",
+                key_path.display()
+            )
+        })?;
+    if &key.to_public_key() != cert_public_key {
+        return Err(format!(
+            "signer private key {} does not match the public key in the signer certificate",
+            key_path.display()
+        ));
+    }
+    Ok(key)
+}
+
+/// Certificate fields needed for one ds:KeyInfo/X509Data entry.
+struct CertKeyInfo {
+    issuer_dn: String,
+    serial: String,
+    der_base64: String,
+}
+
+/// Parse a certificate for its issuer, serial and DER, for ds:KeyInfo.
+fn cert_key_info(cert_path: &Path) -> Result<CertKeyInfo, String> {
+    use base64::Engine;
+    use x509_parser::prelude::*;
+
+    let data = std::fs::read(cert_path)
+        .map_err(|e| format!("cannot read certificate {}: {e}", cert_path.display()))?;
+    let (_, pem) = parse_x509_pem(&data)
+        .map_err(|e| format!("certificate {} is not valid PEM: {e}", cert_path.display()))?;
+    let cert = pem.parse_x509().map_err(|e| {
+        format!(
+            "certificate {} is not valid X.509: {e}",
+            cert_path.display()
+        )
+    })?;
+
+    Ok(CertKeyInfo {
+        issuer_dn: cert.issuer().to_string(),
+        // X509SerialNumber is a decimal integer in XML-DSig.
+        serial: cert.serial.to_str_radix(10),
+        der_base64: base64::engine::general_purpose::STANDARD.encode(&pem.contents),
+    })
+}
+
+/// Extract the RSA public key from a certificate, rejecting non-RSA keys.
+fn cert_rsa_public_key(cert_path: &Path) -> Result<rsa::RsaPublicKey, String> {
+    use rsa::pkcs8::DecodePublicKey;
+    use x509_parser::prelude::*;
+
+    let data = std::fs::read(cert_path)
+        .map_err(|e| format!("cannot read signer cert {}: {e}", cert_path.display()))?;
+    let (_, pem) = parse_x509_pem(&data)
+        .map_err(|e| format!("signer cert {} is not valid PEM: {e}", cert_path.display()))?;
+    let cert = pem.parse_x509().map_err(|e| {
+        format!(
+            "signer cert {} is not valid X.509: {e}",
+            cert_path.display()
+        )
+    })?;
+
+    match cert.public_key().parsed() {
+        Ok(x509_parser::public_key::PublicKey::RSA(_)) => {}
+        Ok(_) => {
+            return Err(format!(
+                "signer cert {} does not hold an RSA key; SMPTE 430-3 signatures require RSA",
+                cert_path.display()
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "cannot parse public key from {}: {e}",
+                cert_path.display()
+            ));
+        }
+    }
+    rsa::RsaPublicKey::from_public_key_der(cert.public_key().raw).map_err(|e| {
+        format!(
+            "cannot load RSA public key from {}: {e}",
+            cert_path.display()
+        )
+    })
+}
+
 /// Generate a SMPTE 430-1 Key Delivery Message (KDM) and write it to disk.
 ///
-/// The content key is encrypted to the recipient certificate, but the message
-/// is NOT XML-signed: SMPTE 430-3 requires a ds:Signature over the
-/// authenticated elements and that is not implemented here. Playback equipment
-/// will reject the result. It is deliberately emitted without a Signature
-/// element rather than with a placeholder one.
+/// The content key is encrypted to the recipient certificate and the message is
+/// signed per SMPTE 430-3 with a ds:Signature over the authenticated elements.
+/// Signing is mandatory: if it cannot be produced no file is written.
 pub fn generate_kdm(config: &KdmConfig) -> Result<(), String> {
     use std::io::Write;
 
@@ -1087,6 +1373,7 @@ mod tests {
     struct Fixtures {
         _dir: tempfile::TempDir,
         root: PathBuf,
+        root_key: PathBuf,
         intermediate: PathBuf,
         signer: PathBuf,
         signer_key: PathBuf,
@@ -1117,6 +1404,7 @@ mod tests {
 
             Fixtures {
                 root: p.join("root.pem"),
+                root_key: p.join("root.key"),
                 intermediate: p.join("intermediate.pem"),
                 signer: p.join("signer.pem"),
                 signer_key: p.join("signer.key"),
@@ -1126,17 +1414,63 @@ mod tests {
         })
     }
 
+    // Signs with the self-signed root, so KeyInfo needs no chain and the
+    // recipient stays the signer leaf (its key decrypts the CipherValue in the
+    // cipher round-trip tests).
     fn test_config(f: &Fixtures, out: PathBuf) -> KdmConfig {
         KdmConfig {
             cpl_id: "8a2b1c3d-4e5f-6071-8293-a4b5c6d7e8f9".to_string(),
             content_title: "Test Feature".to_string(),
             recipient_cert_file: f.signer.clone(),
             signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            signer_chain_files: vec![],
             output_file: out,
             valid_from: "now".to_string(),
             valid_to: "7 days".to_string(),
             formulation: "dci-any".to_string(),
         }
+    }
+
+    // Realistic signer: the leaf signs, KeyInfo embeds leaf + intermediate +
+    // root, and a verifier trusts the root. Recipient is the root cert (any
+    // 2048-bit RSA cert works, its key is not needed here).
+    fn chain_signed_config(f: &Fixtures, out: PathBuf) -> KdmConfig {
+        KdmConfig {
+            cpl_id: "8a2b1c3d-4e5f-6071-8293-a4b5c6d7e8f9".to_string(),
+            content_title: "Test Feature".to_string(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.signer.clone(),
+            signer_key_file: f.signer_key.clone(),
+            signer_chain_files: vec![f.intermediate.clone(), f.root.clone()],
+            output_file: out,
+            valid_from: "now".to_string(),
+            valid_to: "7 days".to_string(),
+            formulation: "dci-any".to_string(),
+        }
+    }
+
+    fn xmlsec1_available() -> bool {
+        std::process::Command::new("xmlsec1")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Run `xmlsec1 --verify` against a signed KDM, returning whether it passed.
+    fn xmlsec1_verify(kdm: &Path, trusted_pem: &Path) -> bool {
+        std::process::Command::new("xmlsec1")
+            .arg("--verify")
+            .arg("--trusted-pem")
+            .arg(trusted_pem)
+            .args(["--id-attr:Id", "AuthenticatedPublic"])
+            .args(["--id-attr:Id", "AuthenticatedPrivate"])
+            .arg(kdm)
+            .output()
+            .expect("run xmlsec1")
+            .status
+            .success()
     }
 
     fn cipher_value(xml: &str) -> Vec<u8> {
@@ -1324,6 +1658,104 @@ mod tests {
             xml.contains(&format!("Algorithm=\"{KDM_ENCRYPTION_METHOD}\"")),
             "missing the rsa-oaep-mgf1p algorithm URI required by DCI CTP 3.4.12"
         );
+    }
+
+    #[test]
+    fn kdm_signature_verifies_with_xmlsec1() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("signed.kdm.xml");
+        generate_kdm(&chain_signed_config(f, out.clone())).expect("generate signed kdm");
+
+        assert!(
+            xmlsec1_verify(&out, &f.root),
+            "xmlsec1 must verify the signed KDM against the trusted root"
+        );
+    }
+
+    #[test]
+    fn tampered_authenticated_public_fails_xmlsec1() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("signed.kdm.xml");
+        generate_kdm(&chain_signed_config(f, out.clone())).expect("generate signed kdm");
+
+        // Flip one byte inside AuthenticatedPublic: the MDIK key type.
+        let xml = std::fs::read_to_string(&out).unwrap();
+        let tampered = xml.replacen("<KeyType>MDIK</KeyType>", "<KeyType>MDAK</KeyType>", 1);
+        assert_ne!(xml, tampered, "tamper must actually change the file");
+        std::fs::write(&out, tampered).unwrap();
+
+        assert!(
+            !xmlsec1_verify(&out, &f.root),
+            "xmlsec1 must reject a KDM whose AuthenticatedPublic was altered"
+        );
+    }
+
+    #[test]
+    fn self_signed_signer_verifies_with_xmlsec1() {
+        // The default test_config signs with the self-signed root.
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("signed.kdm.xml");
+        generate_kdm(&test_config(f, out.clone())).expect("generate signed kdm");
+        assert!(xmlsec1_verify(&out, &f.root), "self-signed KDM must verify");
+    }
+
+    #[test]
+    fn signed_kdm_has_a_real_signature_block() {
+        let f = fixtures();
+        let kdm = build_kdm(&chain_signed_config(f, PathBuf::from("unused"))).expect("build");
+        assert!(kdm.xml.contains("<ds:Signature>"), "no ds:Signature");
+        assert!(
+            kdm.xml.contains(&format!("Algorithm=\"{SIG_METHOD}\"")),
+            "missing rsa-sha256 SignatureMethod"
+        );
+        assert!(
+            kdm.xml.contains(&format!("Algorithm=\"{C14N_METHOD}\"")),
+            "missing inclusive-with-comments c14n method"
+        );
+        // Full chain embedded: leaf + intermediate + root.
+        assert_eq!(
+            kdm.xml.matches("<ds:X509Certificate>").count(),
+            3,
+            "KeyInfo must embed the full signer chain"
+        );
+        assert!(
+            !kdm.xml.contains("<ds:SignatureValue></ds:SignatureValue>"),
+            "SignatureValue must not be empty"
+        );
+    }
+
+    #[test]
+    fn missing_signer_key_errors() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.signer_key_file = PathBuf::new();
+        let err = build_kdm(&config).expect_err("must not build without a signer key");
+        assert!(err.contains("signer private key is required"), "got: {err}");
+    }
+
+    #[test]
+    fn signer_key_not_matching_cert_errors() {
+        // Sign with the root's key but claim the leaf as the signer cert.
+        let f = fixtures();
+        let mut config = chain_signed_config(f, PathBuf::from("unused"));
+        config.signer_key_file = f.root_key.clone();
+        let err = build_kdm(&config).expect_err("must reject a mismatched key");
+        assert!(err.contains("does not match"), "got: {err}");
     }
 
     #[test]
