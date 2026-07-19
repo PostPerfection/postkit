@@ -573,8 +573,10 @@ where
             };
         }
 
-        let status = match grk.wait() {
-            Ok(s) => s,
+        // wait_with_output drains stderr while waiting; a plain wait() deadlocks
+        // as soon as a verbose frame fills the pipe buffer
+        let grk_out = match grk.wait_with_output() {
+            Ok(o) => o,
             Err(e) => {
                 kill_child(&mut ffmpeg);
                 return EncodeResult {
@@ -586,16 +588,8 @@ where
             }
         };
 
-        if !status.success() {
-            let stderr_out = grk
-                .stderr
-                .take()
-                .map(|mut s| {
-                    let mut b = String::new();
-                    let _ = s.read_to_string(&mut b);
-                    b
-                })
-                .unwrap_or_default();
+        if !grk_out.status.success() {
+            let stderr_out = String::from_utf8_lossy(&grk_out.stderr);
             kill_child(&mut ffmpeg);
             return EncodeResult {
                 success: false,
@@ -632,13 +626,13 @@ where
     }
 }
 
-enum ReadResult {
+pub(crate) enum ReadResult {
     Ok,
     Eof,
     Err(std::io::Error),
 }
 
-fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> ReadResult {
+pub(crate) fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> ReadResult {
     let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {

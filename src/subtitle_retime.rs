@@ -100,6 +100,40 @@ fn parse_srt_time(t: &str) -> f64 {
     h * 3600.0 + m * 60.0 + s + ms / 1000.0
 }
 
+/// Latest subtitle end time in seconds, or None when the document has no parsable timing.
+///
+/// Reads TTML/IMSC `end` attributes and Interop DCSubtitle `TimeOut` attributes.
+pub fn subtitle_end_time_seconds(content: &str, fps: f64) -> Option<f64> {
+    let fps = if fps > 0.0 { fps } else { 24.0 };
+    let mut latest: Option<f64> = None;
+
+    for attr in ["end", "TimeOut"] {
+        let needle = format!("{attr}=\"");
+        let mut rest = content;
+        while let Some(pos) = rest.find(&needle) {
+            // require an attribute boundary so "backend=" does not match "end="
+            let at_boundary = rest[..pos]
+                .chars()
+                .next_back()
+                .is_none_or(|c| c.is_whitespace());
+            let val_start = pos + needle.len();
+            let after = &rest[val_start..];
+            let Some(val_end) = after.find('"') else {
+                break;
+            };
+            if at_boundary {
+                let t = parse_ttml_time(&after[..val_end], fps);
+                if t > 0.0 {
+                    latest = Some(latest.map_or(t, |m: f64| m.max(t)));
+                }
+            }
+            rest = &after[val_end + 1..];
+        }
+    }
+
+    latest
+}
+
 /// Re-time a subtitle file from one framerate to another.
 pub fn retime_subtitles(opts: &RetimeOptions) -> Result<RetimeResult, RetimeError> {
     if !opts.input_file.exists() {
@@ -424,5 +458,36 @@ mod tests {
 
         let out_content = fs::read_to_string(&output).unwrap();
         assert!(out_content.contains("00:00:01,000 --> 00:00:02,000"));
+    }
+
+    #[test]
+    fn derives_end_time_from_ttml() {
+        let xml = r#"<tt><body><div>
+            <p begin="00:00:01:00" end="00:00:05:12">hello</p>
+            <p begin="00:00:06:00" end="00:01:02:03">world</p>
+        </div></body></tt>"#;
+        let d = subtitle_end_time_seconds(xml, 24.0).unwrap();
+        assert!((d - 62.125).abs() < 1e-6, "got {d}");
+    }
+
+    #[test]
+    fn derives_end_time_from_interop_timeout() {
+        let xml =
+            r#"<DCSubtitle><Subtitle TimeIn="00:00:01:00" TimeOut="00:00:10:12"/></DCSubtitle>"#;
+        let d = subtitle_end_time_seconds(xml, 24.0).unwrap();
+        assert!((d - 10.5).abs() < 1e-6, "got {d}");
+    }
+
+    #[test]
+    fn end_time_is_none_without_timing() {
+        assert!(subtitle_end_time_seconds("<tt><body><p>no times</p></body></tt>", 24.0).is_none());
+    }
+
+    #[test]
+    fn end_time_ignores_attributes_merely_ending_in_end() {
+        let xml =
+            r#"<tt backend="00:99:99:99"><p begin="00:00:00:00" end="00:00:02:00">x</p></tt>"#;
+        let d = subtitle_end_time_seconds(xml, 24.0).unwrap();
+        assert!((d - 2.0).abs() < 1e-6, "got {d}");
     }
 }

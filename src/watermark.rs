@@ -175,6 +175,9 @@ fn embed_external(tool_name: &str, opts: &WatermarkOptions) -> WatermarkResult {
 }
 
 /// Detect forensic watermark in frame sequence.
+///
+/// The Internal backend has no detector: recovering its payload needs the
+/// unwatermarked reference frames, which this signature does not carry.
 pub fn detect_watermark(
     input: &Path,
     backend: WatermarkBackend,
@@ -184,13 +187,12 @@ pub fn detect_watermark(
         WatermarkBackend::NexGuard => "nexguard_detector",
         WatermarkBackend::Civolution => "civ_detector",
         WatermarkBackend::Internal => {
-            // Internal detection: read overlay text (not feasible for real forensic detection
-            // without the original frames). Return a diagnostic result.
             return WatermarkResult {
-                success: true,
-                error: String::new(),
-                frames_processed: 0,
-                payload_hash: "internal detection requires reference frames".into(),
+                success: false,
+                error: "Internal backend has no detector: forensic detection requires the \
+                        unwatermarked reference frames. Use the NexGuard or Civolution backend."
+                    .into(),
+                ..Default::default()
             };
         }
     };

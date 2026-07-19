@@ -18,21 +18,10 @@ pub struct WatchEvent {
     pub paths: Vec<PathBuf>,
 }
 
-/// Watch action triggered on events.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WatchAction {
-    pub name: String,
-    /// Glob pattern to match against event paths
-    pub pattern: String,
-    /// Command to execute when pattern matches
-    pub command: String,
-}
-
-/// File system watcher with action pipeline.
+/// File system watcher.
 pub struct FileWatcher {
     _watcher: RecommendedWatcher,
     rx: mpsc::Receiver<Result<Event, notify::Error>>,
-    actions: Vec<WatchAction>,
 }
 
 impl FileWatcher {
@@ -50,13 +39,7 @@ impl FileWatcher {
         Ok(Self {
             _watcher: watcher,
             rx,
-            actions: Vec::new(),
         })
-    }
-
-    /// Add an action to execute when a matching event occurs.
-    pub fn add_action(&mut self, action: WatchAction) {
-        self.actions.push(action);
     }
 
     /// Poll for the next event (blocking).

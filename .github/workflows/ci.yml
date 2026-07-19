@@ -53,5 +53,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --features async -- -D warnings
 
+      # openjpeg-sys vendors its C source (no system libs), so the openjpeg FFI
+      # in openjpeg_encoder.rs compiles on every runner. This is the feature set
+      # dcpwizard and imfwizard actually build with. grok-ffi is not covered: it
+      # links libgrokj2k via pkg-config, which is not available on GitHub runners.
+      - name: Build (openjpeg)
+        run: cargo build --features "async openjpeg"
+
+      - name: Test (openjpeg)
+        run: cargo test --features "async openjpeg"
+
+      - name: Clippy (openjpeg)
+        run: cargo clippy --all-targets --features "async openjpeg" -- -D warnings
+
       - name: Format check
         run: cargo fmt -- --check

@@ -75,38 +75,6 @@ impl RestServer {
     }
 }
 
-/// Send a plain text response.
-pub fn send_plain(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        status = status,
-        reason = reason_phrase(status),
-        len = body.len(),
-        body = body,
-    );
-    stream.write_all(response.as_bytes())
-}
-
-/// Send a JSON response.
-pub fn send_json(stream: &mut TcpStream, status: u16, body: &str) -> std::io::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}",
-        status = status,
-        reason = reason_phrase(status),
-        len = body.len(),
-        body = body,
-    );
-    stream.write_all(response.as_bytes())
-}
-
-/// Parse the request body from a stream (reads Content-Length bytes).
-pub fn read_body(reader: &mut BufReader<&TcpStream>, content_length: usize) -> String {
-    let mut body = vec![0u8; content_length];
-    use std::io::Read;
-    let _ = reader.read_exact(&mut body);
-    String::from_utf8_lossy(&body).to_string()
-}
-
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",

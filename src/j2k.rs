@@ -115,6 +115,10 @@ pub fn parse_j2k_header(data: &[u8]) -> Option<J2kHeader> {
         let seg_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
 
+        // a segment length below 2 is malformed and would underflow below
+        if seg_len < 2 {
+            break;
+        }
         if pos + seg_len - 2 > data.len() {
             break;
         }
@@ -124,8 +128,13 @@ pub fn parse_j2k_header(data: &[u8]) -> Option<J2kHeader> {
         match marker {
             SIZ if seg.len() >= 36 => {
                 hdr.profile = u16::from_be_bytes([seg[0], seg[1]]);
-                hdr.width = u32::from_be_bytes([seg[2], seg[3], seg[4], seg[5]]);
-                hdr.height = u32::from_be_bytes([seg[6], seg[7], seg[8], seg[9]]);
+                let xsiz = u32::from_be_bytes([seg[2], seg[3], seg[4], seg[5]]);
+                let ysiz = u32::from_be_bytes([seg[6], seg[7], seg[8], seg[9]]);
+                let xosiz = u32::from_be_bytes([seg[10], seg[11], seg[12], seg[13]]);
+                let yosiz = u32::from_be_bytes([seg[14], seg[15], seg[16], seg[17]]);
+                // image area excludes the codestream origin offset
+                hdr.width = xsiz.saturating_sub(xosiz);
+                hdr.height = ysiz.saturating_sub(yosiz);
                 // tile size at offset 18..26
                 hdr.tile_width = u32::from_be_bytes([seg[18], seg[19], seg[20], seg[21]]);
                 hdr.tile_height = u32::from_be_bytes([seg[22], seg[23], seg[24], seg[25]]);
@@ -229,5 +238,84 @@ mod tests {
         assert_eq!(J2kProfile::from(0), J2kProfile::None);
         assert_eq!(J2kProfile::from(3), J2kProfile::CinemaS2k);
         assert_eq!(J2kProfile::from(4), J2kProfile::CinemaS4k);
+    }
+
+    /// Build a minimal SOC + SIZ + SOD codestream for testing.
+    fn synth_codestream(
+        rsiz: u16,
+        xsiz: u32,
+        ysiz: u32,
+        xosiz: u32,
+        yosiz: u32,
+        components: u16,
+        bit_depth: u8,
+    ) -> Vec<u8> {
+        let mut d = Vec::new();
+        d.extend_from_slice(&SOC.to_be_bytes());
+        d.extend_from_slice(&SIZ.to_be_bytes());
+        let lsiz = 38 + 3 * components;
+        d.extend_from_slice(&lsiz.to_be_bytes());
+        d.extend_from_slice(&rsiz.to_be_bytes());
+        d.extend_from_slice(&xsiz.to_be_bytes());
+        d.extend_from_slice(&ysiz.to_be_bytes());
+        d.extend_from_slice(&xosiz.to_be_bytes());
+        d.extend_from_slice(&yosiz.to_be_bytes());
+        // one tile covering the whole image
+        d.extend_from_slice(&xsiz.to_be_bytes());
+        d.extend_from_slice(&ysiz.to_be_bytes());
+        d.extend_from_slice(&0u32.to_be_bytes());
+        d.extend_from_slice(&0u32.to_be_bytes());
+        d.extend_from_slice(&components.to_be_bytes());
+        for _ in 0..components {
+            d.push(bit_depth - 1); // Ssiz, unsigned
+            d.push(1); // XRsiz
+            d.push(1); // YRsiz
+        }
+        d.extend_from_slice(&SOD.to_be_bytes());
+        d
+    }
+
+    #[test]
+    fn siz_parses_4k_dimensions() {
+        let hdr = parse_j2k_header(&synth_codestream(4, 4096, 2160, 0, 0, 3, 12)).unwrap();
+        assert_eq!(hdr.width, 4096);
+        assert_eq!(hdr.height, 2160);
+        assert_eq!(hdr.num_components, 3);
+        assert_eq!(hdr.bit_depth, 12);
+        assert!(!hdr.is_signed);
+        assert_eq!(J2kProfile::from(hdr.profile), J2kProfile::CinemaS4k);
+    }
+
+    #[test]
+    fn siz_parses_2k_scope_dimensions() {
+        let hdr = parse_j2k_header(&synth_codestream(3, 2048, 858, 0, 0, 3, 12)).unwrap();
+        assert_eq!(hdr.width, 2048);
+        assert_eq!(hdr.height, 858);
+    }
+
+    #[test]
+    fn siz_subtracts_image_origin_offset() {
+        // width/height are Xsiz-XOsiz and Ysiz-YOsiz, not Xsiz/Ysiz
+        let hdr = parse_j2k_header(&synth_codestream(0, 4196, 2260, 100, 100, 3, 12)).unwrap();
+        assert_eq!(hdr.width, 4096);
+        assert_eq!(hdr.height, 2160);
+    }
+
+    #[test]
+    fn rejects_non_codestream() {
+        assert!(parse_j2k_header(b"not a j2k file at all").is_none());
+        assert!(parse_j2k_header(&[]).is_none());
+    }
+
+    #[test]
+    fn malformed_segment_length_does_not_panic() {
+        // Lsiz of 0 would underflow the segment slice arithmetic
+        let mut d = Vec::new();
+        d.extend_from_slice(&SOC.to_be_bytes());
+        d.extend_from_slice(&SIZ.to_be_bytes());
+        d.extend_from_slice(&0u16.to_be_bytes());
+        d.extend_from_slice(&[0u8; 8]);
+        let hdr = parse_j2k_header(&d).unwrap();
+        assert_eq!(hdr.width, 0);
     }
 }

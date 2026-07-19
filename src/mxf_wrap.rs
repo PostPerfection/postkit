@@ -115,15 +115,34 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     }
 
+    let Some(header) = crate::j2k::parse_j2k_header(&frames[0]) else {
+        return MxfTrackFile {
+            error: format!(
+                "invalid JPEG 2000 codestream: {}",
+                opts.input_files[0].display()
+            ),
+            ..Default::default()
+        };
+    };
+    if header.width == 0 || header.height == 0 {
+        return MxfTrackFile {
+            error: format!(
+                "JPEG 2000 codestream has no image area: {}",
+                opts.input_files[0].display()
+            ),
+            ..Default::default()
+        };
+    }
+
     let info = make_writer_info();
     let desc = asdcplib::jp2k::PictureDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         sample_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
-        stored_width: 2048, // default, would be parsed from codestream in production
-        stored_height: 1080,
-        aspect_ratio: asdcplib::Rational::new(2048, 1080),
+        stored_width: header.width,
+        stored_height: header.height,
+        aspect_ratio: asdcplib::Rational::new(header.width as i32, header.height as i32),
         container_duration: frames.len() as u32,
-        component_count: 3,
+        component_count: header.num_components,
     };
 
     let mut writer = asdcplib::jp2k::MxfWriter::new();
@@ -278,10 +297,22 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     };
 
+    let fps = opts.fps_num as f64 / opts.fps_den.max(1) as f64;
+    let Some(end_secs) = crate::subtitle_retime::subtitle_end_time_seconds(&xml_data, fps) else {
+        return MxfTrackFile {
+            error: format!(
+                "cannot determine subtitle duration: no parsable end/TimeOut timing in {}",
+                opts.input_files[0].display()
+            ),
+            ..Default::default()
+        };
+    };
+    let duration_frames = (end_secs * fps).ceil() as u32;
+
     let info = make_writer_info();
     let desc = asdcplib::timed_text::TimedTextDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
-        container_duration: (opts.fps_num * 60) / opts.fps_den.max(1), // default 1 minute
+        container_duration: duration_frames,
         asset_id: info.asset_uuid,
     };
 
