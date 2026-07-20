@@ -69,6 +69,144 @@ pub fn mxf_wrap(opts: &MxfWrapOptions) -> MxfTrackFile {
     }
 }
 
+/// Dispatches JP2K frame writes to the AS-DCP or AS-02 (frame-wrapped) writer.
+enum J2kWriter {
+    AsDcp(asdcplib::jp2k::MxfWriter),
+    As02(asdcplib::as02::jp2k::MxfWriter),
+}
+
+impl J2kWriter {
+    fn new(standard: MxfStandard) -> Self {
+        match standard {
+            MxfStandard::AsDcp => Self::AsDcp(asdcplib::jp2k::MxfWriter::new()),
+            MxfStandard::As02 => Self::As02(asdcplib::as02::jp2k::MxfWriter::new()),
+        }
+    }
+
+    fn open_write(
+        &mut self,
+        filename: &str,
+        info: &asdcplib::WriterInfo,
+        desc: &asdcplib::jp2k::PictureDescriptor,
+        header_size: u32,
+    ) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.open_write(filename, info, desc, header_size),
+            Self::As02(w) => w.open_write(filename, info, desc, header_size),
+        }
+    }
+
+    fn write_frame(&mut self, data: &[u8]) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.write_frame(data, None, None),
+            Self::As02(w) => w.write_frame(data, None, None),
+        }
+    }
+
+    fn finalize(&mut self) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.finalize(),
+            Self::As02(w) => w.finalize(),
+        }
+    }
+}
+
+/// Dispatches PCM writes to the AS-DCP or AS-02 (clip-wrapped) writer.
+enum PcmWriter {
+    AsDcp(asdcplib::pcm::MxfWriter),
+    As02(asdcplib::as02::pcm::MxfWriter),
+}
+
+impl PcmWriter {
+    fn new(standard: MxfStandard) -> Self {
+        match standard {
+            MxfStandard::AsDcp => Self::AsDcp(asdcplib::pcm::MxfWriter::new()),
+            MxfStandard::As02 => Self::As02(asdcplib::as02::pcm::MxfWriter::new()),
+        }
+    }
+
+    fn open_write(
+        &mut self,
+        filename: &str,
+        info: &asdcplib::WriterInfo,
+        desc: &asdcplib::pcm::AudioDescriptor,
+        header_size: u32,
+    ) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.open_write(filename, info, desc, header_size),
+            Self::As02(w) => w.open_write(filename, info, desc, header_size),
+        }
+    }
+
+    fn write_frame(&mut self, data: &[u8]) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.write_frame(data, None, None),
+            Self::As02(w) => w.write_frame(data, None, None),
+        }
+    }
+
+    fn finalize(&mut self) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.finalize(),
+            Self::As02(w) => w.finalize(),
+        }
+    }
+}
+
+/// Dispatches timed text writes to the AS-DCP or AS-02 writer.
+enum TimedTextWriter {
+    AsDcp(asdcplib::timed_text::MxfWriter),
+    As02(asdcplib::as02::timed_text::MxfWriter),
+}
+
+impl TimedTextWriter {
+    fn new(standard: MxfStandard) -> Self {
+        match standard {
+            MxfStandard::AsDcp => Self::AsDcp(asdcplib::timed_text::MxfWriter::new()),
+            MxfStandard::As02 => Self::As02(asdcplib::as02::timed_text::MxfWriter::new()),
+        }
+    }
+
+    fn open_write(
+        &mut self,
+        filename: &str,
+        info: &asdcplib::WriterInfo,
+        desc: &asdcplib::timed_text::TimedTextDescriptor,
+        header_size: u32,
+    ) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.open_write(filename, info, desc, header_size),
+            Self::As02(w) => w.open_write(filename, info, desc, header_size),
+        }
+    }
+
+    fn write_timed_text_resource(&mut self, xml: &str) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.write_timed_text_resource(xml, None, None),
+            Self::As02(w) => w.write_timed_text_resource(xml, None, None),
+        }
+    }
+
+    fn write_ancillary_resource(
+        &mut self,
+        data: &[u8],
+        uuid: &[u8; 16],
+        mime_type: &str,
+    ) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.write_ancillary_resource(data, uuid, mime_type, None, None),
+            Self::As02(w) => w.write_ancillary_resource(data, uuid, mime_type, None, None),
+        }
+    }
+
+    fn finalize(&mut self) -> asdcplib::Result<()> {
+        match self {
+            Self::AsDcp(w) => w.finalize(),
+            Self::As02(w) => w.finalize(),
+        }
+    }
+}
+
 fn make_writer_info() -> asdcplib::WriterInfo {
     let asset_uuid = uuid::Uuid::new_v4();
     let context_id = uuid::Uuid::new_v4();
@@ -145,7 +283,7 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         component_count: header.num_components,
     };
 
-    let mut writer = asdcplib::jp2k::MxfWriter::new();
+    let mut writer = J2kWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
     if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
         return MxfTrackFile {
@@ -155,7 +293,7 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
     }
 
     for frame in &frames {
-        if let Err(e) = writer.write_frame(frame, None, None) {
+        if let Err(e) = writer.write_frame(frame) {
             return MxfTrackFile {
                 error: format!("JP2K write_frame failed: {e}"),
                 ..Default::default()
@@ -233,7 +371,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         channel_format: asdcplib::pcm::ChannelFormat::Cfg1,
     };
 
-    let mut writer = asdcplib::pcm::MxfWriter::new();
+    let mut writer = PcmWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
     if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
         return MxfTrackFile {
@@ -248,7 +386,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         if end > pcm_data.len() {
             break;
         }
-        if let Err(e) = writer.write_frame(&pcm_data[start..end], None, None) {
+        if let Err(e) = writer.write_frame(&pcm_data[start..end]) {
             return MxfTrackFile {
                 error: format!("PCM write_frame failed: {e}"),
                 ..Default::default()
@@ -316,7 +454,7 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
         asset_id: info.asset_uuid,
     };
 
-    let mut writer = asdcplib::timed_text::MxfWriter::new();
+    let mut writer = TimedTextWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
     if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
         return MxfTrackFile {
@@ -325,7 +463,7 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    if let Err(e) = writer.write_timed_text_resource(&xml_data, None, None) {
+    if let Err(e) = writer.write_timed_text_resource(&xml_data) {
         return MxfTrackFile {
             error: format!("TimedText write_resource failed: {e}"),
             ..Default::default()
@@ -354,9 +492,7 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
             "png" => "image/png",
             _ => "application/octet-stream",
         };
-        if let Err(e) =
-            writer.write_ancillary_resource(&resource_data, &resource_uuid, mime, None, None)
-        {
+        if let Err(e) = writer.write_ancillary_resource(&resource_data, &resource_uuid, mime) {
             return MxfTrackFile {
                 error: format!("TimedText write_ancillary failed: {e}"),
                 ..Default::default()
@@ -388,6 +524,13 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
 }
 
 fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
+    // asdcplib exposes AS-02 IAB as detection-only, no writer exists.
+    if opts.standard == MxfStandard::As02 {
+        return MxfTrackFile {
+            error: "AS-02 (IMF) Atmos/IAB wrapping is not supported; asdcplib provides AS-02 writers only for J2K, PCM, and TimedText".to_string(),
+            ..Default::default()
+        };
+    }
     if opts.input_files.is_empty() {
         return MxfTrackFile {
             error: "no input files".to_string(),
