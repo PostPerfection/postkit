@@ -5,6 +5,11 @@
 //! SHA-256 reference digests. The KDM signer in `certificate.rs` builds its
 //! document body then calls `sign_enveloped`, so there is no second signer.
 //!
+//! Verification reads the declared DigestMethod (per Reference) and
+//! SignatureMethod (in SignedInfo) and dispatches on them, so it also accepts
+//! real SHA-1/rsa-sha1 DCPs (Interop and older SMPTE tools), not only the
+//! SHA-256 we sign with. An unsupported algorithm is a hard error.
+//!
 //! Digests and SignedInfo are canonicalized by extracting the target element's
 //! subtree from the document and injecting the namespaces in scope at that
 //! element onto its apex. Under inclusive c14n a subtree node-set renders all
@@ -55,6 +60,29 @@ pub fn sign_enveloped(
     parent_id: Option<&str>,
     signer: &XmlSigner,
 ) -> Result<String, String> {
+    // Public API signs with the SMPTE 430-3 profile (SHA-256 throughout).
+    sign_enveloped_with(
+        xml,
+        reference_ids,
+        id_attr,
+        parent_id,
+        signer,
+        DigestAlg::Sha256,
+        RsaSigAlg::Sha256,
+    )
+}
+
+/// Internal by-Id signer parameterized by digest and signature algorithm. The
+/// public `sign_enveloped` fixes both at SHA-256; tests exercise other pairs.
+fn sign_enveloped_with(
+    xml: &str,
+    reference_ids: &[&str],
+    id_attr: &str,
+    parent_id: Option<&str>,
+    signer: &XmlSigner,
+    digest_alg: DigestAlg,
+    sig_alg: RsaSigAlg,
+) -> Result<String, String> {
     if reference_ids.is_empty() {
         return Err("at least one reference id is required to sign".into());
     }
@@ -70,18 +98,19 @@ pub fn sign_enveloped(
     for id in reference_ids {
         let fragment = find_element_fragment(xml, &|e| element_has_id(e, id_attr, id))?
             .ok_or_else(|| format!("no element with {id_attr}=\"{id}\" to sign"))?;
-        let digest = b64(&sha256(&c14n(&fragment)?));
+        let digest = b64(&digest_alg.digest(&c14n(&fragment)?));
         references.push_str(&format!(
             r##"
       <ds:Reference URI="#{id}">
-        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
+        <ds:DigestMethod Algorithm="{}"/>
         <ds:DigestValue>{digest}</ds:DigestValue>
       </ds:Reference>"##,
+            digest_alg.uri(),
         ));
     }
 
     let (element, insert_offset) =
-        build_signature_element(xml, &references, parent_id, id_attr, signer)?;
+        build_signature_element(xml, &references, parent_id, id_attr, signer, sig_alg)?;
 
     // Insert as the last child of the parent, indented like its siblings. The
     // by-Id digests are over the referenced elements, so this surrounding
@@ -106,12 +135,23 @@ pub fn sign_enveloped(
 /// then equals the original unsigned document, and the reference digest is over
 /// `c14n(unsigned document root)`.
 pub fn sign_document_enveloped(xml: &str, signer: &XmlSigner) -> Result<String, String> {
+    sign_document_enveloped_with(xml, signer, DigestAlg::Sha256, RsaSigAlg::Sha256)
+}
+
+/// Internal whole-document signer parameterized by digest and signature
+/// algorithm. The public `sign_document_enveloped` fixes both at SHA-256.
+fn sign_document_enveloped_with(
+    xml: &str,
+    signer: &XmlSigner,
+    digest_alg: DigestAlg,
+    sig_alg: RsaSigAlg,
+) -> Result<String, String> {
     // The reference digest is over the whole document with ds:Signature removed.
     // Before signing there is no ds:Signature, and c14n drops the XML
     // declaration and whitespace outside the root, so this is c14n of the root.
     let root_fragment =
         find_element_fragment(xml, &|_| Ok(true))?.ok_or("document has no root element to sign")?;
-    let digest = b64(&sha256(&c14n(&root_fragment)?));
+    let digest = b64(&digest_alg.digest(&c14n(&root_fragment)?));
 
     let references = format!(
         r##"
@@ -120,12 +160,14 @@ pub fn sign_document_enveloped(xml: &str, signer: &XmlSigner) -> Result<String, 
           <ds:Transform Algorithm="{ENVELOPED_TRANSFORM}"/>
           <ds:Transform Algorithm="{C14N_METHOD}"/>
         </ds:Transforms>
-        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
+        <ds:DigestMethod Algorithm="{}"/>
         <ds:DigestValue>{digest}</ds:DigestValue>
       </ds:Reference>"##,
+        digest_alg.uri(),
     );
 
-    let (element, insert_offset) = build_signature_element(xml, &references, None, "Id", signer)?;
+    let (element, insert_offset) =
+        build_signature_element(xml, &references, None, "Id", signer, sig_alg)?;
 
     // Insert with no surrounding whitespace so removing the Signature element
     // restores the original document byte-for-byte, matching the digest input.
@@ -145,6 +187,7 @@ fn build_signature_element(
     parent_id: Option<&str>,
     id_attr: &str,
     signer: &XmlSigner,
+    sig_alg: RsaSigAlg,
 ) -> Result<(String, usize), String> {
     if signer.cert_file.as_os_str().is_empty() {
         return Err("signer certificate is required to sign".into());
@@ -171,8 +214,9 @@ fn build_signature_element(
     let signed_info_inner = format!(
         r#"
       <ds:CanonicalizationMethod Algorithm="{C14N_METHOD}"/>
-      <ds:SignatureMethod Algorithm="{SIG_METHOD}"/>{references}
+      <ds:SignatureMethod Algorithm="{}"/>{references}
     "#,
+        sig_alg.uri(),
     );
 
     // SignedInfo is canonicalized in the namespace context it will have in the
@@ -195,11 +239,8 @@ fn build_signature_element(
     let signed_info_fragment =
         format!("<ds:SignedInfo{ns_decls}>{signed_info_inner}</ds:SignedInfo>");
     let signed_info_c14n = c14n(&signed_info_fragment)?;
-    let signature_bytes = private_key
-        .sign(
-            rsa::Pkcs1v15Sign::new::<sha2::Sha256>(),
-            &sha256(&signed_info_c14n),
-        )
+    let signature_bytes = sig_alg
+        .sign(&private_key, &signed_info_c14n)
         .map_err(|e| format!("RSA signing of SignedInfo failed: {e}"))?;
     let signature_value = b64(&signature_bytes);
 
@@ -257,12 +298,14 @@ pub fn verify_enveloped(
         return Err("signature has no ds:Reference".into());
     }
 
-    // Every referenced element must digest to the value in its Reference.
-    for (id, expected) in &parsed.references {
+    // Every referenced element must digest, under its declared DigestMethod, to
+    // the value in its Reference.
+    for reference in &parsed.references {
+        let id = &reference.id;
         let fragment = find_element_fragment(xml, &|e| element_has_id(e, id_attr, id))?
             .ok_or_else(|| format!("reference #{id} resolves to no element"))?;
-        let actual = b64(&sha256(&c14n(&fragment)?));
-        if &actual != expected {
+        let actual = b64(&reference.digest_alg.digest(&c14n(&fragment)?));
+        if actual != reference.digest_b64 {
             return Err(format!("digest mismatch for reference #{id}"));
         }
     }
@@ -294,9 +337,9 @@ pub fn verify_document_enveloped(xml: &str, trusted_cert: Option<&Path>) -> Resu
     unsigned.push_str(&xml[end..]);
     let root_fragment =
         find_element_fragment(&unsigned, &|_| Ok(true))?.ok_or("document has no root element")?;
-    let actual = b64(&sha256(&c14n(&root_fragment)?));
-    let expected = &parsed.references[0].1;
-    if &actual != expected {
+    let reference = &parsed.references[0];
+    let actual = b64(&reference.digest_alg.digest(&c14n(&root_fragment)?));
+    if actual != reference.digest_b64 {
         return Err("digest mismatch for the enveloped document reference".into());
     }
 
@@ -324,12 +367,9 @@ fn verify_signed_info(
         None => embedded_key,
     };
 
-    verify_key
-        .verify(
-            rsa::Pkcs1v15Sign::new::<sha2::Sha256>(),
-            &sha256(signed_info_c14n),
-            &parsed.signature_value,
-        )
+    parsed
+        .signature_method
+        .verify(&verify_key, signed_info_c14n, &parsed.signature_value)
         .map_err(|e| format!("signature verification failed: {e}"))?;
     Ok(())
 }
@@ -544,11 +584,22 @@ fn find_parent(
     })
 }
 
+/// One ds:Reference a verifier must recompute.
+struct ParsedReference {
+    /// Reference id without the leading '#' (empty for a whole-document URI="").
+    id: String,
+    /// Base64 digest value declared in the reference.
+    digest_b64: String,
+    /// The reference's declared DigestMethod.
+    digest_alg: DigestAlg,
+}
+
 /// The pieces of a ds:Signature a verifier needs.
 struct ParsedSignature {
     signature_value: Vec<u8>,
-    /// (reference id without '#', base64 digest).
-    references: Vec<(String, String)>,
+    /// The SignedInfo's declared SignatureMethod.
+    signature_method: RsaSigAlg,
+    references: Vec<ParsedReference>,
     /// DER of the first embedded X509Certificate (the signing leaf).
     leaf_cert_der: Vec<u8>,
 }
@@ -563,6 +614,8 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
 
     let mut references = Vec::new();
     let mut signature_value = None;
+    let mut signature_method = None;
+    let mut current_digest_alg: Option<DigestAlg> = None;
     let mut leaf_cert = None;
 
     loop {
@@ -570,8 +623,14 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
             .read_event()
             .map_err(|e| format!("document is not valid XML: {e}"))?
         {
-            Event::Start(e) => match e.local_name().as_ref() {
+            // SignatureMethod and DigestMethod are empty elements carrying only
+            // an Algorithm attribute; handle both the self-closing and the rare
+            // explicit-end form.
+            Event::Start(e) | Event::Empty(e) => match e.local_name().as_ref() {
                 b"Signature" => in_signature = true,
+                b"SignatureMethod" if in_signature => {
+                    signature_method = Some(RsaSigAlg::from_uri(&read_algorithm_attr(&e)?)?);
+                }
                 b"Reference" if in_signature => {
                     let mut uri = None;
                     for attr in e.attributes() {
@@ -586,6 +645,10 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
                         }
                     }
                     current_ref = uri.map(|u| u.trim().trim_start_matches('#').to_string());
+                    current_digest_alg = None;
+                }
+                b"DigestMethod" if in_signature => {
+                    current_digest_alg = Some(DigestAlg::from_uri(&read_algorithm_attr(&e)?)?);
                 }
                 b"DigestValue" if in_signature => {
                     collecting = Some("digest");
@@ -614,7 +677,13 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
                     let id = current_ref
                         .clone()
                         .ok_or("ds:DigestValue outside a Reference with a URI")?;
-                    references.push((id, buffer.split_whitespace().collect()));
+                    let digest_alg = current_digest_alg
+                        .ok_or("ds:Reference has no ds:DigestMethod before its DigestValue")?;
+                    references.push(ParsedReference {
+                        id,
+                        digest_b64: buffer.split_whitespace().collect(),
+                        digest_alg,
+                    });
                     collecting = None;
                 }
                 b"SignatureValue" if collecting == Some("signature") => {
@@ -636,9 +705,24 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
 
     Ok(ParsedSignature {
         signature_value: signature_value.ok_or("signature has no ds:SignatureValue")?,
+        signature_method: signature_method.ok_or("SignedInfo has no ds:SignatureMethod")?,
         references,
         leaf_cert_der: leaf_cert.ok_or("signature has no ds:X509Certificate")?,
     })
+}
+
+/// Read the required `Algorithm` attribute off a DigestMethod/SignatureMethod.
+fn read_algorithm_attr(e: &BytesStart) -> Result<String, String> {
+    for attr in e.attributes() {
+        let attr = attr.map_err(|err| format!("cannot read an attribute: {err}"))?;
+        if attr.key.as_ref() == b"Algorithm" {
+            return Ok(attr
+                .unescape_value()
+                .map_err(|err| format!("cannot unescape Algorithm: {err}"))?
+                .into_owned());
+        }
+    }
+    Err("method element has no Algorithm attribute".into())
 }
 
 /// Extract the RSA public key from a DER-encoded certificate.
@@ -679,10 +763,135 @@ fn b64d(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("value is not valid base64: {e}"))
 }
 
-/// SHA-256 digest.
-fn sha256(data: &[u8]) -> Vec<u8> {
-    use sha2::Digest;
-    sha2::Sha256::digest(data).to_vec()
+/// A supported reference DigestMethod. Real DCPs are signed with SHA-1 (Interop
+/// and older SMPTE tools); SHA-256 is the KDM profile this crate signs with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DigestAlg {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl DigestAlg {
+    fn from_uri(uri: &str) -> Result<Self, String> {
+        match uri {
+            "http://www.w3.org/2000/09/xmldsig#sha1" => Ok(Self::Sha1),
+            "http://www.w3.org/2001/04/xmlenc#sha256" => Ok(Self::Sha256),
+            "http://www.w3.org/2001/04/xmldsig-more#sha384" => Ok(Self::Sha384),
+            "http://www.w3.org/2001/04/xmlenc#sha512" => Ok(Self::Sha512),
+            other => Err(format!("unsupported DigestMethod algorithm: {other}")),
+        }
+    }
+
+    fn digest(self, data: &[u8]) -> Vec<u8> {
+        use sha2::Digest;
+        match self {
+            // sha1::Sha1 and the sha2 hashers share the same digest::Digest trait.
+            Self::Sha1 => sha1::Sha1::digest(data).to_vec(),
+            Self::Sha256 => sha2::Sha256::digest(data).to_vec(),
+            Self::Sha384 => sha2::Sha384::digest(data).to_vec(),
+            Self::Sha512 => sha2::Sha512::digest(data).to_vec(),
+        }
+    }
+
+    fn uri(self) -> &'static str {
+        match self {
+            Self::Sha1 => "http://www.w3.org/2000/09/xmldsig#sha1",
+            Self::Sha256 => DIGEST_METHOD,
+            Self::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#sha384",
+            Self::Sha512 => "http://www.w3.org/2001/04/xmlenc#sha512",
+        }
+    }
+}
+
+/// A supported RSASSA-PKCS1-v1_5 SignatureMethod (the only signature family
+/// SMPTE and Interop DCPs use), paired with the hash that DigestInfo prefixes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RsaSigAlg {
+    Sha1,
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl RsaSigAlg {
+    fn from_uri(uri: &str) -> Result<Self, String> {
+        match uri {
+            "http://www.w3.org/2000/09/xmldsig#rsa-sha1" => Ok(Self::Sha1),
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256" => Ok(Self::Sha256),
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384" => Ok(Self::Sha384),
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512" => Ok(Self::Sha512),
+            other => Err(format!("unsupported SignatureMethod algorithm: {other}")),
+        }
+    }
+
+    fn uri(self) -> &'static str {
+        match self {
+            Self::Sha1 => "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+            Self::Sha256 => SIG_METHOD,
+            Self::Sha384 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha384",
+            Self::Sha512 => "http://www.w3.org/2001/04/xmldsig-more#rsa-sha512",
+        }
+    }
+
+    /// Verify the PKCS#1 v1.5 signature over the canonical SignedInfo bytes,
+    /// hashing with this method's digest before the RSA check.
+    fn verify(
+        self,
+        key: &rsa::RsaPublicKey,
+        signed_info_c14n: &[u8],
+        signature: &[u8],
+    ) -> Result<(), rsa::Error> {
+        match self {
+            Self::Sha1 => key.verify(
+                rsa::Pkcs1v15Sign::new::<sha1::Sha1>(),
+                &DigestAlg::Sha1.digest(signed_info_c14n),
+                signature,
+            ),
+            Self::Sha256 => key.verify(
+                rsa::Pkcs1v15Sign::new::<sha2::Sha256>(),
+                &DigestAlg::Sha256.digest(signed_info_c14n),
+                signature,
+            ),
+            Self::Sha384 => key.verify(
+                rsa::Pkcs1v15Sign::new::<sha2::Sha384>(),
+                &DigestAlg::Sha384.digest(signed_info_c14n),
+                signature,
+            ),
+            Self::Sha512 => key.verify(
+                rsa::Pkcs1v15Sign::new::<sha2::Sha512>(),
+                &DigestAlg::Sha512.digest(signed_info_c14n),
+                signature,
+            ),
+        }
+    }
+
+    /// Sign the canonical SignedInfo bytes with this method's hash.
+    fn sign(
+        self,
+        key: &rsa::RsaPrivateKey,
+        signed_info_c14n: &[u8],
+    ) -> Result<Vec<u8>, rsa::Error> {
+        match self {
+            Self::Sha1 => key.sign(
+                rsa::Pkcs1v15Sign::new::<sha1::Sha1>(),
+                &DigestAlg::Sha1.digest(signed_info_c14n),
+            ),
+            Self::Sha256 => key.sign(
+                rsa::Pkcs1v15Sign::new::<sha2::Sha256>(),
+                &DigestAlg::Sha256.digest(signed_info_c14n),
+            ),
+            Self::Sha384 => key.sign(
+                rsa::Pkcs1v15Sign::new::<sha2::Sha384>(),
+                &DigestAlg::Sha384.digest(signed_info_c14n),
+            ),
+            Self::Sha512 => key.sign(
+                rsa::Pkcs1v15Sign::new::<sha2::Sha512>(),
+                &DigestAlg::Sha512.digest(signed_info_c14n),
+            ),
+        }
+    }
 }
 
 /// Inclusive Canonical XML 1.0 (WithComments) of a fragment, pure Rust.
@@ -1231,6 +1440,106 @@ mod tests {
         let err = verify_document_enveloped(&tampered, None)
             .expect_err("tampered document must fail verification");
         assert!(err.contains("digest mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn sha1_document_signature_verifies_and_tamper_fails() {
+        let c = chain();
+        // Sign the whole document with SHA-1/rsa-sha1, the profile real Interop
+        // and older SMPTE DCPs use, through the same internal code path.
+        let signed = sign_document_enveloped_with(
+            &cpl_doc(),
+            &leaf_signer(c),
+            DigestAlg::Sha1,
+            RsaSigAlg::Sha1,
+        )
+        .expect("sign document with sha1");
+        assert!(signed.contains("xmldsig#sha1"));
+        assert!(signed.contains("xmldsig#rsa-sha1"));
+
+        verify_document_enveloped(&signed, None).expect("sha1 signature must verify");
+        verify_document_enveloped(&signed, Some(&c.signer))
+            .expect("sha1 signature must verify against the pinned leaf cert");
+
+        let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
+        let err = verify_document_enveloped(&tampered, None)
+            .expect_err("tampered sha1 document must fail verification");
+        assert!(err.contains("digest mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn sha1_byid_signature_verifies_and_tamper_fails() {
+        let c = chain();
+        let signed = sign_enveloped_with(
+            &cpl_doc(),
+            &["ID_title", "ID_reels"],
+            "Id",
+            None,
+            &leaf_signer(c),
+            DigestAlg::Sha1,
+            RsaSigAlg::Sha1,
+        )
+        .expect("sign by-id with sha1");
+
+        verify_enveloped(&signed, "Id", None).expect("sha1 by-id signature must verify");
+        let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
+        assert!(verify_enveloped(&tampered, "Id", None).is_err());
+    }
+
+    #[test]
+    fn unsupported_algorithm_is_rejected() {
+        assert!(DigestAlg::from_uri("http://example.com/md5").is_err());
+        assert!(RsaSigAlg::from_uri("http://example.com/dsa").is_err());
+    }
+
+    // Cross-check against real published DCPs: point POSTKIT_CLAIRMETA_DATA at a
+    // clone of ClairMeta_Data. The ECL set is SHA-1 signed, so before the
+    // algorithm dispatch these all falsely failed with a signature error.
+    #[test]
+    fn real_ecl_dcps_verify() {
+        let Ok(root) = std::env::var("POSTKIT_CLAIRMETA_DATA") else {
+            eprintln!("skipping: set POSTKIT_CLAIRMETA_DATA to a ClairMeta_Data clone");
+            return;
+        };
+        let ecl = std::path::Path::new(&root).join("DCP/ECL-SET");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&ecl).expect("read ECL-SET") {
+            let dir = entry.unwrap().path();
+            if !dir.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(&dir).unwrap() {
+                let path = file.unwrap().path();
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                if !(name.starts_with("CPL") || name.starts_with("PKL")) || !name.ends_with(".xml")
+                {
+                    continue;
+                }
+                let xml = std::fs::read_to_string(&path).unwrap();
+                if !xml.contains("SignatureValue") {
+                    continue;
+                }
+                verify_document_enveloped(&xml, None)
+                    .unwrap_or_else(|e| panic!("real DCP {} must verify: {e}", path.display()));
+                // A tampered copy of the same document must be rejected.
+                if let Some(pos) = xml.find("<Issuer>") {
+                    let mut bad = xml.clone();
+                    bad.insert(pos + "<Issuer>".len(), 'x');
+                    assert!(
+                        verify_document_enveloped(&bad, None).is_err(),
+                        "tampered {} must fail",
+                        path.display()
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert!(
+            checked > 0,
+            "found no signed CPL/PKL under {}",
+            ecl.display()
+        );
+        eprintln!("verified {checked} real signed ECL documents");
     }
 
     #[test]

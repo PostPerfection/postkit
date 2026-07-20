@@ -6,8 +6,8 @@ Shared library crate for the PostPerfection suite. dcpdoctor, dcpwizard, and imf
 
 Packaging and formats:
 - certificate: X.509 chains, KDM creation/rewrap, trust management. KDM content keys are caller-supplied (from the DCP's keys file) so the KDM unlocks the actual encrypted essence, falling back to a fresh MDIK when none are given
-- xmldsig: enveloped XML-DSig sign/verify, SMPTE 430-3 profile (xmlsec1-cross-checked in tests)
-- packaging: shared DCP/IMF CPL, PKL and ASSETMAP XML writers, plus the one public `escape_xml` and namespace constants. DcpCpl reels carry an optional picture/sound KeyId, emitted when the essence is encrypted
+- xmldsig: enveloped XML-DSig sign/verify, SMPTE 430-3 profile (xmlsec1-cross-checked in tests). Signing is SHA-256; verification reads the declared DigestMethod/SignatureMethod and dispatches on them (sha1/256/384/512, rsa-sha1/256/384/512), so real SHA-1-signed Interop DCPs verify. Unknown algorithms fail loud
+- packaging: shared DCP/IMF CPL, PKL and ASSETMAP XML writers, plus the one public `escape_xml` and namespace constants. Output is SMPTE-XSD-valid: writers emit elements in ST 429-7/8/9 order and include the required IssueDate/Issuer/ContentVersion/RatingList; AssetMap orders its metadata by namespace (SMPTE vs Interop). DcpCpl reels carry an optional picture/sound KeyId, emitted when the essence is encrypted
 - mxf_wrap: J2K/PCM/timed-text/Atmos wrapping for DCP and AS-02 via asdcplib-rs, with optional AES-128 essence encryption at wrap time (J2K/PCM); the content key stays out of any serialized form and is redacted in Debug
 - cpl_xml: string-level CPL/OPL XML tag helpers
 - cpl_annotation, metadata_edit: CPL/OPL field read/write
@@ -47,4 +47,4 @@ Workflow and infra:
 
 ## Testing
 
-208 lib tests plus MXF/DCDM/preview integration tests, all passing: xmlsec1-verified signatures, real MXF roundtrips through asdcplib (including an encrypted-wrap roundtrip that proves the essence is no longer stored verbatim), DCDM reference-value colour tests, the inverse display transform (DCI white → sRGB white, black → black, neutral mid grey, monotonic), the encrypted-no-key fail-loud path against a real encrypted MXF, packaging XML writers, and the pure-function parsers (ebur128 short-term, x265 HDR10 params, SRT cues). A gated integration test decrypts + decodes + colour-manages a real J2K frame end to end (`cargo test -- --ignored`), and an `icc`-feature test runs a patch through littleCMS.
+214 lib tests plus MXF/DCDM/preview integration tests, all passing: xmlsec1-verified signatures, SHA-1 and SHA-256 enveloped verify (with tamper rejection) plus a gated cross-check against real signed ClairMeta ECL DCPs, a gated xmllint check that generated ASSETMAP/PKL/CPL pass the SMPTE XSDs, real MXF roundtrips through asdcplib (including an encrypted-wrap roundtrip that proves the essence is no longer stored verbatim), DCDM reference-value colour tests, the inverse display transform (DCI white → sRGB white, black → black, neutral mid grey, monotonic), the encrypted-no-key fail-loud path against a real encrypted MXF, packaging XML writers, and the pure-function parsers (ebur128 short-term, x265 HDR10 params, SRT cues). A gated integration test decrypts + decodes + colour-manages a real J2K frame end to end (`cargo test -- --ignored`), and an `icc`-feature test runs a patch through littleCMS.

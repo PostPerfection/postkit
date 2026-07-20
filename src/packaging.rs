@@ -110,12 +110,18 @@ pub struct AssetMapAsset {
 }
 
 /// An ASSETMAP (ST 429-9). DCP includes `<VolumeCount>`; IMF omits it.
+///
+/// SMPTE 429-9 and Interop order the metadata block differently (SMPTE:
+/// Creator, VolumeCount, IssueDate, Issuer; Interop: VolumeCount, IssueDate,
+/// Issuer, Creator), so `to_xml` picks the order from the namespace.
 #[derive(Debug, Clone, Default)]
 pub struct AssetMap {
     /// Bare UUID.
     pub uuid: String,
     pub namespace: String,
+    pub issuer: String,
     pub creator: String,
+    pub issue_date: String,
     pub include_volume_count: bool,
     pub assets: Vec<AssetMapAsset>,
 }
@@ -126,9 +132,24 @@ impl AssetMap {
         xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(xml, "<AssetMap xmlns=\"{}\">", self.namespace);
         let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
-        let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
-        if self.include_volume_count {
-            xml.push_str("  <VolumeCount>1</VolumeCount>\n");
+        let creator = format!("  <Creator>{}</Creator>\n", escape_xml(&self.creator));
+        let volume_count = if self.include_volume_count {
+            "  <VolumeCount>1</VolumeCount>\n"
+        } else {
+            ""
+        };
+        let issue_date = format!("  <IssueDate>{}</IssueDate>\n", self.issue_date);
+        let issuer = format!("  <Issuer>{}</Issuer>\n", escape_xml(&self.issuer));
+        if self.namespace == ns::AM_INTEROP {
+            xml.push_str(volume_count);
+            xml.push_str(&issue_date);
+            xml.push_str(&issuer);
+            xml.push_str(&creator);
+        } else {
+            xml.push_str(&creator);
+            xml.push_str(volume_count);
+            xml.push_str(&issue_date);
+            xml.push_str(&issuer);
         }
         xml.push_str("  <AssetList>\n");
         for a in &self.assets {
@@ -199,22 +220,39 @@ impl DcpCpl {
         let mut xml = String::new();
         xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(xml, "<CompositionPlaylist xmlns=\"{}\">", self.namespace);
+        // ST 429-7 element order: Id, IssueDate, Issuer, Creator,
+        // ContentTitleText, ContentKind, ContentVersion, RatingList.
         let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
+        let _ = writeln!(xml, "  <IssueDate>{}</IssueDate>", self.issue_date);
+        let _ = writeln!(xml, "  <Issuer>{}</Issuer>", escape_xml(&self.issuer));
+        let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
         let _ = writeln!(
             xml,
             "  <ContentTitleText>{}</ContentTitleText>",
             escape_xml(&self.title)
         );
-        let _ = writeln!(xml, "  <IssueDate>{}</IssueDate>", self.issue_date);
-        let _ = writeln!(xml, "  <Issuer>{}</Issuer>", escape_xml(&self.issuer));
-        let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
-        if !self.content_kind.is_empty() {
-            let _ = writeln!(
-                xml,
-                "  <ContentKind>{}</ContentKind>",
-                escape_xml(&self.content_kind)
-            );
-        }
+        // ContentKind is required; default to "feature" when the caller omits it.
+        let content_kind = if self.content_kind.is_empty() {
+            "feature"
+        } else {
+            &self.content_kind
+        };
+        let _ = writeln!(
+            xml,
+            "  <ContentKind>{}</ContentKind>",
+            escape_xml(content_kind)
+        );
+        // ContentVersion (required by SMPTE) and an empty RatingList (required by
+        // both), synthesized from the CPL id and title.
+        xml.push_str("  <ContentVersion>\n");
+        let _ = writeln!(xml, "    <Id>urn:uuid:{}</Id>", self.uuid);
+        let _ = writeln!(
+            xml,
+            "    <LabelText>{}</LabelText>",
+            escape_xml(&self.title)
+        );
+        xml.push_str("  </ContentVersion>\n");
+        xml.push_str("  <RatingList/>\n");
         xml.push_str("  <ReelList>\n");
         for (i, reel) in self.reels.iter().enumerate() {
             xml.push_str("    <Reel>\n");
@@ -440,6 +478,116 @@ impl ImfCpl {
 mod tests {
     use super::*;
 
+    // Validate the generated SMPTE DCP docs against the official XSDs. Gated on
+    // POSTKIT_DCP_XSD_DIR (a dir holding the SMPTE 429-7/8/9 schemas plus a local
+    // xmldsig-core-schema.xsd and xml.xsd) and xmllint; skips when absent.
+    #[test]
+    fn generated_dcp_docs_pass_xmllint_schema() {
+        let Ok(xsd_dir) = std::env::var("POSTKIT_DCP_XSD_DIR") else {
+            eprintln!("skipping: set POSTKIT_DCP_XSD_DIR to the SMPTE XSD directory");
+            return;
+        };
+        if std::process::Command::new("xmllint")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: xmllint not installed");
+            return;
+        }
+        let xsd = std::path::Path::new(&xsd_dir);
+        let dir = tempfile::tempdir().unwrap();
+
+        // xmllint resolves the CPL's ds:Signature and xml.xsd imports (declared
+        // by http URL) through this catalog to the local copies.
+        let catalog = dir.path().join("catalog.xml");
+        let dsig = xsd.join("xmldsig-core-schema.xsd");
+        let xml_xsd = xsd.join("xml.xsd");
+        std::fs::write(
+            &catalog,
+            format!(
+                r#"<?xml version="1.0"?>
+<catalog xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
+  <system systemId="http://www.w3.org/TR/2002/REC-xmldsig-core-20020212/xmldsig-core-schema.xsd" uri="{dsig}"/>
+  <system systemId="http://www.w3.org/2001/03/xml.xsd" uri="{xml_xsd}"/>
+</catalog>"#,
+                dsig = dsig.display(),
+                xml_xsd = xml_xsd.display(),
+            ),
+        )
+        .unwrap();
+
+        let uuid_a = "aaaaaaaa-7777-8888-9999-aaaaaaaaaaaa";
+        let am = AssetMap {
+            uuid: uuid_a.into(),
+            namespace: ns::AM_SMPTE.into(),
+            issuer: "DCP Wizard".into(),
+            creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            include_volume_count: true,
+            assets: vec![AssetMapAsset {
+                id: "99999999-7777-8888-9999-aaaaaaaaaaaa".into(),
+                path: "PKL.xml".into(),
+                packing_list: true,
+            }],
+        };
+        let pkl = PackingList {
+            uuid: "bbbbbbbb-7777-8888-9999-aaaaaaaaaaaa".into(),
+            namespace: ns::PKL_SMPTE.into(),
+            issuer: "DCP Wizard".into(),
+            creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            assets: vec![PklAsset {
+                id: "cccccccc-7777-8888-9999-aaaaaaaaaaaa".into(),
+                hash: "kO0m3F3qX3qg3n3qg3n3qg3n3q0=".into(),
+                size: 42,
+                asset_type: "application/mxf".into(),
+            }],
+        };
+        let cpl = DcpCpl {
+            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            namespace: ns::CPL_SMPTE.into(),
+            title: "Test".into(),
+            content_kind: "feature".into(),
+            issuer: "DCP Wizard".into(),
+            creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            reels: vec![DcpCplReel {
+                reel_id: "66666666-7777-8888-9999-aaaaaaaaaaaa".into(),
+                picture_id: "77777777-7777-8888-9999-aaaaaaaaaaaa".into(),
+                picture_edit_rate_num: 24,
+                picture_edit_rate_den: 1,
+                picture_duration: 240,
+                sound_id: Some("88888888-7777-8888-9999-aaaaaaaaaaaa".into()),
+                sound_edit_rate_num: 24,
+                sound_edit_rate_den: 1,
+                sound_duration: 240,
+                ..Default::default()
+            }],
+        };
+
+        for (doc, schema, xml) in [
+            ("ASSETMAP", "SMPTE-429-9-2007-AM.xsd", am.to_xml()),
+            ("PKL", "SMPTE-429-8-2006-PKL.xsd", pkl.to_xml()),
+            ("CPL", "SMPTE-429-7-2006-CPL.xsd", cpl.to_xml()),
+        ] {
+            let path = dir.path().join(format!("{doc}.xml"));
+            std::fs::write(&path, &xml).unwrap();
+            let out = std::process::Command::new("xmllint")
+                .args(["--nonet", "--noout", "--schema"])
+                .arg(xsd.join(schema))
+                .arg(&path)
+                .env("XML_CATALOG_FILES", &catalog)
+                .output()
+                .expect("run xmllint");
+            assert!(
+                out.status.success(),
+                "{doc} must pass its SMPTE XSD:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     #[test]
     fn escape_covers_all_five_entities() {
         assert_eq!(escape_xml("a<b>&\"'"), "a&lt;b&gt;&amp;&quot;&apos;");
@@ -478,19 +626,25 @@ mod tests {
         let dcp = AssetMap {
             uuid: "am".into(),
             namespace: ns::AM_SMPTE.into(),
+            issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
             include_volume_count: true,
             assets: assets.clone(),
         }
         .to_xml();
         assert!(dcp.contains("<VolumeCount>1</VolumeCount>"));
+        assert!(dcp.contains("<IssueDate>2024-01-01T00:00:00+00:00</IssueDate>"));
+        assert!(dcp.contains("<Issuer>DCP Wizard</Issuer>"));
         assert!(dcp.contains("<PackingList>true</PackingList>"));
         assert!(dcp.contains("<Path>PKL.xml</Path>"));
 
         let imf = AssetMap {
             uuid: "am".into(),
             namespace: ns::AM_SMPTE.into(),
+            issuer: "IMF Wizard".into(),
             creator: "IMF Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
             include_volume_count: false,
             assets,
         }
@@ -536,6 +690,11 @@ mod tests {
         let xml = cpl.to_xml();
         assert!(xml.contains("429-7/2006/CPL"));
         assert!(xml.contains("<ContentTitleText>A &amp; B</ContentTitleText>"));
+        // ST 429-7 order: IssueDate precedes ContentTitleText, which precedes ContentKind.
+        assert!(xml.find("<IssueDate>").unwrap() < xml.find("<ContentTitleText>").unwrap());
+        assert!(xml.find("<ContentTitleText>").unwrap() < xml.find("<ContentKind>").unwrap());
+        assert!(xml.contains("<ContentVersion>"));
+        assert!(xml.contains("<RatingList/>"));
         assert!(xml.contains("<MainPicture>"));
         assert!(xml.contains("<Id>urn:uuid:pic</Id>"));
         assert!(xml.contains("<MainSound>"));

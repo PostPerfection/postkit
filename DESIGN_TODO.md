@@ -11,7 +11,25 @@ shell_completion's docstring no longer claims clap_complete, and the watermark
 ASSETMAP writers, DCP and IMF CPL writers, and a standalone SRT parser now live
 in postkit.
 
+Differential testing against clairmeta (its ECL reference DCPs) fixed two real
+bugs 2026-07-20: (1) xmldsig hardcoded SHA-256 for both the reference digest and
+the RSA signature, so the 12 SHA-1-signed ECL DCPs were falsely rejected; verify
+now reads the declared DigestMethod/SignatureMethod and dispatches (sha1/256/384/
+512, rsa-sha1/256/384/512), failing loud on anything else. Signing stays SHA-256.
+(2) packaging writers emitted schema-invalid XML: ASSETMAP omitted the required
+IssueDate/Issuer and DcpCpl put ContentTitleText before IssueDate. Fixed to ST
+429-7/8/9 element order with the required IssueDate/Issuer/ContentVersion/empty
+RatingList, and AssetMap now orders its metadata by namespace. Verified with
+xmllint against the SMPTE XSDs and against 58 real signed ECL CPL/PKL.
+
 ## Planned / not started
+
+- Interop-only packaging gaps still schema-invalid (pre-existing, out of the
+  above scope). DcpCpl in the Interop CPL namespace emits `<ScreenAspectRatio>1998
+  1080</ScreenAspectRatio>`, but Interop wants a decimal (e.g. `1.85`); the ratio
+  is hardcoded and no ratio is threaded through. And an IMF ASSETMAP
+  (`include_volume_count = false`) omits `<VolumeCount>`, which ST 429-9 requires.
+  Both need the writers to carry real values, not just reordering.
 
 - Colour-managed DCP preview landed: preview now resolves a DCP/CPL/MXF,
   decrypts encrypted picture essence in Rust, decodes J2K via ffmpeg and applies
