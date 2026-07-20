@@ -86,6 +86,7 @@ fn as02_j2k_roundtrip() {
         fps_num: 24,
         fps_den: 1,
         partition_size: 1,
+        encryption: None,
     });
     assert!(result.success, "wrap failed: {}", result.error);
 
@@ -128,6 +129,7 @@ fn as02_pcm_roundtrip() {
         fps_num: 24,
         fps_den: 1,
         partition_size: 1,
+        encryption: None,
     });
     assert!(result.success, "wrap failed: {}", result.error);
     assert_eq!(result.duration, 2);
@@ -168,6 +170,7 @@ fn as02_atmos_errors() {
         fps_num: 24,
         fps_den: 1,
         partition_size: 1,
+        encryption: None,
     });
     assert!(!result.success);
     assert!(

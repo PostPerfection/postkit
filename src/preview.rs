@@ -1,7 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Frame-accurate media player/preview options for DCP and IMF content.
+/// Media preview options.
+///
+/// Playback is an ffplay wrapper over a decodable file, not a DCP/IMF-native
+/// player: it cannot select a CPL, decode encrypted MXF, drive a GPU decoder or
+/// apply a DCI display transform. `play` reads the file's real frame rate and
+/// honours `start_frame`/`end_frame`/`loop_playback`, and errors when an option
+/// it cannot fulfil (`cpl_uuid`, `gpu_device`, a non-sRGB `display_colourspace`)
+/// is set, rather than ignoring it silently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybackOptions {
     pub input: PathBuf,
@@ -40,10 +47,42 @@ pub struct FrameInfo {
     pub codec: String,
 }
 
+/// Read the video frame rate via ffprobe, falling back to 24 fps when it can't
+/// be determined.
+pub fn read_frame_rate(input: &Path) -> f64 {
+    let output = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "quiet",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=r_frame_rate",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+        ])
+        .arg(input)
+        .output();
+
+    let Ok(output) = output else {
+        return 24.0;
+    };
+    let s = String::from_utf8_lossy(&output.stdout);
+    let s = s.trim();
+    let fps = if let Some((num, den)) = s.split_once('/') {
+        let n: f64 = num.parse().unwrap_or(0.0);
+        let d: f64 = den.parse().unwrap_or(0.0);
+        if d > 0.0 { n / d } else { 0.0 }
+    } else {
+        s.parse().unwrap_or(0.0)
+    };
+    if fps > 0.0 { fps } else { 24.0 }
+}
+
 /// Extract a single frame as image (thumbnail/QC) using ffmpeg.
 pub fn extract_frame(input: &Path, frame: u32, output_image: &Path) -> i32 {
-    // Calculate timecode from frame number (assume 24fps default)
-    let seconds = frame as f64 / 24.0;
+    // Seek by the file's real frame rate, not a hardcoded 24 fps.
+    let seconds = frame as f64 / read_frame_rate(input);
 
     let output = std::process::Command::new("ffmpeg")
         .arg("-y")
@@ -110,13 +149,39 @@ pub fn get_frame_info(input: &Path, frame: u32) -> FrameInfo {
 }
 
 /// Start playback using ffplay (blocking).
+///
+/// Errors out (returns -1) on options the ffplay path cannot honour instead of
+/// silently ignoring them. See `PlaybackOptions`.
 pub fn play(opts: &PlaybackOptions) -> i32 {
+    if !opts.cpl_uuid.is_empty() {
+        tracing::error!("cpl_uuid is set but ffplay plays a file, not a CPL selection");
+        return -1;
+    }
+    if opts.gpu_device >= 0 {
+        tracing::error!("gpu_device is set but the ffplay path has no GPU decode");
+        return -1;
+    }
+    if !opts.display_colourspace.eq_ignore_ascii_case("sRGB") {
+        tracing::error!(
+            "display_colourspace {:?} is unsupported; the ffplay path shows the file as-is",
+            opts.display_colourspace
+        );
+        return -1;
+    }
+
+    let fps = read_frame_rate(&opts.input);
     let mut cmd = std::process::Command::new("ffplay");
     cmd.arg("-autoexit").arg(&opts.input);
 
     if opts.start_frame > 0 {
-        let seconds = opts.start_frame as f64 / 24.0;
+        let seconds = opts.start_frame as f64 / fps;
         cmd.arg("-ss").arg(format!("{seconds:.3}"));
+    }
+
+    // end_frame (0 = play to end) becomes a play duration from the start frame.
+    if opts.end_frame > opts.start_frame {
+        let seconds = (opts.end_frame - opts.start_frame) as f64 / fps;
+        cmd.arg("-t").arg(format!("{seconds:.3}"));
     }
 
     if opts.loop_playback {
@@ -160,5 +225,32 @@ pub fn render_to_sequence(input: &Path, output_dir: &Path, format: Option<&str>)
             tracing::error!("Failed to run ffmpeg: {e}");
             -1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_rejects_options_ffplay_cannot_honour() {
+        // each of these returns before ever spawning ffplay
+        let with_cpl = PlaybackOptions {
+            cpl_uuid: "urn:uuid:x".into(),
+            ..Default::default()
+        };
+        assert_eq!(play(&with_cpl), -1);
+
+        let with_gpu = PlaybackOptions {
+            gpu_device: 0,
+            ..Default::default()
+        };
+        assert_eq!(play(&with_gpu), -1);
+
+        let with_cs = PlaybackOptions {
+            display_colourspace: "P3".into(),
+            ..Default::default()
+        };
+        assert_eq!(play(&with_cs), -1);
     }
 }

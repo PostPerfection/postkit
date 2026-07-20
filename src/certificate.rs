@@ -1,4 +1,5 @@
-use crate::xmldsig::{DSIG_NS, XmlSigner, xml_escape};
+use crate::packaging::escape_xml as xml_escape;
+use crate::xmldsig::{DSIG_NS, XmlSigner};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -587,6 +588,32 @@ pub struct KdmConfig {
     pub valid_from: String,
     pub valid_to: String,
     pub formulation: String,
+    /// Content keys to carry, taken from the DCP's keys file so the KDM unlocks
+    /// the essence that was actually encrypted. Empty makes `build_kdm` mint one
+    /// fresh MDIK key (useful only for a test/DKDM with no bound DCP). Never
+    /// serialized: it holds secret key material.
+    #[serde(skip)]
+    pub content_keys: Vec<KdmContentKey>,
+}
+
+/// A caller-supplied content key placed in a KDM, binding it to an already
+/// encrypted DCP. Holds secret material and is redacted in Debug.
+#[derive(Clone)]
+pub struct KdmContentKey {
+    /// ST 430-1 key type, e.g. `MDIK` (image) or `MDAK` (audio).
+    pub key_type: [u8; 4],
+    pub key_id: uuid::Uuid,
+    pub content_key: [u8; 16],
+}
+
+impl std::fmt::Debug for KdmContentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KdmContentKey")
+            .field("key_type", &String::from_utf8_lossy(&self.key_type))
+            .field("key_id", &self.key_id)
+            .field("content_key", &"<redacted>")
+            .finish()
+    }
 }
 
 /// SMPTE ST 430-1 Table 6: identifies the KDM cipher block layout.
@@ -759,15 +786,28 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
     let not_valid_before = resolve_valid_from(&config.valid_from);
     let not_valid_after = parse_validity_end(&config.valid_to, &not_valid_before)?;
 
-    let content_key: [u8; 16] = rand_bytes()?;
-    let content_key_id = uuid::Uuid::new_v4();
-
-    // MDIK: image essence key, ST 430-1 6.3.9.3 Table 1.
-    let keys = [KdmKey {
-        key_type: *b"MDIK",
-        key_id: content_key_id,
-        content_key,
-    }];
+    // Prefer the caller's keys (from the DCP's keys file) so the KDM unlocks the
+    // essence that was actually encrypted; fall back to a fresh MDIK otherwise.
+    let keys: Vec<KdmKey> = if config.content_keys.is_empty() {
+        // MDIK: image essence key, ST 430-1 6.3.9.3 Table 1.
+        vec![KdmKey {
+            key_type: *b"MDIK",
+            key_id: uuid::Uuid::new_v4(),
+            content_key: rand_bytes()?,
+        }]
+    } else {
+        config
+            .content_keys
+            .iter()
+            .map(|k| KdmKey {
+                key_type: k.key_type,
+                key_id: k.key_id,
+                content_key: k.content_key,
+            })
+            .collect()
+    };
+    let content_key = keys[0].content_key;
+    let content_key_id = keys[0].key_id;
 
     let xml = build_kdm_xml(
         config,
@@ -1558,6 +1598,7 @@ mod tests {
             valid_from: "now".to_string(),
             valid_to: "7 days".to_string(),
             formulation: "dci-any".to_string(),
+            content_keys: Vec::new(),
         }
     }
 
@@ -1576,6 +1617,7 @@ mod tests {
             valid_from: "now".to_string(),
             valid_to: "7 days".to_string(),
             formulation: "dci-any".to_string(),
+            content_keys: Vec::new(),
         }
     }
 

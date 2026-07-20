@@ -1,6 +1,9 @@
 //! Shell completion generation for CLI tools.
 //!
-//! Generates bash, zsh, and fish completion scripts using clap_complete.
+//! Emits lightweight bash/zsh/fish/PowerShell completion scripts that scrape a
+//! binary's `--help` output at runtime; the zsh script only completes filenames.
+//! This is not clap_complete output. CLI tools wanting per-flag completion should
+//! call `clap_complete::generate()` with their own `Command`.
 
 /// Supported shell types for completion generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +26,7 @@ impl Shell {
         }
     }
 
-    /// Return the shell name as used by clap_complete.
+    /// Return the shell name string.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Bash => "bash",

@@ -97,6 +97,81 @@ pub fn subtitle_end_time_seconds(content: &str, fps: f64) -> Option<f64> {
     latest
 }
 
+/// A single parsed SRT cue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SrtCue {
+    pub index: u32,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    /// Cue text; multi-line cues keep their internal '\n'.
+    pub text: String,
+}
+
+/// Parse SubRip (.srt) text into cues.
+///
+/// Standalone parser the apps can share (dcpwizard subtitle.rs and imfwizard
+/// subtitle_convert.rs each rolled their own). Lenient: blank lines separate
+/// cues, a numeric index line is optional, and cues without a valid timecode
+/// line are skipped.
+pub fn parse_srt(content: &str) -> Vec<SrtCue> {
+    let mut cues = Vec::new();
+    let mut lines = content.lines().peekable();
+
+    while lines.peek().is_some() {
+        // skip blank separators
+        while lines.peek().is_some_and(|l| l.trim().is_empty()) {
+            lines.next();
+        }
+        if lines.peek().is_none() {
+            break;
+        }
+
+        // an optional numeric index line precedes the timecode line
+        let first = lines.next().unwrap().trim().to_string();
+        let (index, ts_line) = if first.contains("-->") {
+            (0, first)
+        } else {
+            let idx = first.parse().unwrap_or(0);
+            match lines.next() {
+                Some(l) => (idx, l.trim().to_string()),
+                None => break,
+            }
+        };
+
+        let Some((start_ms, end_ms)) = parse_srt_timecode_line(&ts_line) else {
+            continue;
+        };
+
+        let mut text = String::new();
+        while lines.peek().is_some_and(|l| !l.trim().is_empty()) {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(lines.next().unwrap().trim());
+        }
+
+        cues.push(SrtCue {
+            index,
+            start_ms,
+            end_ms,
+            text,
+        });
+    }
+
+    cues
+}
+
+/// Parse a "HH:MM:SS,mmm --> HH:MM:SS,mmm" line into (start_ms, end_ms).
+fn parse_srt_timecode_line(line: &str) -> Option<(u64, u64)> {
+    let (a, b) = line.split_once("-->")?;
+    Some((srt_time_ms(a.trim()), srt_time_ms(b.trim())))
+}
+
+/// SRT time "HH:MM:SS,mmm" to milliseconds.
+fn srt_time_ms(t: &str) -> u64 {
+    (parse_srt_time(t) * 1000.0).round() as u64
+}
+
 /// Re-time a subtitle file from one framerate to another.
 pub fn retime_subtitles(opts: &RetimeOptions) -> Result<RetimeResult, RetimeError> {
     if !opts.input_file.exists() {
@@ -423,6 +498,28 @@ mod tests {
     #[test]
     fn end_time_is_none_without_timing() {
         assert!(subtitle_end_time_seconds("<tt><body><p>no times</p></body></tt>", 24.0).is_none());
+    }
+
+    #[test]
+    fn parse_srt_reads_indexed_cues() {
+        let srt = "1\n00:00:01,000 --> 00:00:04,000\nHello world\n\n2\n00:00:05,000 --> 00:00:08,500\nSecond\nline\n";
+        let cues = parse_srt(srt);
+        assert_eq!(cues.len(), 2);
+        assert_eq!(cues[0].index, 1);
+        assert_eq!(cues[0].start_ms, 1000);
+        assert_eq!(cues[0].end_ms, 4000);
+        assert_eq!(cues[0].text, "Hello world");
+        assert_eq!(cues[1].start_ms, 5000);
+        assert_eq!(cues[1].end_ms, 8500);
+        assert_eq!(cues[1].text, "Second\nline");
+    }
+
+    #[test]
+    fn parse_srt_tolerates_missing_index_line() {
+        let srt = "00:00:01,000 --> 00:00:02,000\nNo index\n";
+        let cues = parse_srt(srt);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].text, "No index");
     }
 
     #[test]

@@ -23,6 +23,11 @@ pub enum CameraFormat {
 }
 
 /// Ingest options for camera media.
+///
+/// `colour_space`, `debayer_quality` and `gpu_device` describe RAW debayer intent
+/// but stock ffmpeg cannot debayer camera RAW, so they are only meaningful once a
+/// vendor decoder is wired in. Today ingest transcodes ffmpeg-decodable inputs
+/// (ProRes, DNxHR) and rejects true RAW loudly; those fields are not applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestOptions {
     /// Camera card/media directory
@@ -31,12 +36,13 @@ pub struct IngestOptions {
     pub output_dir: PathBuf,
     /// "dpx", "tiff", "exr", "prores"
     pub output_format: String,
-    /// "ACES", "Rec.709", "P3", "LogC"
+    /// "ACES", "Rec.709", "P3", "LogC" (not applied, see struct note)
     pub colour_space: String,
-    /// 1=fast, 3=high quality
+    /// 1=fast, 3=high quality (not applied, see struct note)
     pub debayer_quality: u32,
     pub apply_lut: bool,
     pub lut_path: PathBuf,
+    /// (not applied, see struct note)
     pub gpu_device: i32,
 }
 
@@ -275,7 +281,24 @@ fn parse_fraction(s: &str) -> f64 {
     }
 }
 
+/// True for camera RAW formats stock ffmpeg cannot decode. Decoding these needs
+/// the vendor SDK (ARRI/RED/Blackmagic/Canon) or a dedicated debayer library.
+pub fn is_raw_undecodable(format: CameraFormat) -> bool {
+    matches!(
+        format,
+        CameraFormat::Arriraw
+            | CameraFormat::RedR3d
+            | CameraFormat::BlackmagicBraw
+            | CameraFormat::CanonRaw
+            | CameraFormat::SonyRaw
+    )
+}
+
 /// Ingest/transcode camera media to standardized intermediate using ffmpeg.
+///
+/// Only ffmpeg-decodable inputs (ProRes, DNxHR) are transcoded. Camera RAW
+/// (ARRIRAW, R3D, BRAW, Cinema RAW Light, X-OCN) is detected but rejected: stock
+/// ffmpeg cannot decode it. See `is_raw_undecodable`.
 pub fn ingest(opts: &IngestOptions) -> i32 {
     if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
         tracing::error!("Failed to create output directory: {e}");
@@ -285,6 +308,18 @@ pub fn ingest(opts: &IngestOptions) -> i32 {
     let clips = scan_media(&opts.source);
     if clips.is_empty() {
         tracing::error!("No media clips found in {}", opts.source.display());
+        return -1;
+    }
+
+    // Fail loud on RAW rather than handing an undecodable file to ffmpeg and
+    // letting it die with a cryptic decoder error.
+    if let Some(clip) = clips.iter().find(|c| is_raw_undecodable(c.format)) {
+        tracing::error!(
+            "Cannot ingest {}: {:?} is camera RAW that stock ffmpeg cannot decode; \
+             a vendor SDK/decoder is required",
+            clip.path.display(),
+            clip.format
+        );
         return -1;
     }
 
@@ -408,5 +443,37 @@ mod tests {
     fn test_parse_fraction() {
         assert!((parse_fraction("24000/1001") - 23.976).abs() < 0.01);
         assert!((parse_fraction("25/1") - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn raw_formats_are_flagged_undecodable() {
+        for f in [
+            CameraFormat::Arriraw,
+            CameraFormat::RedR3d,
+            CameraFormat::BlackmagicBraw,
+            CameraFormat::CanonRaw,
+            CameraFormat::SonyRaw,
+        ] {
+            assert!(is_raw_undecodable(f), "{f:?} should be undecodable");
+        }
+        for f in [CameraFormat::ProRes, CameraFormat::DnxHr] {
+            assert!(!is_raw_undecodable(f), "{f:?} is ffmpeg-decodable");
+        }
+    }
+
+    #[test]
+    fn ingest_rejects_raw_clips_loudly() {
+        // a directory holding a .r3d makes scan_media report a RAW clip; ingest
+        // must refuse rather than feed it to ffmpeg
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("A001.r3d"), b"not really r3d").unwrap();
+        let out = tempfile::tempdir().unwrap();
+
+        let opts = IngestOptions {
+            source: src.path().to_path_buf(),
+            output_dir: out.path().to_path_buf(),
+            ..Default::default()
+        };
+        assert_eq!(ingest(&opts), -1);
     }
 }

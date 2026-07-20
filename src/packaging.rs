@@ -1,0 +1,604 @@
+//! Shared DCP/IMF packaging XML writers: CPL, PKL, ASSETMAP.
+//!
+//! Both wizards hand-rolled these. PKL and ASSETMAP are genuinely one concept
+//! across DCP and IMF (same element shape, only the namespace and issuer differ),
+//! so they are single writers parametrised by namespace. The CPL is not: a DCP
+//! CPL (ST 429-7, reels of MainPicture/MainSound) and an IMF CPL (ST 2067-3,
+//! segments of virtual-track sequences) are different documents, so each has its
+//! own writer. Writers return the XML string; the caller does the file I/O.
+
+use std::fmt::Write as _;
+
+/// Standard namespace URIs, kept in one place so the apps don't re-hardcode them.
+pub mod ns {
+    // DCP CPL
+    pub const CPL_SMPTE: &str = "http://www.smpte-ra.org/schemas/429-7/2006/CPL";
+    pub const CPL_INTEROP: &str = "http://www.digicine.com/PROTO-ASDCP-CPL-20040511#";
+    // DCP PKL
+    pub const PKL_SMPTE: &str = "http://www.smpte-ra.org/schemas/429-8/2007/PKL";
+    pub const PKL_INTEROP: &str = "http://www.digicine.com/PROTO-ASDCP-PKL-20040311#";
+    // DCP ASSETMAP (IMF uses the same AM namespace)
+    pub const AM_SMPTE: &str = "http://www.smpte-ra.org/schemas/429-9/2007/AM";
+    pub const AM_INTEROP: &str = "http://www.digicine.com/PROTO-ASDCP-AM-20040311#";
+    // IMF (ST 2067)
+    pub const CPL_IMF: &str = "http://www.smpte-ra.org/schemas/2067-3/2016";
+    pub const CPL_IMF_CC: &str = "http://www.smpte-ra.org/schemas/2067-2/2016";
+    pub const PKL_IMF: &str = "http://www.smpte-ra.org/schemas/2067-2/2016/PKL";
+    pub const APP2E: &str = "http://www.smpte-ra.org/schemas/2067-21/2016";
+}
+
+/// Escape XML special characters in element text or attribute values.
+///
+/// The single escaper the packaging writers and xmldsig share, replacing the
+/// per-app private copies. Covers all five predefined entities.
+pub fn escape_xml(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+// ─── PKL (shared DCP/IMF concept) ──────────────────────────────────────────
+
+/// One asset in a packing list.
+#[derive(Debug, Clone, Default)]
+pub struct PklAsset {
+    /// Bare UUID (no `urn:uuid:` prefix).
+    pub id: String,
+    /// Base64 SHA-1 digest of the file.
+    pub hash: String,
+    pub size: u64,
+    /// MIME type, e.g. `text/xml` or `application/mxf`.
+    pub asset_type: String,
+}
+
+/// A Packing List (ST 429-8 DCP or ST 2067-2 IMF, selected by `namespace`).
+#[derive(Debug, Clone, Default)]
+pub struct PackingList {
+    /// Bare UUID.
+    pub uuid: String,
+    pub namespace: String,
+    pub issuer: String,
+    pub creator: String,
+    pub issue_date: String,
+    pub assets: Vec<PklAsset>,
+}
+
+impl PackingList {
+    pub fn to_xml(&self) -> String {
+        let mut xml = String::new();
+        xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        let _ = writeln!(xml, "<PackingList xmlns=\"{}\">", self.namespace);
+        let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
+        let _ = writeln!(xml, "  <IssueDate>{}</IssueDate>", self.issue_date);
+        let _ = writeln!(xml, "  <Issuer>{}</Issuer>", escape_xml(&self.issuer));
+        let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
+        xml.push_str("  <AssetList>\n");
+        for a in &self.assets {
+            xml.push_str("    <Asset>\n");
+            let _ = writeln!(xml, "      <Id>urn:uuid:{}</Id>", a.id);
+            let _ = writeln!(xml, "      <Hash>{}</Hash>", a.hash);
+            let _ = writeln!(xml, "      <Size>{}</Size>", a.size);
+            let _ = writeln!(xml, "      <Type>{}</Type>", escape_xml(&a.asset_type));
+            xml.push_str("    </Asset>\n");
+        }
+        xml.push_str("  </AssetList>\n");
+        xml.push_str("</PackingList>\n");
+        xml
+    }
+}
+
+// ─── ASSETMAP (shared DCP/IMF concept) ─────────────────────────────────────
+
+/// One asset in an ASSETMAP.
+#[derive(Debug, Clone, Default)]
+pub struct AssetMapAsset {
+    /// Bare UUID.
+    pub id: String,
+    /// Chunk path relative to the package root.
+    pub path: String,
+    /// Marks the PKL entry (`<PackingList>true</PackingList>`).
+    pub packing_list: bool,
+}
+
+/// An ASSETMAP (ST 429-9). DCP includes `<VolumeCount>`; IMF omits it.
+#[derive(Debug, Clone, Default)]
+pub struct AssetMap {
+    /// Bare UUID.
+    pub uuid: String,
+    pub namespace: String,
+    pub creator: String,
+    pub include_volume_count: bool,
+    pub assets: Vec<AssetMapAsset>,
+}
+
+impl AssetMap {
+    pub fn to_xml(&self) -> String {
+        let mut xml = String::new();
+        xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        let _ = writeln!(xml, "<AssetMap xmlns=\"{}\">", self.namespace);
+        let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
+        let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
+        if self.include_volume_count {
+            xml.push_str("  <VolumeCount>1</VolumeCount>\n");
+        }
+        xml.push_str("  <AssetList>\n");
+        for a in &self.assets {
+            xml.push_str("    <Asset>\n");
+            let _ = writeln!(xml, "      <Id>urn:uuid:{}</Id>", a.id);
+            if a.packing_list {
+                xml.push_str("      <PackingList>true</PackingList>\n");
+            }
+            xml.push_str("      <ChunkList>\n");
+            xml.push_str("        <Chunk>\n");
+            let _ = writeln!(xml, "          <Path>{}</Path>", escape_xml(&a.path));
+            xml.push_str("        </Chunk>\n");
+            xml.push_str("      </ChunkList>\n");
+            xml.push_str("    </Asset>\n");
+        }
+        xml.push_str("  </AssetList>\n");
+        xml.push_str("</AssetMap>\n");
+        xml
+    }
+}
+
+/// VOLINDEX document paired with a DCP ASSETMAP.
+pub fn volindex_xml(namespace: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<VolumeIndex xmlns=\"{namespace}\">\n  <Index>1</Index>\n</VolumeIndex>\n"
+    )
+}
+
+// ─── DCP CPL (ST 429-7) ────────────────────────────────────────────────────
+
+/// One reel of a DCP CPL: a MainPicture and an optional MainSound.
+#[derive(Debug, Clone, Default)]
+pub struct DcpCplReel {
+    /// Bare UUIDs.
+    pub reel_id: String,
+    pub picture_id: String,
+    pub picture_edit_rate_num: u32,
+    pub picture_edit_rate_den: u32,
+    pub picture_duration: u64,
+    pub picture_entry_point: u64,
+    /// KeyId (bare UUID) when the picture essence is encrypted.
+    pub picture_key_id: Option<String>,
+    pub sound_id: Option<String>,
+    pub sound_edit_rate_num: u32,
+    pub sound_edit_rate_den: u32,
+    pub sound_duration: u64,
+    pub sound_entry_point: u64,
+    /// KeyId (bare UUID) when the sound essence is encrypted.
+    pub sound_key_id: Option<String>,
+}
+
+/// A DCP Composition Playlist (ST 429-7 SMPTE or Interop, by `namespace`).
+#[derive(Debug, Clone, Default)]
+pub struct DcpCpl {
+    /// Bare UUID.
+    pub uuid: String,
+    pub namespace: String,
+    pub title: String,
+    pub content_kind: String,
+    pub issuer: String,
+    pub creator: String,
+    pub issue_date: String,
+    pub reels: Vec<DcpCplReel>,
+}
+
+impl DcpCpl {
+    pub fn to_xml(&self) -> String {
+        let mut xml = String::new();
+        xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        let _ = writeln!(xml, "<CompositionPlaylist xmlns=\"{}\">", self.namespace);
+        let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
+        let _ = writeln!(
+            xml,
+            "  <ContentTitleText>{}</ContentTitleText>",
+            escape_xml(&self.title)
+        );
+        let _ = writeln!(xml, "  <IssueDate>{}</IssueDate>", self.issue_date);
+        let _ = writeln!(xml, "  <Issuer>{}</Issuer>", escape_xml(&self.issuer));
+        let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
+        if !self.content_kind.is_empty() {
+            let _ = writeln!(
+                xml,
+                "  <ContentKind>{}</ContentKind>",
+                escape_xml(&self.content_kind)
+            );
+        }
+        xml.push_str("  <ReelList>\n");
+        for (i, reel) in self.reels.iter().enumerate() {
+            xml.push_str("    <Reel>\n");
+            let _ = writeln!(xml, "      <Id>urn:uuid:{}</Id>", reel.reel_id);
+            let _ = writeln!(xml, "      <AnnotationText>Reel {}</AnnotationText>", i + 1);
+            xml.push_str("      <AssetList>\n");
+            xml.push_str("        <MainPicture>\n");
+            let _ = writeln!(xml, "          <Id>urn:uuid:{}</Id>", reel.picture_id);
+            let _ = writeln!(
+                xml,
+                "          <EditRate>{} {}</EditRate>",
+                reel.picture_edit_rate_num, reel.picture_edit_rate_den
+            );
+            let _ = writeln!(
+                xml,
+                "          <IntrinsicDuration>{}</IntrinsicDuration>",
+                reel.picture_duration
+            );
+            let _ = writeln!(
+                xml,
+                "          <EntryPoint>{}</EntryPoint>",
+                reel.picture_entry_point
+            );
+            let _ = writeln!(
+                xml,
+                "          <Duration>{}</Duration>",
+                reel.picture_duration
+            );
+            if let Some(ref key_id) = reel.picture_key_id {
+                let _ = writeln!(xml, "          <KeyId>urn:uuid:{key_id}</KeyId>");
+            }
+            let _ = writeln!(
+                xml,
+                "          <FrameRate>{} {}</FrameRate>",
+                reel.picture_edit_rate_num, reel.picture_edit_rate_den
+            );
+            xml.push_str("          <ScreenAspectRatio>1998 1080</ScreenAspectRatio>\n");
+            xml.push_str("        </MainPicture>\n");
+            if let Some(ref sound_id) = reel.sound_id {
+                xml.push_str("        <MainSound>\n");
+                let _ = writeln!(xml, "          <Id>urn:uuid:{sound_id}</Id>");
+                let _ = writeln!(
+                    xml,
+                    "          <EditRate>{} {}</EditRate>",
+                    reel.sound_edit_rate_num, reel.sound_edit_rate_den
+                );
+                let _ = writeln!(
+                    xml,
+                    "          <IntrinsicDuration>{}</IntrinsicDuration>",
+                    reel.sound_duration
+                );
+                let _ = writeln!(
+                    xml,
+                    "          <EntryPoint>{}</EntryPoint>",
+                    reel.sound_entry_point
+                );
+                let _ = writeln!(
+                    xml,
+                    "          <Duration>{}</Duration>",
+                    reel.sound_duration
+                );
+                if let Some(ref key_id) = reel.sound_key_id {
+                    let _ = writeln!(xml, "          <KeyId>urn:uuid:{key_id}</KeyId>");
+                }
+                xml.push_str("        </MainSound>\n");
+            }
+            xml.push_str("      </AssetList>\n");
+            xml.push_str("    </Reel>\n");
+        }
+        xml.push_str("  </ReelList>\n");
+        xml.push_str("</CompositionPlaylist>\n");
+        xml
+    }
+}
+
+// ─── IMF CPL (ST 2067-3) ───────────────────────────────────────────────────
+
+/// Essence kind of an IMF virtual-track resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImfTrackKind {
+    Image,
+    Audio,
+    Subtitle,
+}
+
+impl ImfTrackKind {
+    fn sequence_element(self) -> &'static str {
+        match self {
+            ImfTrackKind::Image => "MainImageSequence",
+            ImfTrackKind::Audio => "MainAudioSequence",
+            ImfTrackKind::Subtitle => "SubtitlesSequence",
+        }
+    }
+}
+
+/// One resource of an IMF CPL, pointing at a track file.
+#[derive(Debug, Clone)]
+pub struct ImfResource {
+    /// Bare UUID of the referenced track file.
+    pub track_file_uuid: String,
+    pub duration: u64,
+    pub kind: ImfTrackKind,
+}
+
+/// An IMF Composition Playlist (ST 2067-3, App #2E).
+#[derive(Debug, Clone, Default)]
+pub struct ImfCpl {
+    /// Bare UUID.
+    pub uuid: String,
+    pub title: String,
+    /// Defaults to "feature" when empty.
+    pub content_kind: String,
+    pub issuer: String,
+    pub creator: String,
+    pub issue_date: String,
+    pub fps_num: u32,
+    pub fps_den: u32,
+    pub resources: Vec<ImfResource>,
+}
+
+impl ImfCpl {
+    pub fn to_xml(&self) -> String {
+        let fps_num = self.fps_num;
+        let fps_den = if self.fps_den == 0 { 1 } else { self.fps_den };
+        let content_kind = if self.content_kind.is_empty() {
+            "feature"
+        } else {
+            &self.content_kind
+        };
+
+        let mut xml = String::new();
+        xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        let _ = writeln!(
+            xml,
+            "<CompositionPlaylist xmlns=\"{}\" xmlns:cc=\"{}\">",
+            ns::CPL_IMF,
+            ns::CPL_IMF_CC
+        );
+        let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
+        let _ = writeln!(xml, "  <IssueDate>{}</IssueDate>", self.issue_date);
+        let _ = writeln!(xml, "  <Issuer>{}</Issuer>", escape_xml(&self.issuer));
+        let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
+        let _ = writeln!(
+            xml,
+            "  <ContentTitle>{}</ContentTitle>",
+            escape_xml(&self.title)
+        );
+        let _ = writeln!(xml, "  <ContentKind>{content_kind}</ContentKind>");
+        let _ = writeln!(xml, "  <EditRate>{fps_num} {fps_den}</EditRate>");
+        xml.push_str("  <ExtensionProperties>\n");
+        let _ = writeln!(
+            xml,
+            "    <cc:ApplicationIdentification>{}</cc:ApplicationIdentification>",
+            ns::APP2E
+        );
+        xml.push_str("  </ExtensionProperties>\n");
+        xml.push_str("  <SegmentList>\n");
+        xml.push_str("    <Segment>\n");
+        let _ = writeln!(xml, "      <Id>urn:uuid:{}</Id>", uuid::Uuid::new_v4());
+        xml.push_str("      <SequenceList>\n");
+
+        // one virtual track per essence kind, image then audio then subtitle
+        for kind in [
+            ImfTrackKind::Image,
+            ImfTrackKind::Audio,
+            ImfTrackKind::Subtitle,
+        ] {
+            for r in self.resources.iter().filter(|r| r.kind == kind) {
+                self.write_sequence(&mut xml, r, fps_num, fps_den);
+            }
+        }
+
+        xml.push_str("      </SequenceList>\n");
+        xml.push_str("    </Segment>\n");
+        xml.push_str("  </SegmentList>\n");
+        xml.push_str("</CompositionPlaylist>\n");
+        xml
+    }
+
+    fn write_sequence(&self, xml: &mut String, r: &ImfResource, fps_num: u32, fps_den: u32) {
+        let el = r.kind.sequence_element();
+        let _ = writeln!(xml, "        <cc:{el} xmlns:cc=\"{}\">", ns::CPL_IMF_CC);
+        let _ = writeln!(xml, "          <Id>urn:uuid:{}</Id>", uuid::Uuid::new_v4());
+        let _ = writeln!(
+            xml,
+            "          <TrackId>urn:uuid:{}</TrackId>",
+            uuid::Uuid::new_v4()
+        );
+        let _ = writeln!(xml, "          <EditRate>{fps_num} {fps_den}</EditRate>");
+        xml.push_str("          <ResourceList>\n");
+        xml.push_str("            <Resource>\n");
+        let _ = writeln!(
+            xml,
+            "              <Id>urn:uuid:{}</Id>",
+            uuid::Uuid::new_v4()
+        );
+        let _ = writeln!(
+            xml,
+            "              <TrackFileId>urn:uuid:{}</TrackFileId>",
+            r.track_file_uuid
+        );
+        let _ = writeln!(
+            xml,
+            "              <EditRate>{fps_num} {fps_den}</EditRate>"
+        );
+        let _ = writeln!(
+            xml,
+            "              <IntrinsicDuration>{}</IntrinsicDuration>",
+            r.duration
+        );
+        let _ = writeln!(
+            xml,
+            "              <SourceDuration>{}</SourceDuration>",
+            r.duration
+        );
+        xml.push_str("            </Resource>\n");
+        xml.push_str("          </ResourceList>\n");
+        let _ = writeln!(xml, "        </cc:{el}>");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_covers_all_five_entities() {
+        assert_eq!(escape_xml("a<b>&\"'"), "a&lt;b&gt;&amp;&quot;&apos;");
+    }
+
+    #[test]
+    fn pkl_writes_assets_and_namespace() {
+        let pkl = PackingList {
+            uuid: "pkl".into(),
+            namespace: ns::PKL_SMPTE.into(),
+            issuer: "DCP Wizard".into(),
+            creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            assets: vec![PklAsset {
+                id: "asset".into(),
+                hash: "base64hash".into(),
+                size: 42,
+                asset_type: "application/mxf".into(),
+            }],
+        };
+        let xml = pkl.to_xml();
+        assert!(xml.contains("429-8/2007/PKL"));
+        assert!(xml.contains("<Id>urn:uuid:pkl</Id>"));
+        assert!(xml.contains("<Hash>base64hash</Hash>"));
+        assert!(xml.contains("<Size>42</Size>"));
+        assert!(xml.contains("<Type>application/mxf</Type>"));
+    }
+
+    #[test]
+    fn assetmap_dcp_has_volume_count_imf_does_not() {
+        let assets = vec![AssetMapAsset {
+            id: "pkl".into(),
+            path: "PKL.xml".into(),
+            packing_list: true,
+        }];
+        let dcp = AssetMap {
+            uuid: "am".into(),
+            namespace: ns::AM_SMPTE.into(),
+            creator: "DCP Wizard".into(),
+            include_volume_count: true,
+            assets: assets.clone(),
+        }
+        .to_xml();
+        assert!(dcp.contains("<VolumeCount>1</VolumeCount>"));
+        assert!(dcp.contains("<PackingList>true</PackingList>"));
+        assert!(dcp.contains("<Path>PKL.xml</Path>"));
+
+        let imf = AssetMap {
+            uuid: "am".into(),
+            namespace: ns::AM_SMPTE.into(),
+            creator: "IMF Wizard".into(),
+            include_volume_count: false,
+            assets,
+        }
+        .to_xml();
+        assert!(!imf.contains("VolumeCount"));
+    }
+
+    #[test]
+    fn volindex_carries_namespace() {
+        let vi = volindex_xml(ns::AM_SMPTE);
+        assert!(
+            vi.contains("<VolumeIndex xmlns=\"http://www.smpte-ra.org/schemas/429-9/2007/AM\">")
+        );
+        assert!(vi.contains("<Index>1</Index>"));
+    }
+
+    #[test]
+    fn dcp_cpl_writes_reel_with_picture_and_sound() {
+        let cpl = DcpCpl {
+            uuid: "cpl".into(),
+            namespace: ns::CPL_SMPTE.into(),
+            title: "A & B".into(),
+            content_kind: "feature".into(),
+            issuer: "DCP Wizard".into(),
+            creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            reels: vec![DcpCplReel {
+                reel_id: "reel".into(),
+                picture_id: "pic".into(),
+                picture_edit_rate_num: 24,
+                picture_edit_rate_den: 1,
+                picture_duration: 240,
+                picture_entry_point: 0,
+                picture_key_id: Some("pic-key".into()),
+                sound_id: Some("snd".into()),
+                sound_edit_rate_num: 24,
+                sound_edit_rate_den: 1,
+                sound_duration: 240,
+                sound_entry_point: 0,
+                sound_key_id: None,
+            }],
+        };
+        let xml = cpl.to_xml();
+        assert!(xml.contains("429-7/2006/CPL"));
+        assert!(xml.contains("<ContentTitleText>A &amp; B</ContentTitleText>"));
+        assert!(xml.contains("<MainPicture>"));
+        assert!(xml.contains("<Id>urn:uuid:pic</Id>"));
+        assert!(xml.contains("<MainSound>"));
+        assert!(xml.contains("<Id>urn:uuid:snd</Id>"));
+        assert!(xml.contains("<FrameRate>24 1</FrameRate>"));
+        // encrypted picture carries its KeyId; unencrypted sound does not
+        assert!(xml.contains("<KeyId>urn:uuid:pic-key</KeyId>"));
+        assert_eq!(xml.matches("<KeyId>").count(), 1);
+    }
+
+    #[test]
+    fn dcp_cpl_omits_sound_when_absent() {
+        let cpl = DcpCpl {
+            uuid: "cpl".into(),
+            namespace: ns::CPL_INTEROP.into(),
+            reels: vec![DcpCplReel {
+                reel_id: "reel".into(),
+                picture_id: "pic".into(),
+                picture_edit_rate_num: 24,
+                picture_edit_rate_den: 1,
+                sound_id: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        assert!(xml.contains("PROTO-ASDCP-CPL-20040511"));
+        assert!(!xml.contains("<MainSound>"));
+    }
+
+    #[test]
+    fn imf_cpl_orders_sequences_and_identifies_app2e() {
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            title: "Test".into(),
+            content_kind: String::new(),
+            issuer: "IMF Wizard".into(),
+            creator: "IMF Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            fps_num: 24,
+            fps_den: 1,
+            resources: vec![
+                ImfResource {
+                    track_file_uuid: "aud".into(),
+                    duration: 240,
+                    kind: ImfTrackKind::Audio,
+                },
+                ImfResource {
+                    track_file_uuid: "vid".into(),
+                    duration: 240,
+                    kind: ImfTrackKind::Image,
+                },
+            ],
+        };
+        let xml = cpl.to_xml();
+        assert!(xml.contains(ns::APP2E));
+        assert!(xml.contains("<ContentKind>feature</ContentKind>"));
+        assert!(xml.contains("MainImageSequence"));
+        assert!(xml.contains("MainAudioSequence"));
+        assert!(xml.contains("<TrackFileId>urn:uuid:vid</TrackFileId>"));
+        // image sequence must precede audio sequence
+        let img = xml.find("MainImageSequence").unwrap();
+        let aud = xml.find("MainAudioSequence").unwrap();
+        assert!(img < aud, "image track should be written before audio");
+    }
+}

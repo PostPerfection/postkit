@@ -23,6 +23,26 @@ pub enum MxfStandard {
     As02,
 }
 
+/// AES-128 essence encryption material for a single MXF.
+///
+/// The 16-byte content key encrypts the essence at wrap time; the MXF header
+/// only records `key_id`. Kept out of any serialized form and redacted in Debug
+/// so the key cannot leak through logs or an on-disk options blob.
+#[derive(Clone)]
+pub struct MxfEncryption {
+    pub content_key: [u8; 16],
+    pub key_id: [u8; 16],
+}
+
+impl std::fmt::Debug for MxfEncryption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MxfEncryption")
+            .field("content_key", &"<redacted>")
+            .field("key_id", &uuid::Uuid::from_bytes(self.key_id))
+            .finish()
+    }
+}
+
 /// Options for MXF wrapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MxfWrapOptions {
@@ -40,6 +60,10 @@ pub struct MxfWrapOptions {
     pub fps_den: u32,
     /// Edit rate (frames per partition) for AS-02
     pub partition_size: u32,
+    /// When set, the essence is AES-128 encrypted at wrap time (J2K/PCM only).
+    /// Never serialized: it carries secret key material.
+    #[serde(skip)]
+    pub encryption: Option<MxfEncryption>,
 }
 
 /// Result of MXF wrapping.
@@ -96,10 +120,11 @@ impl J2kWriter {
         }
     }
 
-    fn write_frame(&mut self, data: &[u8]) -> asdcplib::Result<()> {
+    fn write_frame(&mut self, data: &[u8], enc: &mut EssenceCrypto) -> asdcplib::Result<()> {
+        let (e, h) = enc.contexts();
         match self {
-            Self::AsDcp(w) => w.write_frame(data, None, None),
-            Self::As02(w) => w.write_frame(data, None, None),
+            Self::AsDcp(w) => w.write_frame(data, e, h),
+            Self::As02(w) => w.write_frame(data, e, h),
         }
     }
 
@@ -138,10 +163,11 @@ impl PcmWriter {
         }
     }
 
-    fn write_frame(&mut self, data: &[u8]) -> asdcplib::Result<()> {
+    fn write_frame(&mut self, data: &[u8], enc: &mut EssenceCrypto) -> asdcplib::Result<()> {
+        let (e, h) = enc.contexts();
         match self {
-            Self::AsDcp(w) => w.write_frame(data, None, None),
-            Self::As02(w) => w.write_frame(data, None, None),
+            Self::AsDcp(w) => w.write_frame(data, e, h),
+            Self::As02(w) => w.write_frame(data, e, h),
         }
     }
 
@@ -218,6 +244,57 @@ fn make_writer_info() -> asdcplib::WriterInfo {
     }
 }
 
+/// AES/HMAC contexts for one wrap, or empty for cleartext essence.
+struct EssenceCrypto {
+    enc: Option<asdcplib::crypto::AesEncContext>,
+    hmac: Option<asdcplib::crypto::HmacContext>,
+}
+
+impl EssenceCrypto {
+    fn none() -> Self {
+        Self {
+            enc: None,
+            hmac: None,
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn contexts(
+        &mut self,
+    ) -> (
+        Option<&mut asdcplib::crypto::AesEncContext>,
+        Option<&mut asdcplib::crypto::HmacContext>,
+    ) {
+        (self.enc.as_mut(), self.hmac.as_mut())
+    }
+}
+
+/// Flag `info` as encrypted and build the AES/HMAC contexts for the essence.
+///
+/// Sets the SMPTE key-id and HMAC-required flags so the MXF header carries a
+/// cryptographic context; asdcplib generates a fresh per-frame IV internally.
+fn setup_encryption(
+    info: &mut asdcplib::WriterInfo,
+    enc: &Option<MxfEncryption>,
+) -> Result<EssenceCrypto, String> {
+    let Some(e) = enc else {
+        return Ok(EssenceCrypto::none());
+    };
+    info.encrypted_essence = true;
+    info.uses_hmac = true;
+    info.cryptographic_key_id = e.key_id;
+    let mut ec = asdcplib::crypto::AesEncContext::new();
+    ec.init_key(&e.content_key)
+        .map_err(|err| format!("AES key init failed: {err}"))?;
+    let mut hc = asdcplib::crypto::HmacContext::new();
+    hc.init_key(&e.content_key, info.label_set)
+        .map_err(|err| format!("HMAC key init failed: {err}"))?;
+    Ok(EssenceCrypto {
+        enc: Some(ec),
+        hmac: Some(hc),
+    })
+}
+
 fn compute_hash_and_size(path: &std::path::Path) -> (String, u64) {
     use sha1::Digest;
     let data = match std::fs::read(path) {
@@ -272,7 +349,16 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    let info = make_writer_info();
+    let mut info = make_writer_info();
+    let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
+        Ok(c) => c,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
     let desc = asdcplib::jp2k::PictureDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         sample_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
@@ -293,7 +379,7 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
     }
 
     for frame in &frames {
-        if let Err(e) = writer.write_frame(frame) {
+        if let Err(e) = writer.write_frame(frame, &mut crypto) {
             return MxfTrackFile {
                 error: format!("JP2K write_frame failed: {e}"),
                 ..Default::default()
@@ -453,7 +539,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     };
 
-    let info = make_writer_info();
+    let mut info = make_writer_info();
     let channels = wav.channels as u32;
     let bits = wav.bits_per_sample as u32;
     let sample_rate = wav.sample_rate;
@@ -478,6 +564,16 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         channel_format: channel_format_for(channels),
     };
 
+    let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
+        Ok(c) => c,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
+
     let mut writer = PcmWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
     if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
@@ -493,7 +589,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         if end > pcm_data.len() {
             break;
         }
-        if let Err(e) = writer.write_frame(&pcm_data[start..end]) {
+        if let Err(e) = writer.write_frame(&pcm_data[start..end], &mut crypto) {
             return MxfTrackFile {
                 error: format!("PCM write_frame failed: {e}"),
                 ..Default::default()
@@ -778,6 +874,7 @@ mod tests {
             fps_num: 24,
             fps_den: 1,
             partition_size: 0,
+            encryption: None,
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -806,6 +903,7 @@ mod tests {
             fps_num: 24,
             fps_den: 1,
             partition_size: 0,
+            encryption: None,
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "must not wrap a non-WAV file");
@@ -814,5 +912,96 @@ mod tests {
             "got: {}",
             result.error
         );
+    }
+
+    /// Minimal JPEG 2000 codestream `parse_j2k_header` accepts and asdcplib will
+    /// wrap: SOC, a well-formed SIZ (2048x1080, 3 components), then SOD/EOC.
+    fn synthetic_j2k() -> Vec<u8> {
+        let mut d = vec![0xFF, 0x4F]; // SOC
+        d.extend_from_slice(&[0xFF, 0x51]); // SIZ marker
+        let mut siz = Vec::new();
+        siz.extend_from_slice(&0u16.to_be_bytes()); // Rsiz
+        siz.extend_from_slice(&2048u32.to_be_bytes()); // Xsiz
+        siz.extend_from_slice(&1080u32.to_be_bytes()); // Ysiz
+        siz.extend_from_slice(&0u32.to_be_bytes()); // XOsiz
+        siz.extend_from_slice(&0u32.to_be_bytes()); // YOsiz
+        siz.extend_from_slice(&2048u32.to_be_bytes()); // XTsiz
+        siz.extend_from_slice(&1080u32.to_be_bytes()); // YTsiz
+        siz.extend_from_slice(&0u32.to_be_bytes()); // XTOsiz
+        siz.extend_from_slice(&0u32.to_be_bytes()); // YTOsiz
+        siz.extend_from_slice(&3u16.to_be_bytes()); // Csiz = 3 components
+        for _ in 0..3 {
+            siz.push(11); // Ssiz: 12-bit unsigned
+            siz.push(1); // XRsiz
+            siz.push(1); // YRsiz
+        }
+        let lsiz = (siz.len() + 2) as u16;
+        d.extend_from_slice(&lsiz.to_be_bytes());
+        d.extend_from_slice(&siz);
+        d.extend_from_slice(&[0xFF, 0x93]); // SOD
+        // distinctive payload so we can tell whether the essence was encrypted
+        for _ in 0..4 {
+            d.extend_from_slice(PLAINTEXT_TAG);
+        }
+        d.extend_from_slice(&[0xFF, 0xD9]); // EOC
+        d
+    }
+
+    /// A byte run that won't occur in MXF structure, only in our essence.
+    const PLAINTEXT_TAG: &[u8] = b"DCPWIZARD_PLAINTEXT_ESSENCE_TAG!";
+
+    fn j2k_opts(
+        input: std::path::PathBuf,
+        output: std::path::PathBuf,
+        encryption: Option<MxfEncryption>,
+    ) -> MxfWrapOptions {
+        MxfWrapOptions {
+            input_files: vec![input],
+            output,
+            essence_type: EssenceType::J2k,
+            standard: MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption,
+        }
+    }
+
+    #[test]
+    fn encrypted_wrap_succeeds_and_differs_from_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("0001.j2c");
+        std::fs::write(&frame, synthetic_j2k()).unwrap();
+
+        let plain_out = dir.path().join("plain.mxf");
+        let plain = mxf_wrap(&j2k_opts(frame.clone(), plain_out.clone(), None));
+        assert!(plain.success, "plaintext wrap failed: {}", plain.error);
+
+        let enc_out = dir.path().join("enc.mxf");
+        let enc = mxf_wrap(&j2k_opts(
+            frame,
+            enc_out.clone(),
+            Some(MxfEncryption {
+                content_key: [0x11; 16],
+                key_id: [0x22; 16],
+            }),
+        ));
+        assert!(enc.success, "encrypted wrap failed: {}", enc.error);
+
+        let p = std::fs::read(&plain_out).unwrap();
+        let e = std::fs::read(&enc_out).unwrap();
+        // plaintext essence is stored verbatim; encrypted essence must not be
+        assert!(
+            contains(&p, PLAINTEXT_TAG),
+            "plaintext MXF should store the essence verbatim"
+        );
+        assert!(
+            !contains(&e, PLAINTEXT_TAG),
+            "essence tag survived into the encrypted MXF: essence was not encrypted"
+        );
+    }
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
     }
 }

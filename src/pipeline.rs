@@ -46,11 +46,40 @@ pub struct EncodeResult {
 pub fn run_encode(
     video: &Path,
     output_dir: &Path,
+    fps: u32,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     on_progress: impl Fn(&PipelineProgress),
     on_log: impl Fn(&str),
 ) -> Result<EncodeResult, String> {
+    run_encode_with_ratio(
+        video,
+        output_dir,
+        10.0,
+        fps,
+        cancel,
+        pause,
+        on_progress,
+        on_log,
+    )
+}
+
+/// Same as `run_encode` but with a caller-chosen J2K compression ratio. Only the
+/// video branch honours it; image/J2K sequences ignore it. Callers that expose a
+/// target bitrate convert it to a ratio first. `fps` sets the J2K edit rate
+/// (0 falls back to 24).
+#[allow(clippy::too_many_arguments)]
+pub fn run_encode_with_ratio(
+    video: &Path,
+    output_dir: &Path,
+    compression_ratio: f64,
+    fps: u32,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    on_progress: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<EncodeResult, String> {
+    let fps = if fps == 0 { 24 } else { fps };
     if !video.exists() {
         return Err(format!("Input not found: {}", video.display()));
     }
@@ -72,11 +101,11 @@ pub fn run_encode(
             let opts = StreamEncodeOptions {
                 input: video.to_path_buf(),
                 output_dir: j2k_dir.clone(),
-                compression_ratio: 10.0,
+                compression_ratio,
                 num_resolutions: 6,
                 codeblock_size: 32,
                 progression: "CPRL".to_string(),
-                fps: 24,
+                fps,
                 compressor_path,
                 lib_dir,
             };

@@ -12,12 +12,13 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 
 | Module | Purpose |
 |--------|---------|
-| `accessibility` | Accessibility compliance checking (CVAA, EAA, AODA, Ofcom) |
+| `accessibility` | Accessibility heuristic scan (CVAA, EAA, AODA, Ofcom); keyword-based, not a certified verdict |
 | `burnin` | Subtitle/watermark burn-in |
 | `certificate` | X.509 certificate generation and trust management |
-| `colour` | Colour space conversion (Rec.709, P3, XYZ) |
+| `colour` | Colour conversion via ffmpeg (Rec.709, P3, Rec.2020); wide-gamut/log spaces need a LUT |
 | `conform` | EDL and FCP7/Resolve XML (xmeml) timeline import and reel assembly (AAF not supported) |
 | `cpl_annotation` | CPL annotation and revision metadata |
+| `cpl_xml` | String-level CPL/OPL XML tag read/write helpers |
 | `dashboard` | HTTP server exposing version and distribution analytics as JSON |
 | `dcdm` | Digital Cinema Distribution Master creation and export |
 | `dolby_vision` | Dolby Vision RPU, HDR10, HLG metadata handling |
@@ -26,7 +27,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `grok` | Grok codec detection and configuration |
 | `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
 | `hash` | SHA-1 / SHA-256 file hashing |
-| `ingest` | Camera raw ingest and transcoding (ARRI, RED, Canon Cinema RAW Light, BRAW; Sony X-OCN detection needs MXF metadata parsing, not yet wired) |
+| `ingest` | Camera format detection (ARRI, RED, Canon Cinema RAW Light, BRAW; Sony X-OCN needs MXF metadata parsing, not wired). Transcodes ffmpeg-decodable inputs (ProRes, DNxHR); camera RAW is rejected loudly (stock ffmpeg cannot decode it) |
 | `j2k` | JPEG 2000 codestream utilities |
 | `job_queue` | Background job scheduling |
 | `loudness` | Audio loudness measurement (EBU R128) |
@@ -36,22 +37,25 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `mxf_wrap` | MXF track file wrapping (picture, audio, Atmos) |
 | `openjpeg_encoder` | OpenJPEG J2K encoder (multi-instance, CPU-only, no GPU dependency) |
 | `otioz_import` | OpenTimelineIO zip bundle import |
+| `packaging` | Shared DCP/IMF CPL, PKL and ASSETMAP XML writers |
 | `pipeline` | Full video-to-DCP streaming pipeline |
 | `plugin` | Python plugin system with pre/post hooks |
 | `preferences` | JSON preferences (XDG/AppData) |
-| `preview` | Frame-accurate DCP/IMF playback and frame extraction |
+| `preview` | Media preview (ffplay) and frame extraction; reads the real frame rate, not DCP-native |
 | `probe` | Media file probing (resolution, codec, duration) |
 | `profiles` | Delivery profile presets |
 | `prores` | ProRes detection and transcoding |
 | `report` | HTML/JSON QC report generation |
 | `rest_api` | Shared REST API server utilities |
 | `shell_completion` | Bash/Zsh/Fish/PowerShell completion generation |
-| `subtitle_retime` | Subtitle timing conversion between framerates |
-| `trailer` | Theatrical trailer packaging (ratings cards, leaders) |
+| `subtitle_retime` | Subtitle timing conversion between framerates; standalone SRT parser |
+| `timecode` | SMPTE timecode and frame-rate math |
+| `trailer` | Theatrical trailer packaging (ratings card + leader concatenated ahead of content) |
 | `version_tracker` | Content versioning database (delivery history) |
 | `watch` | Watch folder automation |
 | `watermark` | Burns a visible text mark into each frame (not forensic/invisible) |
 | `webhook` | HTTP webhook notifications on job completion/failure |
+| `xmldsig` | Enveloped XML-DSig sign/verify (SMPTE 430-3 profile) |
 
 ## Building
 

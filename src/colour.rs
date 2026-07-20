@@ -32,17 +32,26 @@ pub struct ColourConvertOptions {
 }
 
 /// Convert colour space of an image or sequence using ffmpeg.
+///
+/// ffmpeg's `colorspace` filter only models the video primaries/transfer sets:
+/// Rec.709, DCI-P3 and Rec.2020. XYZ (DCDM), ACES, ACEScg and LogC are not
+/// expressible there, so mapping them to bt709 gave silently wrong colour. Those
+/// spaces now require a 3D LUT (`lut_path`); without one the conversion is
+/// rejected. For the Rec.709 to DCI X'Y'Z' transform use `rgb_to_xyz_inplace` /
+/// the `dcdm` module, which implement it correctly.
 pub fn convert_colour(opts: &ColourConvertOptions) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.arg("-y").arg("-i").arg(&opts.input);
 
-    // If a custom LUT is provided, use it
+    // If a custom LUT is provided, use it for any pair of spaces.
     if let Some(ref lut) = opts.lut_path {
         cmd.arg("-vf").arg(format!("lut3d={}", lut.display()));
     } else {
-        // Use ffmpeg colorspace filter for standard conversions
-        let (colorspace, primaries, trc) = ffmpeg_color_params(opts.target_space);
-        let (in_colorspace, in_primaries, in_trc) = ffmpeg_color_params(opts.source_space);
+        // No LUT: only spaces the colorspace filter models are honest here.
+        let (colorspace, primaries, trc) = ffmpeg_color_params(opts.target_space)
+            .ok_or_else(|| unsupported_err(opts.target_space))?;
+        let (in_colorspace, in_primaries, in_trc) = ffmpeg_color_params(opts.source_space)
+            .ok_or_else(|| unsupported_err(opts.source_space))?;
 
         let filter = format!(
             "colorspace=all={colorspace}:iall={in_colorspace}:iprimaries={in_primaries}:itrc={in_trc}:primaries={primaries}:trc={trc}"
@@ -62,14 +71,22 @@ pub fn convert_colour(opts: &ColourConvertOptions) -> std::io::Result<()> {
     Ok(())
 }
 
-fn ffmpeg_color_params(cs: ColourSpace) -> (&'static str, &'static str, &'static str) {
+fn unsupported_err(cs: ColourSpace) -> std::io::Error {
+    std::io::Error::other(format!(
+        "{cs:?} has no ffmpeg colorspace model; supply a 3D LUT (lut_path), or use \
+         the dcdm module for X'Y'Z'"
+    ))
+}
+
+/// ffmpeg colorspace params (matrix, primaries, transfer) for the spaces the
+/// filter can model, or None for spaces that need a LUT instead.
+fn ffmpeg_color_params(cs: ColourSpace) -> Option<(&'static str, &'static str, &'static str)> {
     match cs {
-        ColourSpace::Rec709 => ("bt709", "bt709", "bt709"),
-        ColourSpace::P3 => ("bt709", "smpte431", "bt709"),
-        ColourSpace::Xyz => ("bt709", "bt709", "linear"),
-        ColourSpace::Rec2020 => ("bt2020ncl", "bt2020", "bt2020-10"),
-        ColourSpace::Aces | ColourSpace::AcesCg => ("bt709", "bt709", "linear"),
-        ColourSpace::LogC => ("bt709", "bt709", "log"),
+        ColourSpace::Rec709 => Some(("bt709", "bt709", "bt709")),
+        ColourSpace::P3 => Some(("bt709", "smpte431", "bt709")),
+        ColourSpace::Rec2020 => Some(("bt2020ncl", "bt2020", "bt2020-10")),
+        // XYZ/ACES/ACEScg/LogC are not colorspace-filter expressible.
+        ColourSpace::Xyz | ColourSpace::Aces | ColourSpace::AcesCg | ColourSpace::LogC => None,
     }
 }
 
@@ -79,10 +96,35 @@ mod tests {
 
     #[test]
     fn test_ffmpeg_color_params() {
-        let (cs, p, t) = ffmpeg_color_params(ColourSpace::Rec709);
+        let (cs, p, t) = ffmpeg_color_params(ColourSpace::Rec709).unwrap();
         assert_eq!(cs, "bt709");
         assert_eq!(p, "bt709");
         assert_eq!(t, "bt709");
+    }
+
+    #[test]
+    fn wide_gamut_and_log_spaces_have_no_ffmpeg_model() {
+        for cs in [
+            ColourSpace::Xyz,
+            ColourSpace::Aces,
+            ColourSpace::AcesCg,
+            ColourSpace::LogC,
+        ] {
+            assert!(ffmpeg_color_params(cs).is_none(), "{cs:?} must need a LUT");
+        }
+    }
+
+    #[test]
+    fn convert_rejects_unsupported_space_without_lut() {
+        let opts = ColourConvertOptions {
+            input: "in.tif".into(),
+            output: "out.tif".into(),
+            source_space: ColourSpace::Rec709,
+            target_space: ColourSpace::Aces,
+            lut_path: None,
+        };
+        let err = convert_colour(&opts).unwrap_err();
+        assert!(err.to_string().contains("LUT"), "{err}");
     }
 }
 

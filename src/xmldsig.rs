@@ -218,7 +218,7 @@ fn build_signature_element(
         </ds:X509IssuerSerial>
         <ds:X509Certificate>{cert}</ds:X509Certificate>
       </ds:X509Data>"#,
-            issuer = xml_escape(&meta.issuer_dn),
+            issuer = crate::packaging::escape_xml(&meta.issuer_dn),
             serial = meta.serial,
             cert = meta.der_base64,
         ));
@@ -677,25 +677,6 @@ fn b64d(s: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(s.as_bytes())
         .map_err(|e| format!("value is not valid base64: {e}"))
-}
-
-/// Escape text before it goes into XML.
-///
-/// DNs and titles come from user input or certificates, so without this a value
-/// containing markup could rewrite the surrounding elements.
-pub(crate) fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
 }
 
 /// SHA-256 digest.

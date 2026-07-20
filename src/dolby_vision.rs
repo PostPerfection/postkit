@@ -78,34 +78,44 @@ pub struct HdrMetadataOptions {
     pub output: PathBuf,
 }
 
-/// Inject HDR10 static metadata into a video file using ffmpeg.
+/// Build the libx265 params that embed HDR10 static metadata as SEI: mastering
+/// display colour volume (ST 2086) plus MaxCLL/MaxFALL (CTA 861.3).
+fn x265_hdr10_params(m: &Hdr10Metadata) -> String {
+    format!(
+        "hdr10=1:hdr10-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:\
+         master-display=G({},{})B({},{})R({},{})WP({},{})L({},{}):max-cll={},{}",
+        m.display_primaries_gx,
+        m.display_primaries_gy,
+        m.display_primaries_bx,
+        m.display_primaries_by,
+        m.display_primaries_rx,
+        m.display_primaries_ry,
+        m.white_point_x,
+        m.white_point_y,
+        m.max_luminance,
+        m.min_luminance,
+        m.max_cll,
+        m.max_fall,
+    )
+}
+
+/// Embed HDR10 static metadata (mastering display + MaxCLL/MaxFALL) into a video.
+///
+/// HDR10 metadata lives in HEVC SEI, which cannot be added to an existing stream
+/// with `-c copy`. So this re-encodes the video with libx265, writing the SEI via
+/// x265-params; audio is copied. The output is a genuine HDR10 HEVC stream, not a
+/// container tag that players ignore.
 pub fn inject_hdr10_metadata(opts: &HdrMetadataOptions) -> i32 {
-    let metadata_args = format!(
-        "master-display=G({},{})B({},{})R({},{})WP({},{})L({},{}):max-cll={},{}",
-        opts.hdr10.display_primaries_gx,
-        opts.hdr10.display_primaries_gy,
-        opts.hdr10.display_primaries_bx,
-        opts.hdr10.display_primaries_by,
-        opts.hdr10.display_primaries_rx,
-        opts.hdr10.display_primaries_ry,
-        opts.hdr10.white_point_x,
-        opts.hdr10.white_point_y,
-        opts.hdr10.max_luminance,
-        opts.hdr10.min_luminance,
-        opts.hdr10.max_cll,
-        opts.hdr10.max_fall,
-    );
+    let x265_params = x265_hdr10_params(&opts.hdr10);
 
     let output = std::process::Command::new("ffmpeg")
         .arg("-y")
         .arg("-i")
         .arg(&opts.input)
-        .arg("-c")
-        .arg("copy")
-        .arg("-metadata:s:v")
-        .arg("side_data_type=Mastering display metadata")
-        .arg("-metadata:s:v")
-        .arg(format!("hdr10={metadata_args}"))
+        .args(["-c:v", "libx265", "-pix_fmt", "yuv420p10le"])
+        .arg("-x265-params")
+        .arg(&x265_params)
+        .args(["-c:a", "copy"])
         .arg(&opts.output)
         .output();
 
@@ -482,4 +492,35 @@ pub fn inject_rpu(hevc: &Path, rpu: &Path, output: &Path) -> Result<(), String> 
         return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn x265_params_carry_mastering_display_and_cll() {
+        let m = Hdr10Metadata {
+            display_primaries_rx: 34000,
+            display_primaries_ry: 16000,
+            display_primaries_gx: 13250,
+            display_primaries_gy: 34500,
+            display_primaries_bx: 7500,
+            display_primaries_by: 3000,
+            white_point_x: 15635,
+            white_point_y: 16450,
+            max_luminance: 10000000,
+            min_luminance: 50,
+            max_cll: 1000,
+            max_fall: 400,
+        };
+        let p = x265_hdr10_params(&m);
+        // real SEI signalling, not a copy-only container tag
+        assert!(p.contains("hdr10=1"));
+        assert!(p.contains("transfer=smpte2084"));
+        assert!(p.contains(
+            "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)"
+        ));
+        assert!(p.contains("max-cll=1000,400"));
+    }
 }

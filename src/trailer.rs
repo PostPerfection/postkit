@@ -41,13 +41,18 @@ pub struct TrailerResult {
     pub success: bool,
     pub error: String,
     pub output_dir: PathBuf,
-    pub cpl_uuid: String,
+    /// Concatenated trailer file (ratings card + leader + content).
+    pub output_file: PathBuf,
 }
+
+/// Seconds the ratings card is held on screen.
+const RATINGS_CARD_SECONDS: u32 = 5;
 
 /// Package a trailer (ratings card + leader + content).
 ///
-/// Generates a countdown leader, ratings card TIFF, and assembles them with
-/// the trailer content using ffmpeg into a complete trailer package.
+/// Generates a ratings card and a countdown leader as video clips and
+/// concatenates them ahead of the trailer content with ffmpeg. The card, the
+/// leader and the content are joined in that order into one output file.
 pub fn package_trailer(opts: &TrailerOptions) -> TrailerResult {
     if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
         return TrailerResult {
@@ -96,8 +101,9 @@ pub fn package_trailer(opts: &TrailerOptions) -> TrailerResult {
         &opts.rating
     };
 
-    // Generate ratings card
-    let ratings_card = opts.output_dir.join("ratings_card.png");
+    // Generate ratings card as a video clip so it can be concatenated with the
+    // leader and content (a still image cannot join an mp4 concat list).
+    let ratings_card = opts.output_dir.join("ratings_card.mp4");
     let drawtext = format!(
         "drawtext=text='{}':fontsize=72:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2,drawtext=text='{}':fontsize=36:fontcolor=white:x=(w-text_w)/2:y=(h+text_h)/2+20",
         opts.title.replace('\'', "\\'"),
@@ -110,11 +116,15 @@ pub fn package_trailer(opts: &TrailerOptions) -> TrailerResult {
         .arg("-f")
         .arg("lavfi")
         .arg("-i")
-        .arg(format!("color=c={band_color}:s=1920x1080:d=1"))
+        .arg(format!(
+            "color=c={band_color}:s=1920x1080:d={RATINGS_CARD_SECONDS}:r={fps}"
+        ))
         .arg("-vf")
         .arg(&drawtext)
-        .arg("-frames:v")
-        .arg("1")
+        .arg("-c:v")
+        .arg("libx264")
+        .arg("-pix_fmt")
+        .arg("yuv420p")
         .arg(&ratings_card);
 
     if let Err(error) = run_ffmpeg("ratings card", &mut rc_cmd) {
@@ -154,9 +164,12 @@ pub fn package_trailer(opts: &TrailerOptions) -> TrailerResult {
         };
     }
 
-    // Create concat file list
+    // Create concat file list: ratings card, then leader, then content.
     let concat_file = opts.output_dir.join("concat.txt");
     let mut concat_content = String::new();
+    if ratings_card.exists() {
+        concat_content.push_str(&format!("file '{}'\n", ratings_card.display()));
+    }
     if leader_file.exists() {
         concat_content.push_str(&format!("file '{}'\n", leader_file.display()));
     }
@@ -169,7 +182,7 @@ pub fn package_trailer(opts: &TrailerOptions) -> TrailerResult {
         return TrailerResult {
             success: false,
             error: format!(
-                "Nothing to package: no leader was produced and content_dir {} is not a file",
+                "Nothing to package: no card/leader was produced and content_dir {} is not a file",
                 opts.content_dir.display()
             ),
             ..Default::default()
@@ -206,13 +219,11 @@ pub fn package_trailer(opts: &TrailerOptions) -> TrailerResult {
         };
     }
 
-    let cpl_uuid = uuid::Uuid::new_v4().to_string();
-
     TrailerResult {
         success: true,
         error: String::new(),
         output_dir: opts.output_dir.clone(),
-        cpl_uuid,
+        output_file,
     }
 }
 

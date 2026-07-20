@@ -62,7 +62,8 @@ pub fn measure_loudness(input: &Path) -> LoudnessResult {
                     .as_str()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0),
-                short_term_max_lufs: 0.0,
+                // loudnorm's JSON has no short-term field; measure it separately.
+                short_term_max_lufs: measure_short_term_max(input).unwrap_or(0.0),
                 success: true,
                 error: String::new(),
             };
@@ -73,5 +74,64 @@ pub fn measure_loudness(input: &Path) -> LoudnessResult {
         success: false,
         error: "Failed to parse loudnorm output from ffmpeg".to_string(),
         ..Default::default()
+    }
+}
+
+/// Max short-term (3s window) loudness via ffmpeg's ebur128 filter.
+fn measure_short_term_max(input: &Path) -> Option<f64> {
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-i",
+            &input.to_string_lossy(),
+            "-af",
+            "ebur128",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .ok()?;
+    parse_short_term_max(&String::from_utf8_lossy(&output.stderr))
+}
+
+/// Largest `S:` (short-term LUFS) value in ebur128 stderr output.
+///
+/// ebur128 prints per-window lines like
+/// `[Parsed_ebur128_0 @ ..] t: 3 M: -22.0 S: -19.8 I: -23.0 LUFS ...`; the
+/// short-term max is the largest finite `S:` across them.
+fn parse_short_term_max(stderr: &str) -> Option<f64> {
+    let mut max: Option<f64> = None;
+    for line in stderr.lines() {
+        if let Some(pos) = line.find("S:") {
+            let rest = line[pos + 2..].trim_start();
+            let token = rest.split_whitespace().next().unwrap_or("");
+            if let Ok(v) = token.parse::<f64>()
+                && v.is_finite()
+            {
+                max = Some(max.map_or(v, |m: f64| m.max(v)));
+            }
+        }
+    }
+    max
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_max_short_term_from_ebur128() {
+        let stderr = "\
+[Parsed_ebur128_0 @ 0x1] t: 1.0 M: -30.0 S: -25.0 I: -24.0 LUFS LRA: 2.0 LU
+[Parsed_ebur128_0 @ 0x1] t: 2.0 M: -20.0 S: -18.5 I: -23.0 LUFS LRA: 3.0 LU
+[Parsed_ebur128_0 @ 0x1] t: 3.0 M: -40.0 S: -inf I: -23.0 LUFS LRA: 3.0 LU
+";
+        let v = parse_short_term_max(stderr).unwrap();
+        assert!((v - (-18.5)).abs() < 1e-9, "got {v}");
+    }
+
+    #[test]
+    fn short_term_none_without_measurements() {
+        assert!(parse_short_term_max("no ebur128 lines here").is_none());
     }
 }

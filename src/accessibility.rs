@@ -49,9 +49,11 @@ pub struct AccessibilityFinding {
     pub recommendation: String,
 }
 
-/// Result of accessibility compliance check.
+/// Result of an accessibility heuristic scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessibilityResult {
+    /// Heuristic pass: every required track keyword was found. Not a certified
+    /// compliance verdict, see `check_accessibility`.
     pub compliant: bool,
     pub standard: AccessibilityStandard,
     pub findings: Vec<AccessibilityFinding>,
@@ -61,11 +63,13 @@ pub struct AccessibilityResult {
     pub tracks_missing: Vec<AccessibilityTrack>,
 }
 
-/// Check accessibility compliance of a DCP or IMP.
+/// Heuristic accessibility check of a DCP or IMP.
 ///
-/// Scans the package directory for CPL XML files and checks for the presence
-/// of accessibility-related tracks (AD, HI, SL, CC) as required by the
-/// specified standard.
+/// This is a keyword scan, not a certified compliance test: it concatenates the
+/// package's CPL XML files and looks for accessibility track markers (AD, HI, SL,
+/// CC) by case-insensitive substring, then reports which standard-required tracks
+/// appear to be missing. It does not parse the track structure or MCA labels, so
+/// a `compliant: true` is evidence the keywords are present, not a legal sign-off.
 pub fn check_accessibility(
     package_dir: &std::path::Path,
     standard: AccessibilityStandard,
