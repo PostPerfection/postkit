@@ -50,7 +50,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `trailer` | Theatrical trailer packaging (ratings cards, leaders) |
 | `version_tracker` | Content versioning database (delivery history) |
 | `watch` | Watch folder automation |
-| `watermark` | Forensic watermarking via NexGuard/Civolution SDKs; internal backend burns a visible text mark (not forensic) |
+| `watermark` | Burns a visible text mark into each frame (not forensic/invisible) |
 | `webhook` | HTTP webhook notifications on job completion/failure |
 
 ## Building

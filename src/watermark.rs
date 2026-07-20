@@ -1,29 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-/// Watermark backend.
+/// Visible watermark options.
 ///
-/// NexGuard and Civolution shell out to external forensic SDKs (invisible,
-/// recoverable payloads). Internal is NOT forensic: it burns a visible text
-/// mark into each frame with ffmpeg.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum WatermarkBackend {
-    NexGuard,
-    Civolution,
-    #[default]
-    Internal,
-}
-
-/// Watermark options.
+/// This burns a plainly visible text mark into each frame with ffmpeg drawtext.
+/// It is NOT invisible/forensic watermarking and carries no recoverable payload.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WatermarkOptions {
-    pub backend: WatermarkBackend,
     pub operator_id: String,
     pub session_id: String,
     pub strength: f32,
     pub input_dir: PathBuf,
     pub output_dir: PathBuf,
-    pub license_file: PathBuf,
 }
 
 /// Watermark operation result.
@@ -35,22 +23,10 @@ pub struct WatermarkResult {
     pub payload_hash: String,
 }
 
-/// Embed a watermark into a frame sequence.
-///
-/// The Internal backend burns a visible text mark (the first 8 hex chars of the
-/// operator/session hash plus the session id) into each frame with ffmpeg
-/// drawtext. This is a plainly visible burn-in, not invisible/forensic
-/// watermarking, and carries no recoverable payload.
-/// For NexGuard/Civolution, delegates to external forensic SDK tools.
+/// Burn a visible text mark (first 8 hex chars of the operator/session hash plus
+/// the session id) into each frame with ffmpeg drawtext. Plainly visible, not
+/// forensic.
 pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
-    match opts.backend {
-        WatermarkBackend::Internal => embed_internal(opts),
-        WatermarkBackend::NexGuard => embed_external("nexguard_embedder", opts),
-        WatermarkBackend::Civolution => embed_external("civ_embedder", opts),
-    }
-}
-
-fn embed_internal(opts: &WatermarkOptions) -> WatermarkResult {
     if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
         return WatermarkResult {
             success: false,
@@ -59,16 +35,13 @@ fn embed_internal(opts: &WatermarkOptions) -> WatermarkResult {
         };
     }
 
-    // Generate payload hash from operator + session IDs
+    // Payload hash from operator + session IDs, shown in the visible mark.
     use sha2::Digest;
     let mut hasher = sha2::Sha256::new();
     hasher.update(opts.operator_id.as_bytes());
     hasher.update(opts.session_id.as_bytes());
     let payload_hash = hex::encode(hasher.finalize());
 
-    // Use ffmpeg with drawtext as a visible watermark (spatial forensic watermarking
-    // at the pixel level requires image processing libraries; we use a semi-transparent
-    // text overlay as the internal implementation)
     let frames: Vec<PathBuf> = std::fs::read_dir(&opts.input_dir)
         .into_iter()
         .flatten()
@@ -96,7 +69,6 @@ fn embed_internal(opts: &WatermarkOptions) -> WatermarkResult {
         8 // very faint by default
     };
 
-    // Use ffmpeg to embed a semi-transparent text watermark on each frame
     let ext = frames
         .first()
         .and_then(|f| f.extension())
@@ -139,94 +111,6 @@ fn embed_internal(opts: &WatermarkOptions) -> WatermarkResult {
         Err(e) => WatermarkResult {
             success: false,
             error: format!("Failed to run ffmpeg: {e}"),
-            ..Default::default()
-        },
-    }
-}
-
-fn embed_external(tool_name: &str, opts: &WatermarkOptions) -> WatermarkResult {
-    let output = std::process::Command::new(tool_name)
-        .arg("--input")
-        .arg(&opts.input_dir)
-        .arg("--output")
-        .arg(&opts.output_dir)
-        .arg("--operator")
-        .arg(&opts.operator_id)
-        .arg("--session")
-        .arg(&opts.session_id)
-        .arg("--strength")
-        .arg(opts.strength.to_string())
-        .arg("--license")
-        .arg(&opts.license_file)
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => WatermarkResult {
-            success: true,
-            error: String::new(),
-            frames_processed: 0,
-            payload_hash: String::new(),
-        },
-        Ok(o) => WatermarkResult {
-            success: false,
-            error: String::from_utf8_lossy(&o.stderr).into_owned(),
-            ..Default::default()
-        },
-        Err(e) => WatermarkResult {
-            success: false,
-            error: format!("Failed to run {tool_name}: {e}"),
-            ..Default::default()
-        },
-    }
-}
-
-/// Detect forensic watermark in frame sequence.
-///
-/// The Internal backend has no detector: recovering its payload needs the
-/// unwatermarked reference frames, which this signature does not carry.
-pub fn detect_watermark(
-    input: &Path,
-    backend: WatermarkBackend,
-    license_file: Option<&Path>,
-) -> WatermarkResult {
-    let tool = match backend {
-        WatermarkBackend::NexGuard => "nexguard_detector",
-        WatermarkBackend::Civolution => "civ_detector",
-        WatermarkBackend::Internal => {
-            return WatermarkResult {
-                success: false,
-                error: "Internal backend has no detector: forensic detection requires the \
-                        unwatermarked reference frames. Use the NexGuard or Civolution backend."
-                    .into(),
-                ..Default::default()
-            };
-        }
-    };
-
-    let mut cmd = std::process::Command::new(tool);
-    cmd.arg("--input").arg(input);
-    if let Some(lic) = license_file {
-        cmd.arg("--license").arg(lic);
-    }
-
-    match cmd.output() {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout);
-            WatermarkResult {
-                success: true,
-                error: String::new(),
-                frames_processed: 0,
-                payload_hash: stdout.trim().to_string(),
-            }
-        }
-        Ok(o) => WatermarkResult {
-            success: false,
-            error: String::from_utf8_lossy(&o.stderr).into_owned(),
-            ..Default::default()
-        },
-        Err(e) => WatermarkResult {
-            success: false,
-            error: format!("Failed to run {tool}: {e}"),
             ..Default::default()
         },
     }
