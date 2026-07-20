@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::cpl_xml::{read_tag, strip_urn_uuid, write_tag};
+
 /// Editable metadata field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MetadataField {
@@ -36,38 +38,23 @@ pub fn read_metadata(cpl_path: &Path) -> CompositionMetadata {
         }
     };
 
-    let uuid = extract_xml_text(&content, "Id")
-        .map(|s| s.strip_prefix("urn:uuid:").unwrap_or(&s).to_string())
+    let uuid = read_tag(&content, "Id")
+        .map(|s| strip_urn_uuid(&s).to_string())
         .unwrap_or_default();
-    let title = extract_xml_text(&content, "ContentTitle")
-        .or_else(|| extract_xml_text(&content, "AnnotationText"))
+    let title = read_tag(&content, "ContentTitle")
+        .or_else(|| read_tag(&content, "AnnotationText"))
         .unwrap_or_default();
 
     CompositionMetadata {
         uuid,
         title,
-        annotation: extract_xml_text(&content, "AnnotationText").unwrap_or_default(),
-        issuer: extract_xml_text(&content, "Issuer").unwrap_or_default(),
-        creator: extract_xml_text(&content, "Creator").unwrap_or_default(),
-        issue_date: extract_xml_text(&content, "IssueDate").unwrap_or_default(),
-        content_kind: extract_xml_text(&content, "ContentKind").unwrap_or_default(),
-        rating: extract_xml_text(&content, "Rating").unwrap_or_default(),
+        annotation: read_tag(&content, "AnnotationText").unwrap_or_default(),
+        issuer: read_tag(&content, "Issuer").unwrap_or_default(),
+        creator: read_tag(&content, "Creator").unwrap_or_default(),
+        issue_date: read_tag(&content, "IssueDate").unwrap_or_default(),
+        content_kind: read_tag(&content, "ContentKind").unwrap_or_default(),
+        rating: read_tag(&content, "Rating").unwrap_or_default(),
         custom_fields: Vec::new(),
-    }
-}
-
-fn extract_xml_text(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)?;
-    let after_open = xml[start..].find('>')?;
-    let text_start = start + after_open + 1;
-    let end = xml[text_start..].find(&close)?;
-    let text = xml[text_start..text_start + end].trim();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text.to_string())
     }
 }
 
@@ -86,19 +73,19 @@ pub fn write_metadata(cpl_path: &Path, meta: &CompositionMetadata) -> i32 {
     let mut updated = content;
 
     if !meta.title.is_empty() {
-        updated = replace_xml_text(&updated, "ContentTitle", &meta.title);
+        updated = write_tag(&updated, "ContentTitle", &meta.title);
     }
     if !meta.annotation.is_empty() {
-        updated = replace_xml_text(&updated, "AnnotationText", &meta.annotation);
+        updated = write_tag(&updated, "AnnotationText", &meta.annotation);
     }
     if !meta.issuer.is_empty() {
-        updated = replace_xml_text(&updated, "Issuer", &meta.issuer);
+        updated = write_tag(&updated, "Issuer", &meta.issuer);
     }
     if !meta.creator.is_empty() {
-        updated = replace_xml_text(&updated, "Creator", &meta.creator);
+        updated = write_tag(&updated, "Creator", &meta.creator);
     }
     if !meta.content_kind.is_empty() {
-        updated = replace_xml_text(&updated, "ContentKind", &meta.content_kind);
+        updated = write_tag(&updated, "ContentKind", &meta.content_kind);
     }
 
     match std::fs::write(cpl_path, updated) {
@@ -108,30 +95,6 @@ pub fn write_metadata(cpl_path: &Path, meta: &CompositionMetadata) -> i32 {
             -1
         }
     }
-}
-
-fn replace_xml_text(xml: &str, tag: &str, new_value: &str) -> String {
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-
-    if let Some(start) = xml.find(&open)
-        && let Some(after_open) = xml[start..].find('>')
-    {
-        let text_start = start + after_open + 1;
-        if let Some(end) = xml[text_start..].find(&close) {
-            let escaped = new_value
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
-            return format!(
-                "{}{}{}",
-                &xml[..text_start],
-                escaped,
-                &xml[text_start + end..]
-            );
-        }
-    }
-    xml.to_string()
 }
 
 /// Batch update a field across multiple CPLs.

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::timecode::timecode_to_frames;
+
 #[derive(Debug, Error)]
 pub enum EdlError {
     #[error("File not found: {0}")]
@@ -84,19 +86,6 @@ pub fn parse_edl(opts: &EdlParseOptions) -> Result<EdlParseResult, EdlError> {
         EdlFormat::FcpXml => parse_fcp_xml(&opts.input_file, fps),
         EdlFormat::Aaf => Err(EdlError::UnsupportedFormat("AAF".to_string())),
         EdlFormat::Otio => Err(EdlError::UnsupportedFormat("OTIO".to_string())),
-    }
-}
-
-fn timecode_to_frames(tc: &str, fps: f64) -> u32 {
-    let parts: Vec<&str> = tc.split(':').collect();
-    if parts.len() == 4 {
-        let h: u32 = parts[0].parse().unwrap_or(0);
-        let m: u32 = parts[1].parse().unwrap_or(0);
-        let s: u32 = parts[2].parse().unwrap_or(0);
-        let f: u32 = parts[3].parse().unwrap_or(0);
-        ((h * 3600 + m * 60 + s) as f64 * fps) as u32 + f
-    } else {
-        0
     }
 }
 

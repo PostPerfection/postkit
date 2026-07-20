@@ -7,6 +7,8 @@ use serde::Serialize;
 use thiserror::Error;
 use time::OffsetDateTime;
 
+use crate::cpl_xml::{read_tag, strip_urn_uuid};
+
 #[derive(Debug, Error)]
 pub enum AnnotationError {
     #[error("Cannot open file: {0}")]
@@ -86,12 +88,11 @@ pub fn annotate_cpl(cpl_path: &Path, annotation: &CplAnnotation) -> Result<(), A
 pub fn read_cpl_annotations(cpl_path: &Path) -> Result<CplVersionInfo, AnnotationError> {
     let content = fs::read_to_string(cpl_path)?;
 
-    let cpl_uuid = extract_tag(&content, "Id")
-        .unwrap_or_default()
-        .trim_start_matches("urn:uuid:")
-        .to_string();
-    let title = extract_tag(&content, "ContentTitleText")
-        .or_else(|| extract_tag(&content, "ContentTitle"))
+    let cpl_uuid = read_tag(&content, "Id")
+        .map(|s| strip_urn_uuid(&s).to_string())
+        .unwrap_or_default();
+    let title = read_tag(&content, "ContentTitleText")
+        .or_else(|| read_tag(&content, "ContentTitle"))
         .unwrap_or_default();
 
     let mut annotations = Vec::new();
@@ -101,10 +102,10 @@ pub fn read_cpl_annotations(cpl_path: &Path) -> Result<CplVersionInfo, Annotatio
         let after_open = start + "<Annotation>".len();
         if let Some(end) = remaining[after_open..].find("</Annotation>") {
             let block = &remaining[after_open..after_open + end];
-            let text = extract_tag(block, "Text").unwrap_or_default();
-            let author = extract_tag(block, "Author").unwrap_or_default();
-            let timestamp = extract_tag(block, "Timestamp").unwrap_or_default();
-            let revision = extract_tag(block, "Revision").unwrap_or_default();
+            let text = read_tag(block, "Text").unwrap_or_default();
+            let author = read_tag(block, "Author").unwrap_or_default();
+            let timestamp = read_tag(block, "Timestamp").unwrap_or_default();
+            let revision = read_tag(block, "Revision").unwrap_or_default();
 
             annotations.push(CplAnnotation {
                 author,
@@ -144,14 +145,6 @@ pub fn set_cpl_revision(
         revision: revision.to_string(),
     };
     annotate_cpl(cpl_path, &ann)
-}
-
-fn extract_tag(xml: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].trim().to_string())
 }
 
 #[cfg(test)]

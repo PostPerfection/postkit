@@ -6,7 +6,14 @@ use std::path::{Path, PathBuf};
 pub enum CameraFormat {
     Arriraw,
     RedR3d,
+    /// Sony X-OCN / Sony RAW. Not auto-detected: these are OP1a-MXF wrapped and
+    /// share the .mxf extension and the SMPTE partition-pack key with ArriRaw,
+    /// XAVC and DNxHR. Telling them apart needs MXF header-metadata parsing
+    /// (essence descriptor / format id), which is out of scope here. Documented
+    /// gap, not a shallow signature.
     SonyRaw,
+    /// Canon Cinema RAW Light (.crm), detected by extension or by the ISOBMFF
+    /// `ftyp` brand `crx ` plus a `CNCV` box starting with "CanonCRM".
     CanonRaw,
     BlackmagicBraw,
     ProRes,
@@ -75,6 +82,7 @@ pub fn detect_format(source: &Path) -> CameraFormat {
             "ari" => CameraFormat::Arriraw,
             "r3d" => CameraFormat::RedR3d,
             "braw" => CameraFormat::BlackmagicBraw,
+            "crm" => CameraFormat::CanonRaw,
             "mxf" => CameraFormat::DnxHr,
             "mov" => {
                 if source.is_file() {
@@ -90,6 +98,11 @@ pub fn detect_format(source: &Path) -> CameraFormat {
         }
     }
 
+    // Content sniff for a single file whose extension did not identify it.
+    if source.is_file() && is_cinema_raw_light(source) {
+        return CameraFormat::CanonRaw;
+    }
+
     // Check directory for characteristic files
     if source.is_dir() {
         if has_files_with_ext(source, "ari") {
@@ -101,9 +114,32 @@ pub fn detect_format(source: &Path) -> CameraFormat {
         if has_files_with_ext(source, "braw") {
             return CameraFormat::BlackmagicBraw;
         }
+        if has_files_with_ext(source, "crm") {
+            return CameraFormat::CanonRaw;
+        }
     }
 
     CameraFormat::Unknown
+}
+
+/// Canon Cinema RAW Light (.crm) magic sniff.
+///
+/// CRM is an ISOBMFF container whose first box is `ftyp` with major brand
+/// `crx ` (shared with Canon CR3 stills). The `CNCV` box value disambiguates
+/// them: CRM starts with "CanonCRM", CR3 with "CanonCR3". We read a small
+/// header window and require both the `crx ` brand and the "CanonCRM" marker.
+fn is_cinema_raw_light(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = [0u8; 512];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    let head = &buf[..n];
+    let is_crx = head.len() >= 12 && &head[4..8] == b"ftyp" && &head[8..12] == b"crx ";
+    is_crx && head.windows(8).any(|w| w == b"CanonCRM")
 }
 
 fn has_files_with_ext(dir: &Path, ext: &str) -> bool {
@@ -322,6 +358,50 @@ mod tests {
             CameraFormat::BlackmagicBraw
         );
         assert_eq!(detect_format(Path::new("clip.txt")), CameraFormat::Unknown);
+    }
+
+    #[test]
+    fn test_detect_canon_crm_extension() {
+        assert_eq!(
+            detect_format(Path::new("A001C001.crm")),
+            CameraFormat::CanonRaw
+        );
+        assert_eq!(
+            detect_format(Path::new("A001C001.CRM")),
+            CameraFormat::CanonRaw
+        );
+    }
+
+    fn crx_header(cncv: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        // ftyp box: size, "ftyp", major brand "crx ", minor version, compat brands
+        data.extend_from_slice(&[0, 0, 0, 0x14]);
+        data.extend_from_slice(b"ftyp");
+        data.extend_from_slice(b"crx ");
+        data.extend_from_slice(&[0, 0, 0, 1]);
+        data.extend_from_slice(b"crx ");
+        // CNCV box: size, "CNCV", codec-version string
+        data.extend_from_slice(&[0, 0, 0, 0x2c]);
+        data.extend_from_slice(b"CNCV");
+        data.extend_from_slice(cncv);
+        data
+    }
+
+    #[test]
+    fn test_detect_canon_crm_magic_without_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("clip.bin");
+        std::fs::write(&p, crx_header(b"CanonCRM0001/02.09.00/00.00.00")).unwrap();
+        assert_eq!(detect_format(&p), CameraFormat::CanonRaw);
+    }
+
+    #[test]
+    fn test_cr3_stills_not_detected_as_canon_raw() {
+        // Same crx container brand, but CR3 stills, not Cinema RAW Light.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("photo.bin");
+        std::fs::write(&p, crx_header(b"CanonCR3_001/00.09.00/00.00.00")).unwrap();
+        assert_eq!(detect_format(&p), CameraFormat::Unknown);
     }
 
     #[test]

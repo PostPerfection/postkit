@@ -1,7 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Forensic watermark backend.
+/// Watermark backend.
+///
+/// NexGuard and Civolution shell out to external forensic SDKs (invisible,
+/// recoverable payloads). Internal is NOT forensic: it burns a visible text
+/// mark into each frame with ffmpeg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum WatermarkBackend {
     NexGuard,
@@ -31,11 +35,13 @@ pub struct WatermarkResult {
     pub payload_hash: String,
 }
 
-/// Embed forensic watermark into frame sequence.
+/// Embed a watermark into a frame sequence.
 ///
-/// The Internal backend uses spatial-domain least-significant-bit embedding
-/// with a spread-spectrum payload derived from operator_id + session_id.
-/// For NexGuard/Civolution, delegates to external SDK tools.
+/// The Internal backend burns a visible text mark (the first 8 hex chars of the
+/// operator/session hash plus the session id) into each frame with ffmpeg
+/// drawtext. This is a plainly visible burn-in, not invisible/forensic
+/// watermarking, and carries no recoverable payload.
+/// For NexGuard/Civolution, delegates to external forensic SDK tools.
 pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
     match opts.backend {
         WatermarkBackend::Internal => embed_internal(opts),

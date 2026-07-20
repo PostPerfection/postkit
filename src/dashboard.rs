@@ -131,8 +131,16 @@ pub fn register_version(entry: &VersionEntry) -> i32 {
 
 /// List all versions, optionally filtered.
 pub fn list_versions(territory: Option<&str>, status: Option<&str>) -> Vec<VersionEntry> {
-    let db_path = default_db_path();
-    let conn = match rusqlite::Connection::open(&db_path) {
+    list_versions_at(&default_db_path(), territory, status)
+}
+
+/// List versions from a specific database file.
+pub fn list_versions_at(
+    db_path: &Path,
+    territory: Option<&str>,
+    status: Option<&str>,
+) -> Vec<VersionEntry> {
+    let conn = match rusqlite::Connection::open(db_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
@@ -183,8 +191,12 @@ pub fn list_versions(territory: Option<&str>, status: Option<&str>) -> Vec<Versi
 
 /// List territories with version counts.
 pub fn list_territories() -> Vec<TerritoryInfo> {
-    let db_path = default_db_path();
-    let conn = match rusqlite::Connection::open(&db_path) {
+    list_territories_at(&default_db_path())
+}
+
+/// List territories with version counts from a specific database file.
+pub fn list_territories_at(db_path: &Path) -> Vec<TerritoryInfo> {
+    let conn = match rusqlite::Connection::open(db_path) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
@@ -285,17 +297,90 @@ pub fn export_distribution_matrix(output_csv: &Path) -> i32 {
     }
 }
 
-/// Start the web dashboard.
+/// Endpoints served by the dashboard, for the index/discovery response.
+const DASHBOARD_ENDPOINTS: &[&str] = &[
+    "/",
+    "/health",
+    "/api/versions",
+    "/api/territories",
+    "/api/summary",
+];
+
+/// Build the (status, json) response for a dashboard API path against `db_path`.
 ///
-/// This is a simple REST API that serves version data as JSON.
-/// For a full web UI, use a frontend framework with this as the backend.
-pub fn serve_dashboard(_opts: &DashboardOptions) -> i32 {
-    // A full HTTP server would require axum/actix-web as an optional dependency.
-    // For now, generate a static HTML dashboard file.
-    tracing::info!(
-        "Dashboard server requires async HTTP framework (axum). Use the REST API in the server crate instead."
-    );
-    -1
+/// This is the handler the HTTP server dispatches to; kept separate so it can be
+/// tested directly against a real database without binding a socket.
+pub fn dashboard_response(db_path: &Path, path: &str) -> (u16, String) {
+    match path {
+        "/" | "/health" => (
+            200,
+            serde_json::json!({ "status": "ok", "endpoints": DASHBOARD_ENDPOINTS }).to_string(),
+        ),
+        "/api/versions" => {
+            let versions = list_versions_at(db_path, None, None);
+            (
+                200,
+                serde_json::to_string(&versions).unwrap_or_else(|_| "[]".to_string()),
+            )
+        }
+        "/api/territories" => {
+            let territories = list_territories_at(db_path);
+            (
+                200,
+                serde_json::to_string(&territories).unwrap_or_else(|_| "[]".to_string()),
+            )
+        }
+        "/api/summary" => (200, summary_json(db_path)),
+        _ => (404, r#"{"error":"not found"}"#.to_string()),
+    }
+}
+
+/// Aggregate analytics: totals, per-status and per-territory counts.
+fn summary_json(db_path: &Path) -> String {
+    let versions = list_versions_at(db_path, None, None);
+    let territories = list_territories_at(db_path);
+
+    let mut by_status: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+    for v in &versions {
+        *by_status.entry(v.status.clone()).or_insert(0) += 1;
+    }
+
+    serde_json::json!({
+        "total_versions": versions.len(),
+        "total_territories": territories.len(),
+        "by_status": by_status,
+    })
+    .to_string()
+}
+
+/// Start the web dashboard: a blocking HTTP server serving the version and
+/// distribution data as JSON, built on the shared rest_api server.
+pub fn serve_dashboard(opts: &DashboardOptions) -> i32 {
+    let db_path = if opts.database_path.as_os_str().is_empty() {
+        default_db_path()
+    } else {
+        opts.database_path.clone()
+    };
+
+    let bind = format!("{}:{}", opts.bind_address, opts.http_port);
+    let mut server = crate::rest_api::RestServer::new(&bind);
+
+    for path in DASHBOARD_ENDPOINTS {
+        let db = db_path.clone();
+        server.route(
+            "GET",
+            path,
+            Box::new(move |_method, req_path| dashboard_response(&db, req_path)),
+        );
+    }
+
+    match server.start() {
+        Ok(()) => 0,
+        Err(e) => {
+            tracing::error!("Dashboard server failed to start on {bind}: {e}");
+            -1
+        }
+    }
 }
 
 fn default_db_path() -> PathBuf {
@@ -364,5 +449,73 @@ mod tests {
     fn test_territory_name() {
         assert_eq!(territory_name("US"), "United States");
         assert_eq!(territory_name("ZZ"), "ZZ");
+    }
+
+    fn seed_db(db: &Path) {
+        assert_eq!(init_database(db), 0);
+        let conn = rusqlite::Connection::open(db).unwrap();
+        for (uuid, title, terr, lang, status) in [
+            ("u1", "Feature A", "US", "en", "released"),
+            ("u2", "Feature A", "FR", "fr", "draft"),
+        ] {
+            conn.execute(
+                "INSERT INTO versions (uuid, title, version_type, territory, language, standard, dcp_path, ov_uuid, created_date, status, kdm_recipients) VALUES (?1,?2,'OV',?3,?4,'SMPTE','','','',?5,'[]')",
+                rusqlite::params![uuid, title, terr, lang, status],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_dashboard_response_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        seed_db(&db);
+
+        let (status, body) = dashboard_response(&db, "/api/versions");
+        assert_eq!(status, 200);
+        assert!(body.contains("Feature A"));
+        assert!(body.contains("\"territory\":\"US\""));
+        assert!(body.contains("\"territory\":\"FR\""));
+    }
+
+    #[test]
+    fn test_dashboard_response_territories() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        seed_db(&db);
+
+        let (status, body) = dashboard_response(&db, "/api/territories");
+        assert_eq!(status, 200);
+        assert!(body.contains("United States"));
+        assert!(body.contains("France"));
+    }
+
+    #[test]
+    fn test_dashboard_response_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        seed_db(&db);
+
+        let (status, body) = dashboard_response(&db, "/api/summary");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"total_versions\":2"));
+        assert!(body.contains("\"total_territories\":2"));
+        assert!(body.contains("\"released\":1"));
+        assert!(body.contains("\"draft\":1"));
+    }
+
+    #[test]
+    fn test_dashboard_response_index_and_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        seed_db(&db);
+
+        let (status, body) = dashboard_response(&db, "/");
+        assert_eq!(status, 200);
+        assert!(body.contains("/api/versions"));
+
+        let (status, _) = dashboard_response(&db, "/nope");
+        assert_eq!(status, 404);
     }
 }

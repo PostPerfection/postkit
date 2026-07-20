@@ -1,5 +1,7 @@
 use std::path::Path;
 
+use crate::timecode::parse_frame_rate;
+
 /// Video stream metadata from ffprobe.
 #[derive(Debug, Clone)]
 pub struct VideoInfo {
@@ -97,22 +99,4 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
         has_audio,
         total_frames,
     })
-}
-
-fn parse_frame_rate(s: &str) -> Option<(u32, u32)> {
-    if let Some((num, den)) = s.split_once('/') {
-        Some((num.parse().ok()?, den.parse().ok()?))
-    } else {
-        // Might be a plain number like "24"
-        let fps: f64 = s.parse().ok()?;
-        // Convert common rates
-        let (num, den) = match fps as u32 {
-            24 => (24, 1),
-            25 => (25, 1),
-            30 => (30, 1),
-            48 => (48, 1),
-            _ => ((fps * 1000.0) as u32, 1000),
-        };
-        Some((num, den))
-    }
 }

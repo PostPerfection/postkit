@@ -16,9 +16,9 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `burnin` | Subtitle/watermark burn-in |
 | `certificate` | X.509 certificate generation and trust management |
 | `colour` | Colour space conversion (Rec.709, P3, XYZ) |
-| `conform` | EDL/AAF/XML timeline import and reel assembly |
+| `conform` | EDL and FCP7/Resolve XML (xmeml) timeline import and reel assembly (AAF not supported) |
 | `cpl_annotation` | CPL annotation and revision metadata |
-| `dashboard` | Real-time job monitoring and analytics dashboard |
+| `dashboard` | HTTP server exposing version and distribution analytics as JSON |
 | `dcdm` | Digital Cinema Distribution Master creation and export |
 | `dolby_vision` | Dolby Vision RPU, HDR10, HLG metadata handling |
 | `edl_import` | EDL/FCP XML timeline parsing and import |
@@ -26,7 +26,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `grok` | Grok codec detection and configuration |
 | `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
 | `hash` | SHA-1 / SHA-256 file hashing |
-| `ingest` | Camera raw ingest and transcoding (ARRI, RED, Sony, Canon, BRAW) |
+| `ingest` | Camera raw ingest and transcoding (ARRI, RED, Canon Cinema RAW Light, BRAW; Sony X-OCN detection needs MXF metadata parsing, not yet wired) |
 | `j2k` | JPEG 2000 codestream utilities |
 | `job_queue` | Background job scheduling |
 | `loudness` | Audio loudness measurement (EBU R128) |
@@ -50,7 +50,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `trailer` | Theatrical trailer packaging (ratings cards, leaders) |
 | `version_tracker` | Content versioning database (delivery history) |
 | `watch` | Watch folder automation |
-| `watermark` | Forensic watermarking (NexGuard, Civolution, internal) |
+| `watermark` | Forensic watermarking via NexGuard/Civolution SDKs; internal backend burns a visible text mark (not forensic) |
 | `webhook` | HTTP webhook notifications on job completion/failure |
 
 ## Building
