@@ -78,10 +78,16 @@ pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
     let input_pattern = opts.input_dir.join(format!("*.{ext}"));
     let output_pattern = opts.output_dir.join(format!("%06d.{ext}"));
 
-    let watermark_text = format!("{}:{}", &payload_hash[..8], opts.session_id);
+    // Keep the mark to characters drawtext handles without filtergraph escaping
+    // headaches (a raw ':' or '\'' in the text breaks ffmpeg's filter parser).
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect()
+    };
+    let watermark_text = format!("{}_{}", &payload_hash[..8], sanitize(&opts.session_id));
     let filter = format!(
-        "drawtext=text='{}':fontsize=10:fontcolor=white@0.{:02}:x=10:y=h-20",
-        watermark_text.replace('\'', "\\'"),
+        "drawtext=text='{watermark_text}':fontsize=10:fontcolor=white@0.{:02}:x=10:y=h-20",
         strength.min(99)
     );
 
