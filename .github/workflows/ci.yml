@@ -20,7 +20,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libssl-dev libxerces-c-dev
+          sudo apt-get install -y cmake libssl-dev libxerces-c-dev xmlsec1 libxml2-utils
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'

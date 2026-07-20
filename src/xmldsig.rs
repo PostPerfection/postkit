@@ -24,6 +24,9 @@ use quick_xml::reader::Reader;
 pub(crate) const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 /// Inclusive Canonical XML 1.0, WithComments.
 pub(crate) const C14N_METHOD: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
+/// Enveloped-signature transform: digest the document with ds:Signature removed.
+pub(crate) const ENVELOPED_TRANSFORM: &str =
+    "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
 /// RSASSA-PKCS1-v1_5 over SHA-256.
 pub(crate) const SIG_METHOD: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 /// SHA-256 digest.
@@ -62,10 +65,6 @@ pub fn sign_enveloped(
         return Err("signer private key is required to sign".into());
     }
 
-    // Load the signing key and prove it belongs to the signer certificate.
-    let leaf_public_key = cert_rsa_public_key(&signer.cert_file)?;
-    let private_key = load_signer_key(&signer.key_file, &leaf_public_key)?;
-
     // One ds:Reference per referenced element, digested over its canonical form.
     let mut references = String::new();
     for id in reference_ids {
@@ -80,6 +79,83 @@ pub fn sign_enveloped(
       </ds:Reference>"##,
         ));
     }
+
+    let (element, insert_offset) =
+        build_signature_element(xml, &references, parent_id, id_attr, signer)?;
+
+    // Insert as the last child of the parent, indented like its siblings. The
+    // by-Id digests are over the referenced elements, so this surrounding
+    // whitespace does not affect them.
+    let mut out = String::with_capacity(xml.len() + element.len() + 3);
+    out.push_str(&xml[..insert_offset]);
+    out.push_str("  ");
+    out.push_str(&element);
+    out.push('\n');
+    out.push_str(&xml[insert_offset..]);
+    Ok(out)
+}
+
+/// Sign an XML document with the standard whole-document enveloped signature
+/// profile (W3C XML-DSig, SMPTE 2067-3 IMF CPL/PKL): one `<ds:Reference URI="">`
+/// whose transforms are enveloped-signature then inclusive C14N, digesting the
+/// entire document with the ds:Signature removed.
+///
+/// No Id attributes are added, so a verifier needs no `--id-attr` hints. The
+/// ds:Signature is inserted as the last child of the document root with no
+/// surrounding whitespace: since it is the last child, "document minus Signature"
+/// then equals the original unsigned document, and the reference digest is over
+/// `c14n(unsigned document root)`.
+pub fn sign_document_enveloped(xml: &str, signer: &XmlSigner) -> Result<String, String> {
+    // The reference digest is over the whole document with ds:Signature removed.
+    // Before signing there is no ds:Signature, and c14n drops the XML
+    // declaration and whitespace outside the root, so this is c14n of the root.
+    let root_fragment =
+        find_element_fragment(xml, &|_| Ok(true))?.ok_or("document has no root element to sign")?;
+    let digest = b64(&sha256(&c14n(&root_fragment)?));
+
+    let references = format!(
+        r##"
+      <ds:Reference URI="">
+        <ds:Transforms>
+          <ds:Transform Algorithm="{ENVELOPED_TRANSFORM}"/>
+          <ds:Transform Algorithm="{C14N_METHOD}"/>
+        </ds:Transforms>
+        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
+        <ds:DigestValue>{digest}</ds:DigestValue>
+      </ds:Reference>"##,
+    );
+
+    let (element, insert_offset) = build_signature_element(xml, &references, None, "Id", signer)?;
+
+    // Insert with no surrounding whitespace so removing the Signature element
+    // restores the original document byte-for-byte, matching the digest input.
+    let mut out = String::with_capacity(xml.len() + element.len());
+    out.push_str(&xml[..insert_offset]);
+    out.push_str(&element);
+    out.push_str(&xml[insert_offset..]);
+    Ok(out)
+}
+
+/// Build the ds:Signature element (no surrounding whitespace) and the byte offset
+/// where it is inserted, given the caller-built ds:Reference block(s). Shared by
+/// the by-Id and whole-document enveloped signers.
+fn build_signature_element(
+    xml: &str,
+    references: &str,
+    parent_id: Option<&str>,
+    id_attr: &str,
+    signer: &XmlSigner,
+) -> Result<(String, usize), String> {
+    if signer.cert_file.as_os_str().is_empty() {
+        return Err("signer certificate is required to sign".into());
+    }
+    if signer.key_file.as_os_str().is_empty() {
+        return Err("signer private key is required to sign".into());
+    }
+
+    // Load the signing key and prove it belongs to the signer certificate.
+    let leaf_public_key = cert_rsa_public_key(&signer.cert_file)?;
+    let private_key = load_signer_key(&signer.key_file, &leaf_public_key)?;
 
     // Where the signature is inserted, and the namespaces in scope there.
     let (parent_scope, insert_offset) = find_parent(xml, parent_id, id_attr)?;
@@ -148,21 +224,15 @@ pub fn sign_enveloped(
         ));
     }
 
-    let signature_block = format!(
-        r#"  {signature_open}
+    let element = format!(
+        r#"{signature_open}
     <ds:SignedInfo>{signed_info_inner}</ds:SignedInfo>
     <ds:SignatureValue>{signature_value}</ds:SignatureValue>
     <ds:KeyInfo>{key_info}
     </ds:KeyInfo>
-  </ds:Signature>
-"#,
+  </ds:Signature>"#,
     );
-
-    let mut out = String::with_capacity(xml.len() + signature_block.len());
-    out.push_str(&xml[..insert_offset]);
-    out.push_str(&signature_block);
-    out.push_str(&xml[insert_offset..]);
-    Ok(out)
+    Ok((element, insert_offset))
 }
 
 /// Verify an enveloped ds:Signature: recompute every reference digest, then
@@ -197,6 +267,49 @@ pub fn verify_enveloped(
         }
     }
 
+    verify_signed_info(&parsed, &signed_info_c14n, trusted_cert)
+}
+
+/// Verify a standard whole-document enveloped ds:Signature (`URI=""`,
+/// enveloped-signature + C14N transforms): detach the ds:Signature, recompute the
+/// document digest over the remaining canonical document, then check the RSA
+/// signature over SignedInfo. Needs no `--id-attr` hints, unlike the by-Id mode.
+pub fn verify_document_enveloped(xml: &str, trusted_cert: Option<&Path>) -> Result<(), String> {
+    let signed_info_fragment =
+        find_element_fragment(xml, &|e| Ok(e.local_name().as_ref() == b"SignedInfo"))?
+            .ok_or("document has no ds:SignedInfo")?;
+    let signed_info_c14n = c14n(&signed_info_fragment)?;
+
+    let parsed = parse_signature(xml)?;
+    if parsed.references.is_empty() {
+        return Err("signature has no ds:Reference".into());
+    }
+
+    // Enveloped-signature transform: digest the document with ds:Signature gone.
+    // It is the last child inserted with no surrounding whitespace, so removing
+    // it restores the original document, whose c14n is the c14n of its root.
+    let (start, end) = find_signature_span(xml)?;
+    let mut unsigned = String::with_capacity(xml.len() - (end - start));
+    unsigned.push_str(&xml[..start]);
+    unsigned.push_str(&xml[end..]);
+    let root_fragment =
+        find_element_fragment(&unsigned, &|_| Ok(true))?.ok_or("document has no root element")?;
+    let actual = b64(&sha256(&c14n(&root_fragment)?));
+    let expected = &parsed.references[0].1;
+    if &actual != expected {
+        return Err("digest mismatch for the enveloped document reference".into());
+    }
+
+    verify_signed_info(&parsed, &signed_info_c14n, trusted_cert)
+}
+
+/// Check the RSA signature over the canonical SignedInfo against the embedded
+/// leaf certificate, or the pinned trusted certificate when given.
+fn verify_signed_info(
+    parsed: &ParsedSignature,
+    signed_info_c14n: &[u8],
+    trusted_cert: Option<&Path>,
+) -> Result<(), String> {
     let embedded_key = rsa_public_key_from_der(&parsed.leaf_cert_der)?;
     let verify_key = match trusted_cert {
         Some(path) => {
@@ -214,11 +327,33 @@ pub fn verify_enveloped(
     verify_key
         .verify(
             rsa::Pkcs1v15Sign::new::<sha2::Sha256>(),
-            &sha256(&signed_info_c14n),
+            &sha256(signed_info_c14n),
             &parsed.signature_value,
         )
         .map_err(|e| format!("signature verification failed: {e}"))?;
     Ok(())
+}
+
+/// Byte range of the ds:Signature element (from '<' through its end tag).
+fn find_signature_span(xml: &str) -> Result<(usize, usize), String> {
+    let mut reader = Reader::from_str(xml);
+    loop {
+        let start = reader.buffer_position() as usize;
+        match reader
+            .read_event()
+            .map_err(|e| format!("document is not valid XML: {e}"))?
+        {
+            Event::Start(e) if e.local_name().as_ref() == b"Signature" => {
+                reader
+                    .read_to_end(e.name().to_owned())
+                    .map_err(|err| format!("cannot read ds:Signature subtree: {err}"))?;
+                let end = reader.buffer_position() as usize;
+                return Ok((start, end));
+            }
+            Event::Eof => return Err("document has no ds:Signature".into()),
+            _ => {}
+        }
+    }
 }
 
 /// Namespace declarations (prefix, uri) an element carries; "" is the default.
@@ -945,6 +1080,17 @@ mod tests {
             .expect("run xmlsec1")
     }
 
+    // Standard enveloped profile: verify with no --id-attr hints at all.
+    fn xmlsec1_verify_no_id(doc: &Path, trusted_pem: &Path) -> std::process::Output {
+        std::process::Command::new("xmlsec1")
+            .arg("--verify")
+            .arg("--trusted-pem")
+            .arg(trusted_pem)
+            .arg(doc)
+            .output()
+            .expect("run xmlsec1")
+    }
+
     #[test]
     fn generic_doc_signature_verifies_with_xmlsec1() {
         if !xmlsec1_available() {
@@ -1033,6 +1179,76 @@ mod tests {
         let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
         let err = verify_enveloped(&tampered, "Id", None)
             .expect_err("tampered reference must fail verification");
+        assert!(err.contains("digest mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn document_enveloped_signature_verifies_with_xmlsec1() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let signed = sign_document_enveloped(&cpl_doc(), &leaf_signer(c))
+            .expect("sign document (enveloped)");
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("cpl-enveloped.xml");
+        std::fs::write(&out, &signed).unwrap();
+
+        // The whole point of the standard profile: NO --id-attr hints needed.
+        let result = xmlsec1_verify_no_id(&out, &c.root);
+        eprintln!(
+            "xmlsec1 --verify (enveloped, no --id-attr):\n  status: {}\n  stdout: {}\n  stderr: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout).trim(),
+            String::from_utf8_lossy(&result.stderr).trim(),
+        );
+        assert!(
+            result.status.success(),
+            "xmlsec1 must verify the enveloped document with no --id-attr hints"
+        );
+    }
+
+    #[test]
+    fn document_enveloped_tamper_fails_xmlsec1() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let signed = sign_document_enveloped(&cpl_doc(), &leaf_signer(c))
+            .expect("sign document (enveloped)");
+        let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
+        assert_ne!(signed, tampered, "tamper must change the document");
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("cpl-enveloped-tampered.xml");
+        std::fs::write(&out, &tampered).unwrap();
+
+        assert!(
+            !xmlsec1_verify_no_id(&out, &c.root).status.success(),
+            "xmlsec1 must reject a tampered enveloped document"
+        );
+    }
+
+    #[test]
+    fn verify_document_enveloped_accepts_good_and_rejects_tampering() {
+        let c = chain();
+        let signed = sign_document_enveloped(&cpl_doc(), &leaf_signer(c))
+            .expect("sign document (enveloped)");
+
+        verify_document_enveloped(&signed, None).expect("self-consistent signature must verify");
+        verify_document_enveloped(&signed, Some(&c.signer))
+            .expect("signature must verify against the pinned leaf cert");
+        assert!(
+            verify_document_enveloped(&signed, Some(&c.root)).is_err(),
+            "a non-matching trusted cert must fail"
+        );
+
+        let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
+        let err = verify_document_enveloped(&tampered, None)
+            .expect_err("tampered document must fail verification");
         assert!(err.contains("digest mismatch"), "got: {err}");
     }
 
