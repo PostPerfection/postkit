@@ -40,3 +40,4 @@ pub mod version_tracker;
 pub mod watch;
 pub mod watermark;
 pub mod webhook;
+pub mod xmldsig;

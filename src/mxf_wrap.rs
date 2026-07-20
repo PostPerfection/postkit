@@ -324,6 +324,106 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
     }
 }
 
+/// The audio parameters and PCM payload location parsed from a WAV file.
+#[derive(Debug)]
+struct WavFormat {
+    channels: u16,
+    sample_rate: u32,
+    bits_per_sample: u16,
+    /// Byte offset and length of the `data` chunk payload.
+    data_offset: usize,
+    data_len: usize,
+}
+
+const WAVE_FORMAT_PCM: u16 = 0x0001;
+const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+fn le_u16(d: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([d[off], d[off + 1]])
+}
+
+fn le_u32(d: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
+}
+
+/// Parse a RIFF/WAVE header: read the `fmt ` chunk and locate the `data` chunk.
+///
+/// Only linear PCM is accepted (tag 1, or WAVE_FORMAT_EXTENSIBLE whose subformat
+/// is PCM). Anything malformed or non-PCM is an error rather than a wrong MXF.
+fn parse_wav(data: &[u8]) -> Result<WavFormat, String> {
+    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+        return Err("not a RIFF/WAVE file".into());
+    }
+
+    let mut fmt: Option<(u16, u16, u32, u16)> = None; // (tag, channels, rate, bits)
+    let mut data_chunk: Option<(usize, usize)> = None;
+
+    // Chunks start after the 12-byte RIFF/WAVE header; each is an 8-byte header
+    // (4-byte id + 4-byte LE size) followed by size bytes, padded to even.
+    let mut pos = 12usize;
+    while pos + 8 <= data.len() {
+        let id = &data[pos..pos + 4];
+        let size = le_u32(data, pos + 4) as usize;
+        let body = pos + 8;
+        if body + size > data.len() {
+            return Err(format!(
+                "chunk '{}' claims {size} bytes past end of file",
+                String::from_utf8_lossy(id)
+            ));
+        }
+
+        if id == b"fmt " {
+            if size < 16 {
+                return Err("fmt chunk is too short".into());
+            }
+            let mut tag = le_u16(data, body);
+            let channels = le_u16(data, body + 2);
+            let sample_rate = le_u32(data, body + 4);
+            let bits = le_u16(data, body + 14);
+            // WAVE_FORMAT_EXTENSIBLE stores the real tag in the SubFormat GUID.
+            if tag == WAVE_FORMAT_EXTENSIBLE {
+                if size < 40 {
+                    return Err("extensible fmt chunk is too short for a SubFormat".into());
+                }
+                tag = le_u16(data, body + 24);
+            }
+            fmt = Some((tag, channels, sample_rate, bits));
+        } else if id == b"data" {
+            data_chunk = Some((body, size));
+        }
+
+        pos = body + size + (size & 1);
+    }
+
+    let (tag, channels, sample_rate, bits) = fmt.ok_or("no fmt chunk")?;
+    if tag != WAVE_FORMAT_PCM {
+        return Err(format!("audio format {tag:#06x} is not linear PCM"));
+    }
+    if channels == 0 || sample_rate == 0 || bits == 0 || bits % 8 != 0 {
+        return Err(format!(
+            "unusable PCM parameters: {channels} channels, {sample_rate} Hz, {bits} bits"
+        ));
+    }
+    let (data_offset, data_len) = data_chunk.ok_or("no data chunk")?;
+
+    Ok(WavFormat {
+        channels,
+        sample_rate,
+        bits_per_sample: bits,
+        data_offset,
+        data_len,
+    })
+}
+
+/// Map a channel count to a SMPTE channel configuration where one applies; other
+/// counts get no configuration label (the caller can add MCA labels).
+fn channel_format_for(channels: u32) -> asdcplib::pcm::ChannelFormat {
+    match channels {
+        6 => asdcplib::pcm::ChannelFormat::Cfg1, // 5.1
+        _ => asdcplib::pcm::ChannelFormat::None,
+    }
+}
+
 fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
     if opts.input_files.is_empty() {
         return MxfTrackFile {
@@ -332,8 +432,6 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    // Read WAV data — for simplicity, read the entire file as raw PCM
-    // A real implementation would parse WAV headers
     let wav_data = match std::fs::read(&opts.input_files[0]) {
         Ok(d) => d,
         Err(e) => {
@@ -344,18 +442,27 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     };
 
+    // Parse the real RIFF/WAVE header instead of assuming 5.1/24-bit/48k.
+    let wav = match parse_wav(&wav_data) {
+        Ok(w) => w,
+        Err(e) => {
+            return MxfTrackFile {
+                error: format!("invalid WAV {}: {e}", opts.input_files[0].display()),
+                ..Default::default()
+            };
+        }
+    };
+
     let info = make_writer_info();
-    let channels = 6u32; // default 5.1
-    let bits = 24u32;
-    let sample_rate = 48000u32;
+    let channels = wav.channels as u32;
+    let bits = wav.bits_per_sample as u32;
+    let sample_rate = wav.sample_rate;
     let block_align = (bits / 8) * channels;
     let samples_per_frame =
         (sample_rate as f64 / (opts.fps_num as f64 / opts.fps_den as f64)).ceil() as u32;
     let frame_size = samples_per_frame * block_align;
 
-    // Skip WAV header (44 bytes for standard WAV)
-    let pcm_start = if wav_data.len() > 44 { 44 } else { 0 };
-    let pcm_data = &wav_data[pcm_start..];
+    let pcm_data = &wav_data[wav.data_offset..wav.data_offset + wav.data_len];
     let num_frames = (pcm_data.len() as u32).checked_div(frame_size).unwrap_or(0);
 
     let desc = asdcplib::pcm::AudioDescriptor {
@@ -368,7 +475,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         avg_bps: sample_rate * block_align,
         linked_track_id: 0,
         container_duration: num_frames,
-        channel_format: asdcplib::pcm::ChannelFormat::Cfg1,
+        channel_format: channel_format_for(channels),
     };
 
     let mut writer = PcmWriter::new(opts.standard);
@@ -603,5 +710,109 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
         path: opts.output.clone(),
         success: true,
         error: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal PCM WAV (fmt + data chunks) with the given parameters.
+    fn make_wav(channels: u16, sample_rate: u32, bits: u16, sample_frames: u32) -> Vec<u8> {
+        let block_align = (bits / 8) as u32 * channels as u32;
+        let data_len = block_align * sample_frames;
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data_len).to_le_bytes());
+        w.extend_from_slice(b"WAVE");
+        w.extend_from_slice(b"fmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&WAVE_FORMAT_PCM.to_le_bytes());
+        w.extend_from_slice(&channels.to_le_bytes());
+        w.extend_from_slice(&sample_rate.to_le_bytes());
+        w.extend_from_slice(&(sample_rate * block_align).to_le_bytes()); // byte rate
+        w.extend_from_slice(&(block_align as u16).to_le_bytes());
+        w.extend_from_slice(&bits.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&data_len.to_le_bytes());
+        w.resize(w.len() + data_len as usize, 0);
+        w
+    }
+
+    #[test]
+    fn parse_wav_reads_non_default_params() {
+        let wav = make_wav(2, 44100, 16, 100);
+        let f = parse_wav(&wav).expect("parse");
+        assert_eq!(f.channels, 2);
+        assert_eq!(f.sample_rate, 44100);
+        assert_eq!(f.bits_per_sample, 16);
+        assert_eq!(f.data_len, 2 * 2 * 100);
+        assert_eq!(&wav[f.data_offset..f.data_offset + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn parse_wav_rejects_malformed_and_non_pcm() {
+        assert!(parse_wav(b"not a wav at all").is_err());
+
+        // Float (tag 3) is not linear PCM.
+        let mut wav = make_wav(2, 48000, 32, 10);
+        wav[20..22].copy_from_slice(&3u16.to_le_bytes());
+        let err = parse_wav(&wav).expect_err("float must be rejected");
+        assert!(err.contains("not linear PCM"), "got: {err}");
+    }
+
+    #[test]
+    fn wrap_pcm_descriptor_reflects_the_input_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("in.wav");
+        // 2ch / 96000 / 16-bit, one second: all non-default vs the old 5.1/24/48k
+        // (44100 is exercised by parse_wav; asdcplib only wraps 48k/96k for DCP).
+        std::fs::write(&wav_path, make_wav(2, 96000, 16, 96000)).unwrap();
+        let out = dir.path().join("out.mxf");
+
+        let opts = MxfWrapOptions {
+            input_files: vec![wav_path],
+            output: out.clone(),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+        };
+        let result = wrap_pcm(&opts);
+        assert!(result.success, "wrap failed: {}", result.error);
+
+        let mut reader = asdcplib::pcm::MxfReader::new();
+        reader
+            .open_read(&out.to_string_lossy())
+            .expect("open the wrapped MXF");
+        let desc = reader.audio_descriptor().expect("read audio descriptor");
+        assert_eq!(desc.channel_count, 2, "channel count");
+        assert_eq!(desc.audio_sampling_rate.numerator, 96000, "sample rate");
+        assert_eq!(desc.quantization_bits, 16, "bit depth");
+        assert_eq!(desc.block_align, 4, "block align = 2ch * 16-bit");
+    }
+
+    #[test]
+    fn wrap_pcm_errors_on_a_non_wav_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("bogus.wav");
+        std::fs::write(&bogus, b"this is not a wav file").unwrap();
+        let opts = MxfWrapOptions {
+            input_files: vec![bogus],
+            output: dir.path().join("out.mxf"),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+        };
+        let result = wrap_pcm(&opts);
+        assert!(!result.success, "must not wrap a non-WAV file");
+        assert!(
+            result.error.contains("invalid WAV"),
+            "got: {}",
+            result.error
+        );
     }
 }

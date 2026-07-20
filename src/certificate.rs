@@ -1,3 +1,4 @@
+use crate::xmldsig::{DSIG_NS, XmlSigner, xml_escape};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -605,40 +606,15 @@ const KDM_ENCRYPTION_METHOD: &str = "http://www.w3.org/2001/04/xmlenc#rsa-oaep-m
 
 // SMPTE 430-3 ETM ds:Signature profile. Every URI below is what libdcp emits
 // in src/encrypted_kdm.cc / src/certificate_chain.cc for a KDM (distinct from
-// the CPL/PKL signer), and is what DCI-compliant playback gear checks.
+// the CPL/PKL signer), and is what DCI-compliant playback gear checks. The
+// DSIG/c14n/signature/digest URIs live in `xmldsig`, the shared signer.
 const ETM_NS: &str = "http://www.smpte-ra.org/schemas/430-3/2006/ETM";
 const KDM_NS: &str = "http://www.smpte-ra.org/schemas/430-1/2006/KDM";
-const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const ENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
-/// Inclusive Canonical XML 1.0, WithComments. libdcp KDM uses exactly this URI
-/// (not exclusive c14n, not the plain variant the CPL signer uses).
-const C14N_METHOD: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
-/// RSASSA-PKCS1-v1_5 over SHA-256.
-const SIG_METHOD: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-const DIGEST_METHOD: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
 /// Id attribute values on the two authenticated elements. The ds:Reference
 /// URIs point at these, and a verifier resolves them via the Id attribute.
 const AUTH_PUBLIC_ID: &str = "ID_AuthenticatedPublic";
 const AUTH_PRIVATE_ID: &str = "ID_AuthenticatedPrivate";
-
-/// Escape text before it goes into the KDM XML.
-///
-/// Content titles come from user input, so without this a title containing
-/// markup could rewrite the surrounding KDM elements.
-fn xml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
 
 /// Check a validity timestamp is the exact 25-byte form ST 430-1 requires.
 ///
@@ -923,10 +899,7 @@ fn build_kdm_xml(
     let signer_issuer = xml_escape(&signer.issuer_dn);
     let signer_serial = xml_escape(&signer.serial);
 
-    // Inner content of the two authenticated elements. Each is reused twice:
-    // once inside the document, and once (in build_signature) inside a
-    // standalone fragment that carries the document root's namespaces so its
-    // canonical form is byte-identical to the subtree the verifier digests.
+    // Inner content of the two authenticated elements the signer references.
     let auth_public_inner = format!(
         r#"
     <MessageId>urn:uuid:{message_id}</MessageId>
@@ -963,424 +936,30 @@ fn build_kdm_xml(
 
     let auth_private_inner = format!("\n{encrypted_keys}  ");
 
-    let signature = build_signature(config, &auth_public_inner, &auth_private_inner)?;
-
-    // The root declares the ETM default namespace plus xmlns:ds, exactly the
-    // set the standalone fragments in build_signature reproduce.
-    Ok(format!(
+    // Build the unsigned message, then sign it with the shared enveloped-XML
+    // signer. The root declares the ETM default namespace plus xmlns:ds, so the
+    // signer reuses that ds prefix and produces a ds:Signature as the last child.
+    let unsigned = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <DCinemaSecurityMessage xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}">
   <AuthenticatedPublic Id="{AUTH_PUBLIC_ID}">{auth_public_inner}</AuthenticatedPublic>
   <AuthenticatedPrivate Id="{AUTH_PRIVATE_ID}">{auth_private_inner}</AuthenticatedPrivate>
-{signature}
 </DCinemaSecurityMessage>
 "#,
-    ))
-}
-
-/// Build the ETM ds:Signature block (indented as the last child of
-/// DCinemaSecurityMessage), signing over the two authenticated elements.
-///
-/// Canonicalization is the pure-Rust `c14n` below (inclusive Canonical XML 1.0,
-/// matching libxml2, the engine xmlsec1 verifies with) so the digested bytes
-/// match to the byte. Signing itself uses the `rsa` crate. Every failure is
-/// fatal: a KDM must never be written with an absent, empty or placeholder
-/// signature.
-fn build_signature(
-    config: &KdmConfig,
-    auth_public_inner: &str,
-    auth_private_inner: &str,
-) -> Result<String, String> {
-    use base64::Engine;
-
-    if config.signer_key_file.as_os_str().is_empty() {
-        return Err("signer private key is required to sign the KDM".into());
-    }
-
-    // Load the signing key and prove it belongs to the signer certificate.
-    let leaf_public_key = cert_rsa_public_key(&config.signer_cert_file)?;
-    let private_key = load_signer_key(&config.signer_key_file, &leaf_public_key)?;
-
-    // Digest each authenticated element over its canonical form. The fragment
-    // apex carries the root's in-scope namespaces (ETM default + ds); under
-    // inclusive c14n those are rendered on the apex of every digested subtree,
-    // so this matches what the verifier computes in place.
-    let auth_public_fragment = format!(
-        r#"<AuthenticatedPublic xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}" Id="{AUTH_PUBLIC_ID}">{auth_public_inner}</AuthenticatedPublic>"#,
-    );
-    let auth_private_fragment = format!(
-        r#"<AuthenticatedPrivate xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}" Id="{AUTH_PRIVATE_ID}">{auth_private_inner}</AuthenticatedPrivate>"#,
-    );
-    let public_digest =
-        base64::engine::general_purpose::STANDARD.encode(sha256(&c14n(&auth_public_fragment)?));
-    let private_digest =
-        base64::engine::general_purpose::STANDARD.encode(sha256(&c14n(&auth_private_fragment)?));
-
-    // SignedInfo inner content, reused for the digest input and the document.
-    let signed_info_inner = format!(
-        r##"
-      <ds:CanonicalizationMethod Algorithm="{C14N_METHOD}"/>
-      <ds:SignatureMethod Algorithm="{SIG_METHOD}"/>
-      <ds:Reference URI="#{AUTH_PUBLIC_ID}">
-        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
-        <ds:DigestValue>{public_digest}</ds:DigestValue>
-      </ds:Reference>
-      <ds:Reference URI="#{AUTH_PRIVATE_ID}">
-        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
-        <ds:DigestValue>{private_digest}</ds:DigestValue>
-      </ds:Reference>
-    "##,
     );
 
-    // Canonicalize SignedInfo in its in-scope namespace context and sign it.
-    let signed_info_fragment = format!(
-        r#"<ds:SignedInfo xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}">{signed_info_inner}</ds:SignedInfo>"#,
-    );
-    let signed_info_c14n = c14n(&signed_info_fragment)?;
-    let signature_bytes = private_key
-        .sign(
-            rsa::Pkcs1v15Sign::new::<sha2::Sha256>(),
-            &sha256(&signed_info_c14n),
-        )
-        .map_err(|e| format!("RSA signing of SignedInfo failed: {e}"))?;
-    let signature_value = base64::engine::general_purpose::STANDARD.encode(&signature_bytes);
-
-    // KeyInfo: one X509Data per certificate, leaf first up to the root, each
-    // carrying both the issuer/serial reference and the certificate itself.
-    let mut chain = vec![config.signer_cert_file.clone()];
-    chain.extend(config.signer_chain_files.iter().cloned());
-    let mut key_info = String::new();
-    for cert_path in &chain {
-        let meta = cert_key_info(cert_path)?;
-        key_info.push_str(&format!(
-            r#"
-      <ds:X509Data>
-        <ds:X509IssuerSerial>
-          <ds:X509IssuerName>{issuer}</ds:X509IssuerName>
-          <ds:X509SerialNumber>{serial}</ds:X509SerialNumber>
-        </ds:X509IssuerSerial>
-        <ds:X509Certificate>{cert}</ds:X509Certificate>
-      </ds:X509Data>"#,
-            issuer = xml_escape(&meta.issuer_dn),
-            serial = meta.serial,
-            cert = meta.der_base64,
-        ));
-    }
-
-    Ok(format!(
-        r#"  <ds:Signature>
-    <ds:SignedInfo>{signed_info_inner}</ds:SignedInfo>
-    <ds:SignatureValue>{signature_value}</ds:SignatureValue>
-    <ds:KeyInfo>{key_info}
-    </ds:KeyInfo>
-  </ds:Signature>"#,
-    ))
-}
-
-/// SHA-256 digest.
-fn sha256(data: &[u8]) -> Vec<u8> {
-    use sha2::Digest;
-    sha2::Sha256::digest(data).to_vec()
-}
-
-/// Inclusive Canonical XML 1.0 (WithComments) of a fragment, pure Rust.
-///
-/// libxml2 is the engine xmlsec1 canonicalizes with; this matches its output
-/// byte-for-byte for the fragments `build_signature` emits. Scope is narrowed to
-/// exactly that input: elements, text, comments, namespace declarations (the
-/// default and prefixed, including a descendant that redefines the default, as
-/// KDMRequiredExtensions and EncryptedKey do) and unprefixed attributes. A
-/// DOCTYPE, processing instruction, CDATA section, XML declaration, entity
-/// beyond the standard five, or namespaced attribute is a hard error: none can
-/// occur here, and canonicalizing one silently could yield a wrong digest.
-fn c14n(fragment: &str) -> Result<Vec<u8>, String> {
-    use quick_xml::escape::unescape;
-    use quick_xml::events::Event;
-    use quick_xml::reader::Reader;
-
-    let mut reader = Reader::from_str(fragment);
-    let mut out = String::with_capacity(fragment.len());
-
-    // One frame per open element holding the (prefix, uri) declarations that
-    // element rendered, so its End tag can drop them from scope. The default
-    // namespace uses the empty prefix.
-    let mut ns_stack: Vec<Vec<(String, String)>> = Vec::new();
-
-    loop {
-        match reader
-            .read_event()
-            .map_err(|e| format!("fragment is not valid XML for c14n: {e}"))?
-        {
-            Event::Start(e) => out.push_str(&c14n_start_tag(&e, &mut ns_stack)?),
-            Event::End(e) => {
-                out.push_str(&c14n_end_tag(e.name().as_ref())?);
-                ns_stack.pop();
-            }
-            Event::Empty(e) => {
-                // c14n forbids self-closing tags: emit an explicit start + end.
-                out.push_str(&c14n_start_tag(&e, &mut ns_stack)?);
-                out.push_str(&c14n_end_tag(e.name().as_ref())?);
-                ns_stack.pop();
-            }
-            Event::Text(e) => {
-                let raw = std::str::from_utf8(&e)
-                    .map_err(|err| format!("c14n text is not UTF-8: {err}"))?;
-                let normalized = normalize_line_endings(raw);
-                let text = unescape(&normalized)
-                    .map_err(|err| format!("c14n cannot unescape text: {err}"))?;
-                out.push_str(&escape_text(&text));
-            }
-            Event::Comment(e) => {
-                let raw = std::str::from_utf8(&e)
-                    .map_err(|err| format!("c14n comment is not UTF-8: {err}"))?;
-                out.push_str("<!--");
-                out.push_str(&normalize_line_endings(raw));
-                out.push_str("-->");
-            }
-            Event::Eof => break,
-            other => {
-                return Err(format!(
-                    "c14n input has an unsupported node ({other:?}); only elements, \
-                     text and comments are canonicalized here"
-                ));
-            }
-        }
-    }
-
-    Ok(out.into_bytes())
-}
-
-/// Current in-scope URI of `prefix` ("" is the default), searching innermost
-/// frame first. Only rendered (changed) declarations live in the stack, so the
-/// innermost hit is the value in force.
-fn inscope_uri(ns_stack: &[Vec<(String, String)>], prefix: &str) -> Option<String> {
-    ns_stack
-        .iter()
-        .rev()
-        .flat_map(|frame| frame.iter().rev())
-        .find(|(p, _)| p == prefix)
-        .map(|(_, uri)| uri.clone())
-}
-
-/// Serialize one start tag in canonical form and push its rendered namespaces.
-fn c14n_start_tag(
-    e: &quick_xml::events::BytesStart,
-    ns_stack: &mut Vec<Vec<(String, String)>>,
-) -> Result<String, String> {
-    let qname = std::str::from_utf8(e.name().as_ref())
-        .map_err(|err| format!("c14n element name is not UTF-8: {err}"))?
-        .to_string();
-
-    // Split attributes into namespace declarations and ordinary attributes.
-    let mut decls: Vec<(String, String)> = Vec::new(); // (prefix, uri), "" = default
-    let mut attrs: Vec<(String, String)> = Vec::new(); // (name, value)
-    for attr in e.attributes() {
-        let attr = attr.map_err(|err| format!("c14n cannot read an attribute: {err}"))?;
-        let key = std::str::from_utf8(attr.key.as_ref())
-            .map_err(|err| format!("c14n attribute name is not UTF-8: {err}"))?;
-        let value = attr
-            .unescape_value()
-            .map_err(|err| format!("c14n cannot unescape an attribute value: {err}"))?
-            .into_owned();
-        if key == "xmlns" {
-            decls.push((String::new(), value));
-        } else if let Some(prefix) = key.strip_prefix("xmlns:") {
-            decls.push((prefix.to_string(), value));
-        } else if key.contains(':') {
-            return Err(format!(
-                "c14n does not support namespaced attribute '{key}'; build_signature emits none"
-            ));
-        } else {
-            attrs.push((key.to_string(), value));
-        }
-    }
-
-    // Inclusive c14n renders a namespace only where its in-scope value differs
-    // from the ancestor context. An empty default matches an absent one, so
-    // xmlns="" renders only when it overrides a non-empty ancestor default.
-    let mut rendered: Vec<(String, String)> = Vec::new();
-    for (prefix, uri) in decls {
-        if inscope_uri(ns_stack, &prefix).as_deref().unwrap_or("") != uri {
-            rendered.push((prefix, uri));
-        }
-    }
-    ns_stack.push(rendered.clone());
-
-    // Namespaces sort by prefix (empty default first); attributes by name (all
-    // are unprefixed here, so no namespace-uri key participates in the sort).
-    rendered.sort_by(|a, b| a.0.cmp(&b.0));
-    attrs.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut tag = String::new();
-    tag.push('<');
-    tag.push_str(&qname);
-    for (prefix, uri) in &rendered {
-        if prefix.is_empty() {
-            tag.push_str(" xmlns=\"");
-        } else {
-            tag.push_str(" xmlns:");
-            tag.push_str(prefix);
-            tag.push_str("=\"");
-        }
-        tag.push_str(&escape_attr(uri));
-        tag.push('"');
-    }
-    for (name, value) in &attrs {
-        tag.push(' ');
-        tag.push_str(name);
-        tag.push_str("=\"");
-        tag.push_str(&escape_attr(value));
-        tag.push('"');
-    }
-    tag.push('>');
-    Ok(tag)
-}
-
-fn c14n_end_tag(name: &[u8]) -> Result<String, String> {
-    let qname = std::str::from_utf8(name)
-        .map_err(|err| format!("c14n element name is not UTF-8: {err}"))?;
-    Ok(format!("</{qname}>"))
-}
-
-/// C14N text-node escaping: `&` `<` `>` and CR.
-fn escape_text(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '\r' => out.push_str("&#xD;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// C14N attribute-value escaping: `&` `<` `"` and tab, LF, CR.
-fn escape_attr(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '"' => out.push_str("&quot;"),
-            '\t' => out.push_str("&#x9;"),
-            '\n' => out.push_str("&#xA;"),
-            '\r' => out.push_str("&#xD;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-/// XML line-ending normalization: CRLF and lone CR become LF. Character
-/// references such as `&#xD;` are still literal text here and untouched, so a
-/// real CR one later decodes to is preserved and escaped on output.
-fn normalize_line_endings(s: &str) -> String {
-    s.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-/// Load an RSA private key (PKCS#8 or PKCS#1 PEM) and confirm it matches the
-/// signer certificate's public key.
-///
-/// A key that is missing, unreadable, not RSA, or belonging to a different
-/// certificate is fatal: signing with the wrong key yields a KDM that no
-/// verifier will accept.
-fn load_signer_key(
-    key_path: &Path,
-    cert_public_key: &rsa::RsaPublicKey,
-) -> Result<rsa::RsaPrivateKey, String> {
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-    use rsa::pkcs8::DecodePrivateKey;
-
-    let pem = std::fs::read_to_string(key_path)
-        .map_err(|e| format!("cannot read signer private key {}: {e}", key_path.display()))?;
-    let key = rsa::RsaPrivateKey::from_pkcs8_pem(&pem)
-        .or_else(|_| rsa::RsaPrivateKey::from_pkcs1_pem(&pem))
-        .map_err(|e| {
-            format!(
-                "signer private key {} is not a valid RSA private key (PKCS#8 or PKCS#1 PEM): {e}",
-                key_path.display()
-            )
-        })?;
-    if &key.to_public_key() != cert_public_key {
-        return Err(format!(
-            "signer private key {} does not match the public key in the signer certificate",
-            key_path.display()
-        ));
-    }
-    Ok(key)
-}
-
-/// Certificate fields needed for one ds:KeyInfo/X509Data entry.
-struct CertKeyInfo {
-    issuer_dn: String,
-    serial: String,
-    der_base64: String,
-}
-
-/// Parse a certificate for its issuer, serial and DER, for ds:KeyInfo.
-fn cert_key_info(cert_path: &Path) -> Result<CertKeyInfo, String> {
-    use base64::Engine;
-    use x509_parser::prelude::*;
-
-    let data = std::fs::read(cert_path)
-        .map_err(|e| format!("cannot read certificate {}: {e}", cert_path.display()))?;
-    let (_, pem) = parse_x509_pem(&data)
-        .map_err(|e| format!("certificate {} is not valid PEM: {e}", cert_path.display()))?;
-    let cert = pem.parse_x509().map_err(|e| {
-        format!(
-            "certificate {} is not valid X.509: {e}",
-            cert_path.display()
-        )
-    })?;
-
-    Ok(CertKeyInfo {
-        issuer_dn: cert.issuer().to_string(),
-        // X509SerialNumber is a decimal integer in XML-DSig.
-        serial: cert.serial.to_str_radix(10),
-        der_base64: base64::engine::general_purpose::STANDARD.encode(&pem.contents),
-    })
-}
-
-/// Extract the RSA public key from a certificate, rejecting non-RSA keys.
-fn cert_rsa_public_key(cert_path: &Path) -> Result<rsa::RsaPublicKey, String> {
-    use rsa::pkcs8::DecodePublicKey;
-    use x509_parser::prelude::*;
-
-    let data = std::fs::read(cert_path)
-        .map_err(|e| format!("cannot read signer cert {}: {e}", cert_path.display()))?;
-    let (_, pem) = parse_x509_pem(&data)
-        .map_err(|e| format!("signer cert {} is not valid PEM: {e}", cert_path.display()))?;
-    let cert = pem.parse_x509().map_err(|e| {
-        format!(
-            "signer cert {} is not valid X.509: {e}",
-            cert_path.display()
-        )
-    })?;
-
-    match cert.public_key().parsed() {
-        Ok(x509_parser::public_key::PublicKey::RSA(_)) => {}
-        Ok(_) => {
-            return Err(format!(
-                "signer cert {} does not hold an RSA key; SMPTE 430-3 signatures require RSA",
-                cert_path.display()
-            ));
-        }
-        Err(e) => {
-            return Err(format!(
-                "cannot parse public key from {}: {e}",
-                cert_path.display()
-            ));
-        }
-    }
-    rsa::RsaPublicKey::from_public_key_der(cert.public_key().raw).map_err(|e| {
-        format!(
-            "cannot load RSA public key from {}: {e}",
-            cert_path.display()
-        )
-    })
+    let signer_identity = XmlSigner {
+        cert_file: config.signer_cert_file.clone(),
+        key_file: config.signer_key_file.clone(),
+        chain_files: config.signer_chain_files.clone(),
+    };
+    crate::xmldsig::sign_enveloped(
+        &unsigned,
+        &[AUTH_PUBLIC_ID, AUTH_PRIVATE_ID],
+        "Id",
+        None,
+        &signer_identity,
+    )
 }
 
 /// Generate a SMPTE 430-1 Key Delivery Message (KDM) and write it to disk.
@@ -1914,6 +1493,7 @@ fn rand_bytes<const N: usize>() -> Result<[u8; N], String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xmldsig::{C14N_METHOD, DIGEST_METHOD, SIG_METHOD, c14n};
     use base64::Engine;
     use std::sync::OnceLock;
 
