@@ -15,7 +15,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `accessibility` | Accessibility heuristic scan (CVAA, EAA, AODA, Ofcom); keyword-based, not a certified verdict |
 | `burnin` | Subtitle/watermark burn-in |
 | `certificate` | X.509 certificate generation and trust management |
-| `colour` | Colour conversion via ffmpeg (Rec.709, P3, Rec.2020); wide-gamut/log spaces need a LUT |
+| `colour` | Colour conversion via ffmpeg (Rec.709, P3, Rec.2020); wide-gamut/log spaces need a LUT. Also the DCI X'Y'Z' → sRGB display transform (`XyzToSrgb`, inverse of the DCDM encode) and an optional monitor-ICC path (`XyzToIcc`, `icc` feature) |
 | `conform` | EDL and FCP7/Resolve XML (xmeml) timeline import and reel assembly (AAF not supported) |
 | `cpl_annotation` | CPL annotation and revision metadata |
 | `cpl_xml` | String-level CPL/OPL XML tag read/write helpers |
@@ -41,7 +41,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `pipeline` | Full video-to-DCP streaming pipeline |
 | `plugin` | Python plugin system with pre/post hooks |
 | `preferences` | JSON preferences (XDG/AppData) |
-| `preview` | Media preview (ffplay) and frame extraction; reads the real frame rate, not DCP-native |
+| `preview` | Media preview and frame extraction. Plain-file ffplay path, plus a DCP-native path that resolves a DCP dir/CPL/MXF, decrypts encrypted picture essence in Rust (key from `KEYS.json` or hex), decodes J2K via ffmpeg and colour-manages X'Y'Z' → sRGB (or a monitor ICC). Not real-time: decodes to an intermediate first |
 | `probe` | Media file probing (resolution, codec, duration) |
 | `profiles` | Delivery profile presets |
 | `prores` | ProRes detection and transcoding |
@@ -63,6 +63,10 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 cargo build --release
 cargo test
 ```
+
+Cargo features: `openjpeg` / `grok-ffi` (J2K encoders), `async` (tokio), `icc`
+(monitor-ICC display path in `preview`/`colour`, needs liblcms2). All off by
+default.
 
 ## Usage
 

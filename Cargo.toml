@@ -13,6 +13,7 @@ dirs = "6"
 dolby_vision = { version = "3.3.2", features = ["xml"] }
 grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", optional = true }
 hex = "0.4"
+lcms2 = { version = "6", optional = true }
 notify = "8"
 openjpeg-sys = { version = "1.0", optional = true }
 quick-xml = "0.37"
@@ -37,6 +38,7 @@ x509-parser = { version = "0.16", features = ["verify"] }
 default = []
 async = ["dep:tokio"]
 grok-ffi = ["dep:grokj2k-sys"]
+icc = ["dep:lcms2"]
 openjpeg = ["dep:openjpeg-sys"]
 
 [dev-dependencies]

@@ -813,7 +813,7 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
         config,
         &cpl_uuid,
         &config.content_title,
-        formulation_to_uri(&config.formulation),
+        KDM_MESSAGE_TYPE,
         &not_valid_before,
         &not_valid_after,
         &recipient,
@@ -856,14 +856,13 @@ fn resolve_valid_from(valid_from: &str) -> String {
     }
 }
 
-/// Map a formulation name to its SMPTE MessageType URI.
-fn formulation_to_uri(formulation: &str) -> &'static str {
-    match formulation.to_lowercase().replace(' ', "-").as_str() {
-        "dci-any" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-any",
-        "dci-specific" => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-specific",
-        _ => "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type",
-    }
-}
+/// SMPTE ST 430-1 6.1: a KDM's MessageType is always this fixed URI. The ISDCF
+/// "formulation" (modified-transitional-1, dci-any, ...) selects optional
+/// AuthenticatedPublic extensions (AuthorizedDeviceInfo, ForensicMarkFlagList),
+/// not the MessageType; those are not emitted, so formulation has no structural
+/// effect yet. Emitting a per-formulation MessageType (the previous behaviour)
+/// produced a URI compliant gear does not recognise as a KDM.
+const KDM_MESSAGE_TYPE: &str = "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type";
 
 /// Assemble a signed SMPTE 430-1 KDM carrying `keys`, encrypting each key block
 /// to `recipient` with `signer`'s thumbprint embedded.
@@ -876,7 +875,7 @@ fn build_kdm_xml(
     config: &KdmConfig,
     cpl_uuid: &uuid::Uuid,
     content_title: &str,
-    formulation_uri: &str,
+    message_type: &str,
     not_valid_before: &str,
     not_valid_after: &str,
     recipient: &Recipient,
@@ -943,7 +942,7 @@ fn build_kdm_xml(
     let auth_public_inner = format!(
         r#"
     <MessageId>urn:uuid:{message_id}</MessageId>
-    <MessageType>{formulation_uri}</MessageType>
+    <MessageType>{message_type}</MessageType>
     <AnnotationText>{title} KDM for {recipient_subject}</AnnotationText>
     <IssueDate>{issue_date}</IssueDate>
     <Signer>
@@ -1117,11 +1116,8 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         parse_validity_end(&config.valid_to, &not_valid_before)?
     };
 
-    // Preserve the source MessageType (formulation) and title.
-    let formulation_uri = parsed
-        .message_type
-        .as_deref()
-        .unwrap_or("http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type");
+    // Preserve the source MessageType and title.
+    let message_type = parsed.message_type.as_deref().unwrap_or(KDM_MESSAGE_TYPE);
     let content_title = parsed.content_title.as_deref().unwrap_or("");
 
     // build_kdm_xml reads only the signer identity from the config.
@@ -1136,7 +1132,7 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         &signer_config,
         &cpl_uuid,
         content_title,
-        formulation_uri,
+        message_type,
         &not_valid_before,
         &not_valid_after,
         &recipient,
@@ -1942,6 +1938,23 @@ mod tests {
             xml.contains(&format!("Algorithm=\"{KDM_ENCRYPTION_METHOD}\"")),
             "missing the rsa-oaep-mgf1p algorithm URI required by DCI CTP 3.4.12"
         );
+    }
+
+    #[test]
+    fn message_type_is_the_standard_uri_for_every_formulation() {
+        // SMPTE ST 430-1: MessageType is a fixed URI; formulation must not
+        // change it. Regression guard against emitting #kdm-key-type-dci-any etc.
+        let f = fixtures();
+        for formulation in ["modified-transitional-1", "dci-any", "dci-specific"] {
+            let mut cfg = test_config(f, PathBuf::from("unused"));
+            cfg.formulation = formulation.to_string();
+            let kdm = build_kdm(&cfg).expect("build kdm");
+            assert!(
+                kdm.xml
+                    .contains(&format!("<MessageType>{KDM_MESSAGE_TYPE}</MessageType>")),
+                "formulation {formulation} must still emit the standard MessageType"
+            );
+        }
     }
 
     #[test]
