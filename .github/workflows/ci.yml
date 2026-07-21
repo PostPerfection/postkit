@@ -73,7 +73,7 @@ jobs:
               https://github.com/GrokImageCompression/grok.git "$RUNNER_TEMP/grok-src"
             cmake -S "$RUNNER_TEMP/grok-src" -B "$RUNNER_TEMP/grok-build" \
               -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix"
-            cmake --build "$RUNNER_TEMP/grok-build" --parallel
+            cmake --build "$RUNNER_TEMP/grok-build" --parallel "$(getconf _NPROCESSORS_ONLN)"
             cmake --install "$RUNNER_TEMP/grok-build"
           fi
           echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
