@@ -69,7 +69,7 @@ jobs:
         run: |
           prefix="$GITHUB_WORKSPACE/grok-install"
           if [ ! -x "$prefix/bin/grk_compress" ]; then
-            git clone --depth 1 --branch "$GROK_TAG" \
+            git clone --depth 1 --recurse-submodules --shallow-submodules --branch "$GROK_TAG" \
               https://github.com/GrokImageCompression/grok.git "$RUNNER_TEMP/grok-src"
             cmake -S "$RUNNER_TEMP/grok-src" -B "$RUNNER_TEMP/grok-build" \
               -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix"
