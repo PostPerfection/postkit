@@ -101,6 +101,9 @@ modules, so they can't just switch. Extract only after extending the postkit API
   string-splice helper (postkit emits the identical LocaleList block).
 
 Downstream DCP wrap + KDM additions 2026-07-21 (for dcpwizard):
+- HDR-to-DCI delivery policy: dcpwizard requires a supplied 3D LUT for detected HDR
+  source video and calls `colour::convert_colour` with that LUT. Generic FFmpeg
+  tone mapping is opt-in and warns; postkit does not select it by default.
 - Stereoscopic 3D (ST 429-10): `mxf_wrap::wrap_stereoscopic(&StereoscopicWrapOptions)`
   wraps left/right J2K frame sequences into one stereoscopic picture MXF. The
   asdcplib-rs JP2K MXFS writer/reader binding already existed; this is the postkit
