@@ -35,7 +35,11 @@ the calling thread) and runs one encoder thread per core, restoring the pool on
 exit. 8-core grok/opj went 0.78x/0.79x -> 1.15x (2K) / 1.00x (4K). openjpeg then
 removed: the `openjpeg` feature, openjpeg-sys dep, and src/openjpeg_encoder.rs are
 gone; shared types (BoundedQueue, CompressParams, RawFrame, ...) already lived in
-grok_encoder. bench_j2k is now a grok-only rerunnable perf check.
+grok_encoder. bench_j2k is now a grok-only rerunnable perf check. ci.yml follows:
+the stale `async openjpeg` feature steps are replaced by a grok-ffi build/test/clippy
+triple, gated on a cached "Setup grok" step that builds grok v20.3.6 from source
+(cmake) and exports PKG_CONFIG_PATH/LD_LIBRARY_PATH. linux + macOS only; windows
+runs the plain `async` passes since the grok source build there is not wired up.
 
 ImfCpl gained optional composition `languages` (ST 2067-3 LocaleList, replaces
 imfwizard's string-edited injection), optional `essence_descriptors`

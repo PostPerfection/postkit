@@ -53,18 +53,47 @@ jobs:
       - name: Clippy
         run: cargo clippy --features async -- -D warnings
 
-      # openjpeg-sys vendors its C source (no system libs), so the openjpeg FFI
-      # in openjpeg_encoder.rs compiles on every runner. This is the feature set
-      # dcpwizard and imfwizard actually build with. grok-ffi is not covered: it
-      # links libgrokj2k via pkg-config, which is not available on GitHub runners.
-      - name: Build (openjpeg)
-        run: cargo build --features "async openjpeg"
+      # build grok (jpeg 2000 codec) from source once per tag, cached.
+      # provides libgrokj2k on the pkg-config + loader paths and grk_compress on PATH.
+      - name: Cache grok
+        if: runner.os != 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/grok-install
+          key: grok-${{ runner.os }}-v20.3.6
 
-      - name: Test (openjpeg)
-        run: cargo test --features "async openjpeg"
+      - name: Setup grok
+        if: runner.os != 'Windows'
+        env:
+          GROK_TAG: v20.3.6
+        run: |
+          prefix="$GITHUB_WORKSPACE/grok-install"
+          if [ ! -x "$prefix/bin/grk_compress" ]; then
+            git clone --depth 1 --branch "$GROK_TAG" \
+              https://github.com/GrokImageCompression/grok.git "$RUNNER_TEMP/grok-src"
+            cmake -S "$RUNNER_TEMP/grok-src" -B "$RUNNER_TEMP/grok-build" \
+              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix"
+            cmake --build "$RUNNER_TEMP/grok-build" --parallel
+            cmake --install "$RUNNER_TEMP/grok-build"
+          fi
+          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$prefix/lib:$prefix/lib64:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=$prefix/lib:$prefix/lib64:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
+          echo "$prefix/bin" >> "$GITHUB_PATH"
 
-      - name: Clippy (openjpeg)
-        run: cargo clippy --all-targets --features "async openjpeg" -- -D warnings
+      # grok-ffi links libgrokj2k (built above); skipped on windows where the
+      # source build is not wired up.
+      - name: Build (grok-ffi)
+        if: runner.os != 'Windows'
+        run: cargo build --features "async grok-ffi"
+
+      - name: Test (grok-ffi)
+        if: runner.os != 'Windows'
+        run: cargo test --features "async grok-ffi"
+
+      - name: Clippy (grok-ffi)
+        if: runner.os != 'Windows'
+        run: cargo clippy --all-targets --features "async grok-ffi" -- -D warnings
 
       - name: Format check
         run: cargo fmt -- --check

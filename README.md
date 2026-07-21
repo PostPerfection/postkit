@@ -67,6 +67,11 @@ Cargo features: `grok-ffi` (J2K encoder), `async` (tokio), `icc`
 (monitor-ICC display path in `preview`/`colour`, needs liblcms2). All off by
 default.
 
+`grok-ffi` links libgrokj2k (grok >= 12) found via pkg-config, so build and
+install grok first (cmake, e.g. to `~/bin/grok`), then put its `lib/pkgconfig` on
+`PKG_CONFIG_PATH` and its `lib` on `LD_LIBRARY_PATH`. CI does this in a cached
+"Setup grok" step; see `.github/workflows/ci.yml`.
+
 ## Usage
 
 Add to your `Cargo.toml`:
