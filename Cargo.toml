@@ -6,7 +6,7 @@ license = "GPL-3.0-or-later"
 description = "Shared library for DCP Wizard, IMF Wizard, and DCP Doctor"
 
 [dependencies]
-asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "cb3f3de" }
+asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "5fe4d61" }
 base64 = "0.22"
 chrono = "0.4"
 dirs = "6"
@@ -40,14 +40,9 @@ grok-ffi = ["dep:grokj2k-sys"]
 icc = ["dep:lcms2"]
 
 [dev-dependencies]
-asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "cb3f3de" }
+asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "5fe4d61" }
 tempfile = "3"
 
 [[bin]]
 name = "bench_j2k"
 required-features = ["grok-ffi"]
-
-# local asdcplib-rs while the MCA/stereo/atmos additions are unmerged; drop once
-# asdcplib-rs is pushed and the rev above is re-pinned.
-[patch."https://github.com/PostPerfection/asdcplib-rs.git"]
-asdcplib = { path = "/home/aaron/src/PostPerfection/asdcplib-rs/asdcplib" }
