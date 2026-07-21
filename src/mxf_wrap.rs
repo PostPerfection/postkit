@@ -64,6 +64,11 @@ pub struct MxfWrapOptions {
     /// Never serialized: it carries secret key material.
     #[serde(skip)]
     pub encryption: Option<MxfEncryption>,
+    /// SMPTE 377-4 MCA label config for PCM, asdcp-wrap style, e.g.
+    /// `"51(L,R,C,LFE,Ls,Rs),HI,VIN"`. AS-DCP (DCP) only. Build one from a
+    /// soundfield with [`crate::mca::soundfield_to_mca_config`].
+    #[serde(default)]
+    pub mca_config: Option<String>,
 }
 
 /// Result of MXF wrapping.
@@ -150,15 +155,21 @@ impl PcmWriter {
         }
     }
 
+    /// Open the writer, attaching MCA labels when `mca_config` is set (AS-DCP only;
+    /// the AS-02 path here never carries MCA labels).
     fn open_write(
         &mut self,
         filename: &str,
         info: &asdcplib::WriterInfo,
         desc: &asdcplib::pcm::AudioDescriptor,
+        mca_config: Option<&str>,
         header_size: u32,
     ) -> asdcplib::Result<()> {
         match self {
-            Self::AsDcp(w) => w.open_write(filename, info, desc, header_size),
+            Self::AsDcp(w) => match mca_config {
+                Some(m) => w.open_write_mca(filename, info, desc, m, header_size),
+                None => w.open_write(filename, info, desc, header_size),
+            },
             Self::As02(w) => w.open_write(filename, info, desc, header_size),
         }
     }
@@ -518,6 +529,13 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
+    if opts.mca_config.is_some() && opts.standard == MxfStandard::As02 {
+        return MxfTrackFile {
+            error: "MCA labels are only supported on the AS-DCP (DCP) PCM path".to_string(),
+            ..Default::default()
+        };
+    }
+
     let wav_data = match std::fs::read(&opts.input_files[0]) {
         Ok(d) => d,
         Err(e) => {
@@ -576,7 +594,13 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
 
     let mut writer = PcmWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
-    if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
+    if let Err(e) = writer.open_write(
+        &output_str,
+        &info,
+        &desc,
+        opts.mca_config.as_deref(),
+        16384,
+    ) {
         return MxfTrackFile {
             error: format!("PCM open_write failed: {e}"),
             ..Default::default()
@@ -809,6 +833,164 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
     }
 }
 
+/// Options for stereoscopic 3D (ST 429-10) JP2K MXF wrapping.
+///
+/// Left and right eye codestreams are wrapped into one stereoscopic picture MXF.
+/// Stereo is AS-DCP only, so there is no `standard` field.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StereoscopicWrapOptions {
+    /// Left-eye J2K codestream files, one per frame.
+    pub left_files: Vec<PathBuf>,
+    /// Right-eye J2K codestream files, one per frame. Must match `left_files` length.
+    pub right_files: Vec<PathBuf>,
+    /// Output MXF file path.
+    pub output: PathBuf,
+    /// Frame rate numerator.
+    pub fps_num: u32,
+    /// Frame rate denominator.
+    pub fps_den: u32,
+    /// When set, the essence is AES-128 encrypted at wrap time.
+    /// Never serialized: it carries secret key material.
+    #[serde(skip)]
+    pub encryption: Option<MxfEncryption>,
+}
+
+/// Wrap left/right eye J2K frame sequences into one stereoscopic picture MXF.
+pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
+    use asdcplib::jp2k::StereoscopicPhase;
+
+    if opts.left_files.is_empty() {
+        return MxfTrackFile {
+            error: "no input files".to_string(),
+            ..Default::default()
+        };
+    }
+    if opts.left_files.len() != opts.right_files.len() {
+        return MxfTrackFile {
+            error: format!(
+                "left/right frame counts differ: {} left, {} right",
+                opts.left_files.len(),
+                opts.right_files.len()
+            ),
+            ..Default::default()
+        };
+    }
+
+    // Read all left and right frames.
+    let read_all = |files: &[PathBuf]| -> Result<Vec<Vec<u8>>, String> {
+        files
+            .iter()
+            .map(|f| std::fs::read(f).map_err(|e| format!("failed to read {}: {e}", f.display())))
+            .collect()
+    };
+    let left = match read_all(&opts.left_files) {
+        Ok(f) => f,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
+    let right = match read_all(&opts.right_files) {
+        Ok(f) => f,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
+
+    let Some(header) = crate::j2k::parse_j2k_header(&left[0]) else {
+        return MxfTrackFile {
+            error: format!(
+                "invalid JPEG 2000 codestream: {}",
+                opts.left_files[0].display()
+            ),
+            ..Default::default()
+        };
+    };
+    if header.width == 0 || header.height == 0 {
+        return MxfTrackFile {
+            error: format!(
+                "JPEG 2000 codestream has no image area: {}",
+                opts.left_files[0].display()
+            ),
+            ..Default::default()
+        };
+    }
+
+    let mut info = make_writer_info();
+    let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
+        Ok(c) => c,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
+    // container_duration counts stereo frame pairs, not individual eye writes.
+    let desc = asdcplib::jp2k::PictureDescriptor {
+        edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
+        sample_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
+        stored_width: header.width,
+        stored_height: header.height,
+        aspect_ratio: asdcplib::Rational::new(header.width as i32, header.height as i32),
+        container_duration: left.len() as u32,
+        component_count: header.num_components,
+    };
+
+    let mut writer = asdcplib::jp2k::StereoMxfWriter::new();
+    let output_str = opts.output.to_string_lossy().to_string();
+    if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
+        return MxfTrackFile {
+            error: format!("stereoscopic open_write failed: {e}"),
+            ..Default::default()
+        };
+    }
+
+    for (l, r) in left.iter().zip(right.iter()) {
+        let (e, h) = crypto.contexts();
+        if let Err(err) = writer.write_frame(l, StereoscopicPhase::Left, e, h) {
+            return MxfTrackFile {
+                error: format!("stereoscopic write_frame (left) failed: {err}"),
+                ..Default::default()
+            };
+        }
+        let (e, h) = crypto.contexts();
+        if let Err(err) = writer.write_frame(r, StereoscopicPhase::Right, e, h) {
+            return MxfTrackFile {
+                error: format!("stereoscopic write_frame (right) failed: {err}"),
+                ..Default::default()
+            };
+        }
+    }
+
+    if let Err(e) = writer.finalize() {
+        return MxfTrackFile {
+            error: format!("stereoscopic finalize failed: {e}"),
+            ..Default::default()
+        };
+    }
+
+    let (hash, size) = compute_hash_and_size(&opts.output);
+    let uuid_str = uuid::Uuid::from_bytes(info.asset_uuid)
+        .hyphenated()
+        .to_string();
+
+    MxfTrackFile {
+        uuid: uuid_str,
+        hash,
+        size,
+        duration: left.len() as u64,
+        path: opts.output.clone(),
+        success: true,
+        error: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -875,6 +1057,7 @@ mod tests {
             fps_den: 1,
             partition_size: 0,
             encryption: None,
+            mca_config: None,
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -904,6 +1087,7 @@ mod tests {
             fps_den: 1,
             partition_size: 0,
             encryption: None,
+            mca_config: None,
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "must not wrap a non-WAV file");
@@ -964,6 +1148,7 @@ mod tests {
             fps_den: 1,
             partition_size: 0,
             encryption,
+            mca_config: None,
         }
     }
 
@@ -1003,5 +1188,172 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn wrap_stereoscopic_roundtrips_both_eyes() {
+        use asdcplib::jp2k::{StereoMxfReader, StereoscopicPhase};
+
+        let dir = tempfile::tempdir().unwrap();
+        // distinct left/right payloads so a swap cannot pass
+        let mut left_frame = synthetic_j2k();
+        left_frame.extend_from_slice(b"LEFT_EYE");
+        let mut right_frame = synthetic_j2k();
+        right_frame.extend_from_slice(b"RIGHT_EYE");
+        let l = dir.path().join("l0001.j2c");
+        let r = dir.path().join("r0001.j2c");
+        std::fs::write(&l, &left_frame).unwrap();
+        std::fs::write(&r, &right_frame).unwrap();
+
+        let out = dir.path().join("stereo.mxf");
+        let result = wrap_stereoscopic(&StereoscopicWrapOptions {
+            left_files: vec![l],
+            right_files: vec![r],
+            output: out.clone(),
+            fps_num: 24,
+            fps_den: 1,
+            encryption: None,
+        });
+        assert!(result.success, "stereo wrap failed: {}", result.error);
+        assert_eq!(result.duration, 1, "one stereo frame pair");
+
+        assert_eq!(
+            asdcplib::essence_type(&out.to_string_lossy()).unwrap(),
+            asdcplib::EssenceType::Jpeg2000Stereo
+        );
+
+        let mut reader = StereoMxfReader::new();
+        reader.open_read(&out.to_string_lossy()).unwrap();
+        let desc = reader.picture_descriptor().unwrap();
+        assert_eq!(desc.container_duration, 1, "frame-pair count");
+
+        let mut buf = vec![0u8; 8192];
+        let n = reader
+            .read_frame(0, StereoscopicPhase::Left, &mut buf, None, None)
+            .unwrap();
+        assert_eq!(&buf[..n], left_frame.as_slice(), "left eye");
+        let n = reader
+            .read_frame(0, StereoscopicPhase::Right, &mut buf, None, None)
+            .unwrap();
+        assert_eq!(&buf[..n], right_frame.as_slice(), "right eye");
+    }
+
+    #[test]
+    fn wrap_stereoscopic_rejects_mismatched_eye_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let l = dir.path().join("l.j2c");
+        std::fs::write(&l, synthetic_j2k()).unwrap();
+        let result = wrap_stereoscopic(&StereoscopicWrapOptions {
+            left_files: vec![l],
+            right_files: vec![],
+            output: dir.path().join("out.mxf"),
+            fps_num: 24,
+            fps_den: 1,
+            encryption: None,
+        });
+        assert!(!result.success);
+        assert!(result.error.contains("counts differ"), "got: {}", result.error);
+    }
+
+    #[test]
+    fn wrap_pcm_attaches_mca_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("51.wav");
+        // 5.1, 24-bit, 48k, one second
+        std::fs::write(&wav_path, make_wav(6, 48000, 24, 48000)).unwrap();
+        let out = dir.path().join("out.mxf");
+
+        let mca = crate::mca::soundfield_to_mca_config(&crate::mca::soundfield_51());
+        assert_eq!(mca.as_deref(), Some("51(L,R,C,LFE,Ls,Rs)"));
+
+        let opts = MxfWrapOptions {
+            input_files: vec![wav_path],
+            output: out.clone(),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: mca,
+        };
+        let result = wrap_pcm(&opts);
+        assert!(result.success, "wrap failed: {}", result.error);
+
+        let mut reader = asdcplib::pcm::MxfReader::new();
+        reader.open_read(&out.to_string_lossy()).unwrap();
+        let labels = reader.mca_labels().expect("read mca labels");
+        assert_eq!(labels.channel_labels, 6, "one label per 5.1 channel");
+        assert_eq!(labels.soundfield_groups, 1, "one 5.1 soundfield group");
+        assert!(
+            labels.has_mca_channel_assignment,
+            "MCA ChannelAssignment UL must be set"
+        );
+    }
+
+    #[test]
+    fn wrap_pcm_mca_rejected_on_as02() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("51.wav");
+        std::fs::write(&wav_path, make_wav(6, 48000, 24, 48000)).unwrap();
+        let opts = MxfWrapOptions {
+            input_files: vec![wav_path],
+            output: dir.path().join("out.mxf"),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::As02,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: Some("51(L,R,C,LFE,Ls,Rs)".to_string()),
+        };
+        let result = wrap_pcm(&opts);
+        assert!(!result.success, "MCA on AS-02 must be rejected");
+        assert!(result.error.contains("AS-DCP"), "got: {}", result.error);
+    }
+
+    /// Wrap a structurally valid but synthetic DCData/Atmos payload and confirm
+    /// the container is a Dolby Atmos aux-data MXF the reader accepts. This does
+    /// NOT validate real Atmos essence: the frames are filler, so only the MXF
+    /// structure and descriptor are exercised. Real-essence verification needs
+    /// real Atmos material.
+    #[test]
+    fn wrap_atmos_produces_a_readable_dcdata_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let frames: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let p = dir.path().join(format!("atmos{i}.dat"));
+                let payload: Vec<u8> = (0..2048).map(|b| (b as u8).wrapping_add(i * 5)).collect();
+                std::fs::write(&p, payload).unwrap();
+                p
+            })
+            .collect();
+        let out = dir.path().join("atmos.mxf");
+
+        let opts = MxfWrapOptions {
+            input_files: frames,
+            output: out.clone(),
+            essence_type: EssenceType::Atmos,
+            standard: MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: None,
+        };
+        let result = mxf_wrap(&opts);
+        assert!(result.success, "atmos wrap failed: {}", result.error);
+        assert_eq!(result.duration, 3);
+
+        assert_eq!(
+            asdcplib::essence_type(&out.to_string_lossy()).unwrap(),
+            asdcplib::EssenceType::DcDataDolbyAtmos
+        );
+
+        let mut reader = asdcplib::atmos::MxfReader::new();
+        reader.open_read(&out.to_string_lossy()).unwrap();
+        let desc = reader.atmos_descriptor().unwrap();
+        assert_eq!(desc.container_duration, 3, "frame count");
+        assert_eq!(desc.edit_rate, asdcplib::Rational::new(24, 1));
     }
 }

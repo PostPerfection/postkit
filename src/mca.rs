@@ -174,6 +174,66 @@ pub fn detect_soundfield(channel_count: u32) -> McaSoundfield {
     }
 }
 
+impl McaTagSymbol {
+    /// asdcplib `ASDCP_MCAConfigParser` channel token, or `None` when that parser
+    /// has no label for this symbol (its DCP dictionary is L/R/C/LFE/Ls/Rs plus
+    /// the rear-surround pair and HI/VI-N; the wider IMF set is AS-02 only).
+    fn asdcp_token(self) -> Option<&'static str> {
+        match self {
+            Self::L => Some("L"),
+            Self::R => Some("R"),
+            Self::C => Some("C"),
+            Self::Lfe => Some("LFE"),
+            Self::Ls => Some("Ls"),
+            Self::Rs => Some("Rs"),
+            Self::Lrs => Some("Lrs"),
+            Self::Rrs => Some("Rrs"),
+            Self::Hi => Some("HI"),
+            Self::Vi => Some("VIN"),
+            _ => None,
+        }
+    }
+}
+
+/// Build an asdcp-wrap style MCA config string (e.g. `"51(L,R,C,LFE,Ls,Rs),HI,VIN"`)
+/// for the PCM wrap path, or `None` if any channel has no asdcplib DCP label.
+///
+/// HI and VI-N are emitted as standalone channels after the soundfield group,
+/// matching how the accessibility tracks sit outside the 5.1/7.1 group.
+pub fn soundfield_to_mca_config(sf: &McaSoundfield) -> Option<String> {
+    let is_accessibility = |s: McaTagSymbol| matches!(s, McaTagSymbol::Hi | McaTagSymbol::Vi);
+
+    let mut group = Vec::new();
+    let mut standalone = Vec::new();
+    for ch in &sf.channels {
+        let token = ch.symbol.asdcp_token()?;
+        if is_accessibility(ch.symbol) {
+            standalone.push(token);
+        } else {
+            group.push(token);
+        }
+    }
+    if group.is_empty() {
+        return None;
+    }
+
+    // Only 5.1/6.1/7.1 have a soundfield-group label in the DCP dictionary; other
+    // layouts are wrapped as bare channels. Match on the layout prefix so a name
+    // like "51+HI+VI" still uses the 51 group with HI/VI-N as standalone channels.
+    let group_label = ["51", "61", "71"]
+        .into_iter()
+        .find(|g| sf.name.starts_with(g));
+    let mut out = match group_label {
+        Some(g) => format!("{}({})", g, group.join(",")),
+        None => group.join(","),
+    };
+    for s in standalone {
+        out.push(',');
+        out.push_str(s);
+    }
+    Some(out)
+}
+
 /// Generate MCA subdescriptor XML for inclusion in a CPL.
 pub fn generate_mca_xml(sf: &McaSoundfield) -> String {
     let mut xml = String::new();
@@ -301,6 +361,34 @@ mod tests {
         sf.channels[0].spoken_language = "en".to_string();
         let xml = generate_mca_xml(&sf);
         assert!(xml.contains("<r0:RFC5646SpokenLanguage>en</r0:RFC5646SpokenLanguage>"));
+    }
+
+    #[test]
+    fn test_soundfield_to_mca_config() {
+        assert_eq!(
+            soundfield_to_mca_config(&soundfield_51()).as_deref(),
+            Some("51(L,R,C,LFE,Ls,Rs)")
+        );
+        // HI and VI-N sit outside the soundfield group as standalone channels.
+        assert_eq!(
+            soundfield_to_mca_config(&soundfield_51_with_hi_vi()).as_deref(),
+            Some("51(L,R,C,LFE,Ls,Rs),HI,VIN")
+        );
+        // stereo has no group label in the DCP dictionary
+        assert_eq!(
+            soundfield_to_mca_config(&soundfield_stereo()).as_deref(),
+            Some("L,R")
+        );
+    }
+
+    #[test]
+    fn test_soundfield_to_mca_config_rejects_unsupported() {
+        // Lt/Rt have no ASDCP DCP label, so the whole soundfield is unmappable.
+        let sf = McaSoundfield {
+            name: "Lt/Rt".to_string(),
+            channels: vec![label(McaTagSymbol::Lt, 0), label(McaTagSymbol::Rt, 1)],
+        };
+        assert_eq!(soundfield_to_mca_config(&sf), None);
     }
 
     #[test]

@@ -95,3 +95,31 @@ modules, so they can't just switch. Extract only after extending the postkit API
   CPL to postkit::packaging::DcpCpl.
 - imfwizard cpl.rs inject_locale_list: obsolete. Set ImfCpl.languages and drop the
   string-splice helper (postkit emits the identical LocaleList block).
+
+Downstream DCP wrap + KDM additions 2026-07-21 (for dcpwizard):
+- Stereoscopic 3D (ST 429-10): `mxf_wrap::wrap_stereoscopic(&StereoscopicWrapOptions)`
+  wraps left/right J2K frame sequences into one stereoscopic picture MXF. The
+  asdcplib-rs JP2K MXFS writer/reader binding already existed; this is the postkit
+  entry plus a both-eyes roundtrip test.
+- MCA labels (SMPTE 377-4 / ST 429-12): PCM wrap gained `MxfWrapOptions.mca_config`
+  (asdcp-wrap style string, e.g. "51(L,R,C,LFE,Ls,Rs),HI,VIN"; AS-DCP only, else
+  errors). `mca::soundfield_to_mca_config(&McaSoundfield)` builds the string from
+  the existing typed soundfields (HI/VI-N emitted as standalone channels). Needed a
+  new asdcplib-rs shim: `pcm::MxfWriter::open_write_mca` +
+  `pcm::MxfReader::mca_labels`. Roundtrip test reads back 6 channel labels, 1
+  soundfield group, and the MCA ChannelAssignment UL.
+- Atmos (ST 429-18): `wrap_atmos` (EssenceType::Atmos) already existed and fills
+  the correct DataEssenceCoding UL (asdcplib overwrites the zero placeholder). Added
+  a container-structure roundtrip test using a synthetic DCData payload. Real Atmos
+  essence cannot be synthesised, so essence-level conformance is unverified: needs
+  real Atmos material.
+- DTS:X: NOT implemented. It would ride the generic DCData (ST 429-14) aux path, but
+  the correct DataEssenceCoding UL could not be confirmed from asdcplib sources or
+  SMPTE docs, so no wrap_dcdata was added rather than emit a wrong UL. Revisit once a
+  confirmed UL exists.
+- Interop KDM: `certificate::KdmConfig.format: KdmFormat` (Smpte default,
+  byte-identical to before; Interop is opt-in). Interop drops the 4-byte KeyType from
+  the key block (138 -> 134), uses the digicine KDMRequiredExtensions namespace, and
+  emits bare KeyId elements without TypedKeyId. Test round-trips a 134-byte block
+  (RSA-OAEP decrypt, every field asserted) and xmlsec1-verifies the signature.
+  NOT validated against real legacy gear: validate before production use.

@@ -568,6 +568,20 @@ pub fn remove_trusted_device(thumbprint: &str) -> i32 {
     }
 }
 
+/// KDM output format: modern SMPTE (ST 430-1) or legacy Interop (pre-SMPTE).
+///
+/// Interop differs from SMPTE in three ways handled here: the key block drops
+/// the 4-byte KeyType field (138 -> 134 bytes), the KDMRequiredExtensions uses
+/// the digicine namespace, and KeyIdList carries bare KeyId elements without the
+/// TypedKeyId wrapper. Interop output has not been checked against real legacy
+/// gear; validate before production use.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KdmFormat {
+    #[default]
+    Smpte,
+    Interop,
+}
+
 /// KDM generation configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KdmConfig {
@@ -594,6 +608,10 @@ pub struct KdmConfig {
     /// serialized: it holds secret key material.
     #[serde(skip)]
     pub content_keys: Vec<KdmContentKey>,
+    /// SMPTE (default) or legacy Interop output. Defaults to SMPTE so existing
+    /// callers are byte-identical.
+    #[serde(default)]
+    pub format: KdmFormat,
 }
 
 /// A caller-supplied content key placed in a KDM, binding it to an already
@@ -624,6 +642,13 @@ const KDM_STRUCTURE_ID: [u8; 16] = [
 
 /// Total size of the SMPTE key block, per ST 430-1 Table 6.
 const KDM_KEY_BLOCK_LEN: usize = 138;
+
+/// Interop key block size: the SMPTE layout minus the 4-byte KeyType field,
+/// matching libdcp's 134-byte case in decrypted_kdm.cc.
+const KDM_KEY_BLOCK_LEN_INTEROP: usize = 134;
+
+/// Interop (pre-SMPTE) KDMRequiredExtensions namespace, per libdcp.
+const KDM_INTEROP_NS: &str = "http://www.digicine.com/PROTO-ASDCP-KDM-20040311#";
 
 /// ST 430-1 6.3.7/6.3.8: timestamps are exactly 25 ASCII characters.
 const KDM_TIMESTAMP_LEN: usize = 25;
@@ -666,12 +691,13 @@ fn check_kdm_timestamp(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the 138-byte plaintext key block defined by SMPTE ST 430-1 Table 6.
-///
-/// Field order and lengths are fixed by the standard: structure id (16),
-/// signer thumbprint (20), CPL id (16), key type (4), key id (16),
-/// not-valid-before (25), not-valid-after (25), content key (16).
+/// Build the plaintext key block. SMPTE (ST 430-1 Table 6) is 138 bytes:
+/// structure id (16), signer thumbprint (20), CPL id (16), key type (4),
+/// key id (16), not-valid-before (25), not-valid-after (25), content key (16).
+/// Interop drops the 4-byte key type field, giving 134 bytes.
+#[allow(clippy::too_many_arguments)]
 fn build_kdm_key_block(
+    format: KdmFormat,
     signer_thumbprint: &[u8; 20],
     cpl_id: &uuid::Uuid,
     key_type: &[u8; 4],
@@ -687,16 +713,22 @@ fn build_kdm_key_block(
     block.extend_from_slice(&KDM_STRUCTURE_ID);
     block.extend_from_slice(signer_thumbprint);
     block.extend_from_slice(cpl_id.as_bytes());
-    block.extend_from_slice(key_type);
+    if format == KdmFormat::Smpte {
+        block.extend_from_slice(key_type);
+    }
     block.extend_from_slice(key_id.as_bytes());
     block.extend_from_slice(not_before.as_bytes());
     block.extend_from_slice(not_after.as_bytes());
     block.extend_from_slice(content_key);
 
     // The layout is fixed; a mismatch means the code above drifted from the spec.
-    if block.len() != KDM_KEY_BLOCK_LEN {
+    let expected = match format {
+        KdmFormat::Smpte => KDM_KEY_BLOCK_LEN,
+        KdmFormat::Interop => KDM_KEY_BLOCK_LEN_INTEROP,
+    };
+    if block.len() != expected {
         return Err(format!(
-            "internal error: key block is {} bytes, expected {KDM_KEY_BLOCK_LEN}",
+            "internal error: key block is {} bytes, expected {expected}",
             block.len()
         ));
     }
@@ -900,6 +932,7 @@ fn build_kdm_xml(
             std::str::from_utf8(&key.key_type).map_err(|_| "key type is not ASCII".to_string())?;
 
         let key_block = build_kdm_key_block(
+            config.format,
             &signer.thumbprint,
             cpl_uuid,
             &key.key_type,
@@ -911,14 +944,21 @@ fn build_kdm_xml(
         let ciphertext = encrypt_key_block(&recipient.public_key, &key_block)?;
         let cipher_value = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
 
-        typed_key_ids.push_str(&format!(
-            r#"          <TypedKeyId>
+        // Interop has no KeyType, so its KeyIdList is bare KeyId elements.
+        match config.format {
+            KdmFormat::Smpte => typed_key_ids.push_str(&format!(
+                r#"          <TypedKeyId>
             <KeyType>{key_type}</KeyType>
             <KeyId>urn:uuid:{key_id}</KeyId>
           </TypedKeyId>
 "#,
-            key_id = key.key_id,
-        ));
+                key_id = key.key_id,
+            )),
+            KdmFormat::Interop => typed_key_ids.push_str(&format!(
+                "          <KeyId>urn:uuid:{key_id}</KeyId>\n",
+                key_id = key.key_id,
+            )),
+        }
         encrypted_keys.push_str(&format!(
             r#"    <EncryptedKey xmlns="{ENC_NS}">
       <EncryptionMethod Algorithm="{KDM_ENCRYPTION_METHOD}"/>
@@ -938,6 +978,11 @@ fn build_kdm_xml(
     let signer_issuer = xml_escape(&signer.issuer_dn);
     let signer_serial = xml_escape(&signer.serial);
 
+    let kdm_ns = match config.format {
+        KdmFormat::Smpte => KDM_NS,
+        KdmFormat::Interop => KDM_INTEROP_NS,
+    };
+
     // Inner content of the two authenticated elements the signer references.
     let auth_public_inner = format!(
         r#"
@@ -951,7 +996,7 @@ fn build_kdm_xml(
       <X509SubjectName>{signer_subject}</X509SubjectName>
     </Signer>
     <RequiredExtensions>
-      <KDMRequiredExtensions xmlns="{KDM_NS}">
+      <KDMRequiredExtensions xmlns="{kdm_ns}">
         <Recipient>
           <X509IssuerSerial>
             <X509IssuerName>{recipient_issuer}</X509IssuerName>
@@ -1595,6 +1640,7 @@ mod tests {
             valid_to: "7 days".to_string(),
             formulation: "dci-any".to_string(),
             content_keys: Vec::new(),
+            format: KdmFormat::Smpte,
         }
     }
 
@@ -1614,6 +1660,7 @@ mod tests {
             valid_to: "7 days".to_string(),
             formulation: "dci-any".to_string(),
             content_keys: Vec::new(),
+            format: KdmFormat::Smpte,
         }
     }
 
@@ -1822,6 +1869,84 @@ mod tests {
         assert!(not_before < not_after);
 
         assert_eq!(&block[122..138], &kdm.content_key, "content key roundtrip");
+    }
+
+    #[test]
+    fn interop_kdm_key_block_is_134_bytes_and_omits_key_type() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.format = KdmFormat::Interop;
+        let kdm = build_kdm(&config).expect("build interop kdm");
+
+        // digicine namespace and bare KeyId, no TypedKeyId/KeyType wrapper
+        assert!(kdm.xml.contains(KDM_INTEROP_NS), "interop namespace missing");
+        assert!(
+            !kdm.xml.contains("<TypedKeyId>"),
+            "interop must not use TypedKeyId"
+        );
+        assert!(
+            !kdm.xml.contains("<KeyType>"),
+            "interop KeyIdList must omit KeyType"
+        );
+        assert!(
+            kdm.xml
+                .contains(&format!("<KeyId>urn:uuid:{}</KeyId>", kdm.key_id)),
+            "interop KeyIdList must carry a bare KeyId"
+        );
+
+        let block = recipient_private_key(f)
+            .decrypt(rsa::Oaep::new::<sha1::Sha1>(), &cipher_value(&kdm.xml))
+            .expect("recipient private key must decrypt the interop CipherValue");
+
+        // Interop 134-byte layout: SMPTE Table 6 minus the 4-byte KeyType, so the
+        // key id follows the CPL id directly (libdcp decrypted_kdm.cc 134 case).
+        assert_eq!(block.len(), KDM_KEY_BLOCK_LEN_INTEROP);
+        assert_eq!(&block[0..16], &KDM_STRUCTURE_ID, "structure id");
+
+        let signer = parse_signer(&f.root).expect("parse signer");
+        assert_eq!(&block[16..36], &signer.thumbprint, "signer thumbprint");
+
+        let cpl = uuid::Uuid::parse_str(&config.cpl_id).unwrap();
+        assert_eq!(&block[36..52], cpl.as_bytes(), "cpl id");
+        assert_eq!(&block[52..68], kdm.key_id.as_bytes(), "key id (no key type)");
+
+        let not_before = std::str::from_utf8(&block[68..93]).expect("not-before ascii");
+        let not_after = std::str::from_utf8(&block[93..118]).expect("not-after ascii");
+        check_kdm_timestamp("not_before", not_before).expect("valid not-before");
+        check_kdm_timestamp("not_after", not_after).expect("valid not-after");
+        assert!(not_before < not_after);
+
+        assert_eq!(&block[118..134], &kdm.content_key, "content key roundtrip");
+    }
+
+    /// A default (SMPTE) KDM must be byte-identical to before the format field
+    /// existed: it still uses the SMPTE namespace and TypedKeyId.
+    #[test]
+    fn smpte_is_the_default_and_unchanged() {
+        assert_eq!(KdmFormat::default(), KdmFormat::Smpte);
+        let f = fixtures();
+        let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
+        assert!(kdm.xml.contains(KDM_NS), "default must use the SMPTE namespace");
+        assert!(kdm.xml.contains("<TypedKeyId>"), "default must use TypedKeyId");
+        assert!(!kdm.xml.contains(KDM_INTEROP_NS));
+    }
+
+    #[test]
+    fn interop_kdm_signature_verifies_with_xmlsec1() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("interop.kdm.xml");
+        let mut config = chain_signed_config(f, out.clone());
+        config.format = KdmFormat::Interop;
+        generate_kdm(&config).expect("generate interop kdm");
+        assert!(
+            xmlsec1_verify(&out, &f.root),
+            "interop KDM signature must verify"
+        );
     }
 
     #[test]

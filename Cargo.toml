@@ -46,3 +46,8 @@ tempfile = "3"
 [[bin]]
 name = "bench_j2k"
 required-features = ["grok-ffi"]
+
+# local asdcplib-rs while the MCA/stereo/atmos additions are unmerged; drop once
+# asdcplib-rs is pushed and the rev above is re-pinned.
+[patch."https://github.com/PostPerfection/asdcplib-rs.git"]
+asdcplib = { path = "/home/aaron/src/PostPerfection/asdcplib-rs/asdcplib" }
