@@ -519,7 +519,10 @@ impl ImfCpl {
         );
         // SourceEncoding precedes TrackFileId per ST 2067-2 TrackFileResourceType.
         if let Some(se) = &r.source_encoding {
-            let _ = writeln!(xml, "              <SourceEncoding>urn:uuid:{se}</SourceEncoding>");
+            let _ = writeln!(
+                xml,
+                "              <SourceEncoding>urn:uuid:{se}</SourceEncoding>"
+            );
         }
         let _ = writeln!(
             xml,
@@ -1042,7 +1045,9 @@ mod tests {
             walk(root, "imf-cpl-20160411.xsd"),
             walk(root, "xmldsig-core-schema.xsd"),
         ) else {
-            panic!("could not locate imf-cpl-20160411.xsd and xmldsig-core-schema.xsd under {xsd_dir}");
+            panic!(
+                "could not locate imf-cpl-20160411.xsd and xmldsig-core-schema.xsd under {xsd_dir}"
+            );
         };
 
         let se = "12345678-1111-2222-3333-444444444444";

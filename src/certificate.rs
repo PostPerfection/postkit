@@ -1879,7 +1879,10 @@ mod tests {
         let kdm = build_kdm(&config).expect("build interop kdm");
 
         // digicine namespace and bare KeyId, no TypedKeyId/KeyType wrapper
-        assert!(kdm.xml.contains(KDM_INTEROP_NS), "interop namespace missing");
+        assert!(
+            kdm.xml.contains(KDM_INTEROP_NS),
+            "interop namespace missing"
+        );
         assert!(
             !kdm.xml.contains("<TypedKeyId>"),
             "interop must not use TypedKeyId"
@@ -1908,7 +1911,11 @@ mod tests {
 
         let cpl = uuid::Uuid::parse_str(&config.cpl_id).unwrap();
         assert_eq!(&block[36..52], cpl.as_bytes(), "cpl id");
-        assert_eq!(&block[52..68], kdm.key_id.as_bytes(), "key id (no key type)");
+        assert_eq!(
+            &block[52..68],
+            kdm.key_id.as_bytes(),
+            "key id (no key type)"
+        );
 
         let not_before = std::str::from_utf8(&block[68..93]).expect("not-before ascii");
         let not_after = std::str::from_utf8(&block[93..118]).expect("not-after ascii");
@@ -1926,8 +1933,14 @@ mod tests {
         assert_eq!(KdmFormat::default(), KdmFormat::Smpte);
         let f = fixtures();
         let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
-        assert!(kdm.xml.contains(KDM_NS), "default must use the SMPTE namespace");
-        assert!(kdm.xml.contains("<TypedKeyId>"), "default must use TypedKeyId");
+        assert!(
+            kdm.xml.contains(KDM_NS),
+            "default must use the SMPTE namespace"
+        );
+        assert!(
+            kdm.xml.contains("<TypedKeyId>"),
+            "default must use TypedKeyId"
+        );
         assert!(!kdm.xml.contains(KDM_INTEROP_NS));
     }
 

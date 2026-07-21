@@ -40,7 +40,10 @@ struct RunStat {
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn base_params(res: &Res) -> CompressParams {
@@ -66,7 +69,15 @@ fn gen_frames(w: u32, h: u32, k: usize) -> Vec<Vec<u8>> {
     let mut child = std::process::Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
         .arg(format!("testsrc2=size={size}:rate=24"))
-        .args(["-frames:v", &k.to_string(), "-pix_fmt", "rgb48be", "-f", "rawvideo", "pipe:1"])
+        .args([
+            "-frames:v",
+            &k.to_string(),
+            "-pix_fmt",
+            "rgb48be",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -117,7 +128,14 @@ fn avg_output_size(dir: &Path) -> f64 {
     if n == 0 { 0.0 } else { total as f64 / n as f64 }
 }
 
-fn run(dir: &Path, params: &CompressParams, planar: &[[Vec<i32>; 3]], w: u32, h: u32, n: u64) -> RunStat {
+fn run(
+    dir: &Path,
+    params: &CompressParams,
+    planar: &[[Vec<i32>; 3]],
+    w: u32,
+    h: u32,
+    n: u64,
+) -> RunStat {
     clear_dir(dir);
     let cancel = Arc::new(AtomicBool::new(false));
     let k = planar.len() as u64;
@@ -137,7 +155,14 @@ fn run(dir: &Path, params: &CompressParams, planar: &[[Vec<i32>; 3]], w: u32, h:
         })
     };
     let start = Instant::now();
-    encode_pipeline(dir, params, n, &cancel, &mut producer, |_p: EncodeProgress| {});
+    encode_pipeline(
+        dir,
+        params,
+        n,
+        &cancel,
+        &mut producer,
+        |_p: EncodeProgress| {},
+    );
     let elapsed = start.elapsed().as_secs_f64();
     stat(dir, n, elapsed)
 }
@@ -163,7 +188,12 @@ fn sanity(dir: &Path, label: &str) {
         Some(bytes) => match parse_j2k_header(&bytes) {
             Some(h) => println!(
                 "  {label}: valid codestream {}x{} comps={} depth={} profile={:#06x} first_frame_bytes={}",
-                h.width, h.height, h.num_components, h.bit_depth, h.profile, bytes.len()
+                h.width,
+                h.height,
+                h.num_components,
+                h.bit_depth,
+                h.profile,
+                bytes.len()
             ),
             None => println!("  {label}: INVALID codestream (header parse failed)"),
         },
@@ -175,18 +205,36 @@ fn spread(v: &[f64]) -> f64 {
     let max = v.iter().cloned().fold(f64::MIN, f64::max);
     let min = v.iter().cloned().fold(f64::MAX, f64::min);
     let mean = v.iter().sum::<f64>() / v.len() as f64;
-    if mean == 0.0 { 0.0 } else { (max - min) / mean * 100.0 }
+    if mean == 0.0 {
+        0.0
+    } else {
+        (max - min) / mean * 100.0
+    }
 }
 
 fn main() {
     let arg = std::env::args().nth(1).unwrap_or_else(|| "both".into());
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
     let repeats = env_u64("REPEATS", 2) as usize;
     let unique = env_u64("UNIQUE", 32) as usize;
 
     let all = [
-        Res { name: "2K", w: 1998, h: 1080, profile: 0x0003, frames: env_u64("FRAMES_2K", 120) },
-        Res { name: "4K", w: 3996, h: 2160, profile: 0x0004, frames: env_u64("FRAMES_4K", 48) },
+        Res {
+            name: "2K",
+            w: 1998,
+            h: 1080,
+            profile: 0x0003,
+            frames: env_u64("FRAMES_2K", 120),
+        },
+        Res {
+            name: "4K",
+            w: 3996,
+            h: 2160,
+            profile: 0x0004,
+            frames: env_u64("FRAMES_4K", 48),
+        },
     ];
     let sel: Vec<&Res> = all
         .iter()
@@ -195,13 +243,18 @@ fn main() {
 
     grok_encoder::initialize(cores as u32);
     println!("cores (affinity-visible) = {cores}, repeats = {repeats}, unique frames = {unique}");
-    println!("content = ffmpeg testsrc2; 12-bit planar frames; grok ratio set to DCI-like bytes/frame\n");
+    println!(
+        "content = ffmpeg testsrc2; 12-bit planar frames; grok ratio set to DCI-like bytes/frame\n"
+    );
 
     let out = PathBuf::from("/dev/shm/bench_j2k_out");
 
     for res in sel {
         let npix = (res.w as usize) * (res.h as usize);
-        println!("=== {} ({}x{}), {} frames/run ===", res.name, res.w, res.h, res.frames);
+        println!(
+            "=== {} ({}x{}), {} frames/run ===",
+            res.name, res.w, res.h, res.frames
+        );
         let packed = gen_frames(res.w, res.h, unique);
         let planar: Vec<[Vec<i32>; 3]> =
             packed.iter().map(|p| packed_to_planar12(p, npix)).collect();
@@ -227,7 +280,10 @@ fn main() {
         for r in 0..repeats {
             let g = run(&out, &params, &planar, res.w, res.h, res.frames);
             sanity(&out, &format!("grok r{r}"));
-            println!("  r{r}: grok {:.2} fps {:.1} MB/s {:.0} B", g.fps, g.out_mbps, g.avg_size);
+            println!(
+                "  r{r}: grok {:.2} fps {:.1} MB/s {:.0} B",
+                g.fps, g.out_mbps, g.avg_size
+            );
             g_fps.push(g.fps);
             g_last = Some(g);
         }
@@ -235,7 +291,12 @@ fn main() {
         let gm = g_fps.iter().sum::<f64>() / g_fps.len() as f64;
         println!(
             "  SUMMARY {} @ {} cores: grok {:.2} fps ({:.0}% spread) {:.1} MB/s {:.0} B\n",
-            res.name, cores, gm, spread(&g_fps), g.out_mbps, g.avg_size
+            res.name,
+            cores,
+            gm,
+            spread(&g_fps),
+            g.out_mbps,
+            g.avg_size
         );
     }
 

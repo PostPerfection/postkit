@@ -594,13 +594,8 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
 
     let mut writer = PcmWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
-    if let Err(e) = writer.open_write(
-        &output_str,
-        &info,
-        &desc,
-        opts.mca_config.as_deref(),
-        16384,
-    ) {
+    if let Err(e) = writer.open_write(&output_str, &info, &desc, opts.mca_config.as_deref(), 16384)
+    {
         return MxfTrackFile {
             error: format!("PCM open_write failed: {e}"),
             ..Default::default()
@@ -1252,7 +1247,11 @@ mod tests {
             encryption: None,
         });
         assert!(!result.success);
-        assert!(result.error.contains("counts differ"), "got: {}", result.error);
+        assert!(
+            result.error.contains("counts differ"),
+            "got: {}",
+            result.error
+        );
     }
 
     #[test]
