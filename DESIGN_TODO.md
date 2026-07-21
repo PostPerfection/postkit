@@ -24,12 +24,7 @@ xmllint against the SMPTE XSDs and against 58 real signed ECL CPL/PKL.
 
 ## Planned / not started
 
-- Interop-only packaging gaps still schema-invalid (pre-existing, out of the
-  above scope). DcpCpl in the Interop CPL namespace emits `<ScreenAspectRatio>1998
-  1080</ScreenAspectRatio>`, but Interop wants a decimal (e.g. `1.85`); the ratio
-  is hardcoded and no ratio is threaded through. And an IMF ASSETMAP
-  (`include_volume_count = false`) omits `<VolumeCount>`, which ST 429-9 requires.
-  Both need the writers to carry real values, not just reordering.
+(none)
 
 - Colour-managed DCP preview landed: preview now resolves a DCP/CPL/MXF,
   decrypts encrypted picture essence in Rust, decodes J2K via ffmpeg and applies

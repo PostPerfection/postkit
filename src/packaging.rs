@@ -109,7 +109,8 @@ pub struct AssetMapAsset {
     pub packing_list: bool,
 }
 
-/// An ASSETMAP (ST 429-9). DCP includes `<VolumeCount>`; IMF omits it.
+/// An ASSETMAP (ST 429-9). VolumeCount is mandatory in both the SMPTE and
+/// Interop AM schemas, so it is always emitted (single-volume: 1).
 ///
 /// SMPTE 429-9 and Interop order the metadata block differently (SMPTE:
 /// Creator, VolumeCount, IssueDate, Issuer; Interop: VolumeCount, IssueDate,
@@ -122,7 +123,6 @@ pub struct AssetMap {
     pub issuer: String,
     pub creator: String,
     pub issue_date: String,
-    pub include_volume_count: bool,
     pub assets: Vec<AssetMapAsset>,
 }
 
@@ -133,11 +133,7 @@ impl AssetMap {
         let _ = writeln!(xml, "<AssetMap xmlns=\"{}\">", self.namespace);
         let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
         let creator = format!("  <Creator>{}</Creator>\n", escape_xml(&self.creator));
-        let volume_count = if self.include_volume_count {
-            "  <VolumeCount>1</VolumeCount>\n"
-        } else {
-            ""
-        };
+        let volume_count = "  <VolumeCount>1</VolumeCount>\n";
         let issue_date = format!("  <IssueDate>{}</IssueDate>\n", self.issue_date);
         let issuer = format!("  <Issuer>{}</Issuer>\n", escape_xml(&self.issuer));
         if self.namespace == ns::AM_INTEROP {
@@ -190,6 +186,11 @@ pub struct DcpCplReel {
     pub picture_edit_rate_den: u32,
     pub picture_duration: u64,
     pub picture_entry_point: u64,
+    /// Picture container dimensions, e.g. 1998x1080 (flat) or 2048x858 (scope).
+    /// SMPTE writes them as the Rational ScreenAspectRatio; Interop derives a
+    /// decimal ratio from them.
+    pub picture_width: u32,
+    pub picture_height: u32,
     /// KeyId (bare UUID) when the picture essence is encrypted.
     pub picture_key_id: Option<String>,
     pub sound_id: Option<String>,
@@ -213,6 +214,14 @@ pub struct DcpCpl {
     pub creator: String,
     pub issue_date: String,
     pub reels: Vec<DcpCplReel>,
+}
+
+/// Interop ScreenAspectRatio decimal from container dims. Rounding to two
+/// places snaps to the canonical DCI ratios (1998x1080 -> 1.85, 2048x858 ->
+/// 2.39) without a lookup table.
+fn screen_aspect_decimal(width: u32, height: u32) -> String {
+    assert!(height != 0, "picture_height must be set for an Interop CPL");
+    format!("{:.2}", width as f64 / height as f64)
 }
 
 impl DcpCpl {
@@ -289,7 +298,21 @@ impl DcpCpl {
                 "          <FrameRate>{} {}</FrameRate>",
                 reel.picture_edit_rate_num, reel.picture_edit_rate_den
             );
-            xml.push_str("          <ScreenAspectRatio>1998 1080</ScreenAspectRatio>\n");
+            // SMPTE ScreenAspectRatio is a Rational (container dims); Interop is
+            // a decimal (e.g. 1.85, 2.39) derived from those dims.
+            if self.namespace == ns::CPL_INTEROP {
+                let _ = writeln!(
+                    xml,
+                    "          <ScreenAspectRatio>{}</ScreenAspectRatio>",
+                    screen_aspect_decimal(reel.picture_width, reel.picture_height)
+                );
+            } else {
+                let _ = writeln!(
+                    xml,
+                    "          <ScreenAspectRatio>{} {}</ScreenAspectRatio>",
+                    reel.picture_width, reel.picture_height
+                );
+            }
             xml.push_str("        </MainPicture>\n");
             if let Some(ref sound_id) = reel.sound_id {
                 xml.push_str("        <MainSound>\n");
@@ -498,11 +521,14 @@ mod tests {
         let xsd = std::path::Path::new(&xsd_dir);
         let dir = tempfile::tempdir().unwrap();
 
-        // xmllint resolves the CPL's ds:Signature and xml.xsd imports (declared
-        // by http URL) through this catalog to the local copies.
+        // xmllint resolves the CPLs' ds:Signature, xml.xsd, and (Interop only)
+        // the 437-Y stereo-picture import (all declared by http URL) through this
+        // catalog to the local copies.
         let catalog = dir.path().join("catalog.xml");
         let dsig = xsd.join("xmldsig-core-schema.xsd");
         let xml_xsd = xsd.join("xml.xsd");
+        let stereo = xsd.join("437-Y-2007-Main-Stereo-Picture-CPL.xsd");
+        let interop_cpl = xsd.join("PROTO-ASDCP-CPL-20040511.xsd");
         std::fs::write(
             &catalog,
             format!(
@@ -510,9 +536,15 @@ mod tests {
 <catalog xmlns="urn:oasis:names:tc:entity:xmlns:xml:catalog">
   <system systemId="http://www.w3.org/TR/2002/REC-xmldsig-core-20020212/xmldsig-core-schema.xsd" uri="{dsig}"/>
   <system systemId="http://www.w3.org/2001/03/xml.xsd" uri="{xml_xsd}"/>
+  <system systemId="http://www.digicine.com/schemas/437-Y/2007/Main-Stereo-Picture-CPL.xsd" uri="{stereo}"/>
+  <public publicId="http://www.digicine.com/schemas/437-Y/2007/Main-Stereo-Picture-CPL" uri="{stereo}"/>
+  <system systemId="http://www.digicine.com/PROTO-ASDCP-CPL-20040511.xsd" uri="{interop_cpl}"/>
+  <public publicId="http://www.digicine.com/PROTO-ASDCP-CPL-20040511#" uri="{interop_cpl}"/>
 </catalog>"#,
                 dsig = dsig.display(),
                 xml_xsd = xml_xsd.display(),
+                stereo = stereo.display(),
+                interop_cpl = interop_cpl.display(),
             ),
         )
         .unwrap();
@@ -524,9 +556,22 @@ mod tests {
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
-            include_volume_count: true,
             assets: vec![AssetMapAsset {
                 id: "99999999-7777-8888-9999-aaaaaaaaaaaa".into(),
+                path: "PKL.xml".into(),
+                packing_list: true,
+            }],
+        };
+        // IMF ASSETMAP uses the same 429-9 AM schema and must also carry
+        // VolumeCount (the old include_volume_count=false path was schema-invalid).
+        let imf_am = AssetMap {
+            uuid: "dddddddd-7777-8888-9999-aaaaaaaaaaaa".into(),
+            namespace: ns::AM_SMPTE.into(),
+            issuer: "IMF Wizard".into(),
+            creator: "IMF Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            assets: vec![AssetMapAsset {
+                id: "eeeeeeee-7777-8888-9999-aaaaaaaaaaaa".into(),
                 path: "PKL.xml".into(),
                 packing_list: true,
             }],
@@ -558,6 +603,8 @@ mod tests {
                 picture_edit_rate_num: 24,
                 picture_edit_rate_den: 1,
                 picture_duration: 240,
+                picture_width: 1998,
+                picture_height: 1080,
                 sound_id: Some("88888888-7777-8888-9999-aaaaaaaaaaaa".into()),
                 sound_edit_rate_num: 24,
                 sound_edit_rate_den: 1,
@@ -565,11 +612,47 @@ mod tests {
                 ..Default::default()
             }],
         };
+        // Interop CPL: scope container (2048x858) exercises the decimal
+        // ScreenAspectRatio (-> 2.39) that the Interop schema requires.
+        let interop_cpl_doc = DcpCpl {
+            uuid: "22222222-2222-3333-4444-555555555555".into(),
+            namespace: ns::CPL_INTEROP.into(),
+            title: "Test".into(),
+            content_kind: "feature".into(),
+            issuer: "DCP Wizard".into(),
+            creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            reels: vec![DcpCplReel {
+                reel_id: "66666666-7777-8888-9999-aaaaaaaaaaaa".into(),
+                picture_id: "77777777-7777-8888-9999-aaaaaaaaaaaa".into(),
+                picture_edit_rate_num: 24,
+                picture_edit_rate_den: 1,
+                picture_duration: 240,
+                picture_width: 2048,
+                picture_height: 858,
+                sound_id: Some("88888888-7777-8888-9999-aaaaaaaaaaaa".into()),
+                sound_edit_rate_num: 24,
+                sound_edit_rate_den: 1,
+                sound_duration: 240,
+                ..Default::default()
+            }],
+        };
+        assert!(
+            interop_cpl_doc
+                .to_xml()
+                .contains("<ScreenAspectRatio>2.39</ScreenAspectRatio>")
+        );
 
         for (doc, schema, xml) in [
             ("ASSETMAP", "SMPTE-429-9-2007-AM.xsd", am.to_xml()),
+            ("IMF_ASSETMAP", "SMPTE-429-9-2007-AM.xsd", imf_am.to_xml()),
             ("PKL", "SMPTE-429-8-2006-PKL.xsd", pkl.to_xml()),
             ("CPL", "SMPTE-429-7-2006-CPL.xsd", cpl.to_xml()),
+            (
+                "INTEROP_CPL",
+                "PROTO-ASDCP-CPL-20040511.xsd",
+                interop_cpl_doc.to_xml(),
+            ),
         ] {
             let path = dir.path().join(format!("{doc}.xml"));
             std::fs::write(&path, &xml).unwrap();
@@ -586,6 +669,13 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    #[test]
+    fn screen_aspect_decimal_snaps_to_dci_ratios() {
+        assert_eq!(screen_aspect_decimal(1998, 1080), "1.85");
+        assert_eq!(screen_aspect_decimal(2048, 858), "2.39");
+        assert_eq!(screen_aspect_decimal(2048, 1080), "1.90");
     }
 
     #[test]
@@ -617,39 +707,41 @@ mod tests {
     }
 
     #[test]
-    fn assetmap_dcp_has_volume_count_imf_does_not() {
+    fn assetmap_always_emits_volume_count() {
+        // ST 429-9 (and Interop AM) make VolumeCount mandatory, so every
+        // ASSETMAP carries it regardless of DCP vs IMF.
         let assets = vec![AssetMapAsset {
             id: "pkl".into(),
             path: "PKL.xml".into(),
             packing_list: true,
         }];
-        let dcp = AssetMap {
+        let smpte = AssetMap {
             uuid: "am".into(),
             namespace: ns::AM_SMPTE.into(),
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
-            include_volume_count: true,
             assets: assets.clone(),
         }
         .to_xml();
-        assert!(dcp.contains("<VolumeCount>1</VolumeCount>"));
-        assert!(dcp.contains("<IssueDate>2024-01-01T00:00:00+00:00</IssueDate>"));
-        assert!(dcp.contains("<Issuer>DCP Wizard</Issuer>"));
-        assert!(dcp.contains("<PackingList>true</PackingList>"));
-        assert!(dcp.contains("<Path>PKL.xml</Path>"));
+        assert!(smpte.contains("<VolumeCount>1</VolumeCount>"));
+        assert!(smpte.contains("<IssueDate>2024-01-01T00:00:00+00:00</IssueDate>"));
+        assert!(smpte.contains("<Issuer>DCP Wizard</Issuer>"));
+        assert!(smpte.contains("<PackingList>true</PackingList>"));
+        assert!(smpte.contains("<Path>PKL.xml</Path>"));
 
-        let imf = AssetMap {
+        let interop = AssetMap {
             uuid: "am".into(),
-            namespace: ns::AM_SMPTE.into(),
+            namespace: ns::AM_INTEROP.into(),
             issuer: "IMF Wizard".into(),
             creator: "IMF Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
-            include_volume_count: false,
             assets,
         }
         .to_xml();
-        assert!(!imf.contains("VolumeCount"));
+        // Interop orders VolumeCount before IssueDate; it must still be present.
+        assert!(interop.contains("<VolumeCount>1</VolumeCount>"));
+        assert!(interop.find("<VolumeCount>").unwrap() < interop.find("<IssueDate>").unwrap());
     }
 
     #[test]
@@ -678,6 +770,8 @@ mod tests {
                 picture_edit_rate_den: 1,
                 picture_duration: 240,
                 picture_entry_point: 0,
+                picture_width: 1998,
+                picture_height: 1080,
                 picture_key_id: Some("pic-key".into()),
                 sound_id: Some("snd".into()),
                 sound_edit_rate_num: 24,
@@ -689,6 +783,8 @@ mod tests {
         };
         let xml = cpl.to_xml();
         assert!(xml.contains("429-7/2006/CPL"));
+        // SMPTE keeps the Rational (container dims) form.
+        assert!(xml.contains("<ScreenAspectRatio>1998 1080</ScreenAspectRatio>"));
         assert!(xml.contains("<ContentTitleText>A &amp; B</ContentTitleText>"));
         // ST 429-7 order: IssueDate precedes ContentTitleText, which precedes ContentKind.
         assert!(xml.find("<IssueDate>").unwrap() < xml.find("<ContentTitleText>").unwrap());
@@ -715,6 +811,8 @@ mod tests {
                 picture_id: "pic".into(),
                 picture_edit_rate_num: 24,
                 picture_edit_rate_den: 1,
+                picture_width: 1998,
+                picture_height: 1080,
                 sound_id: None,
                 ..Default::default()
             }],
@@ -723,6 +821,8 @@ mod tests {
         let xml = cpl.to_xml();
         assert!(xml.contains("PROTO-ASDCP-CPL-20040511"));
         assert!(!xml.contains("<MainSound>"));
+        // Interop emits the decimal ratio, not the Rational pair.
+        assert!(xml.contains("<ScreenAspectRatio>1.85</ScreenAspectRatio>"));
     }
 
     #[test]
