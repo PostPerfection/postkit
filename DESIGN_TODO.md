@@ -26,6 +26,28 @@ xmllint against the SMPTE XSDs and against 58 real signed ECL CPL/PKL.
 
 (none)
 
+Grok multi-core encode fixed 2026-07-21: grok's compress scheduler always
+parallelises T1 across the global TFSingleton pool (per-codec cparams.num_threads
+is ignored on the compress path), so the old min(4) encoder-thread cap left cores
+idle and lost to openjpeg at 8 cores. encode_pipeline now forces the global pool
+to inline mode (grk_initialize(1) => each grk_compress runs its whole taskflow on
+the calling thread) and runs one encoder thread per core, restoring the pool on
+exit. 8-core grok/opj went 0.78x/0.79x -> 1.15x (2K) / 1.00x (4K). openjpeg then
+removed: the `openjpeg` feature, openjpeg-sys dep, and src/openjpeg_encoder.rs are
+gone; shared types (BoundedQueue, CompressParams, RawFrame, ...) already lived in
+grok_encoder. bench_j2k is now a grok-only rerunnable perf check.
+
+ImfCpl gained optional composition `languages` (ST 2067-3 LocaleList, replaces
+imfwizard's string-edited injection), optional `essence_descriptors`
+(EssenceDescriptorList carrier) plus per-resource `source_encoding`, for per-track
+audio MCA/soundfield + RFC 5646 language and image color/HDR-WCG. postkit carries
+the descriptor body verbatim; the UL-coded MXF descriptor internals come from
+asdcplib, not synthesised here. All default to byte-identical output. Validated
+with xmllint against imf-cpl-20160411.xsd. HDR/WCG synthesis (ST 2067-21 RGBA
+descriptor color/mastering-display ULs) uses the same carrier but is not emitted
+by postkit: those values can only be lax-validated against the CPL XSD and belong
+to the MXF descriptor, so they are left to the wizard/asdcplib.
+
 - Colour-managed DCP preview landed: preview now resolves a DCP/CPL/MXF,
   decrypts encrypted picture essence in Rust, decodes J2K via ffmpeg and applies
   the inverse DCDM transform (X'Y'Z' → sRGB, or a monitor ICC via the `icc`
@@ -42,17 +64,6 @@ xmllint against the SMPTE XSDs and against 58 real signed ECL CPL/PKL.
   4K), so SDI gates on a GPU J2K decode path; also needs genlock-accurate
   scheduling and the physical board to verify. Effort: medium for the SDI
   plumbing (2K), large once GPU decode + 4K + genlock are required.
-
-## Consumers still to switch (other repos, later phase)
-
-- escape_xml: 5 private copies (dcpwizard cpl/subtitle/vf, imfwizard cpl/to_dcp)
-  should switch to `postkit::packaging::escape_xml`.
-- CPL/PKL/ASSETMAP: dcpwizard cpl.rs/pkl.rs/assetmap.rs and imfwizard
-  cpl.rs/pkl.rs/assetmap.rs should map their configs onto the new
-  `postkit::packaging` writers (DcpCpl / ImfCpl / PackingList / AssetMap /
-  volindex_xml) and delete their hand-rolled XML.
-- SRT: dcpwizard subtitle.rs and imfwizard subtitle_convert.rs should use
-  `postkit::subtitle_retime::parse_srt` / `SrtCue`.
 
 ## Dedup that is NOT a straight switch (needs postkit API work first)
 
@@ -77,3 +88,10 @@ modules, so they can't just switch. Extract only after extending the postkit API
   left in the apps.
 - Package diff: dcpwizard dcp_diff.rs vs imfwizard imp_diff.rs are ~75% similar;
   could become one postkit module, not yet attempted.
+- imfwizard to_dcp.rs DCP CPL/PKL/ASSETMAP writers: only the escaper switched to
+  postkit. DcpCplReel now carries per-reel picture_width/height and emits a
+  per-asset ScreenAspectRatio (SMPTE Rational, Interop decimal), so that blocker
+  is gone; the remaining work is the mechanical switch of to_dcp's hand-rolled
+  CPL to postkit::packaging::DcpCpl.
+- imfwizard cpl.rs inject_locale_list: obsolete. Set ImfCpl.languages and drop the
+  string-splice helper (postkit emits the identical LocaleList block).

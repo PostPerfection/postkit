@@ -378,6 +378,24 @@ pub struct ImfResource {
     pub track_file_uuid: String,
     pub duration: u64,
     pub kind: ImfTrackKind,
+    /// Bare UUID linking this resource to an EssenceDescriptorList entry
+    /// (ST 2067-2 SourceEncoding). None keeps the resource unchanged.
+    pub source_encoding: Option<String>,
+}
+
+/// One entry of an IMF CPL EssenceDescriptorList (ST 2067-3): an Id matched by a
+/// resource's SourceEncoding, plus the essence descriptor body. The body is the
+/// MXF header-metadata serialisation in its own reg/335, reg/2003 and reg/395
+/// namespaces (RGBADescriptor for image color/HDR-WCG, WAVEPCMDescriptor + MCA
+/// subdescriptors for audio soundfield and per-track RFC 5646 spoken language).
+/// postkit carries this verbatim; it does not synthesise the UL-coded descriptor
+/// internals (that data comes from the wrapped MXF via asdcplib).
+#[derive(Debug, Clone)]
+pub struct ImfEssenceDescriptor {
+    /// Bare UUID, referenced by an `ImfResource::source_encoding`.
+    pub id: String,
+    /// Descriptor body XML placed inside `<EssenceDescriptor>`, already namespaced.
+    pub body: String,
 }
 
 /// An IMF Composition Playlist (ST 2067-3, App #2E).
@@ -394,6 +412,12 @@ pub struct ImfCpl {
     pub fps_num: u32,
     pub fps_den: u32,
     pub resources: Vec<ImfResource>,
+    /// Composition languages (RFC 5646) written as a ST 2067-3 LocaleList. Empty
+    /// keeps the output unchanged.
+    pub languages: Vec<String>,
+    /// Essence descriptors carrying per-track audio MCA/soundfield/language
+    /// labelling and image color/HDR-WCG metadata. Empty keeps output unchanged.
+    pub essence_descriptors: Vec<ImfEssenceDescriptor>,
 }
 
 impl ImfCpl {
@@ -424,7 +448,28 @@ impl ImfCpl {
             escape_xml(&self.title)
         );
         let _ = writeln!(xml, "  <ContentKind>{content_kind}</ContentKind>");
+        // EssenceDescriptorList precedes EditRate per ST 2067-3 element order.
+        if !self.essence_descriptors.is_empty() {
+            xml.push_str("  <EssenceDescriptorList>\n");
+            for d in &self.essence_descriptors {
+                xml.push_str("    <EssenceDescriptor>\n");
+                let _ = writeln!(xml, "      <Id>urn:uuid:{}</Id>", d.id);
+                // body is caller-supplied, already-namespaced mxf descriptor xml
+                xml.push_str(d.body.trim_end());
+                xml.push('\n');
+                xml.push_str("    </EssenceDescriptor>\n");
+            }
+            xml.push_str("  </EssenceDescriptorList>\n");
+        }
         let _ = writeln!(xml, "  <EditRate>{fps_num} {fps_den}</EditRate>");
+        // LocaleList follows EditRate and precedes ExtensionProperties.
+        if !self.languages.is_empty() {
+            xml.push_str("  <LocaleList>\n    <Locale>\n      <LanguageList>\n");
+            for l in &self.languages {
+                let _ = writeln!(xml, "        <Language>{}</Language>", escape_xml(l));
+            }
+            xml.push_str("      </LanguageList>\n    </Locale>\n  </LocaleList>\n");
+        }
         xml.push_str("  <ExtensionProperties>\n");
         let _ = writeln!(
             xml,
@@ -472,6 +517,10 @@ impl ImfCpl {
             "              <Id>urn:uuid:{}</Id>",
             uuid::Uuid::new_v4()
         );
+        // SourceEncoding precedes TrackFileId per ST 2067-2 TrackFileResourceType.
+        if let Some(se) = &r.source_encoding {
+            let _ = writeln!(xml, "              <SourceEncoding>urn:uuid:{se}</SourceEncoding>");
+        }
         let _ = writeln!(
             xml,
             "              <TrackFileId>urn:uuid:{}</TrackFileId>",
@@ -841,13 +890,17 @@ mod tests {
                     track_file_uuid: "aud".into(),
                     duration: 240,
                     kind: ImfTrackKind::Audio,
+                    source_encoding: None,
                 },
                 ImfResource {
                     track_file_uuid: "vid".into(),
                     duration: 240,
                     kind: ImfTrackKind::Image,
+                    source_encoding: None,
                 },
             ],
+            languages: vec![],
+            essence_descriptors: vec![],
         };
         let xml = cpl.to_xml();
         assert!(xml.contains(ns::APP2E));
@@ -859,5 +912,192 @@ mod tests {
         let img = xml.find("MainImageSequence").unwrap();
         let aud = xml.find("MainAudioSequence").unwrap();
         assert!(img < aud, "image track should be written before audio");
+    }
+
+    /// Compact but structurally real audio essence descriptor body: a
+    /// WAVEPCMDescriptor with a SoundfieldGroupLabelSubDescriptor and an
+    /// AudioChannelLabelSubDescriptor carrying an RFC 5646 spoken language.
+    /// Namespaces mirror a real ST 2067-2 EssenceDescriptorList.
+    fn sample_audio_descriptor_body(lang: &str) -> String {
+        format!(
+            r#"<r0:WAVEPCMDescriptor xmlns:r0="http://www.smpte-ra.org/reg/395/2014/13/1/aaf" xmlns:r1="http://www.smpte-ra.org/reg/335/2012">
+        <r1:ChannelCount>2</r1:ChannelCount>
+        <r1:SubDescriptors>
+          <r0:SoundfieldGroupLabelSubDescriptor>
+            <r1:MCATagSymbol>sg51</r1:MCATagSymbol>
+            <r1:RFC5646SpokenLanguage>{lang}</r1:RFC5646SpokenLanguage>
+          </r0:SoundfieldGroupLabelSubDescriptor>
+          <r0:AudioChannelLabelSubDescriptor>
+            <r1:MCAChannelID>1</r1:MCAChannelID>
+            <r1:MCATagSymbol>chVIN</r1:MCATagSymbol>
+            <r1:MCATagName>Visually Impaired</r1:MCATagName>
+            <r1:RFC5646SpokenLanguage>{lang}</r1:RFC5646SpokenLanguage>
+          </r0:AudioChannelLabelSubDescriptor>
+        </r1:SubDescriptors>
+      </r0:WAVEPCMDescriptor>"#
+        )
+    }
+
+    #[test]
+    fn imf_cpl_writes_locale_list() {
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            languages: vec!["de-DE".into(), "en-US".into()],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        assert!(xml.contains("<LocaleList>"));
+        assert!(xml.contains("<Language>de-DE</Language>"));
+        assert!(xml.contains("<Language>en-US</Language>"));
+        // LocaleList follows EditRate and precedes ExtensionProperties.
+        assert!(xml.find("<EditRate>").unwrap() < xml.find("<LocaleList>").unwrap());
+        assert!(xml.find("<LocaleList>").unwrap() < xml.find("<ExtensionProperties>").unwrap());
+        // empty languages keep the LocaleList out entirely
+        let plain = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            ..Default::default()
+        };
+        assert!(!plain.to_xml().contains("<LocaleList>"));
+    }
+
+    #[test]
+    fn imf_cpl_writes_essence_descriptor_list_with_source_encoding() {
+        let se = "12345678-1111-2222-3333-444444444444";
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            resources: vec![ImfResource {
+                track_file_uuid: "aud".into(),
+                duration: 240,
+                kind: ImfTrackKind::Audio,
+                source_encoding: Some(se.into()),
+            }],
+            essence_descriptors: vec![ImfEssenceDescriptor {
+                id: se.into(),
+                body: sample_audio_descriptor_body("en-US"),
+            }],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        // descriptor list present, carries the MCA soundfield + per-track language
+        assert!(xml.contains("<EssenceDescriptorList>"));
+        assert!(xml.contains(&format!("<Id>urn:uuid:{se}</Id>")));
+        assert!(xml.contains("SoundfieldGroupLabelSubDescriptor"));
+        assert!(xml.contains("<r1:RFC5646SpokenLanguage>en-US</r1:RFC5646SpokenLanguage>"));
+        assert!(xml.contains("<r1:MCATagSymbol>chVIN</r1:MCATagSymbol>"));
+        // resource links to the descriptor via SourceEncoding, before TrackFileId
+        assert!(xml.contains(&format!("<SourceEncoding>urn:uuid:{se}</SourceEncoding>")));
+        assert!(xml.find("<SourceEncoding>").unwrap() < xml.find("<TrackFileId>").unwrap());
+        // EssenceDescriptorList precedes EditRate per ST 2067-3 order
+        assert!(xml.find("<EssenceDescriptorList>").unwrap() < xml.find("<EditRate>").unwrap());
+        // empty descriptors keep it out
+        let plain = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            ..Default::default()
+        };
+        assert!(!plain.to_xml().contains("<EssenceDescriptorList>"));
+    }
+
+    /// Validate an IMF CPL carrying a LocaleList and an audio EssenceDescriptor
+    /// (with MCA soundfield + RFC 5646 language) against the official ST
+    /// 2067-3:2016 XSD. Gated on IMFWIZARD_IMF_XSD_DIR (a dir holding
+    /// imf-cpl-20160411.xsd and xmldsig-core-schema.xsd anywhere below it) plus
+    /// xmllint; skips when absent.
+    #[test]
+    fn imf_cpl_passes_st2067_3_xsd() {
+        let Ok(xsd_dir) = std::env::var("IMFWIZARD_IMF_XSD_DIR") else {
+            eprintln!("skipping: set IMFWIZARD_IMF_XSD_DIR to the ST 2067-3 XSD directory");
+            return;
+        };
+        if std::process::Command::new("xmllint")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: xmllint not installed");
+            return;
+        }
+        fn walk(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+            for e in std::fs::read_dir(dir).ok()?.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    if let Some(f) = walk(&p, name) {
+                        return Some(f);
+                    }
+                } else if p.file_name().and_then(|f| f.to_str()) == Some(name) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        let root = std::path::Path::new(&xsd_dir);
+        let (Some(cpl_xsd), Some(dsig_xsd)) = (
+            walk(root, "imf-cpl-20160411.xsd"),
+            walk(root, "xmldsig-core-schema.xsd"),
+        ) else {
+            panic!("could not locate imf-cpl-20160411.xsd and xmldsig-core-schema.xsd under {xsd_dir}");
+        };
+
+        let se = "12345678-1111-2222-3333-444444444444";
+        let cpl = ImfCpl {
+            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            title: "Lang + MCA".into(),
+            issuer: "postkit".into(),
+            creator: "postkit".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            fps_num: 24,
+            fps_den: 1,
+            resources: vec![ImfResource {
+                track_file_uuid: "aaaaaaaa-1111-2222-3333-444444444444".into(),
+                duration: 240,
+                kind: ImfTrackKind::Audio,
+                source_encoding: Some(se.into()),
+            }],
+            languages: vec!["de-DE".into(), "en-US".into()],
+            essence_descriptors: vec![ImfEssenceDescriptor {
+                id: se.into(),
+                body: sample_audio_descriptor_body("de-DE"),
+            }],
+            ..Default::default()
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let cpl_path = dir.path().join("CPL_lang_mca.xml");
+        std::fs::write(&cpl_path, cpl.to_xml()).unwrap();
+
+        let driver = dir.path().join("driver.xsd");
+        std::fs::write(
+            &driver,
+            format!(
+                r#"<?xml version="1.0"?>
+<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+  <xs:import namespace="http://www.smpte-ra.org/schemas/2067-3/2016" schemaLocation="{cpl}"/>
+  <xs:import namespace="http://www.w3.org/2000/09/xmldsig#" schemaLocation="{dsig}"/>
+</xs:schema>"#,
+                cpl = cpl_xsd.display(),
+                dsig = dsig_xsd.display(),
+            ),
+        )
+        .unwrap();
+
+        let out = std::process::Command::new("xmllint")
+            .arg("--noout")
+            .arg("--schema")
+            .arg(&driver)
+            .arg(&cpl_path)
+            .output()
+            .expect("run xmllint");
+        assert!(
+            out.status.success(),
+            "CPL must pass ST 2067-3 XSD:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

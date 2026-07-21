@@ -589,7 +589,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 [[package]]
 name = "grokj2k-sys"
 version = "1.0.0"
-source = "git+https://github.com/GrokImageCompression/grok.git#f274e89cd47a83a73276b401df428eb6e3e0c8ee"
+source = "git+https://github.com/GrokImageCompression/grok.git#d23160461f1b7bf553c3508f5f2fecfc4ef0ee3e"
 dependencies = [
  "bindgen",
  "libc",
@@ -1006,16 +1006,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "openjpeg-sys"
-version = "1.0.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92682cb92e7b01e2c020cf8ec12f3374558924bb24621df1112d8a7c93d419ef"
-dependencies = [
- "cc",
- "libc",
-]
-
-[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1086,7 +1076,6 @@ dependencies = [
  "hex",
  "lcms2",
  "notify",
- "openjpeg-sys",
  "quick-xml",
  "rcgen",
  "regex",

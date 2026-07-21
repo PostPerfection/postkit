@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/PostPerfection/postkit/actions/workflows/ci.yml/badge.svg)](https://github.com/PostPerfection/postkit/actions/workflows/ci.yml)
 
-Version 0.5 supports OpenJPEG and optional Grok FFI. Tests without `grok-ffi` use the real disabled-feature path and do not require developer-local media.
+Version 0.5 encodes JPEG 2000 via optional Grok FFI (`grok-ffi`). Tests without `grok-ffi` use the real disabled-feature path and do not require developer-local media.
 
 Shared library for DCP Wizard, IMF Wizard, and DCP Doctor, common post-production functionality.
 
@@ -35,7 +35,6 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `metadata_edit` | CPL/OPL metadata editor |
 | `mpv` | mpv IPC player integration for preview |
 | `mxf_wrap` | MXF track file wrapping (picture, audio, Atmos) |
-| `openjpeg_encoder` | OpenJPEG J2K encoder (multi-instance, CPU-only, no GPU dependency) |
 | `otioz_import` | OpenTimelineIO zip bundle import |
 | `packaging` | Shared DCP/IMF CPL, PKL and ASSETMAP XML writers |
 | `pipeline` | Full video-to-DCP streaming pipeline |
@@ -64,7 +63,7 @@ cargo build --release
 cargo test
 ```
 
-Cargo features: `openjpeg` / `grok-ffi` (J2K encoders), `async` (tokio), `icc`
+Cargo features: `grok-ffi` (J2K encoder), `async` (tokio), `icc`
 (monitor-ICC display path in `preview`/`colour`, needs liblcms2). All off by
 default.
 

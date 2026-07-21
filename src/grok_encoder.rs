@@ -230,11 +230,20 @@ where
         .map(|n| n.get())
         .unwrap_or(4);
 
-    // Grok's CompressScheduler uses the global TFSingleton pool for T1 block
-    // encoding. With N encoder threads, N taskflows compete on the shared pool.
-    // Using fewer encoder threads gives each frame more pool bandwidth.
+    // grok's compress scheduler always parallelises T1 across the global
+    // TFSingleton pool sized by grk_initialize; the per-codec cparams.num_threads
+    // is not read on the compress path. for n independent single-thread codecs we
+    // force the global pool to inline mode (0 workers => each grk_compress runs
+    // its whole taskflow on the calling thread) and run one encoder thread per
+    // core, restoring the pool on exit.
     let threads_per_codec = 1;
-    let num_encoder_threads = num_threads.min(4);
+    let num_encoder_threads = num_threads;
+    #[cfg(feature = "grok-ffi")]
+    let prev_pool_workers = grok_pool_workers();
+    #[cfg(feature = "grok-ffi")]
+    if prev_pool_workers != 1 {
+        set_grok_pool(1);
+    }
 
     // Queue sized to keep all encoder threads fed without excessive memory use
     // (each 2K frame ≈ 21MB in planar i32)
@@ -345,6 +354,12 @@ where
         // Scoped threads join here
         drop(encoder_handles);
     });
+
+    // all grk_compress calls are done; restore the pool for later decode paths.
+    #[cfg(feature = "grok-ffi")]
+    if prev_pool_workers != 1 {
+        set_grok_pool(prev_pool_workers);
+    }
 
     // Wait for writer to flush
     let _ = writer_handle.join();
@@ -591,6 +606,22 @@ pub fn initialize(num_threads: u32) {
 /// Stub when grok-ffi is not enabled.
 #[cfg(not(feature = "grok-ffi"))]
 pub fn initialize(_num_threads: u32) {}
+
+/// Current grok global thread-pool worker count (inline mode reports 1).
+#[cfg(feature = "grok-ffi")]
+fn grok_pool_workers() -> u32 {
+    unsafe { grokj2k_sys::grk_num_workers() as u32 }
+}
+
+/// Resize grok's global thread pool. Pass 1 for inline mode so each grk_compress
+/// runs its whole taskflow on the calling thread (n threads => n independent
+/// single-thread codecs).
+#[cfg(feature = "grok-ffi")]
+fn set_grok_pool(num_workers: u32) {
+    unsafe {
+        grokj2k_sys::grk_initialize(std::ptr::null(), num_workers, std::ptr::null_mut());
+    }
+}
 
 /// Shut down the Grok library.
 #[cfg(feature = "grok-ffi")]
