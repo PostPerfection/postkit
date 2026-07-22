@@ -24,7 +24,13 @@ xmllint against the SMPTE XSDs and against 58 real signed ECL CPL/PKL.
 
 ## Planned / not started
 
-(none)
+- DCI JPEG 2000 validation before DCP wrapping: `mxf_wrap::wrap_j2k` parses the
+  codestream header but does not reject non-DCI `RSIZ` profiles. Validate the
+  profile, dimensions, and other DCI-required codestream fields before writing
+  an MXF so an IMF or Profile None J2K input cannot become an invalid DCP.
+- Imported KDM decryption: preview can decrypt when given the content key, but
+  it cannot read a supplied KDM with the recipient private key and resolve the
+  DCP keys itself. Add this as a reusable API without exposing plaintext keys.
 
 Grok multi-core encode fixed 2026-07-21: grok's compress scheduler always
 parallelises T1 across the global TFSingleton pool (per-codec cparams.num_threads
