@@ -450,8 +450,8 @@ fn compress_frame_grok(
 
     let width = frame.width();
     let height = frame.height();
-    // dci cinema profiles require 12-bit unsigned samples; grok silently strips
-    // the profile (rsiz -> 0) from anything deeper, so downshift here
+    // dci cinema profiles require 12-bit unsigned samples; grok rejects
+    // anything deeper, so round down to 12 bits here
     let is_cinema = params.profile == 0x0003 || params.profile == 0x0004;
     let shift = if is_cinema && frame.precision() > 12 {
         (frame.precision() - 12) as u32
@@ -459,6 +459,8 @@ fn compress_frame_grok(
         0
     };
     let precision = frame.precision() - shift as u8;
+    let half = if shift > 0 { 1i32 << (shift - 1) } else { 0 };
+    let max = (1i32 << precision) - 1;
 
     // Ensure buffer is large enough for this frame
     let needed = (width as usize) * (height as usize) * 3 * 2;
@@ -510,7 +512,7 @@ fn compress_frame_grok(
                             ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, w);
                         } else {
                             for (x, sample) in src_row.iter().enumerate() {
-                                *dst_row.add(x) = sample >> shift;
+                                *dst_row.add(x) = ((sample + half) >> shift).min(max);
                             }
                         }
                     }
@@ -539,9 +541,9 @@ fn compress_frame_grok(
                         let r = ((data[off] as i32) << 8) | (data[off + 1] as i32);
                         let g = ((data[off + 2] as i32) << 8) | (data[off + 3] as i32);
                         let b = ((data[off + 4] as i32) << 8) | (data[off + 5] as i32);
-                        *r_data.add(row_offset + x) = r >> shift;
-                        *g_data.add(row_offset + x) = g >> shift;
-                        *b_data.add(row_offset + x) = b >> shift;
+                        *r_data.add(row_offset + x) = ((r + half) >> shift).min(max);
+                        *g_data.add(row_offset + x) = ((g + half) >> shift).min(max);
+                        *b_data.add(row_offset + x) = ((b + half) >> shift).min(max);
                     }
                 }
             }
