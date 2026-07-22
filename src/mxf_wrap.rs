@@ -350,14 +350,31 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
             ..Default::default()
         };
     };
-    if header.width == 0 || header.height == 0 {
+    if let Err(error) = crate::j2k::validate_dci_header(&header) {
         return MxfTrackFile {
             error: format!(
-                "JPEG 2000 codestream has no image area: {}",
+                "invalid DCI JPEG 2000 codestream: {error}: {}",
                 opts.input_files[0].display()
             ),
             ..Default::default()
         };
+    }
+    for (path, frame) in opts.input_files.iter().zip(frames.iter()).skip(1) {
+        let Some(header) = crate::j2k::parse_j2k_header(frame) else {
+            return MxfTrackFile {
+                error: format!("invalid JPEG 2000 codestream: {}", path.display()),
+                ..Default::default()
+            };
+        };
+        if let Err(error) = crate::j2k::validate_dci_header(&header) {
+            return MxfTrackFile {
+                error: format!(
+                    "invalid DCI JPEG 2000 codestream: {error}: {}",
+                    path.display()
+                ),
+                ..Default::default()
+            };
+        }
     }
 
     let mut info = make_writer_info();
@@ -906,14 +923,37 @@ pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
             ..Default::default()
         };
     };
-    if header.width == 0 || header.height == 0 {
+    if let Err(error) = crate::j2k::validate_dci_header(&header) {
         return MxfTrackFile {
             error: format!(
-                "JPEG 2000 codestream has no image area: {}",
+                "invalid DCI JPEG 2000 codestream: {error}: {}",
                 opts.left_files[0].display()
             ),
             ..Default::default()
         };
+    }
+    for (path, frame) in opts
+        .left_files
+        .iter()
+        .zip(left.iter())
+        .skip(1)
+        .chain(opts.right_files.iter().zip(right.iter()))
+    {
+        let Some(header) = crate::j2k::parse_j2k_header(frame) else {
+            return MxfTrackFile {
+                error: format!("invalid JPEG 2000 codestream: {}", path.display()),
+                ..Default::default()
+            };
+        };
+        if let Err(error) = crate::j2k::validate_dci_header(&header) {
+            return MxfTrackFile {
+                error: format!(
+                    "invalid DCI JPEG 2000 codestream: {error}: {}",
+                    path.display()
+                ),
+                ..Default::default()
+            };
+        }
     }
 
     let mut info = make_writer_info();
@@ -1096,10 +1136,14 @@ mod tests {
     /// Minimal JPEG 2000 codestream `parse_j2k_header` accepts and asdcplib will
     /// wrap: SOC, a well-formed SIZ (2048x1080, 3 components), then SOD/EOC.
     fn synthetic_j2k() -> Vec<u8> {
+        synthetic_j2k_with_profile(3)
+    }
+
+    fn synthetic_j2k_with_profile(profile: u16) -> Vec<u8> {
         let mut d = vec![0xFF, 0x4F]; // SOC
         d.extend_from_slice(&[0xFF, 0x51]); // SIZ marker
         let mut siz = Vec::new();
-        siz.extend_from_slice(&0u16.to_be_bytes()); // Rsiz
+        siz.extend_from_slice(&profile.to_be_bytes()); // Rsiz
         siz.extend_from_slice(&2048u32.to_be_bytes()); // Xsiz
         siz.extend_from_slice(&1080u32.to_be_bytes()); // Ysiz
         siz.extend_from_slice(&0u32.to_be_bytes()); // XOsiz
@@ -1178,6 +1222,21 @@ mod tests {
         assert!(
             !contains(&e, PLAINTEXT_TAG),
             "essence tag survived into the encrypted MXF: essence was not encrypted"
+        );
+    }
+
+    #[test]
+    fn wrap_j2k_rejects_non_dci_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("0001.j2c");
+        std::fs::write(&frame, synthetic_j2k_with_profile(0)).unwrap();
+
+        let result = mxf_wrap(&j2k_opts(frame, dir.path().join("out.mxf"), None));
+        assert!(!result.success);
+        assert!(
+            result.error.contains("not a DCI JPEG 2000 profile"),
+            "got: {}",
+            result.error
         );
     }
 

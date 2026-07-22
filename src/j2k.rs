@@ -41,8 +41,12 @@ pub enum J2kProfile {
     /// No profile / unrestricted
     None,
     /// Profile 0 (DCI 2K)
-    CinemaS2k,
+    Dci2k,
     /// Profile 1 (DCI 4K)
+    Dci4k,
+    /// Cinema 2K
+    CinemaS2k,
+    /// Cinema 4K
     CinemaS4k,
     /// Profile 3 (broadcast)
     Broadcast,
@@ -54,12 +58,63 @@ impl From<u16> for J2kProfile {
     fn from(rsiz: u16) -> Self {
         match rsiz {
             0 => J2kProfile::None,
+            1 => J2kProfile::Dci2k,
+            2 => J2kProfile::Dci4k,
             3 => J2kProfile::CinemaS2k,
             4 => J2kProfile::CinemaS4k,
             5 => J2kProfile::Broadcast,
             v => J2kProfile::Unknown(v),
         }
     }
+}
+
+/// Check the header fields DCP picture wrapping requires.
+pub fn validate_dci_header(header: &J2kHeader) -> Result<(), String> {
+    let max_dimensions = match header.profile {
+        1 | 3 => (2048, 1080),
+        2 | 4 => (4096, 2160),
+        profile => {
+            return Err(format!(
+                "RSIZ {profile:#06x} is not a DCI JPEG 2000 profile"
+            ));
+        }
+    };
+
+    if header.width == 0 || header.height == 0 {
+        return Err("JPEG 2000 codestream has no image area".to_string());
+    }
+    if header.width > max_dimensions.0 || header.height > max_dimensions.1 {
+        return Err(format!(
+            "JPEG 2000 {} profile exceeds its {}x{} limit: {}x{}",
+            match header.profile {
+                1 | 3 => "2K",
+                _ => "4K",
+            },
+            max_dimensions.0,
+            max_dimensions.1,
+            header.width,
+            header.height
+        ));
+    }
+    if header.num_components != 3 {
+        return Err(format!(
+            "DCI JPEG 2000 requires 3 components, got {}",
+            header.num_components
+        ));
+    }
+    if header.bit_depth != 12 || header.is_signed {
+        return Err(format!(
+            "DCI JPEG 2000 requires unsigned 12-bit components, got {}-bit {}",
+            header.bit_depth,
+            if header.is_signed {
+                "signed"
+            } else {
+                "unsigned"
+            }
+        ));
+    }
+
+    Ok(())
 }
 
 /// Per-frame bitrate measurement.
@@ -236,6 +291,8 @@ mod tests {
     #[test]
     fn profile_from_rsiz() {
         assert_eq!(J2kProfile::from(0), J2kProfile::None);
+        assert_eq!(J2kProfile::from(1), J2kProfile::Dci2k);
+        assert_eq!(J2kProfile::from(2), J2kProfile::Dci4k);
         assert_eq!(J2kProfile::from(3), J2kProfile::CinemaS2k);
         assert_eq!(J2kProfile::from(4), J2kProfile::CinemaS4k);
     }
@@ -291,6 +348,25 @@ mod tests {
         let hdr = parse_j2k_header(&synth_codestream(3, 2048, 858, 0, 0, 3, 12)).unwrap();
         assert_eq!(hdr.width, 2048);
         assert_eq!(hdr.height, 858);
+    }
+
+    #[test]
+    fn dci_validation_rejects_non_dci_profile() {
+        let header = parse_j2k_header(&synth_codestream(0, 2048, 1080, 0, 0, 3, 12)).unwrap();
+        assert_eq!(
+            validate_dci_header(&header),
+            Err("RSIZ 0x0000 is not a DCI JPEG 2000 profile".to_string())
+        );
+    }
+
+    #[test]
+    fn dci_validation_rejects_oversized_2k_profile() {
+        let header = parse_j2k_header(&synth_codestream(3, 2049, 1080, 0, 0, 3, 12)).unwrap();
+        assert!(
+            validate_dci_header(&header)
+                .unwrap_err()
+                .contains("2K profile exceeds")
+        );
     }
 
     #[test]
