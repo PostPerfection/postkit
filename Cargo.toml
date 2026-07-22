@@ -11,8 +11,10 @@ base64 = "0.22"
 chrono = "0.4"
 dirs = "6"
 dolby_vision = { version = "3.3.2", features = ["xml"] }
+ebur128 = "0.1.10"
 grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", optional = true }
 hex = "0.4"
+hound = "3.5.1"
 lcms2 = { version = "6", optional = true }
 notify = "8"
 quick-xml = "0.37"

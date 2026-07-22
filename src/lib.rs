@@ -19,6 +19,7 @@ pub mod job_queue;
 pub mod loudness;
 pub mod mca;
 pub mod metadata_edit;
+pub mod mid_side;
 pub mod mpv;
 pub mod mxf_wrap;
 pub mod otioz_import;

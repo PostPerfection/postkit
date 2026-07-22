@@ -1,3 +1,5 @@
+use ebur128::{EbuR128, Mode};
+use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -291,6 +293,208 @@ pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
     }
 }
 
+// Loudness adjustment (dom#1382): pure sample-domain gain to hit a target.
+
+/// Which loudness quantity a gain adjustment targets.
+#[derive(Debug, Clone, Copy)]
+pub enum LoudnessTarget {
+    /// EBU R128 integrated loudness, in LUFS (e.g. -20.0 for theatrical).
+    IntegratedLufs(f64),
+    /// ISO 21727 Leq(m), in dB.
+    LeqM(f64),
+}
+
+/// Default true-peak ceiling, dBTP.
+pub const DEFAULT_TRUE_PEAK_CEILING_DBTP: f64 = -1.0;
+
+/// The numbers behind moving a measured level to a target with a linear gain,
+/// and the resulting true peak (all before any file is written).
+#[derive(Debug, Clone, Copy)]
+pub struct GainPlan {
+    pub measured_db: f64,
+    pub target_db: f64,
+    pub gain_db: f64,
+    pub input_true_peak_dbtp: f64,
+    pub resulting_true_peak_dbtp: f64,
+    pub true_peak_ceiling_dbtp: f64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AdjustError {
+    #[error("wav i/o: {0}")]
+    Wav(#[from] hound::Error),
+    #[error("ebur128: {0}")]
+    Ebur128(#[from] ebur128::Error),
+    #[error("no audio samples to measure")]
+    Empty,
+    #[error("measured level is {0} dB; cannot compute a finite gain")]
+    NonFiniteMeasurement(f64),
+    #[error(
+        "true-peak ceiling exceeded: a gain of {gain_db:.2} dB would raise true peak from \
+         {input_true_peak_dbtp:.2} to {resulting_true_peak_dbtp:.2} dBTP, above the \
+         {true_peak_ceiling_dbtp:.2} dBTP ceiling (only {headroom_db:.2} dB headroom); \
+         pass a lower target"
+    )]
+    TruePeakExceeded {
+        gain_db: f64,
+        input_true_peak_dbtp: f64,
+        resulting_true_peak_dbtp: f64,
+        true_peak_ceiling_dbtp: f64,
+        headroom_db: f64,
+    },
+}
+
+// decoded PCM in its native form. gain is applied by scaling the raw values, so
+// int stays int at the same bit depth and float stays float.
+enum Pcm {
+    Int(Vec<i32>),
+    Float(Vec<f32>),
+}
+
+impl Pcm {
+    fn frame_count(&self, channels: usize) -> usize {
+        let len = match self {
+            Pcm::Int(s) => s.len(),
+            Pcm::Float(s) => s.len(),
+        };
+        len / channels.max(1)
+    }
+
+    // interleaved, normalized to full-scale (-1.0..=1.0), for loudness measurement.
+    fn normalized(&self, bits_per_sample: u16) -> Vec<f32> {
+        match self {
+            Pcm::Int(s) => {
+                let fs = (1i64 << (bits_per_sample - 1)) as f32;
+                s.iter().map(|&v| v as f32 / fs).collect()
+            }
+            Pcm::Float(s) => s.clone(),
+        }
+    }
+}
+
+fn load_pcm(input: &Path) -> Result<(WavSpec, Pcm), AdjustError> {
+    let reader = WavReader::open(input)?;
+    let spec = reader.spec();
+    let pcm = match spec.sample_format {
+        SampleFormat::Int => Pcm::Int(reader.into_samples::<i32>().collect::<Result<_, _>>()?),
+        SampleFormat::Float => Pcm::Float(reader.into_samples::<f32>().collect::<Result<_, _>>()?),
+    };
+    Ok((spec, pcm))
+}
+
+// mono downmix (mean of channels) of an interleaved buffer.
+fn downmix_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    interleaved
+        .chunks_exact(channels)
+        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+        .collect()
+}
+
+// measured level (per the target's metric) and the input true peak in dBTP.
+fn measure(spec: &WavSpec, pcm: &Pcm, target: LoudnessTarget) -> Result<(f64, f64), AdjustError> {
+    let channels = spec.channels as usize;
+    if channels == 0 || pcm.frame_count(channels) == 0 {
+        return Err(AdjustError::Empty);
+    }
+    let interleaved = pcm.normalized(spec.bits_per_sample);
+
+    let mut meter = EbuR128::new(
+        spec.channels as u32,
+        spec.sample_rate,
+        Mode::I | Mode::TRUE_PEAK,
+    )?;
+    meter.add_frames_f32(&interleaved)?;
+    let mut peak_linear = 0.0f64;
+    for ch in 0..spec.channels as u32 {
+        peak_linear = peak_linear.max(meter.true_peak(ch)?);
+    }
+    let true_peak_dbtp = 20.0 * peak_linear.log10();
+
+    let measured = match target {
+        LoudnessTarget::IntegratedLufs(_) => meter.loudness_global()?,
+        LoudnessTarget::LeqM(_) => {
+            let mono = downmix_mono(&interleaved, channels);
+            leq_m_from_samples(&mono, spec.sample_rate)
+        }
+    };
+    Ok((measured, true_peak_dbtp))
+}
+
+/// Compute the gain needed to move `input` to `target` and check it against the
+/// true-peak ceiling. Returns the plan, or fails loud (no writing, no limiting).
+pub fn plan_gain(
+    input: &Path,
+    target: LoudnessTarget,
+    true_peak_ceiling_dbtp: f64,
+) -> Result<GainPlan, AdjustError> {
+    let (spec, pcm) = load_pcm(input)?;
+    let (measured_db, input_true_peak_dbtp) = measure(&spec, &pcm, target)?;
+    if !measured_db.is_finite() {
+        return Err(AdjustError::NonFiniteMeasurement(measured_db));
+    }
+    let target_db = match target {
+        LoudnessTarget::IntegratedLufs(t) | LoudnessTarget::LeqM(t) => t,
+    };
+    let gain_db = target_db - measured_db;
+    // a linear gain shifts true peak by exactly the same dB.
+    let resulting_true_peak_dbtp = input_true_peak_dbtp + gain_db;
+    if resulting_true_peak_dbtp > true_peak_ceiling_dbtp {
+        return Err(AdjustError::TruePeakExceeded {
+            gain_db,
+            input_true_peak_dbtp,
+            resulting_true_peak_dbtp,
+            true_peak_ceiling_dbtp,
+            headroom_db: true_peak_ceiling_dbtp - input_true_peak_dbtp,
+        });
+    }
+    Ok(GainPlan {
+        measured_db,
+        target_db,
+        gain_db,
+        input_true_peak_dbtp,
+        resulting_true_peak_dbtp,
+        true_peak_ceiling_dbtp,
+    })
+}
+
+/// Apply a pure sample-domain gain to a WAV, preserving format, bit depth,
+/// channel count and sample rate. No resampling, no re-encode, no limiting.
+pub fn apply_gain(input: &Path, output: &Path, gain_db: f64) -> Result<(), AdjustError> {
+    let (spec, pcm) = load_pcm(input)?;
+    let scale = 10f64.powf(gain_db / 20.0);
+    let mut writer = WavWriter::create(output, spec)?;
+    match pcm {
+        Pcm::Int(samples) => {
+            for s in samples {
+                // scale the raw integer directly, so the bit depth is unchanged.
+                writer.write_sample((s as f64 * scale).round() as i32)?;
+            }
+        }
+        Pcm::Float(samples) => {
+            let g = scale as f32;
+            for s in samples {
+                writer.write_sample(s * g)?;
+            }
+        }
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+/// Measure `input`, compute the gain to hit `target`, guard the true-peak
+/// ceiling, then write the adjusted WAV to `output`. Fails loud (writing
+/// nothing) if the gain would breach the ceiling.
+pub fn adjust_loudness(
+    input: &Path,
+    output: &Path,
+    target: LoudnessTarget,
+    true_peak_ceiling_dbtp: f64,
+) -> Result<GainPlan, AdjustError> {
+    let plan = plan_gain(input, target, true_peak_ceiling_dbtp)?;
+    apply_gain(input, output, plan.gain_db)?;
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +564,124 @@ mod tests {
             (d - 6.02).abs() < 0.1,
             "difference was {d} dB, expected ~6.02"
         );
+    }
+
+    // write a `seconds`-long `freq` Hz tone at `amplitude` (0..1 full-scale) to a
+    // wav with `spec` on every channel.
+    fn write_tone(path: &Path, spec: WavSpec, freq: f32, amplitude: f32, seconds: f32) {
+        let sr = spec.sample_rate;
+        let frames = (sr as f32 * seconds) as usize;
+        let mut w = WavWriter::create(path, spec).unwrap();
+        let full_scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+        for i in 0..frames {
+            let s = amplitude * (2.0 * PI * freq * i as f32 / sr as f32).sin();
+            for _ in 0..spec.channels {
+                match spec.sample_format {
+                    SampleFormat::Int => w.write_sample((s * full_scale).round() as i32).unwrap(),
+                    SampleFormat::Float => w.write_sample(s).unwrap(),
+                }
+            }
+        }
+        w.finalize().unwrap();
+    }
+
+    fn int_spec(channels: u16, bits: u16) -> WavSpec {
+        WavSpec {
+            channels,
+            sample_rate: 48000,
+            bits_per_sample: bits,
+            sample_format: SampleFormat::Int,
+        }
+    }
+
+    #[test]
+    fn adjust_hits_integrated_lufs_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.wav");
+        let dst = dir.path().join("out.wav");
+        write_tone(&src, int_spec(2, 16), 1000.0, 0.5, 3.0);
+
+        let target = LoudnessTarget::IntegratedLufs(-23.0);
+        let plan = adjust_loudness(&src, &dst, target, DEFAULT_TRUE_PEAK_CEILING_DBTP).unwrap();
+        // re-measure the written file; its measured level must now be the target.
+        let (remeasured, _) =
+            measure(&int_spec(2, 16), &load_pcm(&dst).unwrap().1, target).unwrap();
+        assert!(
+            (remeasured - (-23.0)).abs() < 0.3,
+            "re-measured {remeasured} LUFS, target -23; plan {plan:?}"
+        );
+    }
+
+    #[test]
+    fn adjust_hits_leq_m_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.wav");
+        let dst = dir.path().join("out.wav");
+        write_tone(&src, int_spec(1, 16), 1000.0, 0.5, 2.0);
+
+        let target = LoudnessTarget::LeqM(85.0);
+        adjust_loudness(&src, &dst, target, DEFAULT_TRUE_PEAK_CEILING_DBTP).unwrap();
+        let (remeasured, _) =
+            measure(&int_spec(1, 16), &load_pcm(&dst).unwrap().1, target).unwrap();
+        assert!(
+            (remeasured - 85.0).abs() < 0.15,
+            "re-measured {remeasured} dB Leq(m), target 85"
+        );
+    }
+
+    #[test]
+    fn headroom_exceeded_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.wav");
+        let dst = dir.path().join("out.wav");
+        write_tone(&src, int_spec(1, 16), 1000.0, 0.5, 2.0);
+
+        // a 120 dB Leq(m) target needs ~+24 dB, pushing the ~-6 dBTP peak well
+        // over the -1 dBTP ceiling.
+        let err = adjust_loudness(&src, &dst, LoudnessTarget::LeqM(120.0), -1.0).unwrap_err();
+        match err {
+            AdjustError::TruePeakExceeded {
+                gain_db,
+                input_true_peak_dbtp,
+                resulting_true_peak_dbtp,
+                true_peak_ceiling_dbtp,
+                headroom_db,
+            } => {
+                assert!(gain_db > 0.0, "expected positive gain, got {gain_db}");
+                assert!((true_peak_ceiling_dbtp - (-1.0)).abs() < 1e-9);
+                assert!((resulting_true_peak_dbtp - (input_true_peak_dbtp + gain_db)).abs() < 1e-9);
+                assert!(
+                    (headroom_db - (true_peak_ceiling_dbtp - input_true_peak_dbtp)).abs() < 1e-9
+                );
+                assert!(gain_db > headroom_db, "gain must exceed the headroom");
+            }
+            other => panic!("expected TruePeakExceeded, got {other:?}"),
+        }
+        // nothing was written.
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    fn bit_depth_and_channels_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.wav");
+        let dst = dir.path().join("out.wav");
+        let spec = int_spec(2, 24);
+        write_tone(&src, spec, 1000.0, 0.5, 1.0);
+
+        adjust_loudness(
+            &src,
+            &dst,
+            LoudnessTarget::LeqM(80.0),
+            DEFAULT_TRUE_PEAK_CEILING_DBTP,
+        )
+        .unwrap();
+
+        let out = WavReader::open(&dst).unwrap();
+        let out_spec = out.spec();
+        assert_eq!(out_spec.channels, 2);
+        assert_eq!(out_spec.bits_per_sample, 24);
+        assert_eq!(out_spec.sample_format, SampleFormat::Int);
+        assert_eq!(out.duration(), WavReader::open(&src).unwrap().duration());
     }
 }
