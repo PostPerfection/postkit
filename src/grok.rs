@@ -231,12 +231,19 @@ pub fn compress_file_subprocess(
 }
 
 /// Get the LD_LIBRARY_PATH for grok libraries.
+///
+/// Keeps the process's own LD_LIBRARY_PATH so callers can pass the result to
+/// `.env("LD_LIBRARY_PATH", ...)` without hiding grok libs already on the path.
 pub fn grok_lib_path() -> String {
+    let inherited = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
     if let Ok(home) = std::env::var("HOME") {
         let p = format!("{}/bin/grok/lib64", home);
         if std::path::Path::new(&p).exists() {
-            return p;
+            if inherited.is_empty() {
+                return p;
+            }
+            return format!("{p}:{inherited}");
         }
     }
-    String::new()
+    inherited
 }
