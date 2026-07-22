@@ -29,7 +29,8 @@ tracker (dom#N = https://dcpomatic.com/bugs/view.php?id=N); the wizards and
 dcpdoctor expose them (see their DESIGN_TODOs, same date).
 
 - Leq(m) in loudness (dom#3092): ISO 21727 / CCIR 468 weighting alongside EBU
-  R128. dcpdoctor is the first consumer.
+  R128. Implemented locally in dcpdoctor-core (2026-07-22, rustfft); migrate that
+  implementation here so the wizards can report it too.
 - Loudness adjustment (dom#1382): apply gain to hit an R128/Leq(m) target, not
   just measure.
 - Audio DSP: upmix stereo to 5.1 (dom#921, dom#1080), crossfades (dom#374),
@@ -37,8 +38,9 @@ dcpdoctor expose them (see their DESIGN_TODOs, same date).
 - Subtitle parsers: ASS with styling (dom#1462), PAC (dom#1719), MKS (dom#3131),
   FCPXML (dom#2909), Interop XML+PNG bitmap subs (dom#1376); RTL shaping
   (dom#860); auto line-wrap (dom#1626).
-- Font subsetting (dom#1023) and glyph-coverage query for a text + font pair
-  (dom#838, feeds dcpdoctor's check).
+- Font subsetting (dom#1023). Glyph coverage itself landed in dcpdoctor
+  (2026-07-22, skrifa, plain-XML + MXF-wrapped fonts); a shared query here is
+  only worth it if a wizard grows a pre-package check.
 - Player direction (dom#2700 loop, dom#2917 speed, dom#2893 markers, dom#3091
   waveform, dom#1974/dom#3165 3D view modes, dom#3083 A/V sync offset): all gate
   on the GPU J2K decode path already noted under the SDI/DeckLink item.
@@ -52,6 +54,8 @@ dcpdoctor expose them (see their DESIGN_TODOs, same date).
 - Imported KDM decryption: preview can decrypt when given the content key, but
   it cannot read a supplied KDM with the recipient private key and resolve the
   DCP keys itself. Add this as a reusable API without exposing plaintext keys.
+  Now the blocker for dcpdoctor's last DoM gap item (verify encrypted DCPs,
+  dom#2971/dom#1957) and dcpwizard's "Encrypted DCP derivatives".
 
 Grok multi-core encode fixed 2026-07-21: grok's compress scheduler always
 parallelises T1 across the global TFSingleton pool (per-codec cparams.num_threads
