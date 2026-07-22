@@ -350,10 +350,21 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
             ..Default::default()
         };
     };
-    if let Err(error) = crate::j2k::validate_dci_header(&header) {
+    // dci profile rules apply to dcp only; as-02 (imf) takes any codestream with an image area
+    if opts.standard == MxfStandard::AsDcp {
+        if let Err(error) = crate::j2k::validate_dci_header(&header) {
+            return MxfTrackFile {
+                error: format!(
+                    "invalid DCI JPEG 2000 codestream: {error}: {}",
+                    opts.input_files[0].display()
+                ),
+                ..Default::default()
+            };
+        }
+    } else if header.width == 0 || header.height == 0 {
         return MxfTrackFile {
             error: format!(
-                "invalid DCI JPEG 2000 codestream: {error}: {}",
+                "JPEG 2000 codestream has no image area: {}",
                 opts.input_files[0].display()
             ),
             ..Default::default()
@@ -366,7 +377,9 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
                 ..Default::default()
             };
         };
-        if let Err(error) = crate::j2k::validate_dci_header(&header) {
+        if opts.standard == MxfStandard::AsDcp
+            && let Err(error) = crate::j2k::validate_dci_header(&header)
+        {
             return MxfTrackFile {
                 error: format!(
                     "invalid DCI JPEG 2000 codestream: {error}: {}",
