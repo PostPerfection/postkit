@@ -33,6 +33,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `loudness` | Audio loudness measurement (EBU R128) |
 | `mca` | SMPTE ST 377-4 Multi-Channel Audio label generation |
 | `metadata_edit` | CPL/OPL metadata editor |
+| `mid_side` | Mid-side stereo decode (M/S to L/R) in interleaved multi-channel buffers |
 | `mpv` | mpv IPC player integration for preview |
 | `mxf_wrap` | MXF track file wrapping (picture, audio, Atmos) |
 | `otioz_import` | OpenTimelineIO zip bundle import |

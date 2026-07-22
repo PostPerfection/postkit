@@ -19,7 +19,7 @@ Packaging and formats:
 Encoding:
 - encode: J2K encode orchestration (detection, parallel encode, progress)
 - grok / grok_encoder: grk_compress subprocess and in-process FFI pipeline (feature-gated)
-- openjpeg_encoder: in-process OpenJPEG pipeline (feature-gated)
+- grok_encoder: in-process Grok J2K encoder (FFI, feature-gated behind `grok-ffi`)
 - pipeline: shared encode workflow used by the wizard GUIs
 - prores: ProRes probe and extraction arg builders
 
