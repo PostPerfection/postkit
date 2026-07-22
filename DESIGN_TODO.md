@@ -22,6 +22,27 @@ IssueDate/Issuer and DcpCpl put ContentTitleText before IssueDate. Fixed to ST
 RatingList, and AssetMap now orders its metadata by namespace. Verified with
 xmllint against the SMPTE XSDs and against 58 real signed ECL CPL/PKL.
 
+## DoM tracker gaps (2026-07-22)
+
+Library-level capabilities behind feature requests in the DCP-o-matic Mantis
+tracker (dom#N = https://dcpomatic.com/bugs/view.php?id=N); the wizards and
+dcpdoctor expose them (see their DESIGN_TODOs, same date).
+
+- Leq(m) in loudness (dom#3092): ISO 21727 / CCIR 468 weighting alongside EBU
+  R128. dcpdoctor is the first consumer.
+- Loudness adjustment (dom#1382): apply gain to hit an R128/Leq(m) target, not
+  just measure.
+- Audio DSP: upmix stereo to 5.1 (dom#921, dom#1080), crossfades (dom#374),
+  mid-side decode passing unused channels through (dom#3020).
+- Subtitle parsers: ASS with styling (dom#1462), PAC (dom#1719), MKS (dom#3131),
+  FCPXML (dom#2909), Interop XML+PNG bitmap subs (dom#1376); RTL shaping
+  (dom#860); auto line-wrap (dom#1626).
+- Font subsetting (dom#1023) and glyph-coverage query for a text + font pair
+  (dom#838, feeds dcpdoctor's check).
+- Player direction (dom#2700 loop, dom#2917 speed, dom#2893 markers, dom#3091
+  waveform, dom#1974/dom#3165 3D view modes, dom#3083 A/V sync offset): all gate
+  on the GPU J2K decode path already noted under the SDI/DeckLink item.
+
 ## Planned / not started
 
 - DCI JPEG 2000 validation before DCP wrapping: `mxf_wrap::wrap_j2k` parses the
