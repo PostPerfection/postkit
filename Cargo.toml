@@ -21,6 +21,7 @@ regex = "1"
 ring = "0.17"
 rsa = { version = "0.9", features = ["getrandom"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = { version = "0.10", features = ["oid"] }
@@ -30,8 +31,9 @@ tiff = "0.9"
 time = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "process", "io-util", "fs"], optional = true }
 tracing = "0.1"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 x509-parser = { version = "0.16", features = ["verify"] }
+zeroize = "1"
 
 [features]
 default = []

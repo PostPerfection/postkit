@@ -1114,7 +1114,7 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
 
     let dkdm_xml = std::fs::read_to_string(&config.dkdm_file)
         .map_err(|e| format!("cannot read DKDM {}: {e}", config.dkdm_file.display()))?;
-    let parsed = parse_dkdm(&dkdm_xml)?;
+    let parsed = parse_kdm_xml(&dkdm_xml)?;
     if parsed.cipher_values.is_empty() {
         return Err("DKDM has no EncryptedKey CipherValue in AuthenticatedPrivate".into());
     }
@@ -1126,8 +1126,15 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
     let mut src_not_before: Option<String> = None;
     let mut src_not_after: Option<String> = None;
     for ciphertext in &parsed.cipher_values {
-        let block = decrypt_key_block(&dkdm_key, ciphertext)?;
-        let recovered = parse_kdm_key_block(&block)?;
+        use zeroize::Zeroize;
+        let mut block = decrypt_key_block(&dkdm_key, ciphertext)?;
+        let recovered = parse_kdm_key_block(&block, parsed.format)?;
+        block.zeroize();
+
+        // Re-wrap targets SMPTE key blocks, which need a key type.
+        let key_type = recovered.key_type.ok_or_else(|| {
+            "cannot re-wrap an Interop DKDM: its key block carries no key type".to_string()
+        })?;
 
         // Every key in a KDM shares one CPL and one validity window.
         match cpl_uuid {
@@ -1141,7 +1148,7 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         src_not_after.get_or_insert_with(|| recovered.not_after.clone());
 
         keys.push(KdmKey {
-            key_type: recovered.key_type,
+            key_type,
             key_id: recovered.key_id,
             content_key: recovered.content_key,
         });
@@ -1212,25 +1219,76 @@ pub fn rewrap_dkdm_to_file(config: &RewrapConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// The fields recovered from a DKDM's XML needed to re-issue it.
-struct ParsedDkdm {
+/// A KeyId from a KDM's public KeyIdList. `key_type` is None for Interop, whose
+/// KeyIdList carries bare KeyId elements with no type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KdmKeyId {
+    pub key_type: Option<[u8; 4]>,
+    pub key_id: uuid::Uuid,
+}
+
+/// Public metadata read from a KDM without the recipient key: what the KDM is
+/// for and which keys it carries. The content keys themselves come only from
+/// `unwrap_kdm`, which needs the recipient private key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KdmMetadata {
+    pub format: KdmFormat,
+    pub cpl_id: uuid::Uuid,
+    pub content_title: String,
+    pub annotation_text: String,
+    /// ST 430-1 ContentKeysNotValidBefore, the RFC 3339 start of the window.
+    pub not_valid_before: String,
+    /// ST 430-1 ContentKeysNotValidAfter, the RFC 3339 end of the window.
+    pub not_valid_after: String,
+    pub key_ids: Vec<KdmKeyId>,
+}
+
+/// Everything read from a KDM's XML without the recipient key: the public
+/// metadata plus the base64-decoded EncryptedKey ciphertexts.
+struct ParsedKdmXml {
+    format: KdmFormat,
     /// Base64-decoded ciphertext of every EncryptedKey under AuthenticatedPrivate.
     cipher_values: Vec<Vec<u8>>,
     content_title: Option<String>,
     message_type: Option<String>,
+    annotation_text: Option<String>,
+    cpl_id: Option<uuid::Uuid>,
+    not_valid_before: Option<String>,
+    not_valid_after: Option<String>,
+    key_ids: Vec<KdmKeyId>,
 }
 
-/// Extract the encrypted key blocks and public metadata from a DKDM.
+/// Accept a `urn:uuid:` or bare UUID string, rejecting anything else.
+fn parse_urn_uuid(value: &str) -> Result<uuid::Uuid, String> {
+    let trimmed = value
+        .trim()
+        .strip_prefix("urn:uuid:")
+        .unwrap_or(value.trim());
+    uuid::Uuid::parse_str(trimmed).map_err(|e| format!("'{value}' is not a UUID: {e}"))
+}
+
+/// Parse a KDM's XML (SMPTE or Interop): the encrypted key blocks and the public
+/// metadata. No private key is needed; nothing here decrypts a content key.
 ///
 /// CipherValues are collected only from within AuthenticatedPrivate so nothing
-/// outside the private block can be mistaken for a content key.
-fn parse_dkdm(xml: &str) -> Result<ParsedDkdm, String> {
+/// outside the private block can be mistaken for a content key. Format is taken
+/// from the KDMRequiredExtensions namespace.
+fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
     use base64::Engine;
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
+    let format = if xml.contains(KDM_INTEROP_NS) {
+        KdmFormat::Interop
+    } else {
+        KdmFormat::Smpte
+    };
+
     let mut reader = Reader::from_str(xml);
     let mut in_auth_private = false;
+    let mut in_key_id_list = false;
+    // Type of the current TypedKeyId (SMPTE); None until a KeyType is seen.
+    let mut pending_key_type: Option<[u8; 4]> = None;
     // Set while text is being gathered for the named field.
     let mut collecting: Option<&'static str> = None;
     let mut buffer = String::new();
@@ -1238,14 +1296,23 @@ fn parse_dkdm(xml: &str) -> Result<ParsedDkdm, String> {
     let mut cipher_values = Vec::new();
     let mut content_title = None;
     let mut message_type = None;
+    let mut annotation_text = None;
+    let mut cpl_id = None;
+    let mut not_valid_before = None;
+    let mut not_valid_after = None;
+    let mut key_ids = Vec::new();
 
     loop {
         match reader
             .read_event()
-            .map_err(|e| format!("DKDM is not valid XML: {e}"))?
+            .map_err(|e| format!("KDM is not valid XML: {e}"))?
         {
             Event::Start(e) => match e.local_name().as_ref() {
                 b"AuthenticatedPrivate" => in_auth_private = true,
+                b"KeyIdList" => {
+                    in_key_id_list = true;
+                    pending_key_type = None;
+                }
                 b"CipherValue" if in_auth_private => {
                     collecting = Some("cipher");
                     buffer.clear();
@@ -1258,21 +1325,46 @@ fn parse_dkdm(xml: &str) -> Result<ParsedDkdm, String> {
                     collecting = Some("message_type");
                     buffer.clear();
                 }
+                b"AnnotationText" => {
+                    collecting = Some("annotation");
+                    buffer.clear();
+                }
+                b"CompositionPlaylistId" => {
+                    collecting = Some("cpl");
+                    buffer.clear();
+                }
+                b"ContentKeysNotValidBefore" => {
+                    collecting = Some("not_before");
+                    buffer.clear();
+                }
+                b"ContentKeysNotValidAfter" => {
+                    collecting = Some("not_after");
+                    buffer.clear();
+                }
+                b"KeyType" if in_key_id_list => {
+                    collecting = Some("key_type");
+                    buffer.clear();
+                }
+                b"KeyId" if in_key_id_list => {
+                    collecting = Some("key_id");
+                    buffer.clear();
+                }
                 _ => {}
             },
             Event::Text(e) if collecting.is_some() => {
                 let text = e
                     .unescape()
-                    .map_err(|err| format!("DKDM text is not valid XML: {err}"))?;
+                    .map_err(|err| format!("KDM text is not valid XML: {err}"))?;
                 buffer.push_str(&text);
             }
             Event::End(e) => match e.local_name().as_ref() {
                 b"AuthenticatedPrivate" => in_auth_private = false,
+                b"KeyIdList" => in_key_id_list = false,
                 b"CipherValue" if collecting == Some("cipher") => {
                     let stripped: String = buffer.split_whitespace().collect();
                     let bytes = base64::engine::general_purpose::STANDARD
                         .decode(stripped.as_bytes())
-                        .map_err(|e| format!("DKDM CipherValue is not valid base64: {e}"))?;
+                        .map_err(|e| format!("KDM CipherValue is not valid base64: {e}"))?;
                     cipher_values.push(bytes);
                     collecting = None;
                 }
@@ -1284,6 +1376,40 @@ fn parse_dkdm(xml: &str) -> Result<ParsedDkdm, String> {
                     message_type = Some(buffer.trim().to_string());
                     collecting = None;
                 }
+                b"AnnotationText" if collecting == Some("annotation") => {
+                    annotation_text = Some(buffer.trim().to_string());
+                    collecting = None;
+                }
+                b"CompositionPlaylistId" if collecting == Some("cpl") => {
+                    cpl_id = Some(parse_urn_uuid(buffer.trim())?);
+                    collecting = None;
+                }
+                b"ContentKeysNotValidBefore" if collecting == Some("not_before") => {
+                    not_valid_before = Some(buffer.trim().to_string());
+                    collecting = None;
+                }
+                b"ContentKeysNotValidAfter" if collecting == Some("not_after") => {
+                    not_valid_after = Some(buffer.trim().to_string());
+                    collecting = None;
+                }
+                b"KeyType" if collecting == Some("key_type") => {
+                    let bytes = buffer.trim().as_bytes();
+                    if bytes.len() != 4 {
+                        return Err(format!(
+                            "KDM KeyType must be 4 ASCII characters, got '{}'",
+                            buffer.trim()
+                        ));
+                    }
+                    pending_key_type = Some([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    collecting = None;
+                }
+                b"KeyId" if collecting == Some("key_id") => {
+                    key_ids.push(KdmKeyId {
+                        key_type: pending_key_type.take(),
+                        key_id: parse_urn_uuid(buffer.trim())?,
+                    });
+                    collecting = None;
+                }
                 _ => {}
             },
             Event::Eof => break,
@@ -1291,57 +1417,230 @@ fn parse_dkdm(xml: &str) -> Result<ParsedDkdm, String> {
         }
     }
 
-    Ok(ParsedDkdm {
+    Ok(ParsedKdmXml {
+        format,
         cipher_values,
         content_title,
         message_type,
+        annotation_text,
+        cpl_id,
+        not_valid_before,
+        not_valid_after,
+        key_ids,
     })
 }
 
-/// A content key recovered from a decrypted DKDM key block.
+/// One content key recovered from a KDM: which essence it unlocks and the raw
+/// 16-byte AES-128 key. Secret material: the key is private, redacted in Debug
+/// and zeroed on drop. Read it with `content_key`.
+pub struct UnwrappedKey {
+    pub key_id: uuid::Uuid,
+    /// ST 430-1 key type (MDIK/MDAK/...); None for Interop, whose block has none.
+    pub key_type: Option<[u8; 4]>,
+    pub cpl_id: uuid::Uuid,
+    pub not_valid_before: String,
+    pub not_valid_after: String,
+    content_key: [u8; 16],
+}
+
+impl UnwrappedKey {
+    /// The raw 16-byte AES-128 content key this KDM entry unlocks.
+    pub fn content_key(&self) -> &[u8; 16] {
+        &self.content_key
+    }
+}
+
+/// Redacts the content key so it cannot reach a log through a stray debug print.
+impl std::fmt::Debug for UnwrappedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnwrappedKey")
+            .field("key_id", &self.key_id)
+            .field(
+                "key_type",
+                &self
+                    .key_type
+                    .map(|t| String::from_utf8_lossy(&t).into_owned()),
+            )
+            .field("cpl_id", &self.cpl_id)
+            .field("not_valid_before", &self.not_valid_before)
+            .field("not_valid_after", &self.not_valid_after)
+            .field("content_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for UnwrappedKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.content_key.zeroize();
+    }
+}
+
+/// The content keys recovered from a KDM, keyed by KeyId. Every key is zeroed on
+/// drop; none is ever logged. Look one up with `content_key`.
+#[derive(Debug)]
+pub struct UnwrappedKdm {
+    pub format: KdmFormat,
+    pub cpl_id: uuid::Uuid,
+    pub keys: Vec<UnwrappedKey>,
+}
+
+impl UnwrappedKdm {
+    /// The 16-byte AES-128 content key for `key_id`, if this KDM carried it.
+    pub fn content_key(&self, key_id: &uuid::Uuid) -> Option<&[u8; 16]> {
+        self.keys
+            .iter()
+            .find(|k| &k.key_id == key_id)
+            .map(|k| k.content_key())
+    }
+}
+
+/// Read a KDM's public metadata (CPL id, validity window, KeyIds and types)
+/// without decrypting anything. Works for both SMPTE and Interop KDMs and needs
+/// no recipient key.
+pub fn parse_kdm(kdm_xml: &str) -> Result<KdmMetadata, String> {
+    let parsed = parse_kdm_xml(kdm_xml)?;
+    Ok(KdmMetadata {
+        format: parsed.format,
+        cpl_id: parsed.cpl_id.ok_or("KDM has no CompositionPlaylistId")?,
+        content_title: parsed.content_title.unwrap_or_default(),
+        annotation_text: parsed.annotation_text.unwrap_or_default(),
+        not_valid_before: parsed
+            .not_valid_before
+            .ok_or("KDM has no ContentKeysNotValidBefore")?,
+        not_valid_after: parsed
+            .not_valid_after
+            .ok_or("KDM has no ContentKeysNotValidAfter")?,
+        key_ids: parsed.key_ids,
+    })
+}
+
+/// Decrypt a KDM's content keys with the recipient's RSA private key.
+///
+/// The inverse of `build_kdm`/`generate_kdm`: parses the KDM (SMPTE or Interop),
+/// RSA-OAEP-decrypts every EncryptedKey with the recipient key, parses each
+/// plaintext key block and returns the recovered KeyId -> AES-128 key map. A
+/// wrong recipient key fails loud (the OAEP unpad or the key block structure-id
+/// check rejects it) rather than returning garbage keys. The returned keys are
+/// zeroed on drop and never logged.
+pub fn unwrap_kdm(kdm_xml: &str, recipient_key_file: &Path) -> Result<UnwrappedKdm, String> {
+    let parsed = parse_kdm_xml(kdm_xml)?;
+    if parsed.cipher_values.is_empty() {
+        return Err("KDM has no EncryptedKey CipherValue in AuthenticatedPrivate".into());
+    }
+    let key = load_rsa_private_key(recipient_key_file)?;
+
+    let mut keys = Vec::with_capacity(parsed.cipher_values.len());
+    let mut cpl_uuid: Option<uuid::Uuid> = None;
+    for ciphertext in &parsed.cipher_values {
+        use zeroize::Zeroize;
+        let mut block = decrypt_key_block(&key, ciphertext)?;
+        let recovered = parse_kdm_key_block(&block, parsed.format)?;
+        block.zeroize();
+
+        // Every key in one KDM shares a single CPL id.
+        match cpl_uuid {
+            Some(existing) if existing != recovered.cpl_id => {
+                return Err("KDM key blocks reference more than one CPL id".into());
+            }
+            None => cpl_uuid = Some(recovered.cpl_id),
+            _ => {}
+        }
+
+        keys.push(UnwrappedKey {
+            key_id: recovered.key_id,
+            key_type: recovered.key_type,
+            cpl_id: recovered.cpl_id,
+            not_valid_before: recovered.not_before.clone(),
+            not_valid_after: recovered.not_after.clone(),
+            content_key: recovered.content_key,
+        });
+    }
+    let cpl_id = cpl_uuid.expect("at least one key block was decrypted");
+    Ok(UnwrappedKdm {
+        format: parsed.format,
+        cpl_id,
+        keys,
+    })
+}
+
+/// Decrypt a KDM file's content keys with the recipient's RSA private key.
+pub fn unwrap_kdm_file(kdm_file: &Path, recipient_key_file: &Path) -> Result<UnwrappedKdm, String> {
+    let xml = std::fs::read_to_string(kdm_file)
+        .map_err(|e| format!("cannot read KDM {}: {e}", kdm_file.display()))?;
+    unwrap_kdm(&xml, recipient_key_file)
+}
+
+/// A content key recovered from a decrypted key block. Holds secret material:
+/// `content_key` is zeroed when this value drops and never logged. `key_type` is
+/// None for Interop, whose block carries no type field.
 struct RecoveredKey {
     cpl_id: uuid::Uuid,
-    key_type: [u8; 4],
+    key_type: Option<[u8; 4]>,
     key_id: uuid::Uuid,
     not_before: String,
     not_after: String,
     content_key: [u8; 16],
 }
 
-/// Parse a decrypted 138-byte SMPTE key block back into its fields.
+impl Drop for RecoveredKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.content_key.zeroize();
+    }
+}
+
+/// Parse a decrypted key block back into its fields, for the layout given by
+/// `format`: SMPTE (138 bytes, with a 4-byte key type) or Interop (134, none).
 ///
 /// The layout mirrors `build_kdm_key_block`. A wrong length or a bad structure
-/// id means the wrong recipient key was used or the DKDM is corrupt; either is
+/// id means the wrong recipient key was used or the KDM is corrupt; either is
 /// fatal. The signer thumbprint at [16..36] is the original issuer's and is
 /// discarded: on re-wrap the new key block carries the re-issuer's thumbprint.
-fn parse_kdm_key_block(block: &[u8]) -> Result<RecoveredKey, String> {
-    if block.len() != KDM_KEY_BLOCK_LEN {
+fn parse_kdm_key_block(block: &[u8], format: KdmFormat) -> Result<RecoveredKey, String> {
+    let expected = match format {
+        KdmFormat::Smpte => KDM_KEY_BLOCK_LEN,
+        KdmFormat::Interop => KDM_KEY_BLOCK_LEN_INTEROP,
+    };
+    if block.len() != expected {
         return Err(format!(
-            "decrypted DKDM key block is {} bytes, expected {KDM_KEY_BLOCK_LEN} \
-             (wrong recipient key or corrupt DKDM)",
+            "decrypted key block is {} bytes, expected {expected} \
+             (wrong recipient key or corrupt KDM)",
             block.len()
         ));
     }
     if block[..16] != KDM_STRUCTURE_ID {
-        return Err("decrypted DKDM key block has a bad structure id \
-                    (wrong recipient key or corrupt DKDM)"
+        return Err("decrypted key block has a bad structure id \
+                    (wrong recipient key or corrupt KDM)"
             .into());
     }
 
     let cpl_id = uuid::Uuid::from_slice(&block[36..52])
-        .map_err(|e| format!("DKDM key block has a malformed CPL id: {e}"))?;
-    let mut key_type = [0u8; 4];
-    key_type.copy_from_slice(&block[52..56]);
-    let key_id = uuid::Uuid::from_slice(&block[56..72])
-        .map_err(|e| format!("DKDM key block has a malformed key id: {e}"))?;
-    let not_before = std::str::from_utf8(&block[72..97])
-        .map_err(|_| "DKDM key block not-valid-before is not ASCII".to_string())?
+        .map_err(|e| format!("key block has a malformed CPL id: {e}"))?;
+
+    // SMPTE carries the 4-byte key type before the key id; Interop omits it.
+    let (key_type, mut off) = match format {
+        KdmFormat::Smpte => {
+            let mut kt = [0u8; 4];
+            kt.copy_from_slice(&block[52..56]);
+            (Some(kt), 56usize)
+        }
+        KdmFormat::Interop => (None, 52usize),
+    };
+
+    let key_id = uuid::Uuid::from_slice(&block[off..off + 16])
+        .map_err(|e| format!("key block has a malformed key id: {e}"))?;
+    off += 16;
+    let not_before = std::str::from_utf8(&block[off..off + KDM_TIMESTAMP_LEN])
+        .map_err(|_| "key block not-valid-before is not ASCII".to_string())?
         .to_string();
-    let not_after = std::str::from_utf8(&block[97..122])
-        .map_err(|_| "DKDM key block not-valid-after is not ASCII".to_string())?
+    off += KDM_TIMESTAMP_LEN;
+    let not_after = std::str::from_utf8(&block[off..off + KDM_TIMESTAMP_LEN])
+        .map_err(|_| "key block not-valid-after is not ASCII".to_string())?
         .to_string();
+    off += KDM_TIMESTAMP_LEN;
     let mut content_key = [0u8; 16];
-    content_key.copy_from_slice(&block[122..138]);
+    content_key.copy_from_slice(&block[off..off + 16]);
 
     Ok(RecoveredKey {
         cpl_id,
@@ -2311,7 +2610,7 @@ mod tests {
         // Decrypt B's CipherValues and confirm the content keys survived.
         let xml = std::fs::read_to_string(&out).unwrap();
         let b_key = load_private_key(&f.root_key);
-        let cvs = parse_dkdm(&xml).expect("parse rewrapped").cipher_values;
+        let cvs = parse_kdm_xml(&xml).expect("parse rewrapped").cipher_values;
         assert_eq!(cvs.len(), 2, "both keys must be re-wrapped");
 
         let mut recovered = std::collections::HashMap::new();
@@ -2319,17 +2618,17 @@ mod tests {
             let block = b_key
                 .decrypt(rsa::Oaep::new::<sha1::Sha1>(), &ct)
                 .expect("recipient B must decrypt the re-wrapped key");
-            let rk = parse_kdm_key_block(&block).expect("valid key block");
+            let rk = parse_kdm_key_block(&block, KdmFormat::Smpte).expect("valid key block");
             recovered.insert(rk.key_id, (rk.key_type, rk.content_key));
         }
         assert_eq!(
             recovered.get(&mdik_id),
-            Some(&(*b"MDIK", mdik_key)),
+            Some(&(Some(*b"MDIK"), mdik_key)),
             "MDIK key id/type/value must round-trip"
         );
         assert_eq!(
             recovered.get(&mdak_id),
-            Some(&(*b"MDAK", mdak_key)),
+            Some(&(Some(*b"MDAK"), mdak_key)),
             "MDAK key id/type/value must round-trip"
         );
     }
@@ -2344,7 +2643,7 @@ mod tests {
             content_key: [0x33u8; 16],
         }];
         let dkdm_xml = build_stand_in_dkdm(f, &f.signer, &src_keys);
-        let src_ct = parse_dkdm(&dkdm_xml).unwrap().cipher_values.remove(0);
+        let src_ct = parse_kdm_xml(&dkdm_xml).unwrap().cipher_values.remove(0);
 
         let dir = tempfile::tempdir().unwrap();
         let dkdm_path = dir.path().join("dkdm.xml");
@@ -2362,7 +2661,7 @@ mod tests {
             valid_to: String::new(),
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
-        let new_ct = parse_dkdm(&std::fs::read_to_string(&out).unwrap())
+        let new_ct = parse_kdm_xml(&std::fs::read_to_string(&out).unwrap())
             .unwrap()
             .cipher_values
             .remove(0);
@@ -2457,5 +2756,137 @@ mod tests {
         );
         assert!(info.is_ca);
         assert!(!info.is_expired);
+    }
+
+    // Build a KDM to the signer-leaf recipient carrying caller-chosen keys, then
+    // unwrap it with that recipient's private key. Non-vacuous: the keys are
+    // fixed bytes so the round-trip asserts on exact values, not just success.
+    #[test]
+    fn unwrap_recovers_every_wrapped_key_smpte() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        let mdik_id = uuid::Uuid::new_v4();
+        let mdak_id = uuid::Uuid::new_v4();
+        let mdik_key = [0xA1u8; 16];
+        let mdak_key = [0xB2u8; 16];
+        config.content_keys = vec![
+            KdmContentKey {
+                key_type: *b"MDIK",
+                key_id: mdik_id,
+                content_key: mdik_key,
+            },
+            KdmContentKey {
+                key_type: *b"MDAK",
+                key_id: mdak_id,
+                content_key: mdak_key,
+            },
+        ];
+        let kdm = build_kdm(&config).expect("build kdm");
+
+        let unwrapped = unwrap_kdm(&kdm.xml, &f.signer_key).expect("unwrap");
+        assert_eq!(unwrapped.format, KdmFormat::Smpte);
+        assert_eq!(unwrapped.keys.len(), 2, "both wrapped keys must come back");
+        assert_eq!(
+            unwrapped.cpl_id,
+            uuid::Uuid::parse_str(&config.cpl_id).unwrap()
+        );
+        assert_eq!(unwrapped.content_key(&mdik_id), Some(&mdik_key));
+        assert_eq!(unwrapped.content_key(&mdak_id), Some(&mdak_key));
+
+        let mdik = unwrapped.keys.iter().find(|k| k.key_id == mdik_id).unwrap();
+        assert_eq!(mdik.key_type, Some(*b"MDIK"), "SMPTE key type preserved");
+        assert_eq!(mdik.cpl_id, unwrapped.cpl_id);
+        assert!(mdik.not_valid_before < mdik.not_valid_after);
+    }
+
+    // Interop blocks are 134 bytes and carry no key type.
+    #[test]
+    fn unwrap_recovers_wrapped_key_interop() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.format = KdmFormat::Interop;
+        let key_id = uuid::Uuid::new_v4();
+        let content = [0xC3u8; 16];
+        config.content_keys = vec![KdmContentKey {
+            key_type: *b"MDIK",
+            key_id,
+            content_key: content,
+        }];
+        let kdm = build_kdm(&config).expect("build interop kdm");
+
+        let unwrapped = unwrap_kdm(&kdm.xml, &f.signer_key).expect("unwrap interop");
+        assert_eq!(unwrapped.format, KdmFormat::Interop);
+        assert_eq!(unwrapped.content_key(&key_id), Some(&content));
+        assert_eq!(
+            unwrapped.keys[0].key_type, None,
+            "interop key block carries no key type"
+        );
+    }
+
+    // The wrong recipient key must fail the OAEP unpad (or the structure-id
+    // check), never return a plausible-looking but wrong key.
+    #[test]
+    fn unwrap_with_wrong_recipient_key_fails_loud() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        let key_id = uuid::Uuid::new_v4();
+        config.content_keys = vec![KdmContentKey {
+            key_type: *b"MDIK",
+            key_id,
+            content_key: [0xD4u8; 16],
+        }];
+        let kdm = build_kdm(&config).expect("build kdm");
+
+        // root_key is not the recipient (signer leaf) key.
+        let err = unwrap_kdm(&kdm.xml, &f.root_key).expect_err("wrong key must fail");
+        assert!(
+            err.contains("wrong recipient key")
+                || err.contains("decryption")
+                || err.contains("structure id"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_kdm_reads_public_metadata_without_a_key() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        let key_id = uuid::Uuid::new_v4();
+        config.content_keys = vec![KdmContentKey {
+            key_type: *b"MDIK",
+            key_id,
+            content_key: [0u8; 16],
+        }];
+        let kdm = build_kdm(&config).expect("build");
+
+        let meta = parse_kdm(&kdm.xml).expect("parse metadata");
+        assert_eq!(meta.format, KdmFormat::Smpte);
+        assert_eq!(meta.cpl_id, uuid::Uuid::parse_str(&config.cpl_id).unwrap());
+        assert_eq!(meta.content_title, "Test Feature");
+        assert_eq!(meta.key_ids.len(), 1);
+        assert_eq!(meta.key_ids[0].key_id, key_id);
+        assert_eq!(meta.key_ids[0].key_type, Some(*b"MDIK"));
+        assert!(meta.not_valid_before < meta.not_valid_after);
+    }
+
+    // Key hygiene: the content key must never surface through Debug.
+    #[test]
+    fn unwrapped_key_debug_redacts_the_content_key() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        let key_id = uuid::Uuid::new_v4();
+        let content = [0x7Eu8; 16];
+        config.content_keys = vec![KdmContentKey {
+            key_type: *b"MDIK",
+            key_id,
+            content_key: content,
+        }];
+        let kdm = build_kdm(&config).expect("build");
+        let unwrapped = unwrap_kdm(&kdm.xml, &f.signer_key).expect("unwrap");
+
+        let dump = format!("{unwrapped:?}");
+        assert!(dump.contains("<redacted>"), "content key not redacted");
+        let hex: String = content.iter().map(|b| format!("{b:02x}")).collect();
+        assert!(!dump.contains(&hex), "content key leaked into Debug");
     }
 }

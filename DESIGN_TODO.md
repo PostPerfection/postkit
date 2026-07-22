@@ -29,8 +29,10 @@ tracker (dom#N = https://dcpomatic.com/bugs/view.php?id=N); the wizards and
 dcpdoctor expose them (see their DESIGN_TODOs, same date).
 
 - Leq(m) in loudness (dom#3092): ISO 21727 / CCIR 468 weighting alongside EBU
-  R128. Implemented locally in dcpdoctor-core (2026-07-22, rustfft); migrate that
-  implementation here so the wizards can report it too.
+  R128. Migrated into postkit::loudness (2026-07-22, rustfft): leq_m_from_samples
+  + measure_leq_m with the same shapes, ported with the CCIR-gain spot checks and
+  the derived full-scale 1 kHz sine reference (101.99 dB). dcpdoctor-core still
+  has its own copy; a later pass switches it to postkit.
 - Loudness adjustment (dom#1382): apply gain to hit an R128/Leq(m) target, not
   just measure.
 - Audio DSP: upmix stereo to 5.1 (dom#921, dom#1080), crossfades (dom#374),
@@ -51,11 +53,21 @@ dcpdoctor expose them (see their DESIGN_TODOs, same date).
   codestream header but does not reject non-DCI `RSIZ` profiles. Validate the
   profile, dimensions, and other DCI-required codestream fields before writing
   an MXF so an IMF or Profile None J2K input cannot become an invalid DCP.
-- Imported KDM decryption: preview can decrypt when given the content key, but
-  it cannot read a supplied KDM with the recipient private key and resolve the
-  DCP keys itself. Add this as a reusable API without exposing plaintext keys.
-  Now the blocker for dcpdoctor's last DoM gap item (verify encrypted DCPs,
-  dom#2971/dom#1957) and dcpwizard's "Encrypted DCP derivatives".
+
+Imported KDM decryption landed 2026-07-22 (certificate.rs): the inverse of the
+KDM generation path. `parse_kdm` reads a KDM's public metadata (format, CPL id,
+validity window, KeyIds/types) without a key; `unwrap_kdm`/`unwrap_kdm_file`
+RSA-OAEP-decrypt every EncryptedKey with the recipient private key, parse the
+plaintext block (138-byte SMPTE / 134-byte Interop) and return the KeyId ->
+16-byte AES key map as an `UnwrappedKdm`. Key hygiene: content keys are private
+(read via `content_key`), no derived Debug (manual redacting impl), and every
+key plus the decrypted key-block buffer is zeroed on drop (zeroize, already in
+the tree via rsa). A wrong recipient key fails loud at the OAEP unpad or the
+structure-id check, never returning garbage. The XML parser is now shared with
+re-wrap, and the block parser handles both formats. Round-trip tests (both
+formats, caller-chosen key bytes asserted) plus a wrong-key negative test and a
+Debug-redaction test. Unblocks dcpdoctor's verify-encrypted-DCPs gap
+(dom#2971/dom#1957) and dcpwizard's "Encrypted DCP derivatives".
 
 Grok multi-core encode fixed 2026-07-21: grok's compress scheduler always
 parallelises T1 across the global TFSingleton pool (per-codec cparams.num_threads
