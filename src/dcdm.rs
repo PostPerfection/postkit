@@ -10,6 +10,17 @@ pub enum DcdmColourEncoding {
     Xyz16Bit,
 }
 
+/// Output colour space of the transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DcdmTarget {
+    /// CIE X'Y'Z' with DCI white and 48/52.37 companding (SMPTE 428-1), the DCDM standard.
+    #[default]
+    Xyz,
+    /// P3-D65 RGB, 2.6 gamma. a mastering target (P3 primaries, D65 white), not a DCDM;
+    /// source white maps to full-scale, no DCI companding.
+    P3D65,
+}
+
 /// DCDM creation options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DcdmOptions {
@@ -24,6 +35,8 @@ pub struct DcdmOptions {
     pub fps_den: u32,
     /// Source colour space for conversion
     pub colour_space: String,
+    /// Output colour space (X'Y'Z' by default, or P3-D65 RGB)
+    pub target: DcdmTarget,
     /// Optional 3D LUT for colour transform
     pub lut_path: PathBuf,
 }
@@ -39,6 +52,7 @@ impl Default for DcdmOptions {
             fps_num: 24,
             fps_den: 1,
             colour_space: String::new(),
+            target: DcdmTarget::Xyz,
             lut_path: PathBuf::new(),
         }
     }
@@ -165,8 +179,9 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
         };
     };
 
+    let xf = space.to_target(opts.target);
     let max_code = opts.encoding.max_code_value();
-    let lin = build_linear_lut(space.gamma);
+    let lin = build_linear_lut(xf.gamma);
     let pixels = width as usize * height as usize;
     let mut frame_buf = vec![0u8; pixels * 3 * 2];
     let mut xyz_buf = vec![0u16; pixels * 3];
@@ -188,7 +203,7 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
             }
         }
 
-        convert_frame(&frame_buf, &space, &lin, max_code, &mut xyz_buf);
+        convert_frame(&frame_buf, &xf, &lin, max_code, &mut xyz_buf);
 
         let path = opts
             .output_dir
@@ -269,6 +284,113 @@ struct SourceSpace {
     scale: f32,
 }
 
+/// The resolved linear transform for one (source, target) pair: linear source
+/// RGB -> output space, plus the luminance scale applied before the 2.6 gamma.
+struct Transform {
+    /// linear source RGB to the output space (X'Y'Z' or P3-D65 linear RGB)
+    matrix: [[f32; 3]; 3],
+    /// gamma used to linearise the incoming code values
+    gamma: f32,
+    /// linear scale applied to the matrix output
+    scale: f32,
+}
+
+impl SourceSpace {
+    /// Compose the source->XYZ matrix with the chosen output target.
+    fn to_target(&self, target: DcdmTarget) -> Transform {
+        match target {
+            DcdmTarget::Xyz => Transform {
+                matrix: self.to_xyz,
+                gamma: self.gamma,
+                scale: self.scale,
+            },
+            DcdmTarget::P3D65 => Transform {
+                // linear source RGB -> XYZ -> P3-D65 linear RGB
+                matrix: mat_mul(&xyz_to_p3d65(), &self.to_xyz),
+                gamma: self.gamma,
+                // rgb mastering target: source white -> full-scale, no dci companding
+                scale: 1.0,
+            },
+        }
+    }
+}
+
+// P3 primaries (SMPTE RP 431-2) and the D65 white point (CIE), as (x, y).
+const P3_PRIMARIES: [[f64; 2]; 3] = [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]];
+const D65_WHITE: [f64; 2] = [0.3127, 0.3290];
+
+/// CIE XYZ -> P3-D65 linear RGB, derived from the P3 primaries + D65 white.
+fn xyz_to_p3d65() -> [[f32; 3]; 3] {
+    let m = invert3(rgb_to_xyz_matrix(&P3_PRIMARIES, D65_WHITE));
+    let mut out = [[0.0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = m[i][j] as f32;
+        }
+    }
+    out
+}
+
+/// RGB->XYZ matrix from chromaticities: build the primary matrix, solve for the
+/// per-channel scale that lands the white point, then scale the columns.
+fn rgb_to_xyz_matrix(primaries: &[[f64; 2]; 3], white: [f64; 2]) -> [[f64; 3]; 3] {
+    let col = |x: f64, y: f64| [x / y, 1.0, (1.0 - x - y) / y];
+    let mut p = [[0.0f64; 3]; 3];
+    for j in 0..3 {
+        let c = col(primaries[j][0], primaries[j][1]);
+        for i in 0..3 {
+            p[i][j] = c[i];
+        }
+    }
+    let w = col(white[0], white[1]);
+    let s = mat_vec(&invert3(p), w);
+    let mut m = [[0.0f64; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            m[i][j] = p[i][j] * s[j];
+        }
+    }
+    m
+}
+
+fn mat_vec(m: &[[f64; 3]; 3], v: [f64; 3]) -> [f64; 3] {
+    [
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    ]
+}
+
+fn mat_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut r = [[0.0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                r[i][j] += a[i][k] * b[k][j];
+            }
+        }
+    }
+    r
+}
+
+fn invert3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    let inv_det = 1.0 / det;
+    let mut r = [[0.0f64; 3]; 3];
+    r[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det;
+    r[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det;
+    r[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det;
+    r[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det;
+    r[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det;
+    r[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det;
+    r[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det;
+    r[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det;
+    r[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det;
+    r
+}
+
 /// Resolve a source colour space name to its transform.
 ///
 /// An empty name is treated as Rec.709, matching the wizard CLIs' own default.
@@ -327,8 +449,8 @@ fn build_linear_lut(gamma: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Convert one rgb48le frame into DCI X'Y'Z' code values.
-fn convert_frame(rgb: &[u8], space: &SourceSpace, lin: &[f32], max_code: u16, out: &mut [u16]) {
+/// Convert one rgb48le frame into the target's code values (X'Y'Z' or P3-D65).
+fn convert_frame(rgb: &[u8], xf: &Transform, lin: &[f32], max_code: u16, out: &mut [u16]) {
     let inv_gamma = 1.0 / DCDM_GAMMA;
     let max = max_code as f32;
 
@@ -337,8 +459,8 @@ fn convert_frame(rgb: &[u8], space: &SourceSpace, lin: &[f32], max_code: u16, ou
         let g = lin[u16::from_le_bytes([px[2], px[3]]) as usize];
         let b = lin[u16::from_le_bytes([px[4], px[5]]) as usize];
 
-        for (row, slot) in space.to_xyz.iter().zip(xyz.iter_mut()) {
-            let v = (row[0] * r + row[1] * g + row[2] * b) * space.scale;
+        for (row, slot) in xf.matrix.iter().zip(xyz.iter_mut()) {
+            let v = (row[0] * r + row[1] * g + row[2] * b) * xf.scale;
             *slot = (v.clamp(0.0, 1.0).powf(inv_gamma) * max).round() as u16;
         }
     }
@@ -420,14 +542,23 @@ mod tests {
     use super::*;
 
     fn convert_pixel(rgb: [u16; 3], colour_space: &str, encoding: DcdmColourEncoding) -> [u16; 3] {
-        let space = source_space(colour_space).unwrap();
-        let lin = build_linear_lut(space.gamma);
+        convert_pixel_to(rgb, colour_space, DcdmTarget::Xyz, encoding)
+    }
+
+    fn convert_pixel_to(
+        rgb: [u16; 3],
+        colour_space: &str,
+        target: DcdmTarget,
+        encoding: DcdmColourEncoding,
+    ) -> [u16; 3] {
+        let xf = source_space(colour_space).unwrap().to_target(target);
+        let lin = build_linear_lut(xf.gamma);
         let mut bytes = Vec::new();
         for c in rgb {
             bytes.extend_from_slice(&c.to_le_bytes());
         }
         let mut out = [0u16; 3];
-        convert_frame(&bytes, &space, &lin, encoding.max_code_value(), &mut out);
+        convert_frame(&bytes, &xf, &lin, encoding.max_code_value(), &mut out);
         out
     }
 
@@ -503,8 +634,8 @@ mod tests {
 
     #[test]
     fn converts_every_pixel_in_a_frame() {
-        let space = source_space("rec709").unwrap();
-        let lin = build_linear_lut(space.gamma);
+        let xf = source_space("rec709").unwrap().to_target(DcdmTarget::Xyz);
+        let lin = build_linear_lut(xf.gamma);
         let mut bytes = Vec::new();
         for px in [[65535u16; 3], [0; 3], [65535; 3]] {
             for c in px {
@@ -512,10 +643,87 @@ mod tests {
             }
         }
         let mut out = vec![0u16; 9];
-        convert_frame(&bytes, &space, &lin, 4095, &mut out);
+        convert_frame(&bytes, &xf, &lin, 4095, &mut out);
         assert_eq!(out[1], 3960);
         assert_eq!(&out[3..6], &[0, 0, 0]);
         assert_eq!(out[7], 3960);
+    }
+
+    #[test]
+    fn p3d65_matrix_matches_published() {
+        // derived P3-D65 RGB->XYZ (from primaries) vs the published SMPTE RP 431-2
+        // matrix (colour-science reference), within f32 rounding.
+        let m = rgb_to_xyz_matrix(&P3_PRIMARIES, D65_WHITE);
+        let pub_m = [
+            [0.4865709, 0.2656677, 0.1982173],
+            [0.2289746, 0.6917385, 0.0792869],
+            [0.0, 0.0451134, 1.0439444],
+        ];
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (m[i][j] - pub_m[i][j]).abs() < 1e-6,
+                    "[{i}][{j}] {} vs {}",
+                    m[i][j],
+                    pub_m[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn p3d65_white_maps_to_full_scale_neutral() {
+        // rec709 white is D65; through the P3-D65 target it lands on the P3-D65
+        // white, i.e. neutral (1,1,1) linear, encoded at full 12-bit scale.
+        let out = convert_pixel_to(
+            [65535; 3],
+            "rec709",
+            DcdmTarget::P3D65,
+            DcdmColourEncoding::Xyz12Bit,
+        );
+        for c in out {
+            assert_eq!(c, 4095, "P3-D65 white not full-scale neutral: {out:?}");
+        }
+    }
+
+    #[test]
+    fn p3d65_red_matches_reference() {
+        // rec709 red (1,0,0) in linear P3-D65 is (0.822462, 0.033194, 0.017083),
+        // then gamma 2.6 to 12-bit. independent of the impl (f64 reference).
+        let lin = [0.822_462f64, 0.033_194, 0.017_083];
+        let want: [u16; 3] =
+            std::array::from_fn(|i| (lin[i].powf(1.0 / 2.6) * 4095.0).round() as u16);
+        let got = convert_pixel_to(
+            [65535, 0, 0],
+            "rec709",
+            DcdmTarget::P3D65,
+            DcdmColourEncoding::Xyz12Bit,
+        );
+        for i in 0..3 {
+            assert!(
+                (got[i] as i32 - want[i] as i32).abs() <= 3,
+                "channel {i}: got {got:?} want {want:?}"
+            );
+        }
+        // rec709 red sits inside the wider P3 gamut, so no channel clips or goes negative.
+        assert!(got[0] > got[1] && got[1] > got[2], "red ordering: {got:?}");
+    }
+
+    #[test]
+    fn p3d65_differs_from_xyz_target() {
+        let xyz = convert_pixel_to(
+            [40000, 50000, 20000],
+            "rec709",
+            DcdmTarget::Xyz,
+            DcdmColourEncoding::Xyz12Bit,
+        );
+        let p3 = convert_pixel_to(
+            [40000, 50000, 20000],
+            "rec709",
+            DcdmTarget::P3D65,
+            DcdmColourEncoding::Xyz12Bit,
+        );
+        assert_ne!(xyz, p3);
     }
 
     #[test]
