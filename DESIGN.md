@@ -2,7 +2,7 @@
 
 Shared library crate for the PostPerfection suite. dcpdoctor, dcpwizard, and imfwizard depend on it by path; anything needed by more than one app lives here. Depends on asdcplib-rs (git) for MXF I/O. dcpdoctor-wasm deliberately does not use postkit (no-std-io rewrites in dcpdoctor-parse/-imf).
 
-## Modules (49 in lib.rs)
+## Modules (50 in lib.rs)
 
 Packaging and formats:
 - certificate: X.509 chains, KDM creation/rewrap, trust management. KDM content keys are caller-supplied (from the DCP's keys file) so the KDM unlocks the actual encrypted essence, falling back to a fresh MDIK when none are given
