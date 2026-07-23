@@ -69,6 +69,13 @@ pub struct MxfWrapOptions {
     /// soundfield with [`crate::mca::soundfield_to_mca_config`].
     #[serde(default)]
     pub mca_config: Option<String>,
+    /// TimedText only: explicit asset ids for the ancillary resources (the
+    /// `input_files` after the first). Entry `i` is the id for `input_files[i+1]`.
+    /// A DCST that references a font/image by `urn:uuid:<id>` must embed that
+    /// resource under the same id, so the caller controls it here. Missing or
+    /// short: those resources get a random id (back-compatible default).
+    #[serde(default)]
+    pub resource_ids: Vec<[u8; 16]>,
 }
 
 /// Result of MXF wrapping.
@@ -723,7 +730,7 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
     }
 
     // Write ancillary resources (fonts, images) — remaining input files
-    for f in opts.input_files.iter().skip(1) {
+    for (i, f) in opts.input_files.iter().skip(1).enumerate() {
         let resource_data = match std::fs::read(f) {
             Ok(d) => d,
             Err(e) => {
@@ -733,7 +740,12 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
                 };
             }
         };
-        let resource_uuid = *uuid::Uuid::new_v4().as_bytes();
+        // caller-supplied id so a DCST urn:uuid ref matches the embedded resource
+        let resource_uuid = opts
+            .resource_ids
+            .get(i)
+            .copied()
+            .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
         let ext = f
             .extension()
             .and_then(|e| e.to_str())
@@ -1106,6 +1118,7 @@ mod tests {
             partition_size: 0,
             encryption: None,
             mca_config: None,
+            resource_ids: vec![],
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -1136,6 +1149,7 @@ mod tests {
             partition_size: 0,
             encryption: None,
             mca_config: None,
+            resource_ids: vec![],
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "must not wrap a non-WAV file");
@@ -1201,6 +1215,7 @@ mod tests {
             partition_size: 0,
             encryption,
             mca_config: None,
+            resource_ids: vec![],
         }
     }
 
@@ -1347,6 +1362,7 @@ mod tests {
             partition_size: 0,
             encryption: None,
             mca_config: mca,
+            resource_ids: vec![],
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -1377,6 +1393,7 @@ mod tests {
             partition_size: 0,
             encryption: None,
             mca_config: Some("51(L,R,C,LFE,Ls,Rs)".to_string()),
+            resource_ids: vec![],
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "MCA on AS-02 must be rejected");
@@ -1411,6 +1428,7 @@ mod tests {
             partition_size: 0,
             encryption: None,
             mca_config: None,
+            resource_ids: vec![],
         };
         let result = mxf_wrap(&opts);
         assert!(result.success, "atmos wrap failed: {}", result.error);
@@ -1426,5 +1444,63 @@ mod tests {
         let desc = reader.atmos_descriptor().unwrap();
         assert_eq!(desc.container_duration, 3, "frame count");
         assert_eq!(desc.edit_rate, asdcplib::Rational::new(24, 1));
+    }
+
+    const DCST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<dcst:SubtitleReel xmlns:dcst=\"http://www.smpte-ra.org/schemas/428-7/2010/DCST\">\n\
+  <dcst:Id>urn:uuid:11111111-1111-1111-1111-111111111111</dcst:Id>\n\
+  <dcst:ContentTitleText>t</dcst:ContentTitleText>\n\
+  <dcst:IssueDate>2020-01-01T00:00:00+00:00</dcst:IssueDate>\n\
+  <dcst:EditRate>24 1</dcst:EditRate>\n\
+  <dcst:TimeCodeRate>24</dcst:TimeCodeRate>\n\
+  <dcst:LoadFont ID=\"f1\">urn:uuid:22222222-2222-2222-2222-222222222222</dcst:LoadFont>\n\
+  <dcst:SubtitleList>\n\
+    <dcst:Font ID=\"f1\">\n\
+      <dcst:Subtitle SpotNumber=\"1\" TimeIn=\"00:00:01:00\" TimeOut=\"00:00:04:00\">\n\
+        <dcst:Text>hi</dcst:Text>\n\
+      </dcst:Subtitle>\n\
+    </dcst:Font>\n\
+  </dcst:SubtitleList>\n\
+</dcst:SubtitleReel>\n";
+
+    #[test]
+    fn timed_text_embeds_ancillary_font_with_caller_supplied_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("sub.xml");
+        std::fs::write(&xml, DCST).unwrap();
+        // a stand-in font resource; the wrapper stores bytes verbatim
+        let font = dir.path().join("f.ttf");
+        std::fs::write(&font, vec![0u8; 4096]).unwrap();
+        let out = dir.path().join("sub.mxf");
+        // the id referenced by LoadFont above
+        let font_id = *uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222")
+            .unwrap()
+            .as_bytes();
+
+        let opts = MxfWrapOptions {
+            input_files: vec![xml, font],
+            output: out.clone(),
+            essence_type: EssenceType::TimedText,
+            standard: MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: None,
+            resource_ids: vec![font_id],
+        };
+        let result = mxf_wrap(&opts);
+        assert!(result.success, "timed text wrap failed: {}", result.error);
+        assert_eq!(result.duration, 96, "4.0 s at 24 fps");
+
+        // the primary timed-text resource round-trips out of the MXF
+        let mut reader = asdcplib::timed_text::MxfReader::new();
+        reader.open_read(&out.to_string_lossy()).unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let n = reader
+            .read_timed_text_resource(&mut buf, None, None)
+            .unwrap();
+        let back = String::from_utf8_lossy(&buf[..n]);
+        assert!(back.contains("SubtitleReel"), "XML round-trips");
     }
 }

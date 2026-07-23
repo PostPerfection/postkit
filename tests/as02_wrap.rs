@@ -88,6 +88,7 @@ fn as02_j2k_roundtrip() {
         partition_size: 1,
         encryption: None,
         mca_config: None,
+        resource_ids: vec![],
     });
     assert!(result.success, "wrap failed: {}", result.error);
 
@@ -132,6 +133,7 @@ fn as02_pcm_roundtrip() {
         partition_size: 1,
         encryption: None,
         mca_config: None,
+        resource_ids: vec![],
     });
     assert!(result.success, "wrap failed: {}", result.error);
     assert_eq!(result.duration, 2);
@@ -174,6 +176,7 @@ fn as02_atmos_errors() {
         partition_size: 1,
         encryption: None,
         mca_config: None,
+        resource_ids: vec![],
     });
     assert!(!result.success);
     assert!(
