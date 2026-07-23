@@ -7,7 +7,7 @@
 use allsorts::binary::read::ReadScope;
 use allsorts::font::{Font, MatchingPresentation};
 use allsorts::font_data::FontData;
-use allsorts::subset::{subset, CmapTarget, SubsetProfile};
+use allsorts::subset::{CmapTarget, SubsetProfile, subset};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -55,15 +55,32 @@ pub fn subset_font(
         .table_provider(0)
         .map_err(|e| FontSubsetError::Parse(e.to_string()))?;
     // Minimal keeps a usable standalone font; Unicode cmap so renderers can map chars
-    subset(&provider, &gids, &SubsetProfile::Minimal, CmapTarget::Unicode)
-        .map_err(|e| FontSubsetError::Subset(e.to_string()))
+    subset(
+        &provider,
+        &gids,
+        &SubsetProfile::Minimal,
+        CmapTarget::Unicode,
+    )
+    .map_err(|e| FontSubsetError::Subset(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use skrifa::{FontRef, MetadataProvider};
-    use std::path::PathBuf;
+    use skrifa::{FontRef, MetadataProvider, Tag};
+    use std::path::{Path, PathBuf};
+
+    // some system .ttf files have CFF outlines or no latin cmap (CI runners hit
+    // these); require glyf/loca and an 'A' mapping
+    fn usable(p: &Path) -> bool {
+        let Ok(bytes) = std::fs::read(p) else {
+            return false;
+        };
+        let Ok(font) = FontRef::new(&bytes) else {
+            return false;
+        };
+        font.table_data(Tag::new(b"loca")).is_some() && font.charmap().map('A').is_some()
+    }
 
     fn find_ttf() -> Option<PathBuf> {
         let mut stack = vec![PathBuf::from("/usr/share/fonts")];
@@ -75,7 +92,8 @@ mod tests {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ttf")) {
+                } else if p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ttf")) && usable(&p)
+                {
                     return Some(p);
                 }
             }

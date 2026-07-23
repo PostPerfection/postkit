@@ -66,7 +66,9 @@ pub fn parse_fcpxml(content: &str) -> Result<Vec<StyledCue>, SubtitleError> {
                             // a run reference inside <text>
                             cur_ref = Some(r);
                             cur_ref_text.clear();
-                        } else if let (Some(cue), Some(def_id)) = (cur.as_mut(), cur_def_id.as_ref()) {
+                        } else if let (Some(cue), Some(def_id)) =
+                            (cur.as_mut(), cur_def_id.as_ref())
+                        {
                             // the style body inside a text-style-def
                             cue.defs.insert(def_id.clone(), parse_run_style(&e));
                         }
@@ -147,7 +149,10 @@ fn parse_run_style(e: &quick_xml::events::BytesStart) -> RunStyle {
 
 /// Parse an FCPXML fontColor "r g b a" (floats 0..1) to Rgba.
 fn parse_fcp_color(s: &str) -> Option<Rgba> {
-    let vals: Vec<f32> = s.split_whitespace().filter_map(|v| v.parse().ok()).collect();
+    let vals: Vec<f32> = s
+        .split_whitespace()
+        .filter_map(|v| v.parse().ok())
+        .collect();
     if vals.len() < 3 {
         return None;
     }
@@ -235,7 +240,15 @@ mod tests {
         assert_eq!(c1.start_ms, 10000);
         assert_eq!(c1.end_ms, 15000);
         assert_eq!(c1.plain_text(), "A title");
-        assert_eq!(c1.runs[0].color, Some(Rgba { r: 255, g: 0, b: 0, a: 255 }));
+        assert_eq!(
+            c1.runs[0].color,
+            Some(Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255
+            })
+        );
     }
 
     #[test]

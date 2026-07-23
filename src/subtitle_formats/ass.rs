@@ -61,8 +61,7 @@ pub fn parse_ass(content: &str) -> Result<AssParsed, SubtitleError> {
             "events" => match key.as_str() {
                 "format" => event_format = split_fields(value),
                 "dialogue" => {
-                    if let Some(cue) =
-                        parse_dialogue(&event_format, value, &styles, &mut warnings)
+                    if let Some(cue) = parse_dialogue(&event_format, value, &styles, &mut warnings)
                     {
                         cues.push(cue);
                     }
@@ -96,7 +95,10 @@ fn parse_style(format: &[String], value: &str) -> Option<(String, Style)> {
         field_index(format, name).and_then(|i| fields.get(i).copied())
     };
     let name = get("name")?.to_string();
-    let ass_bool = |s: Option<&str>| s.map(|v| v.trim_start_matches('-') != "0" && !v.is_empty() && v != "0").unwrap_or(false);
+    let ass_bool = |s: Option<&str>| {
+        s.map(|v| v.trim_start_matches('-') != "0" && !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    };
     let mut style = Style {
         italic: ass_bool(get("italic")),
         bold: ass_bool(get("bold")),
@@ -114,15 +116,19 @@ fn parse_style(format: &[String], value: &str) -> Option<(String, Style)> {
 
 /// Parse an ASS colour literal &HAABBGGRR (alpha 00 = opaque).
 fn parse_ass_color(s: &str) -> Option<Rgba> {
-    let hex = s.trim().trim_start_matches('&').trim_start_matches(['h', 'H']).trim_end_matches('&');
+    let hex = s
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches(['h', 'H'])
+        .trim_end_matches('&');
     let v = u32::from_str_radix(hex, 16).ok()?;
-    let (a, b, g, r) = (
-        (v >> 24) as u8,
-        (v >> 16) as u8,
-        (v >> 8) as u8,
-        v as u8,
-    );
-    Some(Rgba { r, g, b, a: 255u8.wrapping_sub(a) })
+    let (a, b, g, r) = ((v >> 24) as u8, (v >> 16) as u8, (v >> 8) as u8, v as u8);
+    Some(Rgba {
+        r,
+        g,
+        b,
+        a: 255u8.wrapping_sub(a),
+    })
 }
 
 /// Map an \an numpad alignment (1-9) to horizontal + vertical anchors.
@@ -214,21 +220,18 @@ fn parse_text(
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
 
-    let flush = |cur: &mut String,
-                 runs: &mut Vec<StyledRun>,
-                 italic: bool,
-                 bold: bool,
-                 underline: bool| {
-        if !cur.is_empty() {
-            runs.push(StyledRun {
-                text: std::mem::take(cur),
-                italic,
-                bold,
-                underline,
-                color,
-            });
-        }
-    };
+    let flush =
+        |cur: &mut String, runs: &mut Vec<StyledRun>, italic: bool, bold: bool, underline: bool| {
+            if !cur.is_empty() {
+                runs.push(StyledRun {
+                    text: std::mem::take(cur),
+                    italic,
+                    bold,
+                    underline,
+                    color,
+                });
+            }
+        };
 
     while i < chars.len() {
         match chars[i] {
@@ -297,19 +300,19 @@ fn apply_overrides(
         if tok.is_empty() {
             continue;
         }
-        if let Some(rest) = tok.strip_prefix("an") {
-            if let Ok(a) = rest.parse::<u8>() {
-                let (h, v) = alignment_an(a);
-                *align = h;
-                *valign = v;
-                continue;
-            }
+        if let Some(rest) = tok.strip_prefix("an")
+            && let Ok(a) = rest.parse::<u8>()
+        {
+            let (h, v) = alignment_an(a);
+            *align = h;
+            *valign = v;
+            continue;
         }
-        if let Some(rest) = tok.strip_prefix('i') {
-            if rest == "0" || rest == "1" {
-                *italic = rest == "1";
-                continue;
-            }
+        if let Some(rest) = tok.strip_prefix('i')
+            && (rest == "0" || rest == "1")
+        {
+            *italic = rest == "1";
+            continue;
         }
         if let Some(rest) = tok.strip_prefix('b') {
             // \b1/\b0 toggle bold; \b<weight> also sets bold (>0)
@@ -318,11 +321,11 @@ fn apply_overrides(
                 continue;
             }
         }
-        if let Some(rest) = tok.strip_prefix('u') {
-            if rest == "0" || rest == "1" {
-                *underline = rest == "1";
-                continue;
-            }
+        if let Some(rest) = tok.strip_prefix('u')
+            && (rest == "0" || rest == "1")
+        {
+            *underline = rest == "1";
+            continue;
         }
         // unsupported: record the tag name (letters up to first digit/paren)
         let name: String = tok

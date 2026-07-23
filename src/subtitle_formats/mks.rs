@@ -9,7 +9,7 @@ use std::process::Command;
 
 use uuid::Uuid;
 
-use super::{ass, StyledCue, StyledRun, SubtitleError};
+use super::{StyledCue, StyledRun, SubtitleError, ass};
 use crate::subtitle_retime::parse_srt;
 
 /// A subtitle stream in the container (subtitle-relative index + codec name).
@@ -59,7 +59,10 @@ pub fn list_subtitle_streams(path: &Path) -> Result<Vec<SubStream>, SubtitleErro
 ///
 /// `stream_index` selects the subtitle-relative stream (0-based); `None` picks
 /// the first. ASS/SSA streams keep styling; text streams come back as plain runs.
-pub fn parse_mks(path: &Path, stream_index: Option<usize>) -> Result<Vec<StyledCue>, SubtitleError> {
+pub fn parse_mks(
+    path: &Path,
+    stream_index: Option<usize>,
+) -> Result<Vec<StyledCue>, SubtitleError> {
     let streams = list_subtitle_streams(path)?;
     let idx = stream_index.unwrap_or(0);
     let stream = streams
@@ -69,8 +72,7 @@ pub fn parse_mks(path: &Path, stream_index: Option<usize>) -> Result<Vec<StyledC
 
     let is_ass = matches!(stream.codec.as_str(), "ass" | "ssa");
     let ext = if is_ass { "ass" } else { "srt" };
-    let tmp: PathBuf =
-        std::env::temp_dir().join(format!("postkit-mks-{}.{ext}", Uuid::new_v4()));
+    let tmp: PathBuf = std::env::temp_dir().join(format!("postkit-mks-{}.{ext}", Uuid::new_v4()));
 
     let codec_arg = if is_ass { "copy" } else { "srt" };
     let out = Command::new("ffmpeg")

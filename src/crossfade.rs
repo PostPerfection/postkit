@@ -172,7 +172,10 @@ mod tests {
         let overlap = 480;
         let out = crossfade_join(&a, &b, 1, overlap).unwrap();
         assert_eq!(out.len(), 1000 + 1000 - overlap);
-        let max_step = out.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0, f32::max);
+        let max_step = out
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f32::max);
         // the mid-crossfade equal-power bump is gradual; no sample-to-sample jump.
         assert!(max_step < 0.01, "max step {max_step}");
     }
@@ -205,7 +208,10 @@ mod tests {
         ));
         assert!(matches!(
             crossfade_join(&[0.0; 10], &[0.0; 4], 1, 6),
-            Err(CrossfadeError::OverlapTooLong { overlap_frames: 6, .. })
+            Err(CrossfadeError::OverlapTooLong {
+                overlap_frames: 6,
+                ..
+            })
         ));
     }
 

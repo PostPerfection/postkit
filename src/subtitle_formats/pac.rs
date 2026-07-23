@@ -196,84 +196,6 @@ fn latin_lookup(code: u32) -> Option<(&'static str, i32)> {
         .map(|(_, s, p)| (*s, *p))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Build a one-record PAC buffer. `align`: raw alignment byte (bits 0-1
-    /// align, bit 2 italic). `text` is raw Latin bytes; 0xFE separates lines.
-    fn build_pac(start_ms_parts: (u16, u16), end_ms_parts: (u16, u16), valign: u8, align: u8, text: &[u8]) -> Vec<u8> {
-        let mut b = vec![0u8; 41];
-        b[0] = 1;
-        let ts = 23;
-        b[ts] = 0x60; // spot byte
-        let put16 = |b: &mut [u8], at: usize, v: u16| {
-            b[at] = (v & 0xff) as u8;
-            b[at + 1] = (v >> 8) as u8;
-        };
-        // start tc: high (HHMM), low (SSFF)
-        put16(&mut b, ts + 1, start_ms_parts.0);
-        put16(&mut b, ts + 3, start_ms_parts.1);
-        put16(&mut b, ts + 5, end_ms_parts.0);
-        put16(&mut b, ts + 7, end_ms_parts.1);
-        // text length: large enough to cover the text plus slack
-        b[ts + 9] = (text.len() as u8).saturating_add(20);
-        b[ts + 10] = 0;
-        b[ts + 11] = valign;
-        // fe record at ts+15
-        b[ts + 15] = 0xFE;
-        b[ts + 16] = align;
-        b[ts + 17] = 0x03;
-        b.extend_from_slice(text);
-        // trailing padding so the record is found and the scan then ends
-        b.extend(std::iter::repeat_n(0u8, 30));
-        b
-    }
-
-    #[test]
-    fn pac_parses_latin_text_and_timing() {
-        // start 00:00:01:00 -> high 0, low 100 ; end 00:00:05:00 -> high 0, low 500
-        let buf = build_pac((0, 100), (0, 500), 10, 0x02, b"AB");
-        let cues = parse_pac(&buf, CODEPAGE_LATIN).unwrap();
-        assert_eq!(cues.len(), 1);
-        let c = &cues[0];
-        assert_eq!(c.start_ms, 1000);
-        assert_eq!(c.end_ms, 5000);
-        assert_eq!(c.plain_text(), "AB");
-        assert_eq!(c.align, Some(HAlign::Center));
-    }
-
-    #[test]
-    fn pac_decodes_diacritic_and_italic_lines() {
-        // line 1 italic (align bit 0x04): "A", 0xFE next-align non-italic, then
-        // accented "á" via 0xE2 0x61
-        let text = [b'A', 0xFE, 0x00, 0x03, 0xE2, 0x61];
-        let buf = build_pac((0, 100), (0, 300), 10, 0x04, &text);
-        let cues = parse_pac(&buf, CODEPAGE_LATIN).unwrap();
-        let c = &cues[0];
-        assert_eq!(c.plain_text(), "A\ná");
-        assert!(c.runs[0].italic);
-        assert!(!c.runs[1].italic);
-    }
-
-    #[test]
-    fn pac_rejects_unsupported_codepage() {
-        let buf = build_pac((0, 100), (0, 500), 10, 0x02, b"AB");
-        assert!(matches!(
-            parse_pac(&buf, 3),
-            Err(SubtitleError::UnsupportedCodepage(3))
-        ));
-    }
-
-    #[test]
-    fn pac_rejects_bad_header() {
-        assert!(matches!(
-            parse_pac(&[0u8; 40], CODEPAGE_LATIN),
-            Err(SubtitleError::Parse(_))
-        ));
-    }
-}
-
 /// (code, char, priority) from Subtitle Edit's LatinCodes dictionary.
 static LATIN_CODES: &[(u32, &str, i32)] = &[
     (0xE041, "Ã", 2),
@@ -617,3 +539,87 @@ static LATIN_CODES: &[(u32, &str, i32)] = &[
     (0x00C0, "[", 2),
     (0x00C1, "]", 2),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a one-record PAC buffer. `align`: raw alignment byte (bits 0-1
+    /// align, bit 2 italic). `text` is raw Latin bytes; 0xFE separates lines.
+    fn build_pac(
+        start_ms_parts: (u16, u16),
+        end_ms_parts: (u16, u16),
+        valign: u8,
+        align: u8,
+        text: &[u8],
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; 41];
+        b[0] = 1;
+        let ts = 23;
+        b[ts] = 0x60; // spot byte
+        let put16 = |b: &mut [u8], at: usize, v: u16| {
+            b[at] = (v & 0xff) as u8;
+            b[at + 1] = (v >> 8) as u8;
+        };
+        // start tc: high (HHMM), low (SSFF)
+        put16(&mut b, ts + 1, start_ms_parts.0);
+        put16(&mut b, ts + 3, start_ms_parts.1);
+        put16(&mut b, ts + 5, end_ms_parts.0);
+        put16(&mut b, ts + 7, end_ms_parts.1);
+        // text length: large enough to cover the text plus slack
+        b[ts + 9] = (text.len() as u8).saturating_add(20);
+        b[ts + 10] = 0;
+        b[ts + 11] = valign;
+        // fe record at ts+15
+        b[ts + 15] = 0xFE;
+        b[ts + 16] = align;
+        b[ts + 17] = 0x03;
+        b.extend_from_slice(text);
+        // trailing padding so the record is found and the scan then ends
+        b.extend(std::iter::repeat_n(0u8, 30));
+        b
+    }
+
+    #[test]
+    fn pac_parses_latin_text_and_timing() {
+        // start 00:00:01:00 -> high 0, low 100 ; end 00:00:05:00 -> high 0, low 500
+        let buf = build_pac((0, 100), (0, 500), 10, 0x02, b"AB");
+        let cues = parse_pac(&buf, CODEPAGE_LATIN).unwrap();
+        assert_eq!(cues.len(), 1);
+        let c = &cues[0];
+        assert_eq!(c.start_ms, 1000);
+        assert_eq!(c.end_ms, 5000);
+        assert_eq!(c.plain_text(), "AB");
+        assert_eq!(c.align, Some(HAlign::Center));
+    }
+
+    #[test]
+    fn pac_decodes_diacritic_and_italic_lines() {
+        // line 1 italic (align bit 0x04): "A", 0xFE next-align non-italic, then
+        // accented "á" via 0xE2 0x61
+        let text = [b'A', 0xFE, 0x00, 0x03, 0xE2, 0x61];
+        let buf = build_pac((0, 100), (0, 300), 10, 0x04, &text);
+        let cues = parse_pac(&buf, CODEPAGE_LATIN).unwrap();
+        let c = &cues[0];
+        assert_eq!(c.plain_text(), "A\ná");
+        assert!(c.runs[0].italic);
+        assert!(!c.runs[1].italic);
+    }
+
+    #[test]
+    fn pac_rejects_unsupported_codepage() {
+        let buf = build_pac((0, 100), (0, 500), 10, 0x02, b"AB");
+        assert!(matches!(
+            parse_pac(&buf, 3),
+            Err(SubtitleError::UnsupportedCodepage(3))
+        ));
+    }
+
+    #[test]
+    fn pac_rejects_bad_header() {
+        assert!(matches!(
+            parse_pac(&[0u8; 40], CODEPAGE_LATIN),
+            Err(SubtitleError::Parse(_))
+        ));
+    }
+}

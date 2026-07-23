@@ -198,12 +198,18 @@ mod tests {
         }
         assert!(wrapped.plain_text().contains('\n'));
         // the italic word keeps its styling
-        assert!(wrapped
-            .runs
-            .iter()
-            .any(|r| r.italic && r.text.contains("world")));
+        assert!(
+            wrapped
+                .runs
+                .iter()
+                .any(|r| r.italic && r.text.contains("world"))
+        );
         // words stay whole
-        let joined: String = wrapped.plain_text().split('\n').collect::<Vec<_>>().join(" ");
+        let joined: String = wrapped
+            .plain_text()
+            .split('\n')
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(joined.contains("world"));
         assert!(joined.contains("foo"));
     }

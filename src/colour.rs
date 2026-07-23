@@ -640,7 +640,10 @@ mod tests_xyz {
         let grok12 = [2817u16, 2183, 870];
         for (i, &g) in grok12.iter().enumerate() {
             let twelve = (got[i] as u32 * 4095 / 65535) as i32;
-            assert!((twelve - g as i32).abs() <= 2, "12-bit {i}: {twelve} vs grok {g}");
+            assert!(
+                (twelve - g as i32).abs() <= 2,
+                "12-bit {i}: {twelve} vs grok {g}"
+            );
         }
     }
 

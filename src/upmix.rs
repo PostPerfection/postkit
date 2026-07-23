@@ -112,7 +112,10 @@ fn split_stereo(x: &[f32]) -> (Vec<f32>, Vec<f32>) {
 
 // (L + R) at -6 dB amplitude, DoM's centre/LFE source.
 fn mix_lr(l: &[f32], r: &[f32]) -> Vec<f32> {
-    l.iter().zip(r).map(|(&a, &b)| (a + b) * MINUS_6DB).collect()
+    l.iter()
+        .zip(r)
+        .map(|(&a, &b)| (a + b) * MINUS_6DB)
+        .collect()
 }
 
 fn interleave6(ch: [&[f32]; 6]) -> Vec<f32> {
@@ -253,8 +256,14 @@ mod tests {
         let out_l = rms(&channel(&out, 0));
         assert!(out_l > 0.05, "L should carry the tone, got {out_l}");
         assert!(rms(&channel(&out, 1)) < out_l * 0.01, "R must stay silent");
-        assert!(rms(&channel(&out, 2)) < out_l * 0.2, "C must not carry 3 kHz");
-        assert!(rms(&channel(&out, 4)) < out_l * 0.2, "Ls must not carry 3 kHz");
+        assert!(
+            rms(&channel(&out, 2)) < out_l * 0.2,
+            "C must not carry 3 kHz"
+        );
+        assert!(
+            rms(&channel(&out, 4)) < out_l * 0.2,
+            "Ls must not carry 3 kHz"
+        );
     }
 
     #[test]
@@ -291,8 +300,8 @@ mod tests {
         let rs = channel(&out, 5);
         assert_eq!(ls, rs, "Rs must copy Ls");
         let delay = (0.02 * SR as f32) as usize;
-        for i in 0..delay {
-            assert_eq!(ls[i], 0.0, "surround must be silent during the delay");
+        for &s in &ls[..delay] {
+            assert_eq!(s, 0.0, "surround must be silent during the delay");
         }
         for i in delay..l.len() {
             assert!((ls[i] - (l[i - delay] - r[i - delay])).abs() < 1e-6);
@@ -305,9 +314,18 @@ mod tests {
         let frames = SR as usize;
         let low = interleave(&tone(60.0, 0.5, frames), &tone(60.0, 0.5, frames));
         let high = interleave(&tone(5000.0, 0.5, frames), &tone(5000.0, 0.5, frames));
-        let lfe_low = rms(&channel(&upmix_stereo_to_51(Upmixer::B, &low, SR).unwrap(), 3));
-        let lfe_high = rms(&channel(&upmix_stereo_to_51(Upmixer::B, &high, SR).unwrap(), 3));
-        assert!(lfe_low > lfe_high * 20.0, "low {lfe_low} vs high {lfe_high}");
+        let lfe_low = rms(&channel(
+            &upmix_stereo_to_51(Upmixer::B, &low, SR).unwrap(),
+            3,
+        ));
+        let lfe_high = rms(&channel(
+            &upmix_stereo_to_51(Upmixer::B, &high, SR).unwrap(),
+            3,
+        ));
+        assert!(
+            lfe_low > lfe_high * 20.0,
+            "low {lfe_low} vs high {lfe_high}"
+        );
     }
 
     #[test]

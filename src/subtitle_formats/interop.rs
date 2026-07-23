@@ -91,7 +91,8 @@ struct ImgAttrs {
 
 fn resolve_png(base: &Path, name: &str) -> Result<PathBuf, SubtitleError> {
     let path = base.join(name);
-    let mut f = std::fs::File::open(&path).map_err(|_| SubtitleError::MissingImage(path.clone()))?;
+    let mut f =
+        std::fs::File::open(&path).map_err(|_| SubtitleError::MissingImage(path.clone()))?;
     use std::io::Read;
     let mut magic = [0u8; 8];
     if f.read_exact(&mut magic).is_err() || magic != PNG_MAGIC {

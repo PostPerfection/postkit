@@ -1,8 +1,8 @@
 //! Subtitle input parsers and text utilities for the wizards.
 //!
-//! Parsers turn each source format into `StyledCue`s (timing + styled text runs
-//! + optional alignment/position/image). `to_srt_cue` collapses a `StyledCue`
-//! back to the plain `subtitle_retime::SrtCue` so existing consumers keep working.
+//! Parsers turn each source format into `StyledCue`s (timing, styled text runs,
+//! optional alignment/position/image). `to_srt_cue` collapses a `StyledCue` back
+//! to the plain `subtitle_retime::SrtCue` so existing consumers keep working.
 
 use std::path::PathBuf;
 
