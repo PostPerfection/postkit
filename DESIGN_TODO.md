@@ -28,18 +28,71 @@ Library-level capabilities behind feature requests in the DCP-o-matic Mantis
 tracker (dom#N = https://dcpomatic.com/bugs/view.php?id=N); the wizards and
 dcpdoctor expose them (see their DESIGN_TODOs, same date).
 
-- Leq(m) (dom#3092): dcpdoctor-core still has its own copy of the CCIR 468
-  weighting + level math; a later pass switches it to postkit::loudness.
+- Leq(m) (dom#3092): DONE 2026-07-23. dcpdoctor-core dropped its CCIR 468
+  weighting + level math (and the rustfft dep) and re-exports
+  `postkit::loudness::{leq_m_from_samples, measure_leq_m, LeqMResult}`.
 - Player direction (dom#2700 loop, dom#2917 speed, dom#2893 markers, dom#3091
   waveform, dom#1974/dom#3165 3D view modes, dom#3083 A/V sync offset): all gate
   on the GPU J2K decode path already noted under the SDI/DeckLink item.
 
 ## Planned / not started
 
-- DCI JPEG 2000 validation before DCP wrapping: `mxf_wrap::wrap_j2k` parses the
-  codestream header but does not reject non-DCI `RSIZ` profiles. Validate the
-  profile, dimensions, and other DCI-required codestream fields before writing
-  an MXF so an IMF or Profile None J2K input cannot become an invalid DCP.
+(nothing open)
+
+Subtitle input parsers landed 2026-07-23 (b67e038, src/subtitle_formats/): a
+`StyledCue` model (start/end ms matching `parse_srt`, `StyledRun`s with
+italic/bold/underline/colour, optional HAlign/VAlign/vposition, optional bitmap
+image) plus parsers `ass::parse_ass` (V4+ styles + inline \i \b \u \an override
+tags, unsupported tags collected as warnings, dom#1462), `fcpxml::parse_fcpxml`
+(caption/title, rational offset/duration timing, per-run text-style-def styling,
+dom#2909), and `mks::parse_mks` (Matroska via ffprobe/ffmpeg extract to srt/ass
+then reparse, dom#3131), alongside `pac`, `interop` PNG bitmap subs, `bidi` RTL
+shaping, and `wrap` line-wrap. `to_srt_cue`/`to_srt_cues` flatten back to
+`subtitle_retime::SrtCue` so existing callers are unaffected. dcpwizard already
+consumes these via its vendored postkit copy (dcpwizard-core/src/subtitle.rs);
+imfwizard's subtitle-convert wiring landed 2026-07-23 (its DESIGN_TODO; pin bump
+pending): ass/fcpxml/mks now convert to IMSC/TTML keeping styling+placement.
+Tests per parser assert styling/timing; MKS skips when ffmpeg/ffprobe are absent.
+
+P3-D65 DCDM target landed 2026-07-23 (dcdm.rs): `DcdmOptions.target: DcdmTarget`
+(default `Xyz`, byte-identical to before) adds a `P3D65` output. The XYZ->P3-D65
+matrix is derived from the P3 primaries + D65 white (`rgb_to_xyz_matrix`/`invert3`,
+cross-checked against the published SMPTE RP 431-2 matrix within 1e-6), composed
+with the source->XYZ matrix so a source RGB frame lands in linear P3-D65, encoded
+with 2.6 gamma. It is a mastering target (P3 primaries, D65 white), not a DCDM:
+source white maps to full-scale neutral, no 48/52.37 DCI companding. Exposes
+`--target p3-d65` for dcpwizard (mechanical routing alongside the existing `xyz`
+DCDM path). Tests: matrix vs published, rec709 white -> full-scale neutral, rec709
+red vs f64 reference, and P3-D65 differs from the XYZ target.
+
+RGB->X'Y'Z' harmonization with grok landed 2026-07-23 (32838ea): postkit's matrix
+was aligned to the grok/libdcp/DoM reference (gamma 2.2 display-referred
+linearization + the sRGB/D65 primaries matrix + 48/52.37 companding + 2.6 encode),
+replacing the old gamma-2.4 path. Both encode paths now agree: whether grok applies
+its internal XYZ transform (`apply_xyz_transform`) or postkit pre-transforms and
+feeds XYZ, BT.709 red lands on grok's published 12-bit `[2817, 2183, 870]`.
+`colour::tests_xyz::red_matches_reference` asserts that agreement (<=2 codes) plus
+an independent f64 reference; `dcdm::rec709_mid_grey_uses_gamma_2_2` locks the same
+gamma-2.2 linearization in the file pipeline.
+
+Packaging AnnotationText + KDM annotation landed 2026-07-23:
+`packaging::PackingList` and `packaging::AssetMap` gained an optional
+`annotation: Option<String>`, emitted as `<AnnotationText>` right after `<Id>`
+(the schema slot in ST 429-8/-9 and the shared IMF ST 2067-2 PKL / 429-9 AM).
+`certificate::KdmConfig` gained `annotation: Option<String>` overriding the
+derived `"<title> KDM for <recipient>"` ETM AnnotationText. All three default
+None and are byte-identical to before (existing writer/XSD/xmlsec1 tests plus new
+None-vs-Some diff tests prove it). This removes dcpwizard combine.rs's
+string-injection workaround (dom#2027). Extended the gated DCP-XSD test with
+annotated PKL/ASSETMAP and the KDM round-trip with an annotation override.
+
+DCI JPEG 2000 validation before DCP wrapping (done 2026-07-21, fb322e1/337adb5):
+`mxf_wrap::wrap_j2k` runs `j2k::validate_dci_header` on every input frame before
+writing, rejecting non-DCI RSIZ profiles (2K = 1/3, 4K = 2/4 per dcpdoctor's
+convention), out-of-bounds dimensions, component count != 3, and non-12-bit
+unsigned components. Gated to `MxfStandard::AsDcp`; AS-02 (IMF) only checks for a
+non-empty image area, so imfwizard's non-DCI J2K is unaffected. Tests: a
+conformant profile-3 codestream wraps, a Profile-None codestream is rejected.
 
 Imported KDM decryption landed 2026-07-22 (certificate.rs): the inverse of the
 KDM generation path. `parse_kdm` reads a KDM's public metadata (format, CPL id,
@@ -104,24 +157,55 @@ to the MXF descriptor, so they are left to the wizard/asdcplib.
 Audited 2026-07-20: these app copies are not drop-in supersets of the postkit
 modules, so they can't just switch. Extract only after extending the postkit API.
 
-- j2k: dcpdoctor-core/j2k.rs adds DCI validation + MXF extraction and a richer
-  `J2kCodestreamInfo`; dcpdoctor-wasm/j2k.rs is pure-bytes with extra fields
-  (bit_depths Vec, codeblock dims, marker flags) and parses J2K out of MXF.
-  postkit::j2k::parse_j2k_header is a smaller pure-bytes header parser. To unify,
-  postkit would need the extra fields and an MXF-extraction entry point.
-- bitrate: dcpdoctor-core/bitrate.rs reads MXF descriptors via asdcplib;
-  postkit::j2k::analyse_bitrate works on a slice of file paths. Different inputs.
+- j2k: DONE 2026-07-23 (uncommitted, app pin bump pending). `J2kHeader` gained the
+  richer fields both apps carried: per-component `bit_depths`, code-block
+  width/height + exponents, `irreversible_transform`, `mct`, `guard_bits`, and the
+  `tlm_present`/`poc_present`/`tile_part_count` marker/tile info. `parse_j2k_header`
+  fills them all (existing callers unaffected, fields are additive). Added the
+  MXF-extraction entry points `read_mxf_j2k_frame(path, frame)` and
+  `parse_j2k_from_mxf(path, frame)` via the asdcplib jp2k reader (unencrypted).
+  dcpdoctor-core/j2k.rs can drop its `parse_cod_extras`; dcpdoctor-wasm stays
+  pure-bytes by choice. Tests build full SOC/SIZ/COD/QCD/TLM + tile-part streams
+  and assert every new field for 2K (3 parts) and 4K (6 parts).
+  dcpdoctor switched 2026-07-23: dropped `parse_cod_extras`, `J2kCodestreamInfo`
+  built off `parse_j2k_header`, and `analyze_j2k_from_mxf` prefers
+  `read_mxf_j2k_frame` (real codestream) with an ffprobe fallback for AS-02/OP1a
+  essence the OP-Atom reader can't open (noted in dcpdoctor's DESIGN_TODO).
+- bitrate: DONE 2026-07-23 (uncommitted, pin bump pending). Added
+  `j2k::analyse_mxf_bitrate(path) -> MxfBitrateStats` reading frame sizes via the
+  asdcplib picture descriptor + read_frame loop, mirroring dcpdoctor-core
+  bitrate.rs's `FrameBitrateStats` fields (valid/error/frame_count/width/height/
+  frame_rate/total+min+max bytes/max_frame_index/avg+min+max mbps). The
+  Note-producing `check_bitrate_compliance` stays app-side (uses dcpdoctor's
+  Note/Code). The path-slice `analyse_bitrate` is unchanged. dcpdoctor switched
+  2026-07-23: `FrameBitrateStats` is a type alias for `MxfBitrateStats` and
+  `analyze_picture_bitrate` delegates to `analyse_mxf_bitrate`.
 - hash: dcpdoctor-core/hash.rs (sha1_base64/sha1_hex over a path) can adapt onto
   postkit::hash::hash_file cleanly; dcpdoctor-wasm/hash.rs is pure-bytes and
   postkit has no bytes-based hash. dcpdoctor-wasm deliberately avoids postkit.
-- timecode: imfwizard-core/timecode.rs is a `Timecode` struct with methods;
-  postkit::timecode is free functions. A switch needs a postkit Timecode type.
-- frame_compare: dcpdoctor-core and imfwizard-core versions have incompatible
-  APIs (CompareOptions/QualityMetrics + regex_lite vs a simple compare_frames
-  returning per-frame PSNR/SSIM). Does not drop into one postkit module cleanly;
-  left in the apps.
-- Package diff: dcpwizard dcp_diff.rs vs imfwizard imp_diff.rs are ~75% similar;
-  could become one postkit module, not yet attempted.
+- timecode: DONE 2026-07-23 (uncommitted, pin bump pending). Added a
+  `timecode::Timecode` struct (hours/minutes/seconds/frames/fps/drop_frame) with
+  `new`/`parse`/`to_frames`/`from_frames`/Display, a superset of imfwizard-core's
+  API (SMPTE drop-frame compensation at 30/60 fps). Ported imfwizard's tests.
+  imfwizard switched to it and deleted its local copy 2026-07-23.
+- frame_compare: DONE 2026-07-23 (uncommitted, pin bump pending). New
+  `postkit::frame_compare` module. Per-frame core `compare_frames(ref, dist)` returns
+  per-frame PSNR (y/u/v/avg) + SSIM (y/avg) (imfwizard drop-in), plus `VmafScore`/
+  `ffmpeg_has_libvmaf`/`compute_vmaf` and the pooled `QualityMetrics`/`QualityOptions`/
+  `compute_quality` wrapper (dcpdoctor). ffmpeg stat output is parsed by whitespace
+  split, no regex (the regex was only ffmpeg-output parsing, not an app concern).
+  dcpdoctor's threshold scoring (CompareOptions/FrameDiff `significant`) stays a thin
+  app wrapper over `compare_frames`'s per_frame + a threshold. Tests cover the log
+  and token parsers with sample ffmpeg output (no ffmpeg needed).
+  imfwizard switched to it and deleted its local copy 2026-07-23. dcpdoctor
+  switched 2026-07-23: `compare_files` is now a thin threshold wrapper over
+  `compare_frames`/`compute_vmaf`; its unused `QualityMetrics`/`compute_quality`
+  copies were deleted.
+- Package diff: MOOT (verified 2026-07-23). The premise was stale: imfwizard's
+  imp_diff was deleted as a dead module (zero callers) and dcpwizard has no dcp_diff.
+  The only remaining diff is dcpdoctor-core/diff.rs (DCP-only, single consumer, built
+  on dcpdoctor's own DCP model + hash). With one consumer there is nothing to dedup,
+  so no postkit module was added.
 - imfwizard to_dcp.rs DCP CPL/PKL/ASSETMAP writers: only the escaper switched to
   postkit. DcpCplReel now carries per-reel picture_width/height and emits a
   per-asset ScreenAspectRatio (SMPTE Rational, Interop decimal), so that blocker

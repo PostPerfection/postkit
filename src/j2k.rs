@@ -1,9 +1,13 @@
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// JPEG 2000 marker codes.
 const SOC: u16 = 0xFF4F; // Start of codestream
 const SIZ: u16 = 0xFF51; // Image and tile size
 const COD: u16 = 0xFF52; // Coding style default
+const QCD: u16 = 0xFF5C; // Quantization default
+const TLM: u16 = 0xFF55; // Tile-part lengths
+const POC: u16 = 0xFF5F; // Progression order change
 const SOT: u16 = 0xFF90; // Start of tile-part
 const SOD: u16 = 0xFF93; // Start of data
 const EOC: u16 = 0xFFD9; // End of codestream
@@ -33,6 +37,28 @@ pub struct J2kHeader {
     pub progression_order: u8,
     /// Number of quality layers
     pub num_layers: u16,
+    /// Bit depth per component (from each Ssiz), same order as the components
+    pub bit_depths: Vec<u8>,
+    /// Code-block width exponent (actual width = 2^(exp+2))
+    pub codeblock_width_exp: u8,
+    /// Code-block height exponent (actual height = 2^(exp+2))
+    pub codeblock_height_exp: u8,
+    /// Code-block width in samples
+    pub codeblock_width: u32,
+    /// Code-block height in samples
+    pub codeblock_height: u32,
+    /// Wavelet transform: true = 9-7 irreversible, false = 5-3 reversible
+    pub irreversible_transform: bool,
+    /// Multi-component transform present
+    pub mct: bool,
+    /// Guard bits declared in the QCD marker (top 3 bits of Sqcd)
+    pub guard_bits: u8,
+    /// TLM (tile-part lengths) marker present
+    pub tlm_present: bool,
+    /// POC (progression order change) marker present
+    pub poc_present: bool,
+    /// Number of tile-parts (SOT markers)
+    pub tile_part_count: u32,
 }
 
 /// DCI compliance profile identifiers.
@@ -199,19 +225,86 @@ pub fn parse_j2k_header(data: &[u8]) -> Option<J2kHeader> {
                     hdr.is_signed = (ssiz & 0x80) != 0;
                     hdr.bit_depth = (ssiz & 0x7F) + 1;
                 }
+                // per-component Ssiz bytes start at 36, 3 bytes each (Ssiz, XRsiz, YRsiz)
+                let mut cp = 36;
+                for _ in 0..hdr.num_components {
+                    if cp >= seg.len() {
+                        break;
+                    }
+                    hdr.bit_depths.push((seg[cp] & 0x7F) + 1);
+                    cp += 3;
+                }
             }
             COD if seg.len() >= 5 => {
                 hdr.progression_order = seg[1];
                 hdr.num_layers = u16::from_be_bytes([seg[2], seg[3]]);
+                if seg.len() > 4 {
+                    hdr.mct = seg[4] != 0;
+                }
                 hdr.num_decomp_levels = seg[5];
+                if seg.len() > 7 {
+                    hdr.codeblock_width_exp = seg[6];
+                    hdr.codeblock_height_exp = seg[7];
+                    hdr.codeblock_width = 1u32 << (seg[6] + 2);
+                    hdr.codeblock_height = 1u32 << (seg[7] + 2);
+                }
+                if seg.len() > 9 {
+                    // 0 = 9-7 irreversible, 1 = 5-3 reversible
+                    hdr.irreversible_transform = seg[9] == 0;
+                }
             }
+            QCD if !seg.is_empty() => {
+                hdr.guard_bits = seg[0] >> 5;
+            }
+            TLM => hdr.tlm_present = true,
+            POC => hdr.poc_present = true,
             _ => {}
         }
 
         pos += seg_len - 2;
     }
 
+    hdr.tile_part_count = count_tile_parts(data);
+
     Some(hdr)
+}
+
+/// Count tile-parts by walking SOT segments from the first one, following each
+/// Psot length. A Psot of 0 (allowed for a final tile-part) stops the walk.
+fn count_tile_parts(data: &[u8]) -> u32 {
+    // find the first SOT among the main-header marker segments
+    let mut pos = 2; // skip SOC
+    let lmh = loop {
+        if pos + 4 > data.len() {
+            return 0;
+        }
+        let marker = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        if marker == SOT {
+            break pos;
+        }
+        if marker == SOD || marker == EOC {
+            return 0;
+        }
+        let seg_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        if seg_len < 2 {
+            return 0;
+        }
+        pos += 2 + seg_len;
+    };
+
+    let mut count = 0u32;
+    let mut pos = lmh;
+    while pos + 12 <= data.len() && u16::from_be_bytes([data[pos], data[pos + 1]]) == SOT {
+        // SOT: FF90, Lsot(2), Isot(2), Psot(4), TPsot(1), TNsot(1)
+        let psot = u32::from_be_bytes([data[pos + 6], data[pos + 7], data[pos + 8], data[pos + 9]])
+            as usize;
+        count += 1;
+        if psot == 0 {
+            break;
+        }
+        pos += psot;
+    }
+    count
 }
 
 /// Compute DCI max bitrate for a given resolution.
@@ -276,6 +369,115 @@ pub fn analyse_bitrate(j2k_files: &[std::path::PathBuf], fps: f64, width: u32) -
         dci_compliant: over_limit.is_empty(),
         over_limit_frames: over_limit,
     }
+}
+
+/// Read frame `frame` of a JP2K picture MXF and return its raw J2K codestream.
+/// Reads unencrypted essence only; an encrypted picture track yields ciphertext.
+pub fn read_mxf_j2k_frame(path: &Path, frame: u32) -> Result<Vec<u8>, String> {
+    let s = path.to_str().ok_or("non-UTF-8 MXF path")?;
+    let mut reader = asdcplib::jp2k::MxfReader::new();
+    reader.open_read(s).map_err(|e| format!("open MXF: {e}"))?;
+    // DCI caps a frame near 1.3 MB (2K) / 2.6 MB (4K); 16 MiB is safe headroom.
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+    let n = reader
+        .read_frame(frame, &mut buf, None, None)
+        .map_err(|e| format!("read frame {frame}: {e}"))?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Parse the J2K codestream header of frame `frame` in a JP2K picture MXF.
+pub fn parse_j2k_from_mxf(path: &Path, frame: u32) -> Result<J2kHeader, String> {
+    let data = read_mxf_j2k_frame(path, frame)?;
+    parse_j2k_header(&data)
+        .ok_or_else(|| "frame is not a J2K codestream (no SOC marker)".to_string())
+}
+
+/// Frame-level bitrate statistics for a picture MXF, read via asdcplib.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MxfBitrateStats {
+    pub valid: bool,
+    pub error: String,
+    pub frame_count: u32,
+    pub width: u32,
+    pub height: u32,
+    pub frame_rate: f64,
+    pub total_bytes: u64,
+    pub min_frame_bytes: u64,
+    pub max_frame_bytes: u64,
+    pub max_frame_index: u32,
+    pub avg_bitrate_mbps: f64,
+    pub min_bitrate_mbps: f64,
+    pub max_bitrate_mbps: f64,
+}
+
+/// Analyse per-frame bitrate of a JP2K picture MXF via the asdcplib reader.
+/// Reads each frame's stored size (unencrypted; ciphertext frame sizes match
+/// plaintext) and derives the DCI-relevant peak/avg bitrate.
+pub fn analyse_mxf_bitrate(mxf_path: &Path) -> MxfBitrateStats {
+    let mut stats = MxfBitrateStats::default();
+
+    let Some(path_str) = mxf_path.to_str() else {
+        stats.error = "non-UTF-8 MXF path".into();
+        return stats;
+    };
+
+    let mut reader = asdcplib::jp2k::MxfReader::new();
+    if let Err(e) = reader.open_read(path_str) {
+        stats.error = format!("Failed to open MXF: {e}");
+        return stats;
+    }
+
+    let desc = match reader.picture_descriptor() {
+        Ok(d) => d,
+        Err(e) => {
+            stats.error = format!("Failed to read picture descriptor: {e}");
+            return stats;
+        }
+    };
+
+    stats.frame_count = desc.container_duration;
+    stats.width = desc.stored_width;
+    stats.height = desc.stored_height;
+    stats.frame_rate = desc.edit_rate.numerator as f64 / desc.edit_rate.denominator.max(1) as f64;
+
+    if stats.frame_count == 0 || stats.frame_rate <= 0.0 {
+        stats.error = "Invalid frame count or rate".into();
+        return stats;
+    }
+
+    stats.min_frame_bytes = u64::MAX;
+    let mut buf = vec![0u8; 16 * 1024 * 1024];
+
+    for i in 0..stats.frame_count {
+        let frame_size = match reader.read_frame(i, &mut buf, None, None) {
+            Ok(sz) => sz as u64,
+            Err(_) => break,
+        };
+        stats.total_bytes += frame_size;
+        if frame_size > stats.max_frame_bytes {
+            stats.max_frame_bytes = frame_size;
+            stats.max_frame_index = i;
+        }
+        if frame_size < stats.min_frame_bytes {
+            stats.min_frame_bytes = frame_size;
+        }
+    }
+
+    if stats.min_frame_bytes == u64::MAX {
+        stats.min_frame_bytes = 0;
+    }
+
+    let frame_duration_sec = 1.0 / stats.frame_rate;
+    stats.avg_bitrate_mbps = (stats.total_bytes as f64 * 8.0)
+        / (stats.frame_count as f64 * frame_duration_sec * 1_000_000.0);
+    stats.max_bitrate_mbps =
+        (stats.max_frame_bytes as f64 * 8.0) / (frame_duration_sec * 1_000_000.0);
+    stats.min_bitrate_mbps =
+        (stats.min_frame_bytes as f64 * 8.0) / (frame_duration_sec * 1_000_000.0);
+
+    stats.valid = true;
+    stats
 }
 
 #[cfg(test)]
@@ -393,5 +595,80 @@ mod tests {
         d.extend_from_slice(&[0u8; 8]);
         let hdr = parse_j2k_header(&d).unwrap();
         assert_eq!(hdr.width, 0);
+    }
+
+    // full codestream: SOC, SIZ, COD, QCD, TLM, then tile-parts, EOC
+    fn full_codestream(rsiz: u16, w: u32, h: u32, guard: u8, tile_parts: u8) -> Vec<u8> {
+        let mut d = vec![0xFF, 0x4F]; // SOC
+        // SIZ
+        let csiz: u16 = 3;
+        let mut siz = Vec::new();
+        siz.extend_from_slice(&rsiz.to_be_bytes());
+        siz.extend_from_slice(&w.to_be_bytes());
+        siz.extend_from_slice(&h.to_be_bytes());
+        siz.extend_from_slice(&0u32.to_be_bytes());
+        siz.extend_from_slice(&0u32.to_be_bytes());
+        siz.extend_from_slice(&w.to_be_bytes()); // one tile
+        siz.extend_from_slice(&h.to_be_bytes());
+        siz.extend_from_slice(&0u32.to_be_bytes());
+        siz.extend_from_slice(&0u32.to_be_bytes());
+        siz.extend_from_slice(&csiz.to_be_bytes());
+        for _ in 0..csiz {
+            siz.extend_from_slice(&[11, 1, 1]); // 12-bit
+        }
+        d.extend_from_slice(&SIZ.to_be_bytes());
+        d.extend_from_slice(&((2 + siz.len()) as u16).to_be_bytes());
+        d.extend_from_slice(&siz);
+        // COD: Scod, prog(LRCP), layers=1, MCT=1, decomp=5, cbw exp=3, cbh exp=3, style, transform=0(9-7)
+        let cod = [0u8, 0, 0, 1, 1, 5, 3, 3, 0, 0];
+        d.extend_from_slice(&COD.to_be_bytes());
+        d.extend_from_slice(&((2 + cod.len()) as u16).to_be_bytes());
+        d.extend_from_slice(&cod);
+        // QCD: Sqcd guard bits in top 3 bits + 1 SPqcd byte
+        d.extend_from_slice(&QCD.to_be_bytes());
+        d.extend_from_slice(&(2u16 + 2).to_be_bytes());
+        d.extend_from_slice(&[guard << 5, 0]);
+        // TLM (empty payload)
+        d.extend_from_slice(&TLM.to_be_bytes());
+        d.extend_from_slice(&(2u16 + 2).to_be_bytes());
+        d.extend_from_slice(&[0, 0]);
+        // tile-parts
+        for i in 0..tile_parts {
+            let psot = (12 + 2 + 8) as u32; // SOT(12) + SOD(2) + 8 data bytes
+            d.extend_from_slice(&SOT.to_be_bytes());
+            d.extend_from_slice(&10u16.to_be_bytes()); // Lsot
+            d.extend_from_slice(&0u16.to_be_bytes()); // Isot
+            d.extend_from_slice(&psot.to_be_bytes());
+            d.push(i);
+            d.push(tile_parts);
+            d.extend_from_slice(&SOD.to_be_bytes());
+            d.extend_from_slice(&[0u8; 8]);
+        }
+        d.extend_from_slice(&EOC.to_be_bytes());
+        d
+    }
+
+    #[test]
+    fn parses_extended_fields() {
+        let hdr = parse_j2k_header(&full_codestream(3, 2048, 1080, 1, 3)).unwrap();
+        assert_eq!(hdr.bit_depths, vec![12, 12, 12]);
+        assert_eq!(hdr.codeblock_width_exp, 3);
+        assert_eq!(hdr.codeblock_height_exp, 3);
+        assert_eq!(hdr.codeblock_width, 32);
+        assert_eq!(hdr.codeblock_height, 32);
+        assert!(hdr.irreversible_transform);
+        assert!(hdr.mct);
+        assert_eq!(hdr.num_decomp_levels, 5);
+        assert_eq!(hdr.guard_bits, 1);
+        assert!(hdr.tlm_present);
+        assert!(!hdr.poc_present);
+        assert_eq!(hdr.tile_part_count, 3);
+    }
+
+    #[test]
+    fn counts_4k_tile_parts() {
+        let hdr = parse_j2k_header(&full_codestream(4, 4096, 2160, 2, 6)).unwrap();
+        assert_eq!(hdr.tile_part_count, 6);
+        assert_eq!(hdr.guard_bits, 2);
     }
 }

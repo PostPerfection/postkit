@@ -12,6 +12,7 @@ pub mod dolby_vision;
 pub mod edl_import;
 pub mod encode;
 pub mod font_subset;
+pub mod frame_compare;
 pub mod grok;
 pub mod grok_encoder;
 pub mod hash;
