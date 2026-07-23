@@ -28,33 +28,8 @@ Library-level capabilities behind feature requests in the DCP-o-matic Mantis
 tracker (dom#N = https://dcpomatic.com/bugs/view.php?id=N); the wizards and
 dcpdoctor expose them (see their DESIGN_TODOs, same date).
 
-- Leq(m) in loudness (dom#3092): ISO 21727 / CCIR 468 weighting alongside EBU
-  R128. Migrated into postkit::loudness (2026-07-22, rustfft): leq_m_from_samples
-  + measure_leq_m with the same shapes, ported with the CCIR-gain spot checks and
-  the derived full-scale 1 kHz sine reference (101.99 dB). dcpdoctor-core still
-  has its own copy; a later pass switches it to postkit.
-- Loudness adjustment (dom#1382): apply gain to hit an R128/Leq(m) target.
-  Landed in postkit::loudness (2026-07-22, hound + ebur128): plan_gain measures
-  a WAV (integrated LUFS via ebur128, or Leq(m) via the existing in-process
-  path) and computes gain_db = target - measured; apply_gain scales the raw PCM
-  in place (PCM in, PCM out, same format/bit depth/channels/rate, no resample,
-  no ffmpeg); adjust_loudness does both. True-peak guard: a linear gain shifts
-  true peak by the same dB, so if input_tp + gain would breach the ceiling
-  (default -1 dBTP) it fails loud with the numbers (AdjustError::TruePeak
-  Exceeded), never limits or clips. measure_loudness stays ffmpeg-based (out of
-  scope to switch). Tests synthesize tones, hit both target types on re-measure,
-  and check the headroom-exceeded and bit-depth/channel-preservation cases.
-- Audio DSP: upmix stereo to 5.1 (dom#921, dom#1080), crossfades (dom#374).
-  Mid-side decode landed in postkit::mid_side (2026-07-22): decode_mid_side
-  turns an M/S pair back to L=M+S, R=M-S in place (matching DoM's mid_side_
-  decoder.cc /2 normalization, not 1/sqrt(2)), leaving every other lane (HI/VI,
-  surrounds) byte-identical (dom#3020).
-- Subtitle parsers: ASS with styling (dom#1462), PAC (dom#1719), MKS (dom#3131),
-  FCPXML (dom#2909), Interop XML+PNG bitmap subs (dom#1376); RTL shaping
-  (dom#860); auto line-wrap (dom#1626).
-- Font subsetting (dom#1023). Glyph coverage itself landed in dcpdoctor
-  (2026-07-22, skrifa, plain-XML + MXF-wrapped fonts); a shared query here is
-  only worth it if a wizard grows a pre-package check.
+- Leq(m) (dom#3092): dcpdoctor-core still has its own copy of the CCIR 468
+  weighting + level math; a later pass switches it to postkit::loudness.
 - Player direction (dom#2700 loop, dom#2917 speed, dom#2893 markers, dom#3091
   waveform, dom#1974/dom#3165 3D view modes, dom#3083 A/V sync offset): all gate
   on the GPU J2K decode path already noted under the SDI/DeckLink item.

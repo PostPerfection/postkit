@@ -130,15 +130,17 @@ mod tests {
 
 // ─── In-memory RGB → X'Y'Z' transform for DCI ─────────────────────────────
 
-// Rec.709 transfer function: gamma → linear
-// For values > 0.081, linear = ((V + 0.099) / 1.099)^(1/0.45)
-// For values <= 0.081, linear = V / 4.5
+// DCI companding (SMPTE 428-1 / RP 431-2): 48 cd/m² reference white over the
+// 52.37 encoding peak. libdcp/DoM (rgb_xyz.cc) and grok fold this into the
+// matrix so diffuse white lands below full code, not at 4095.
+const DCI_COEFFICIENT: f64 = 48.0 / 52.37;
+
+// Display-referred Rec.709 linearization: pure gamma 2.2. This matches libdcp's
+// rec709_to_xyz and grok's applyXYZTransform (the DoM-parity reference), not the
+// camera OETF inverse. The OETF inverse is for scene-referred capture; DCP
+// content is display-referred, so gamma 2.2 is the mastering convention here.
 fn rec709_to_linear(v: f64) -> f64 {
-    if v <= 0.081 {
-        v / 4.5
-    } else {
-        ((v + 0.099) / 1.099).powf(1.0 / 0.45)
-    }
+    if v <= 0.0 { 0.0 } else { v.powf(2.2) }
 }
 
 // DCI 2.6 gamma: linear → X'Y'Z' (gamma-encoded)
@@ -146,14 +148,27 @@ fn linear_to_dci_gamma(v: f64) -> f64 {
     if v <= 0.0 { 0.0 } else { v.powf(1.0 / 2.6) }
 }
 
+// Rec.709/D65 RGB → CIE XYZ, pre-multiplied by the DCI companding coefficient.
+const C: f32 = DCI_COEFFICIENT as f32;
+const M00: f32 = 0.4124564 * C;
+const M01: f32 = 0.3575761 * C;
+const M02: f32 = 0.1804375 * C;
+const M10: f32 = 0.2126729 * C;
+const M11: f32 = 0.7151522 * C;
+const M12: f32 = 0.0721750 * C;
+const M20: f32 = 0.0193339 * C;
+const M21: f32 = 0.119192 * C;
+const M22: f32 = 0.9503041 * C;
+
 /// Transform a 16-bit big-endian RGB frame buffer to X'Y'Z' (DCI) in-place.
 ///
 /// Assumes `buf` contains pixels as [R_hi, R_lo, G_hi, G_lo, B_hi, B_lo, ...]
 /// (rgb48be format from ffmpeg). Each sample is 16-bit unsigned big-endian.
 ///
-/// The transform pipeline:
-/// 1. Rec.709 OETF⁻¹ (gamma → linear)
-/// 2. 3×3 matrix (linear Rec.709 RGB → linear CIE XYZ)
+/// The transform pipeline (libdcp/DoM and grok parity):
+/// 1. Rec.709 gamma 2.2 (display-referred → linear)
+/// 2. 3×3 matrix (linear Rec.709/D65 RGB → linear CIE XYZ), pre-multiplied by
+///    the DCI companding coefficient (48/52.37)
 /// 3. DCI 2.6 gamma (linear → X'Y'Z')
 ///
 /// Output overwrites `buf` in the same rgb48be layout.
@@ -187,10 +202,10 @@ pub fn rgb_to_xyz_inplace(buf: &mut [u8]) {
         let g_lin = lin_lut[g_raw as usize];
         let b_lin = lin_lut[b_raw as usize];
 
-        // Step 2: 3×3 matrix multiply (linear RGB → linear XYZ)
-        let x_lin = 0.4124564_f32 * r_lin + 0.3575761_f32 * g_lin + 0.1804375_f32 * b_lin;
-        let y_lin = 0.2126729_f32 * r_lin + 0.7151522_f32 * g_lin + 0.0721750_f32 * b_lin;
-        let z_lin = 0.0193339_f32 * r_lin + 0.119_192_f32 * g_lin + 0.9503041_f32 * b_lin;
+        // Step 2: 3×3 matrix multiply (linear RGB → linear XYZ), with DCI companding folded in
+        let x_lin = M00 * r_lin + M01 * g_lin + M02 * b_lin;
+        let y_lin = M10 * r_lin + M11 * g_lin + M12 * b_lin;
+        let z_lin = M20 * r_lin + M21 * g_lin + M22 * b_lin;
 
         // Step 3: Quantize and apply DCI 2.6 gamma via LUT (no powf)
         let x16 = gamma_lut[(x_lin.clamp(0.0, 1.0) * 65535.0 + 0.5) as usize];
@@ -568,22 +583,78 @@ mod tests_display {
 mod tests_xyz {
     use super::*;
 
-    #[test]
-    fn test_black_stays_black() {
-        let mut buf = [0u8; 6];
+    // Independent reference: display-referred Rec.709 RGB (16-bit) → 16-bit
+    // X'Y'Z', done in f64 with no LUTs. gamma 2.2 → Rec.709/D65 matrix ×
+    // (48/52.37) → 2.6 out, matching libdcp rec709_to_xyz + rgb_xyz.cc and
+    // grok's applyXYZTransform. Derived from the spec, not from the impl.
+    fn expected_xyz16(rgb: [u16; 3]) -> [u16; 3] {
+        let coeff = 48.0f64 / 52.37;
+        let m = [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ];
+        let lin: Vec<f64> = rgb
+            .iter()
+            .map(|&v| (v as f64 / 65535.0).powf(2.2))
+            .collect();
+        let mut out = [0u16; 3];
+        for (i, row) in m.iter().enumerate() {
+            let xyz = (row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2]) * coeff;
+            out[i] = (xyz.clamp(0.0, 1.0).powf(1.0 / 2.6) * 65535.0 + 0.5) as u16;
+        }
+        out
+    }
+
+    fn run(rgb: [u16; 3]) -> [u16; 3] {
+        let mut buf = Vec::new();
+        for c in rgb {
+            buf.extend_from_slice(&c.to_be_bytes());
+        }
         rgb_to_xyz_inplace(&mut buf);
-        assert_eq!(buf, [0, 0, 0, 0, 0, 0]);
+        [
+            u16::from_be_bytes([buf[0], buf[1]]),
+            u16::from_be_bytes([buf[2], buf[3]]),
+            u16::from_be_bytes([buf[4], buf[5]]),
+        ]
+    }
+
+    // two-stage LUT quantization vs the f64 reference costs a few codes at most
+    fn assert_close(got: [u16; 3], want: [u16; 3]) {
+        for i in 0..3 {
+            let d = (got[i] as i32 - want[i] as i32).abs();
+            assert!(d <= 4, "channel {i}: got {got:?} want {want:?} (Δ{d})");
+        }
     }
 
     #[test]
-    fn test_white_maps_reasonably() {
-        let mut buf = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-        rgb_to_xyz_inplace(&mut buf);
-        let x = ((buf[0] as u16) << 8) | buf[1] as u16;
-        let y = ((buf[2] as u16) << 8) | buf[3] as u16;
-        let z = ((buf[4] as u16) << 8) | buf[5] as u16;
-        assert!(y > 60000, "Y should be near max for white, got {y}");
-        assert!(x > 50000, "X should be high for white, got {x}");
-        assert!(z > 50000, "Z should be high for white, got {z}");
+    fn black_stays_black() {
+        assert_eq!(run([0, 0, 0]), [0, 0, 0]);
+    }
+
+    #[test]
+    fn red_matches_reference() {
+        // solid Rec.709 red; scaled to 12-bit this is grok's [2817, 2183, 870]
+        let got = run([65535, 0, 0]);
+        assert_close(got, expected_xyz16([65535, 0, 0]));
+        let grok12 = [2817u16, 2183, 870];
+        for (i, &g) in grok12.iter().enumerate() {
+            let twelve = (got[i] as u32 * 4095 / 65535) as i32;
+            assert!((twelve - g as i32).abs() <= 2, "12-bit {i}: {twelve} vs grok {g}");
+        }
+    }
+
+    #[test]
+    fn white_matches_reference() {
+        // DCI companding puts white Y below full code, not at 65535
+        let got = run([65535, 65535, 65535]);
+        assert_close(got, expected_xyz16([65535, 65535, 65535]));
+        assert!(got[1] < 64000, "white Y must be companded, got {}", got[1]);
+    }
+
+    #[test]
+    fn mid_grey_matches_reference() {
+        let rgb = [32768, 32768, 32768];
+        assert_close(run(rgb), expected_xyz16(rgb));
     }
 }

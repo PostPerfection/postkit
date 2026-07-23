@@ -281,7 +281,9 @@ fn source_space(name: &str) -> Result<SourceSpace, String> {
                 [0.212_639, 0.715_168_7, 0.072_192_3],
                 [0.019_330_8, 0.119_194_8, 0.950_532_2],
             ],
-            gamma: 2.4,
+            // gamma 2.2 for display-referred Rec.709, matching libdcp rec709_to_xyz,
+            // DoM and grok. Was 2.4 (Rec.1886); harmonized 2026-07-23.
+            gamma: 2.2,
             scale: dci_scale,
         },
         "p3" | "dcip3" | "dci-p3" | "p3dci" | "smpte431" => SourceSpace {
@@ -464,6 +466,22 @@ mod tests {
         assert!(
             out[0] > 0 && out[1] > 0 && out[2] > 0,
             "pure red has non-zero X, Y and Z: {out:?}"
+        );
+    }
+
+    #[test]
+    fn rec709_mid_grey_uses_gamma_2_2() {
+        // locks the display-referred linearization at gamma 2.2 (libdcp/DoM/grok).
+        // white/red/black don't constrain gamma; a mid value does.
+        let out = convert_pixel([32768; 3], "rec709", DcdmColourEncoding::Xyz12Bit);
+        // independent f64 reference: (0.5^2.2)·white·(48/52.37) then ^(1/2.6)
+        let lin = (32768.0f64 / 65535.0).powf(2.2);
+        let coeff = 48.0f64 / 52.37;
+        let y = (lin * coeff).powf(1.0 / 2.6) * 4095.0;
+        assert!(
+            (out[1] as f64 - y).abs() <= 2.0,
+            "mid-grey Y {} vs gamma-2.2 reference {y:.1}",
+            out[1]
         );
     }
 
