@@ -54,6 +54,29 @@ imfwizard's subtitle-convert wiring landed 2026-07-23 (its DESIGN_TODO; pin bump
 pending): ass/fcpxml/mks now convert to IMSC/TTML keeping styling+placement.
 Tests per parser assert styling/timing; MKS skips when ffmpeg/ffprobe are absent.
 
+Sony RAW / X-OCN detection landed 2026-07-23 (ingest.rs): now detected-but-
+undecodable, like ARRIRAW/R3D/BRAW. `detect_format` opens each .mxf, reads the
+header partition pack's EssenceContainers batch, and scans the header-metadata
+region (bounded by HeaderByteCount) for Sony's private essence ULs -> `SonyRaw`;
+non-Sony .mxf still resolves to `DnxHr` by extension. `is_raw_undecodable` already
+covered `SonyRaw`, so ingest rejects it loud. Error/logs now use
+`CameraFormat::label()` -> "Sony RAW (X-OCN family)".
+
+The two ULs are reverse-engineered by MediaInfo (MediaArea/MediaInfoLib
+Source/MediaInfo/Multiple/File_Mxf.cpp): PictureEssenceCoding
+`06 0e 2b 34 04 01 01 0x 0e 06 04 01 02 04 02 xx` (Mxf_EssenceCompression:702-717,
+"Sony RAW SQ") and EssenceContainer `06 0e 2b 34 04 01 01 0x 0e 06 0d 03 02 01 00
+00` (Mxf_EssenceContainer:347-372; label def File_Mxf_Automated.h:5066,10047).
+Caveats recorded in the code: bmx (bbc/bmx `EssenceType`/mxf_helper) and ffmpeg
+(mxf.c/mxfdec.c) have no Sony RAW essence at all; the SMPTE register has only Sony's
+private-use org node, so these ULs are NOT SMPTE-registered. They sit under Sony's
+private node and mark the Sony RAW family (X-OCN + older linear RAW) without
+distinguishing the X-OCN ST/LT/XT tiers, so the match is "Sony RAW family", not an
+X-OCN-tier claim. Byte 7 (registry version) is wildcarded. Tests: synthetic KLV
+fixtures fire `SonyRaw` on a Sony container UL, on a Sony picture-coding UL, and
+stay `DnxHr` on JPEG2000 ULs. Not used: asdcplib's readers only open
+JP2K/PCM/TimedText essence, so they can't probe a Sony RAW MXF.
+
 P3-D65 DCDM target landed 2026-07-23 (dcdm.rs): `DcdmOptions.target: DcdmTarget`
 (default `Xyz`, byte-identical to before) adds a `P3D65` output. The XYZ->P3-D65
 matrix is derived from the P3 primaries + D65 white (`rgb_to_xyz_matrix`/`invert3`,

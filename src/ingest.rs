@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 pub enum CameraFormat {
     Arriraw,
     RedR3d,
-    /// Sony X-OCN / Sony RAW. Not auto-detected: these are OP1a-MXF wrapped and
-    /// share the .mxf extension and the SMPTE partition-pack key with ArriRaw,
-    /// XAVC and DNxHR. Telling them apart needs MXF header-metadata parsing
-    /// (essence descriptor / format id), which is out of scope here. Documented
-    /// gap, not a shallow signature.
+    /// Sony RAW (X-OCN family). OP1a-MXF wrapped, sharing the .mxf extension and
+    /// the SMPTE partition-pack key with ArriRaw, XAVC and DNxHR. Detected by
+    /// matching Sony's private essence ULs in the MXF header (see
+    /// `is_sony_raw_mxf`); the ULs are reverse-engineered (MediaInfo) and mark
+    /// the Sony RAW family without distinguishing the X-OCN ST/LT/XT tiers.
     SonyRaw,
     /// Canon Cinema RAW Light (.crm), detected by extension or by the ISOBMFF
     /// `ftyp` brand `crx ` plus a `CNCV` box starting with "CanonCRM".
@@ -20,6 +20,22 @@ pub enum CameraFormat {
     DnxHr,
     #[default]
     Unknown,
+}
+
+impl CameraFormat {
+    /// Human-readable name for logs and error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            CameraFormat::Arriraw => "ARRIRAW",
+            CameraFormat::RedR3d => "RED R3D",
+            CameraFormat::SonyRaw => "Sony RAW (X-OCN family)",
+            CameraFormat::CanonRaw => "Canon Cinema RAW Light",
+            CameraFormat::BlackmagicBraw => "Blackmagic BRAW",
+            CameraFormat::ProRes => "ProRes",
+            CameraFormat::DnxHr => "DNxHR",
+            CameraFormat::Unknown => "unknown",
+        }
+    }
 }
 
 /// Ingest options for camera media.
@@ -89,7 +105,13 @@ pub fn detect_format(source: &Path) -> CameraFormat {
             "r3d" => CameraFormat::RedR3d,
             "braw" => CameraFormat::BlackmagicBraw,
             "crm" => CameraFormat::CanonRaw,
-            "mxf" => CameraFormat::DnxHr,
+            "mxf" => {
+                if source.is_file() && is_sony_raw_mxf(source) {
+                    CameraFormat::SonyRaw
+                } else {
+                    CameraFormat::DnxHr
+                }
+            }
             "mov" => {
                 if source.is_file() {
                     probe_mov_codec(source)
@@ -179,6 +201,130 @@ fn probe_mov_codec(path: &Path) -> CameraFormat {
     } else {
         CameraFormat::Unknown
     }
+}
+
+// reverse-engineered Sony RAW / X-OCN essence ULs, from MediaInfo
+// (MediaArea/MediaInfoLib Source/MediaInfo/Multiple/File_Mxf.cpp, "Sony RAW SQ").
+// they sit under Sony's private node (06 0e 2b 34 ... 0e 06 ...), are not
+// SMPTE-registered, and mark the Sony RAW family (X-OCN + older linear RAW)
+// without distinguishing the X-OCN ST/LT/XT tiers. byte 7 is the UL registry
+// version and varies between files, so it is wildcarded in both matchers.
+
+/// PictureEssenceCoding value (File_Mxf.cpp Mxf_EssenceCompression, "Sony RAW SQ").
+fn is_sony_raw_pict_coding(ul: &[u8]) -> bool {
+    ul.len() >= 16
+        && ul[..7] == [0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01]
+        && ul[8..15] == [0x0e, 0x06, 0x04, 0x01, 0x02, 0x04, 0x02]
+}
+
+/// EssenceContainer label (File_Mxf.cpp Mxf_EssenceContainer, "Sony RAW?").
+fn is_sony_raw_container(ul: &[u8]) -> bool {
+    ul.len() >= 16
+        && ul[..7] == [0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01]
+        && ul[8..14] == [0x0e, 0x06, 0x0d, 0x03, 0x02, 0x01]
+}
+
+fn is_mxf_partition_key(k: &[u8]) -> bool {
+    k.len() >= 16
+        && k[..13]
+            == [
+                0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0d, 0x01, 0x02, 0x01, 0x01,
+            ]
+        // header / body / footer partition
+        && matches!(k[13], 0x02..=0x04)
+}
+
+/// BER length decode. returns (length, bytes_consumed).
+fn read_ber_len(d: &[u8]) -> Option<(usize, usize)> {
+    let first = *d.first()?;
+    if first < 0x80 {
+        return Some((first as usize, 1));
+    }
+    let n = (first & 0x7f) as usize;
+    if n == 0 || n > 8 || d.len() < 1 + n {
+        return None;
+    }
+    let mut len = 0usize;
+    for &b in &d[1..1 + n] {
+        len = (len << 8) | b as usize;
+    }
+    Some((len, 1 + n))
+}
+
+fn be_u32(d: &[u8]) -> u32 {
+    u32::from_be_bytes([d[0], d[1], d[2], d[3]])
+}
+
+fn be_u64(d: &[u8]) -> u64 {
+    u64::from_be_bytes([d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]])
+}
+
+/// Detect the Sony RAW / X-OCN family in an OP1a-MXF file.
+///
+/// X-OCN and older Sony linear RAW share the .mxf extension and partition-pack
+/// key with ArriRaw / XAVC / DNxHR, so extension alone can't tell them apart.
+/// We parse the header partition pack's EssenceContainers batch and scan the
+/// header-metadata region for Sony's private essence ULs (see the UL note
+/// above). The scan is bounded to HeaderByteCount so essence data can't produce
+/// a false positive. A match only yields a clearer detected-but-undecodable
+/// error, since postkit rejects Sony RAW either way.
+fn is_sony_raw_mxf(path: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    // partition pack + primer + header metadata sit at the top of the file;
+    // 1 MiB covers the descriptor region of any real camera-raw MXF.
+    let mut buf = vec![0u8; 1 << 20];
+    let Ok(n) = f.read(&mut buf) else {
+        return false;
+    };
+    buf.truncate(n);
+
+    // first KLV must be a partition pack
+    if !is_mxf_partition_key(&buf) {
+        return false;
+    }
+    let Some((val_len, hdr)) = read_ber_len(&buf[16..]) else {
+        return false;
+    };
+    let val_start = 16 + hdr;
+    let val = &buf[val_start..(val_start + val_len).min(buf.len())];
+
+    // partition-pack fixed fields, in order: MajorVersion(2) MinorVersion(2)
+    // KAGSize(4) ThisPartition(8) PreviousPartition(8) FooterPartition(8)
+    // HeaderByteCount(8) IndexByteCount(8) IndexSID(4) BodyOffset(8) BodySID(4)
+    // OperationalPattern(16), then the EssenceContainers batch.
+    let header_byte_count = val.get(32..40).map(be_u64).unwrap_or(0) as usize;
+    const BATCH_OFF: usize = 80;
+    if let Some(batch) = val.get(BATCH_OFF..)
+        && batch.len() >= 8
+    {
+        let count = be_u32(batch) as usize;
+        let item = be_u32(&batch[4..]) as usize;
+        if item == 16 {
+            for i in 0..count {
+                let off = 8 + i * 16;
+                if let Some(ul) = batch.get(off..off + 16)
+                    && is_sony_raw_container(ul)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // scan the header-metadata region for the PictureEssenceCoding UL.
+    let meta_start = val_start + val_len;
+    let meta_end = if header_byte_count > 0 {
+        (meta_start + header_byte_count).min(buf.len())
+    } else {
+        buf.len()
+    };
+    if let Some(meta) = buf.get(meta_start..meta_end) {
+        return meta.windows(16).any(is_sony_raw_pict_coding);
+    }
+    false
 }
 
 /// Scan a camera card and return clip info using ffprobe.
@@ -315,10 +461,10 @@ pub fn ingest(opts: &IngestOptions) -> i32 {
     // letting it die with a cryptic decoder error.
     if let Some(clip) = clips.iter().find(|c| is_raw_undecodable(c.format)) {
         tracing::error!(
-            "Cannot ingest {}: {:?} is camera RAW that stock ffmpeg cannot decode; \
+            "Cannot ingest {}: {} is camera RAW that stock ffmpeg cannot decode; \
              a vendor SDK/decoder is required",
             clip.path.display(),
-            clip.format
+            clip.format.label()
         );
         return -1;
     }
@@ -459,6 +605,95 @@ mod tests {
         for f in [CameraFormat::ProRes, CameraFormat::DnxHr] {
             assert!(!is_raw_undecodable(f), "{f:?} is ffmpeg-decodable");
         }
+    }
+
+    // Sony private ULs (byte 7 is a made-up registry version to exercise the
+    // wildcard); JPEG2000 ULs stand in for a non-Sony .mxf.
+    const SONY_CONTAINER: [u8; 16] = [
+        0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0a, 0x0e, 0x06, 0x0d, 0x03, 0x02, 0x01, 0x01,
+        0x00,
+    ];
+    const SONY_PICT_CODING: [u8; 16] = [
+        0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0a, 0x0e, 0x06, 0x04, 0x01, 0x02, 0x04, 0x02,
+        0x01,
+    ];
+    const J2K_CONTAINER: [u8; 16] = [
+        0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x07, 0x0d, 0x01, 0x03, 0x01, 0x02, 0x0c, 0x01,
+        0x00,
+    ];
+    const J2K_PICT_CODING: [u8; 16] = [
+        0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x07, 0x04, 0x01, 0x02, 0x02, 0x03, 0x01, 0x01,
+        0x00,
+    ];
+
+    // Minimal OP1a-MXF: header partition pack (with a one-entry EssenceContainers
+    // batch) followed by a header-metadata blob carrying the picture-coding UL.
+    fn build_mxf(container: &[u8; 16], pict_coding: &[u8; 16]) -> Vec<u8> {
+        let mut meta = Vec::new();
+        meta.extend_from_slice(&[0xAA; 8]);
+        meta.extend_from_slice(pict_coding);
+        meta.extend_from_slice(&[0xBB; 8]);
+
+        let op1a: [u8; 16] = [
+            0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x0d, 0x01, 0x02, 0x01, 0x01, 0x01,
+            0x09, 0x00,
+        ];
+        let mut val = Vec::new();
+        val.extend_from_slice(&1u16.to_be_bytes()); // MajorVersion
+        val.extend_from_slice(&2u16.to_be_bytes()); // MinorVersion
+        val.extend_from_slice(&0u32.to_be_bytes()); // KAGSize
+        val.extend_from_slice(&0u64.to_be_bytes()); // ThisPartition
+        val.extend_from_slice(&0u64.to_be_bytes()); // PreviousPartition
+        val.extend_from_slice(&0u64.to_be_bytes()); // FooterPartition
+        val.extend_from_slice(&(meta.len() as u64).to_be_bytes()); // HeaderByteCount
+        val.extend_from_slice(&0u64.to_be_bytes()); // IndexByteCount
+        val.extend_from_slice(&0u32.to_be_bytes()); // IndexSID
+        val.extend_from_slice(&0u64.to_be_bytes()); // BodyOffset
+        val.extend_from_slice(&0u32.to_be_bytes()); // BodySID
+        val.extend_from_slice(&op1a);
+        val.extend_from_slice(&1u32.to_be_bytes()); // batch count
+        val.extend_from_slice(&16u32.to_be_bytes()); // batch item length
+        val.extend_from_slice(container);
+        assert!(val.len() < 0x80);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[
+            0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01, 0x01, 0x0d, 0x01, 0x02, 0x01, 0x01, 0x02,
+            0x04, 0x00,
+        ]);
+        out.push(val.len() as u8); // single-byte BER length
+        out.extend_from_slice(&val);
+        out.extend_from_slice(&meta);
+        out
+    }
+
+    fn write_mxf(container: &[u8; 16], pict_coding: &[u8; 16]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("clip.mxf");
+        std::fs::write(&p, build_mxf(container, pict_coding)).unwrap();
+        (dir, p)
+    }
+
+    #[test]
+    fn detect_sony_raw_mxf_via_essence_container() {
+        let (_d, p) = write_mxf(&SONY_CONTAINER, &J2K_PICT_CODING);
+        assert!(is_sony_raw_mxf(&p));
+        assert_eq!(detect_format(&p), CameraFormat::SonyRaw);
+    }
+
+    #[test]
+    fn detect_sony_raw_mxf_via_picture_essence_coding() {
+        let (_d, p) = write_mxf(&J2K_CONTAINER, &SONY_PICT_CODING);
+        assert!(is_sony_raw_mxf(&p));
+        assert_eq!(detect_format(&p), CameraFormat::SonyRaw);
+    }
+
+    #[test]
+    fn non_sony_mxf_is_not_sony_raw() {
+        let (_d, p) = write_mxf(&J2K_CONTAINER, &J2K_PICT_CODING);
+        assert!(!is_sony_raw_mxf(&p));
+        // a non-Sony .mxf still resolves by extension to DNxHR, as before
+        assert_eq!(detect_format(&p), CameraFormat::DnxHr);
     }
 
     #[test]
