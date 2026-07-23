@@ -76,6 +76,11 @@ pub struct MxfWrapOptions {
     /// short: those resources get a random id (back-compatible default).
     #[serde(default)]
     pub resource_ids: Vec<[u8; 16]>,
+    /// HDR/WCG picture metadata (ST 2067-21) for a J2K wrap: transfer/colour ULs
+    /// and ST 2086 mastering display, written onto the RGBA essence descriptor
+    /// via open_write_hdr. Never serialized (asdcplib type is not serde).
+    #[serde(skip)]
+    pub hdr: Option<asdcplib::jp2k::HdrMetadata>,
 }
 
 /// Result of MXF wrapping.
@@ -124,11 +129,14 @@ impl J2kWriter {
         filename: &str,
         info: &asdcplib::WriterInfo,
         desc: &asdcplib::jp2k::PictureDescriptor,
+        hdr: Option<&asdcplib::jp2k::HdrMetadata>,
         header_size: u32,
     ) -> asdcplib::Result<()> {
-        match self {
-            Self::AsDcp(w) => w.open_write(filename, info, desc, header_size),
-            Self::As02(w) => w.open_write(filename, info, desc, header_size),
+        match (self, hdr) {
+            (Self::AsDcp(w), None) => w.open_write(filename, info, desc, header_size),
+            (Self::AsDcp(w), Some(h)) => w.open_write_hdr(filename, info, desc, h, header_size),
+            (Self::As02(w), None) => w.open_write(filename, info, desc, header_size),
+            (Self::As02(w), Some(h)) => w.open_write_hdr(filename, info, desc, h, header_size),
         }
     }
 
@@ -419,7 +427,7 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
 
     let mut writer = J2kWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
-    if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
+    if let Err(e) = writer.open_write(&output_str, &info, &desc, opts.hdr.as_ref(), 16384) {
         return MxfTrackFile {
             error: format!("JP2K open_write failed: {e}"),
             ..Default::default()
@@ -1119,6 +1127,7 @@ mod tests {
             encryption: None,
             mca_config: None,
             resource_ids: vec![],
+            hdr: None,
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -1150,6 +1159,7 @@ mod tests {
             encryption: None,
             mca_config: None,
             resource_ids: vec![],
+            hdr: None,
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "must not wrap a non-WAV file");
@@ -1216,6 +1226,7 @@ mod tests {
             encryption,
             mca_config: None,
             resource_ids: vec![],
+            hdr: None,
         }
     }
 
@@ -1363,6 +1374,7 @@ mod tests {
             encryption: None,
             mca_config: mca,
             resource_ids: vec![],
+            hdr: None,
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -1394,6 +1406,7 @@ mod tests {
             encryption: None,
             mca_config: Some("51(L,R,C,LFE,Ls,Rs)".to_string()),
             resource_ids: vec![],
+            hdr: None,
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "MCA on AS-02 must be rejected");
@@ -1429,6 +1442,7 @@ mod tests {
             encryption: None,
             mca_config: None,
             resource_ids: vec![],
+            hdr: None,
         };
         let result = mxf_wrap(&opts);
         assert!(result.success, "atmos wrap failed: {}", result.error);
@@ -1488,6 +1502,7 @@ mod tests {
             encryption: None,
             mca_config: None,
             resource_ids: vec![font_id],
+            hdr: None,
         };
         let result = mxf_wrap(&opts);
         assert!(result.success, "timed text wrap failed: {}", result.error);

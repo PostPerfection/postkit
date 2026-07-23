@@ -153,10 +153,17 @@ imfwizard's string-edited injection), optional `essence_descriptors`
 audio MCA/soundfield + RFC 5646 language and image color/HDR-WCG. postkit carries
 the descriptor body verbatim; the UL-coded MXF descriptor internals come from
 asdcplib, not synthesised here. All default to byte-identical output. Validated
-with xmllint against imf-cpl-20160411.xsd. HDR/WCG synthesis (ST 2067-21 RGBA
+with xmllint against imf-cpl-20160411.xsd. HDR/WCG CPL synthesis (ST 2067-21 RGBA
 descriptor color/mastering-display ULs) uses the same carrier but is not emitted
 by postkit: those values can only be lax-validated against the CPL XSD and belong
-to the MXF descriptor, so they are left to the wizard/asdcplib.
+to the MXF descriptor, so the CPL body is left to the wizard/asdcplib.
+
+The MXF side of HDR/WCG is wired here (2026-07-23): `mxf_wrap::MxfWrapOptions`
+gained an `hdr: Option<asdcplib::jp2k::HdrMetadata>` field (serde-skipped, like
+`encryption`); when set on a J2K wrap, `wrap_j2k` calls
+`jp2k::MxfWriter::open_write_hdr` instead of `open_write`, writing the
+transfer/colour/ST-2086 values onto the RGBA essence descriptor. Needs the
+asdcplib pin at or past the HDR commit (6d7b8ca).
 
 - Colour-managed DCP preview landed: preview now resolves a DCP/CPL/MXF,
   decrypts encrypted picture essence in Rust, decodes J2K via ffmpeg and applies
