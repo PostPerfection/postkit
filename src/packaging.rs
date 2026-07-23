@@ -69,6 +69,9 @@ pub struct PackingList {
     pub issuer: String,
     pub creator: String,
     pub issue_date: String,
+    /// Optional AnnotationText, emitted right after Id (schema position in both
+    /// the ST 429-8 DCP and ST 2067-2 IMF PKL). None keeps output byte-identical.
+    pub annotation: Option<String>,
     pub assets: Vec<PklAsset>,
 }
 
@@ -78,6 +81,9 @@ impl PackingList {
         xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(xml, "<PackingList xmlns=\"{}\">", self.namespace);
         let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
+        if let Some(a) = &self.annotation {
+            let _ = writeln!(xml, "  <AnnotationText>{}</AnnotationText>", escape_xml(a));
+        }
         let _ = writeln!(xml, "  <IssueDate>{}</IssueDate>", self.issue_date);
         let _ = writeln!(xml, "  <Issuer>{}</Issuer>", escape_xml(&self.issuer));
         let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
@@ -123,6 +129,9 @@ pub struct AssetMap {
     pub issuer: String,
     pub creator: String,
     pub issue_date: String,
+    /// Optional AnnotationText, emitted right after Id (schema position in both
+    /// the SMPTE 429-9 and Interop AM). None keeps output byte-identical.
+    pub annotation: Option<String>,
     pub assets: Vec<AssetMapAsset>,
 }
 
@@ -132,6 +141,9 @@ impl AssetMap {
         xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(xml, "<AssetMap xmlns=\"{}\">", self.namespace);
         let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
+        if let Some(a) = &self.annotation {
+            let _ = writeln!(xml, "  <AnnotationText>{}</AnnotationText>", escape_xml(a));
+        }
         let creator = format!("  <Creator>{}</Creator>\n", escape_xml(&self.creator));
         let volume_count = "  <VolumeCount>1</VolumeCount>\n";
         let issue_date = format!("  <IssueDate>{}</IssueDate>\n", self.issue_date);
@@ -608,6 +620,7 @@ mod tests {
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
             assets: vec![AssetMapAsset {
                 id: "99999999-7777-8888-9999-aaaaaaaaaaaa".into(),
                 path: "PKL.xml".into(),
@@ -622,6 +635,7 @@ mod tests {
             issuer: "IMF Wizard".into(),
             creator: "IMF Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
             assets: vec![AssetMapAsset {
                 id: "eeeeeeee-7777-8888-9999-aaaaaaaaaaaa".into(),
                 path: "PKL.xml".into(),
@@ -634,6 +648,7 @@ mod tests {
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
             assets: vec![PklAsset {
                 id: "cccccccc-7777-8888-9999-aaaaaaaaaaaa".into(),
                 hash: "kO0m3F3qX3qg3n3qg3n3qg3n3q0=".into(),
@@ -695,10 +710,26 @@ mod tests {
                 .contains("<ScreenAspectRatio>2.39</ScreenAspectRatio>")
         );
 
+        // annotated PKL/ASSETMAP: AnnotationText must validate in its post-Id slot.
+        let mut pkl_annotated = pkl.clone();
+        pkl_annotated.annotation = Some("Feature reel 1 & 2".into());
+        let mut am_annotated = am.clone();
+        am_annotated.annotation = Some("Combined: A & B".into());
+
         for (doc, schema, xml) in [
             ("ASSETMAP", "SMPTE-429-9-2007-AM.xsd", am.to_xml()),
+            (
+                "ASSETMAP_ANNOTATED",
+                "SMPTE-429-9-2007-AM.xsd",
+                am_annotated.to_xml(),
+            ),
             ("IMF_ASSETMAP", "SMPTE-429-9-2007-AM.xsd", imf_am.to_xml()),
             ("PKL", "SMPTE-429-8-2006-PKL.xsd", pkl.to_xml()),
+            (
+                "PKL_ANNOTATED",
+                "SMPTE-429-8-2006-PKL.xsd",
+                pkl_annotated.to_xml(),
+            ),
             ("CPL", "SMPTE-429-7-2006-CPL.xsd", cpl.to_xml()),
             (
                 "INTEROP_CPL",
@@ -743,6 +774,7 @@ mod tests {
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
             assets: vec![PklAsset {
                 id: "asset".into(),
                 hash: "base64hash".into(),
@@ -756,6 +788,67 @@ mod tests {
         assert!(xml.contains("<Hash>base64hash</Hash>"));
         assert!(xml.contains("<Size>42</Size>"));
         assert!(xml.contains("<Type>application/mxf</Type>"));
+    }
+
+    #[test]
+    fn pkl_annotation_is_optional_and_positioned_after_id() {
+        let base = PackingList {
+            uuid: "pkl".into(),
+            namespace: ns::PKL_SMPTE.into(),
+            issuer: "DCP Wizard".into(),
+            creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
+            assets: vec![],
+        };
+        // None keeps the pre-field output: no AnnotationText anywhere.
+        let none = base.to_xml();
+        assert!(!none.contains("<AnnotationText>"));
+
+        // Some emits an escaped AnnotationText between Id and IssueDate; the rest
+        // of the document is byte-identical to the None output (proof: dropping the
+        // one inserted line reproduces `none`).
+        let mut annotated = base.clone();
+        annotated.annotation = Some("A & B <combo>".into());
+        let some = annotated.to_xml();
+        assert!(some.contains("<AnnotationText>A &amp; B &lt;combo&gt;</AnnotationText>"));
+        assert!(some.find("</Id>").unwrap() < some.find("<AnnotationText>").unwrap());
+        assert!(some.find("<AnnotationText>").unwrap() < some.find("<IssueDate>").unwrap());
+        let stripped: String = some
+            .lines()
+            .filter(|l| !l.contains("<AnnotationText>"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(stripped, none, "None output must be byte-identical");
+    }
+
+    #[test]
+    fn assetmap_annotation_is_optional_and_positioned_after_id() {
+        let base = AssetMap {
+            uuid: "am".into(),
+            namespace: ns::AM_SMPTE.into(),
+            issuer: "DCP Wizard".into(),
+            creator: "DCP Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
+            assets: vec![],
+        };
+        let none = base.to_xml();
+        assert!(!none.contains("<AnnotationText>"));
+
+        let mut annotated = base.clone();
+        annotated.annotation = Some("Merged: X & Y".into());
+        let some = annotated.to_xml();
+        assert!(some.contains("<AnnotationText>Merged: X &amp; Y</AnnotationText>"));
+        // after Id, before the Creator/VolumeCount metadata block
+        assert!(some.find("</Id>").unwrap() < some.find("<AnnotationText>").unwrap());
+        assert!(some.find("<AnnotationText>").unwrap() < some.find("<Creator>").unwrap());
+        let stripped: String = some
+            .lines()
+            .filter(|l| !l.contains("<AnnotationText>"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert_eq!(stripped, none, "None output must be byte-identical");
     }
 
     #[test]
@@ -773,6 +866,7 @@ mod tests {
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
             assets: assets.clone(),
         }
         .to_xml();
@@ -788,6 +882,7 @@ mod tests {
             issuer: "IMF Wizard".into(),
             creator: "IMF Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
             assets,
         }
         .to_xml();

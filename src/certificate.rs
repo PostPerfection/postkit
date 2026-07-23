@@ -587,6 +587,10 @@ pub enum KdmFormat {
 pub struct KdmConfig {
     pub cpl_id: String,
     pub content_title: String,
+    /// AnnotationText override. None derives `"<content_title> KDM for
+    /// <recipient>"` (byte-identical to before this field existed).
+    #[serde(default)]
+    pub annotation: Option<String>,
     pub recipient_cert_file: PathBuf,
     /// Leaf certificate of the entity issuing this KDM. Its thumbprint is part
     /// of the encrypted key block and it is the certificate whose key signs the
@@ -983,12 +987,18 @@ fn build_kdm_xml(
         KdmFormat::Interop => KDM_INTEROP_NS,
     };
 
+    // AnnotationText: caller override (escaped), else the derived default.
+    let annotation = match &config.annotation {
+        Some(a) => xml_escape(a),
+        None => format!("{title} KDM for {recipient_subject}"),
+    };
+
     // Inner content of the two authenticated elements the signer references.
     let auth_public_inner = format!(
         r#"
     <MessageId>urn:uuid:{message_id}</MessageId>
     <MessageType>{message_type}</MessageType>
-    <AnnotationText>{title} KDM for {recipient_subject}</AnnotationText>
+    <AnnotationText>{annotation}</AnnotationText>
     <IssueDate>{issue_date}</IssueDate>
     <Signer>
       <X509IssuerName>{signer_issuer}</X509IssuerName>
@@ -1930,6 +1940,7 @@ mod tests {
         KdmConfig {
             cpl_id: "8a2b1c3d-4e5f-6071-8293-a4b5c6d7e8f9".to_string(),
             content_title: "Test Feature".to_string(),
+            annotation: None,
             recipient_cert_file: f.signer.clone(),
             signer_cert_file: f.root.clone(),
             signer_key_file: f.root_key.clone(),
@@ -1950,6 +1961,7 @@ mod tests {
         KdmConfig {
             cpl_id: "8a2b1c3d-4e5f-6071-8293-a4b5c6d7e8f9".to_string(),
             content_title: "Test Feature".to_string(),
+            annotation: None,
             recipient_cert_file: f.root.clone(),
             signer_cert_file: f.signer.clone(),
             signer_key_file: f.signer_key.clone(),
@@ -2867,6 +2879,34 @@ mod tests {
         assert_eq!(meta.key_ids[0].key_id, key_id);
         assert_eq!(meta.key_ids[0].key_type, Some(*b"MDIK"));
         assert!(meta.not_valid_before < meta.not_valid_after);
+    }
+
+    #[test]
+    fn annotation_override_replaces_derived_text() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+
+        // None: byte-identical to before, derived "<title> KDM for <recipient>".
+        let default_kdm = build_kdm(&config).expect("build default");
+        let default_meta = parse_kdm(&default_kdm.xml).expect("parse default");
+        assert!(
+            default_meta
+                .annotation_text
+                .starts_with("Test Feature KDM for "),
+            "got: {}",
+            default_meta.annotation_text
+        );
+
+        // Some: the exact override, escaped in the XML and read back verbatim.
+        config.annotation = Some("Release KDM <v2> & final".to_string());
+        let kdm = build_kdm(&config).expect("build annotated");
+        assert!(
+            kdm.xml
+                .contains("<AnnotationText>Release KDM &lt;v2&gt; &amp; final</AnnotationText>"),
+            "annotation must be escaped in the KDM XML"
+        );
+        let meta = parse_kdm(&kdm.xml).expect("parse annotated");
+        assert_eq!(meta.annotation_text, "Release KDM <v2> & final");
     }
 
     // Key hygiene: the content key must never surface through Debug.
