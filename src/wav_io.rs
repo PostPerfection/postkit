@@ -6,7 +6,7 @@ use std::path::Path;
 
 /// Read a WAV into (spec, interleaved f32 in -1.0..=1.0). Int is scaled by
 /// 2^(bits-1); float passes through.
-pub(crate) fn read_interleaved(path: &Path) -> Result<(WavSpec, Vec<f32>), hound::Error> {
+pub fn read_interleaved(path: &Path) -> Result<(WavSpec, Vec<f32>), hound::Error> {
     let reader = WavReader::open(path)?;
     let spec = reader.spec();
     let samples = match spec.sample_format {
@@ -25,11 +25,7 @@ pub(crate) fn read_interleaved(path: &Path) -> Result<(WavSpec, Vec<f32>), hound
 /// Write interleaved f32 back to WAV in `spec`'s format. Int is scaled by
 /// 2^(bits-1) and clamped: dsp can overshoot full scale, and wrapping a
 /// narrower int would flip sign.
-pub(crate) fn write_interleaved(
-    path: &Path,
-    spec: WavSpec,
-    samples: &[f32],
-) -> Result<(), hound::Error> {
+pub fn write_interleaved(path: &Path, spec: WavSpec, samples: &[f32]) -> Result<(), hound::Error> {
     let mut w = WavWriter::create(path, spec)?;
     match spec.sample_format {
         SampleFormat::Int => {

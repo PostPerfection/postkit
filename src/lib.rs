@@ -44,6 +44,6 @@ pub mod upmix;
 pub mod version_tracker;
 pub mod watch;
 pub mod watermark;
-mod wav_io;
+pub mod wav_io;
 pub mod webhook;
 pub mod xmldsig;

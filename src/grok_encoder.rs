@@ -669,6 +669,50 @@ pub fn encode_video_pipeline<P>(
     width: u32,
     height: u32,
     cancel: &Arc<AtomicBool>,
+    on_progress: P,
+) -> PipelineResult
+where
+    P: FnMut(EncodeProgress),
+{
+    encode_video_pipeline_resumable(
+        input_video,
+        output_dir,
+        params,
+        total_frames,
+        width,
+        height,
+        cancel,
+        false,
+        on_progress,
+    )
+}
+
+/// Number of `frame_{:08}.j2c` files forming a contiguous prefix (0,1,2,...) in
+/// `dir`. This is the count of frames a resumable encode can safely skip.
+pub fn contiguous_encoded_frames(dir: &Path) -> u64 {
+    let mut n = 0u64;
+    while dir.join(format!("frame_{n:08}.j2c")).is_file() {
+        n += 1;
+    }
+    n
+}
+
+/// Like [`encode_video_pipeline`], but when `resume` is true it skips frames
+/// already encoded on disk (dom#344: an interrupted encode picks up where it
+/// left off). The already-present contiguous prefix is decoded-and-discarded so
+/// ffmpeg stays frame-aligned, then encoding continues from the next index. The
+/// last existing frame is always re-encoded in case it was truncated by the
+/// interruption.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_video_pipeline_resumable<P>(
+    input_video: &Path,
+    output_dir: &Path,
+    params: &CompressParams,
+    total_frames: u64,
+    width: u32,
+    height: u32,
+    cancel: &Arc<AtomicBool>,
+    resume: bool,
     mut on_progress: P,
 ) -> PipelineResult
 where
@@ -681,6 +725,23 @@ where
         return PipelineResult {
             success: false,
             error: format!("Failed to create output directory: {e}"),
+            frames_encoded: 0,
+            output_dir: output_dir.to_path_buf(),
+        };
+    }
+
+    // resume: re-encode from the last-but-one existing frame (the last is
+    // suspect: fs::write is not atomic, so an interrupt can truncate it).
+    let start_frame = if resume {
+        contiguous_encoded_frames(output_dir).saturating_sub(1)
+    } else {
+        0
+    };
+    // everything already done: nothing to encode.
+    if resume && total_frames > 0 && start_frame >= total_frames {
+        return PipelineResult {
+            success: true,
+            error: String::new(),
             frames_encoded: 0,
             output_dir: output_dir.to_path_buf(),
         };
@@ -714,12 +775,39 @@ where
     let frame_size = (width as usize) * (height as usize) * 6; // rgb48be = 6 bytes/pixel
     let mut stdout = child.stdout.take().unwrap();
 
-    // Feed decoded frames into the generic encode_pipeline
+    // discard the already-encoded prefix so ffmpeg stays frame-aligned.
     let mut frame_index: u64 = 0;
+    if start_frame > 0 {
+        let mut skip_buf = vec![0u8; frame_size];
+        let mut aligned = true;
+        while frame_index < start_frame {
+            if stdout.read_exact(&mut skip_buf).is_err() {
+                aligned = false;
+                break;
+            }
+            frame_index += 1;
+        }
+        if !aligned {
+            let _ = child.kill();
+            let _ = child.wait();
+            return PipelineResult {
+                success: false,
+                error: format!(
+                    "resume: source has fewer than {start_frame} frames, cannot skip the encoded prefix"
+                ),
+                frames_encoded: 0,
+                output_dir: output_dir.to_path_buf(),
+            };
+        }
+    }
+
+    // progress total is the remaining frames so the pipeline's completion check
+    // (done >= total) is reachable after a resume.
+    let remaining_total = total_frames.saturating_sub(start_frame);
     let result = encode_pipeline(
         output_dir,
         params,
-        total_frames,
+        remaining_total,
         cancel,
         || {
             if cancel.load(Ordering::Relaxed) {
@@ -1023,6 +1111,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contiguous_frames_counts_prefix_and_stops_at_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert_eq!(contiguous_encoded_frames(p), 0);
+        for i in 0..3 {
+            std::fs::write(p.join(format!("frame_{i:08}.j2c")), b"x").unwrap();
+        }
+        assert_eq!(contiguous_encoded_frames(p), 3);
+        // a gap (missing frame 3) then frame 4 must not extend the prefix.
+        std::fs::write(p.join(format!("frame_{:08}.j2c", 4)), b"x").unwrap();
+        assert_eq!(contiguous_encoded_frames(p), 3);
+    }
 
     #[test]
     fn test_bounded_queue_basic() {
