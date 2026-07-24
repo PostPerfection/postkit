@@ -2,7 +2,7 @@
 name = "postkit"
 version = "0.5.0"
 edition = "2024"
-license = "GPL-3.0-or-later"
+license = "AGPL-3.0-or-later"
 description = "Shared library for DCP Wizard, IMF Wizard, and DCP Doctor"
 
 [dependencies]

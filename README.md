@@ -90,4 +90,4 @@ postkit = { git = "https://github.com/PostPerfection/postkit.git", tag = "v0.5.0
 
 ## License
 
-GPL-3.0
+AGPL-3.0-or-later. Copyright (C) 2026 Grok Image Compression Inc. See [LICENSE](LICENSE).
