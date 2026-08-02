@@ -17,23 +17,13 @@
   no `wrap_dcdata` was added rather than emit a wrong UL. Revisit once a confirmed UL
   exists.
 
-## App-side dedup still pending (no further postkit work needed)
-
-- hash: dcpdoctor-core/hash.rs can adapt onto `postkit::hash::hash_file`;
-  dcpdoctor-wasm is pure-bytes and deliberately avoids postkit (postkit has no
-  bytes-based hash).
-- imfwizard to_dcp.rs: mechanical switch of the hand-rolled DCP CPL to
-  `packaging::DcpCpl`. The escaper and per-reel ScreenAspectRatio blockers are gone.
-- imfwizard cpl.rs inject_locale_list: obsolete. Set `ImfCpl.languages` and drop the
-  string-splice helper (postkit emits the identical LocaleList block).
-
-Cross-repo pins current at cleanup: dcpwizard a0c51aa, imfwizard 1afde88,
-dcpdoctor 37540f3, dci-ctp 175c488. dcpwizard consumes the subtitle parsers via its
-vendored postkit copy (dcpwizard-core/src/subtitle.rs). imfwizard and dcpdoctor pin
-bumps for the uncommitted 07-23 dedup (j2k/bitrate/timecode/frame_compare) are
-pending.
-
 # Done
+
+## App-side dedup: all landed
+
+hash (dcpdoctor hash.rs adapts `postkit::hash::hash_file`), imfwizard to_dcp.rs
+(`packaging::DcpCpl`), and imfwizard inject_locale_list (`ImfCpl.languages`) are
+done in the app repos. All three apps pin postkit at or past the 07-23 dedup.
 
 ## 2026-07-23
 
