@@ -789,7 +789,6 @@ where
     );
 
     kill_child(&mut ffmpeg);
-    grok_encoder::deinitialize();
 
     EncodeResult {
         success: result.success,

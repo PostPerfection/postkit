@@ -230,20 +230,11 @@ where
         .map(|n| n.get())
         .unwrap_or(4);
 
-    // grok's compress scheduler always parallelises T1 across the global
-    // TFSingleton pool sized by grk_initialize; the per-codec cparams.num_threads
-    // is not read on the compress path. for n independent single-thread codecs we
-    // force the global pool to inline mode (0 workers => each grk_compress runs
-    // its whole taskflow on the calling thread) and run one encoder thread per
-    // core, restoring the pool on exit.
+    // grok >= 20.3.8 honors cparams.num_threads == 1 by giving each codec its
+    // own inline executor, so n encoder threads => n independent single-thread
+    // codecs with no global pool contention.
     let threads_per_codec = 1;
     let num_encoder_threads = num_threads;
-    #[cfg(feature = "grok-ffi")]
-    let prev_pool_workers = grok_pool_workers();
-    #[cfg(feature = "grok-ffi")]
-    if prev_pool_workers != 1 {
-        set_grok_pool(1);
-    }
 
     // Queue sized to keep all encoder threads fed without excessive memory use
     // (each 2K frame ≈ 21MB in planar i32)
@@ -354,12 +345,6 @@ where
         // Scoped threads join here
         drop(encoder_handles);
     });
-
-    // all grk_compress calls are done; restore the pool for later decode paths.
-    #[cfg(feature = "grok-ffi")]
-    if prev_pool_workers != 1 {
-        set_grok_pool(prev_pool_workers);
-    }
 
     // Wait for writer to flush
     let _ = writer_handle.join();
@@ -622,34 +607,6 @@ pub fn initialize(num_threads: u32) {
 /// Stub when grok-ffi is not enabled.
 #[cfg(not(feature = "grok-ffi"))]
 pub fn initialize(_num_threads: u32) {}
-
-/// Current grok global thread-pool worker count (inline mode reports 1).
-#[cfg(feature = "grok-ffi")]
-fn grok_pool_workers() -> u32 {
-    unsafe { grokj2k_sys::grk_num_workers() as u32 }
-}
-
-/// Resize grok's global thread pool. Pass 1 for inline mode so each grk_compress
-/// runs its whole taskflow on the calling thread (n threads => n independent
-/// single-thread codecs).
-#[cfg(feature = "grok-ffi")]
-fn set_grok_pool(num_workers: u32) {
-    unsafe {
-        grokj2k_sys::grk_initialize(std::ptr::null(), num_workers, std::ptr::null_mut());
-    }
-}
-
-/// Shut down the Grok library.
-#[cfg(feature = "grok-ffi")]
-pub fn deinitialize() {
-    unsafe {
-        grokj2k_sys::grk_deinitialize();
-    }
-}
-
-/// Stub when grok-ffi is not enabled.
-#[cfg(not(feature = "grok-ffi"))]
-pub fn deinitialize() {}
 
 // ─── Video-to-J2K in-process pipeline (ffmpeg pipe → Grok FFI) ─────────────────
 
@@ -1197,7 +1154,6 @@ mod tests {
             fps,
             elapsed.as_secs_f64() / n as f64 * 1000.0
         );
-        deinitialize();
     }
 
     #[cfg(feature = "grok-ffi")]
@@ -1216,11 +1172,53 @@ mod tests {
         initialize(0);
         let mut buf = Vec::new();
         let bytes = compress_frame_grok(&frame, &CompressParams::default(), &mut buf).unwrap();
-        deinitialize();
         // SOC ff4f, SIZ ff51, Lsiz u16, then Rsiz u16
         assert_eq!(&bytes[..4], &[0xff, 0x4f, 0xff, 0x51]);
         let rsiz = u16::from_be_bytes([bytes[6], bytes[7]]);
         assert_eq!(rsiz, 0x0003, "cinema 2k profile was stripped");
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn overlapping_pipelines_share_the_inline_pool() {
+        // pipelines resize grok's global pool; unguarded, one pipeline's exit
+        // destroys the executor another's codecs are running on (segfault).
+        let dir = tempfile::tempdir().unwrap();
+        initialize(0);
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let out = dir.path().join(format!("p{i}"));
+                std::thread::spawn(move || {
+                    let (w, h) = (128u32, 128u32);
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    let mut left = 3u64;
+                    let result = encode_pipeline(
+                        &out,
+                        &CompressParams::default(),
+                        3,
+                        &cancel,
+                        || {
+                            if left == 0 {
+                                return None;
+                            }
+                            left -= 1;
+                            Some(RawFrame::Packed {
+                                data: vec![0x80u8; (w * h * 6) as usize],
+                                width: w,
+                                height: h,
+                                precision: 16,
+                                index: 3 - left - 1,
+                            })
+                        },
+                        |_| {},
+                    );
+                    assert!(result.success, "pipeline {i} failed: {}", result.error);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[cfg(not(feature = "grok-ffi"))]

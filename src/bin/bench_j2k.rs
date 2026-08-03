@@ -300,6 +300,5 @@ fn main() {
         );
     }
 
-    grok_encoder::deinitialize();
     let _ = std::fs::remove_dir_all(&out);
 }
