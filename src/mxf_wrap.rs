@@ -81,6 +81,13 @@ pub struct MxfWrapOptions {
     /// via open_write_hdr. Never serialized (asdcplib type is not serde).
     #[serde(skip)]
     pub hdr: Option<asdcplib::jp2k::HdrMetadata>,
+    /// The asset id written into the MXF as its AssetUUID and returned as
+    /// [`MxfTrackFile::uuid`]. A caller that names the output file or writes the
+    /// CPL/PKL/ASSETMAP entry before wrapping must pass its id here, otherwise
+    /// the MXF ends up carrying a different id than the package claims. None
+    /// mints a fresh id.
+    #[serde(default)]
+    pub asset_uuid: Option<[u8; 16]>,
 }
 
 /// Result of MXF wrapping.
@@ -259,11 +266,10 @@ impl TimedTextWriter {
     }
 }
 
-fn make_writer_info() -> asdcplib::WriterInfo {
-    let asset_uuid = uuid::Uuid::new_v4();
+fn make_writer_info(asset_uuid: Option<[u8; 16]>) -> asdcplib::WriterInfo {
     let context_id = uuid::Uuid::new_v4();
     asdcplib::WriterInfo {
-        asset_uuid: *asset_uuid.as_bytes(),
+        asset_uuid: asset_uuid.unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes()),
         context_id: *context_id.as_bytes(),
         label_set: asdcplib::LabelSet::Smpte,
         ..Default::default()
@@ -405,7 +411,7 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     }
 
-    let mut info = make_writer_info();
+    let mut info = make_writer_info(opts.asset_uuid);
     let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
         Ok(c) => c,
         Err(error) => {
@@ -602,7 +608,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     };
 
-    let mut info = make_writer_info();
+    let mut info = make_writer_info(opts.asset_uuid);
     let channels = wav.channels as u32;
     let bits = wav.bits_per_sample as u32;
     let sample_rate = wav.sample_rate;
@@ -714,7 +720,7 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
     };
     let duration_frames = (end_secs * fps).ceil() as u32;
 
-    let info = make_writer_info();
+    let info = make_writer_info(opts.asset_uuid);
     let desc = asdcplib::timed_text::TimedTextDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         container_duration: duration_frames,
@@ -824,7 +830,7 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     }
 
-    let info = make_writer_info();
+    let info = make_writer_info(opts.asset_uuid);
     let desc = asdcplib::atmos::AtmosDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         container_duration: frames.len() as u32,
@@ -898,6 +904,10 @@ pub struct StereoscopicWrapOptions {
     /// Never serialized: it carries secret key material.
     #[serde(skip)]
     pub encryption: Option<MxfEncryption>,
+    /// The asset id written into the MXF as its AssetUUID and returned as
+    /// [`MxfTrackFile::uuid`], as in [`MxfWrapOptions::asset_uuid`].
+    #[serde(default)]
+    pub asset_uuid: Option<[u8; 16]>,
 }
 
 /// Wrap left/right eye J2K frame sequences into one stereoscopic picture MXF.
@@ -989,7 +999,7 @@ pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
         }
     }
 
-    let mut info = make_writer_info();
+    let mut info = make_writer_info(opts.asset_uuid);
     let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
         Ok(c) => c,
         Err(error) => {
@@ -1128,6 +1138,7 @@ mod tests {
             mca_config: None,
             resource_ids: vec![],
             hdr: None,
+            asset_uuid: None,
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -1160,6 +1171,7 @@ mod tests {
             mca_config: None,
             resource_ids: vec![],
             hdr: None,
+            asset_uuid: None,
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "must not wrap a non-WAV file");
@@ -1227,6 +1239,7 @@ mod tests {
             mca_config: None,
             resource_ids: vec![],
             hdr: None,
+            asset_uuid: None,
         }
     }
 
@@ -1306,6 +1319,7 @@ mod tests {
             fps_num: 24,
             fps_den: 1,
             encryption: None,
+            asset_uuid: None,
         });
         assert!(result.success, "stereo wrap failed: {}", result.error);
         assert_eq!(result.duration, 1, "one stereo frame pair");
@@ -1343,6 +1357,7 @@ mod tests {
             fps_num: 24,
             fps_den: 1,
             encryption: None,
+            asset_uuid: None,
         });
         assert!(!result.success);
         assert!(
@@ -1375,6 +1390,7 @@ mod tests {
             mca_config: mca,
             resource_ids: vec![],
             hdr: None,
+            asset_uuid: None,
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -1407,6 +1423,7 @@ mod tests {
             mca_config: Some("51(L,R,C,LFE,Ls,Rs)".to_string()),
             resource_ids: vec![],
             hdr: None,
+            asset_uuid: None,
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "MCA on AS-02 must be rejected");
@@ -1443,6 +1460,7 @@ mod tests {
             mca_config: None,
             resource_ids: vec![],
             hdr: None,
+            asset_uuid: None,
         };
         let result = mxf_wrap(&opts);
         assert!(result.success, "atmos wrap failed: {}", result.error);
@@ -1503,6 +1521,7 @@ mod tests {
             mca_config: None,
             resource_ids: vec![font_id],
             hdr: None,
+            asset_uuid: None,
         };
         let result = mxf_wrap(&opts);
         assert!(result.success, "timed text wrap failed: {}", result.error);
@@ -1517,5 +1536,175 @@ mod tests {
             .unwrap();
         let back = String::from_utf8_lossy(&buf[..n]);
         assert!(back.contains("SubtitleReel"), "XML round-trips");
+    }
+
+    /// Read the AssetUUID an MXF actually carries, using an independent
+    /// asdcp-info binary rather than this crate's own reader. Returns None when
+    /// the tool reports no AssetUUID (it refuses AS-02 files).
+    fn asdcp_info_asset_uuid(tool: &str, path: &std::path::Path) -> Option<String> {
+        let out = std::process::Command::new(tool)
+            .arg("-i")
+            .arg(path)
+            .output()
+            .expect("run asdcp-info");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("AssetUUID:"))
+            .map(|v| v.trim().to_lowercase())
+    }
+
+    /// The one id an asset is known by: the AssetUUID inside the MXF, the uuid in
+    /// the file name, and the id postkit reports for the CPL/PKL/ASSETMAP must all
+    /// be the same. The MXF side is read back with an external asdcp-info binary,
+    /// so postkit cannot agree with itself and pass. Gated on POSTKIT_ASDCP_INFO.
+    #[test]
+    fn every_wrap_path_writes_the_caller_supplied_asset_uuid() {
+        let Ok(tool) = std::env::var("POSTKIT_ASDCP_INFO") else {
+            eprintln!("skipping: set POSTKIT_ASDCP_INFO to an asdcp-info binary");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let frame = dir.path().join("0001.j2c");
+        std::fs::write(&frame, synthetic_j2k()).unwrap();
+        let wav = dir.path().join("in.wav");
+        std::fs::write(&wav, make_wav(2, 48000, 24, 48000)).unwrap();
+        let dcst = dir.path().join("sub.xml");
+        std::fs::write(&dcst, DCST).unwrap();
+        let atmos_frame = dir.path().join("a.dat");
+        std::fs::write(&atmos_frame, vec![7u8; 2048]).unwrap();
+        let right = dir.path().join("r.j2c");
+        std::fs::write(&right, synthetic_j2k()).unwrap();
+
+        let cases: [(&str, &str, EssenceType, &std::path::Path); 4] = [
+            (
+                "picture",
+                "f80300de-a6d9-4be8-820f-4df99ae5143c",
+                EssenceType::J2k,
+                &frame,
+            ),
+            (
+                "sound",
+                "ba1ea856-b639-4868-9f1e-3b4c76279c07",
+                EssenceType::Pcm,
+                &wav,
+            ),
+            (
+                "subtitle",
+                "3c2b1a09-8877-4655-a433-2211ffeeddcc",
+                EssenceType::TimedText,
+                &dcst,
+            ),
+            (
+                "atmos",
+                "0d1c2b3a-4958-4677-8695-a4b3c2d1e0f9",
+                EssenceType::Atmos,
+                &atmos_frame,
+            ),
+        ];
+
+        for (kind, id, essence_type, input) in cases {
+            let asset_uuid = *uuid::Uuid::parse_str(id).unwrap().as_bytes();
+            let output = dir.path().join(format!("{kind}_{id}.mxf"));
+            let mut opts = j2k_opts(input.to_path_buf(), output.clone(), None);
+            opts.essence_type = essence_type;
+            opts.asset_uuid = Some(asset_uuid);
+            let result = mxf_wrap(&opts);
+            assert!(result.success, "{kind} wrap failed: {}", result.error);
+
+            let in_mxf = asdcp_info_asset_uuid(&tool, &output)
+                .unwrap_or_else(|| panic!("{kind}: asdcp-info reported no AssetUUID"));
+            assert_eq!(in_mxf, id, "{kind}: MXF AssetUUID vs the file name");
+            assert_eq!(result.uuid, in_mxf, "{kind}: reported id vs MXF AssetUUID");
+        }
+
+        let stereo_id = "5a4b3c2d-1e0f-4988-a776-655443322110";
+        let stereo_out = dir.path().join(format!("picture_{stereo_id}.mxf"));
+        let stereo = wrap_stereoscopic(&StereoscopicWrapOptions {
+            left_files: vec![frame.clone()],
+            right_files: vec![right],
+            output: stereo_out.clone(),
+            fps_num: 24,
+            fps_den: 1,
+            encryption: None,
+            asset_uuid: Some(*uuid::Uuid::parse_str(stereo_id).unwrap().as_bytes()),
+        });
+        assert!(stereo.success, "stereo wrap failed: {}", stereo.error);
+        let in_mxf = asdcp_info_asset_uuid(&tool, &stereo_out)
+            .expect("stereo: asdcp-info reported no AssetUUID");
+        assert_eq!(in_mxf, stereo_id, "stereo: MXF AssetUUID vs the file name");
+        assert_eq!(stereo.uuid, in_mxf, "stereo: reported id vs MXF AssetUUID");
+    }
+
+    /// Without a caller-supplied id the wrap mints one, and the id it reports must
+    /// still be the id the MXF carries. Read back with the external asdcp-info, so
+    /// this asserts nothing the test itself chose. Gated on POSTKIT_ASDCP_INFO.
+    #[test]
+    fn a_minted_asset_uuid_is_reported_as_the_mxf_carries_it() {
+        let Ok(tool) = std::env::var("POSTKIT_ASDCP_INFO") else {
+            eprintln!("skipping: set POSTKIT_ASDCP_INFO to an asdcp-info binary");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("0001.j2c");
+        std::fs::write(&frame, synthetic_j2k()).unwrap();
+        let output = dir.path().join("minted.mxf");
+
+        let result = mxf_wrap(&j2k_opts(frame, output.clone(), None));
+        assert!(result.success, "wrap failed: {}", result.error);
+        assert_eq!(
+            asdcp_info_asset_uuid(&tool, &output).expect("asdcp-info reported no AssetUUID"),
+            result.uuid,
+        );
+    }
+
+    /// asdcp-info refuses AS-02 files, so the AS-02 wraps are checked against the
+    /// file bytes: the caller's id must be present as the raw 16-byte UMID material
+    /// asdcplib writes, and it must be what postkit reports.
+    #[test]
+    fn as02_wraps_write_the_caller_supplied_asset_uuid_into_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("0001.j2c");
+        std::fs::write(&frame, synthetic_j2k()).unwrap();
+        let wav = dir.path().join("in.wav");
+        std::fs::write(&wav, make_wav(2, 48000, 24, 48000)).unwrap();
+        let dcst = dir.path().join("sub.xml");
+        std::fs::write(&dcst, DCST).unwrap();
+
+        let cases: [(&str, EssenceType, &std::path::Path); 3] = [
+            (
+                "6f5e4d3c-2b1a-4099-8877-665544332211",
+                EssenceType::J2k,
+                &frame,
+            ),
+            (
+                "1a2b3c4d-5e6f-4788-9900-aabbccddeeff",
+                EssenceType::Pcm,
+                &wav,
+            ),
+            (
+                "9e8d7c6b-5a49-4382-b170-fedcba987654",
+                EssenceType::TimedText,
+                &dcst,
+            ),
+        ];
+
+        for (id, essence_type, input) in cases {
+            let asset_uuid = *uuid::Uuid::parse_str(id).unwrap().as_bytes();
+            let output = dir.path().join(format!("as02_{id}.mxf"));
+            let mut opts = j2k_opts(input.to_path_buf(), output.clone(), None);
+            opts.essence_type = essence_type;
+            opts.standard = MxfStandard::As02;
+            opts.asset_uuid = Some(asset_uuid);
+            let result = mxf_wrap(&opts);
+            assert!(result.success, "{id} wrap failed: {}", result.error);
+            assert_eq!(result.uuid, id, "{id}: reported id");
+
+            let bytes = std::fs::read(&output).unwrap();
+            assert!(
+                contains(&bytes, &asset_uuid),
+                "{id}: the AS-02 MXF does not carry the caller's asset id"
+            );
+        }
     }
 }

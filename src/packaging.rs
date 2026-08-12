@@ -60,6 +60,10 @@ pub struct PklAsset {
     pub asset_type: String,
 }
 
+/// The digest identifier for the base64 SHA-1 in [`PklAsset::hash`], as ST 2067-2
+/// requires and Photon expects.
+const SHA1_DIGEST_METHOD: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
+
 /// A Packing List (ST 429-8 DCP or ST 2067-2 IMF, selected by `namespace`).
 #[derive(Debug, Clone, Default)]
 pub struct PackingList {
@@ -94,6 +98,15 @@ impl PackingList {
             let _ = writeln!(xml, "      <Hash>{}</Hash>", a.hash);
             let _ = writeln!(xml, "      <Size>{}</Size>", a.size);
             let _ = writeln!(xml, "      <Type>{}</Type>", escape_xml(&a.asset_type));
+            // ST 2067-2 requires HashAlgorithm last in the Asset sequence; the
+            // ST 429-8 DCP and Interop PKL schemas have no such element at all,
+            // so emitting it there would make the PKL schema-invalid.
+            if self.namespace == ns::PKL_IMF {
+                let _ = writeln!(
+                    xml,
+                    "      <HashAlgorithm Algorithm=\"{SHA1_DIGEST_METHOD}\"/>"
+                );
+            }
             xml.push_str("    </Asset>\n");
         }
         xml.push_str("  </AssetList>\n");
@@ -788,6 +801,74 @@ mod tests {
         assert!(xml.contains("<Hash>base64hash</Hash>"));
         assert!(xml.contains("<Size>42</Size>"));
         assert!(xml.contains("<Type>application/mxf</Type>"));
+    }
+
+    fn pkl_in(namespace: &str) -> PackingList {
+        PackingList {
+            uuid: "bbbbbbbb-7777-8888-9999-aaaaaaaaaaaa".into(),
+            namespace: namespace.into(),
+            issuer: "Wizard".into(),
+            creator: "Wizard".into(),
+            issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation: None,
+            assets: vec![PklAsset {
+                id: "cccccccc-7777-8888-9999-aaaaaaaaaaaa".into(),
+                hash: "kO0m3F3qX3qg3n3qg3n3qg3n3q0=".into(),
+                size: 42,
+                asset_type: "application/mxf".into(),
+            }],
+        }
+    }
+
+    /// The two PKL schemas disagree about HashAlgorithm: ST 2067-2 requires it as
+    /// the last child of Asset, while ST 429-8 and Interop have no such element and
+    /// reject it. Emitting it everywhere would trade a broken IMP for broken DCPs.
+    #[test]
+    fn hash_algorithm_is_emitted_for_imf_and_withheld_from_dcp() {
+        let imf = pkl_in(ns::PKL_IMF).to_xml();
+        let element = format!("      <HashAlgorithm Algorithm=\"{SHA1_DIGEST_METHOD}\"/>\n");
+        assert!(imf.contains(&element), "IMF PKL must carry HashAlgorithm");
+        // last in the Asset sequence, after Type
+        assert!(imf.find("</Type>").unwrap() < imf.find("<HashAlgorithm").unwrap());
+        assert!(imf.find("<HashAlgorithm").unwrap() < imf.find("</Asset>").unwrap());
+
+        for dcp_namespace in [ns::PKL_SMPTE, ns::PKL_INTEROP] {
+            assert!(
+                !pkl_in(dcp_namespace).to_xml().contains("<HashAlgorithm"),
+                "{dcp_namespace} has no HashAlgorithm element in its schema"
+            );
+        }
+    }
+
+    /// The IMF PKL against the vendored ST 2067-2 packing-list schema. Gated on
+    /// POSTKIT_IMF_PKL_XSD (the path to packingList_schema.xsd) and xmllint.
+    #[test]
+    fn generated_imf_pkl_passes_xmllint_schema() {
+        let Ok(schema) = std::env::var("POSTKIT_IMF_PKL_XSD") else {
+            eprintln!("skipping: set POSTKIT_IMF_PKL_XSD to the ST 2067-2 PKL schema");
+            return;
+        };
+        if std::process::Command::new("xmllint")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: xmllint not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("IMF_PKL.xml");
+        std::fs::write(&path, pkl_in(ns::PKL_IMF).to_xml()).unwrap();
+        let out = std::process::Command::new("xmllint")
+            .args(["--nonet", "--noout", "--schema", &schema])
+            .arg(&path)
+            .output()
+            .expect("run xmllint");
+        assert!(
+            out.status.success(),
+            "IMF PKL must pass the ST 2067-2 XSD:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

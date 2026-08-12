@@ -90,6 +90,7 @@ fn as02_j2k_roundtrip() {
         mca_config: None,
         resource_ids: vec![],
         hdr: None,
+        asset_uuid: None,
     });
     assert!(result.success, "wrap failed: {}", result.error);
 
@@ -136,6 +137,7 @@ fn as02_pcm_roundtrip() {
         mca_config: None,
         resource_ids: vec![],
         hdr: None,
+        asset_uuid: None,
     });
     assert!(result.success, "wrap failed: {}", result.error);
     assert_eq!(result.duration, 2);
@@ -180,6 +182,7 @@ fn as02_atmos_errors() {
         mca_config: None,
         resource_ids: vec![],
         hdr: None,
+        asset_uuid: None,
     });
     assert!(!result.success);
     assert!(
