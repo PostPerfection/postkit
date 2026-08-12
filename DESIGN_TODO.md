@@ -16,6 +16,16 @@
   DataEssenceCoding UL could not be confirmed from asdcplib sources or SMPTE docs, so
   no `wrap_dcdata` was added rather than emit a wrong UL. Revisit once a confirmed UL
   exists.
+- P-HFR gets no separate bitrate limit. `DCI_MAX_BITRATE_MBPS` is the flat DCI
+  figure, which is the only one with normative text behind it: DCSS 4.3.3 states
+  byte caps per frame and every one works out to 250 Mb/s. Two other numbers are
+  in circulation for high frame rates and neither is normative. ISDCF's P-HFR
+  paper (v005, 2012) sets 500 Mb/s for the total codestream of 2K stereoscopic
+  HFR, keyed on a P-HFR-2K picture essence label, and calls itself a proposal for
+  experimental use. asdcplib applies 400 to that same label with no source cited,
+  which is stricter than the document defining the label. Applying either would
+  mean reading the essence coding UL, which nothing here does. Settle which
+  number is right before adding that.
 
 # Done
 
@@ -45,6 +55,72 @@ configuration slot, but that list mirrors DCP-o-matic rather than Doc 13.
 Sound files resolve through the ASSETMAP (new src/assetmap.rs, shared with
 preview) rather than by reading an id out of a filename, which only holds for
 packages some tools build.
+
+`AccessibilityTrack::VisuallyImpairedText` (src/accessibility.rs): the ST 2067-2
+VisuallyImpairedTextSequence is now its own track rather than a footnote on the
+AudioDescription evidence. Element name confirmed from the published
+ST 2067-2:2020 section 6.3.3 Table 14, with Annex B.3 defining the content kind.
+It is deliberately not AudioDescription: this is timed text a renderer speaks
+aloud, while AudioDescription is a narration channel already carried as audio, so
+a package can have either without the other and merging them would report a track
+that is not there.
+
+Only an ST 2067-3 SequenceList can declare it, so the three-state contract reads:
+sequence present means Present, a SequenceList read without one means Absent, and
+a DCP composition leaves it Undeterminable however completely it describes its
+reels. `AccessibilityTrack` also gained `#[non_exhaustive]`, so downstream crates
+need a wildcard arm and future track types are additive. Matches inside postkit
+stay exhaustive on purpose, so a new variant breaks the build here instead of
+falling through a catch-all.
+
+KDM Trusted Device List (src/certificate.rs): every KDM now carries
+AuthorizedDeviceInfo, SMPTE and Interop alike. It is required by ST 430-1 Annex B
+with no minOccurs, so the KDMs postkit wrote before this were schema-invalid
+rather than merely incomplete. Its position in KDMRequiredExtensions is fixed
+between ContentKeysNotValidAfter and KeyIdList.
+
+`KdmConfig.device_cert_files` and `RewrapConfig.device_cert_files` choose the
+contents. Empty emits the DCI DCSS 9.4.3.5 assume-trust thumbprint
+(`2jmj7l5rSw0yVb/vlWAYkK/YBwk=`, base64 SHA-1 of the empty string) alone, and the
+exclusivity is normative: listing any real thumbprint beside it disables
+assume-trust entirely, so it is one or the other. An empty DeviceList is not an
+option, CertificateThumbprint is minOccurs="1". The recipient's own certificate is
+deliberately excluded, per ISDCF Doc 5 deprecating the formulation that carried
+it. No formulation enum was added, since the ISDCF formulations are just
+combinations of ContentAuthenticator presence and device list contents.
+
+CertificateThumbprint is SHA-1 over the complete DER TBSCertificate including the
+SEQUENCE tag and length, the same value the 138-byte key block already carried.
+ST 430-2 5.4 says to exclude the tag and length, but libdcp hashes `i2d_re_X509_tbs`
+output, which includes them, and its KDMs work in the field. Settled by computing
+both readings for a generated certificate and cross-checking against openssl
+asn1parse, which put the TBSCertificate at 535 bytes with a 4-byte header. Note
+this is a third distinct value from `sha1_thumbprint`, which hex encodes a hash of
+the whole certificate for the local trusted-device registry.
+
+Two older KDM defects surfaced once the schema would compile and are fixed in the
+same change. `Recipient/X509IssuerSerial` children were emitted unprefixed when
+`ds:X509IssuerSerialType` puts them in the xmldsig namespace, and the ETM `Signer`
+carried a third `X509SubjectName` child that type does not allow. Three real
+Doremi-signed KDMs settled both, and they also declare `xmlns:ds` locally on
+`Signer` and `X509IssuerSerial` rather than relying on the root, which is what
+keeps those elements valid when read on their own. The `Recipient`'s own
+`X509SubjectName` is a sibling of `X509IssuerSerial` and was always right.
+
+Certificate serials were the third defect. `generate_certificate` never set one,
+so rcgen fell back to 20 bytes of a SHA-256 over the public key. ST 430-2 5.2
+requires an unsigned integer of 64 bits or less and DCI CTP 2.1.4 fails anything
+larger, so serials are now random 63-bit values, minimally DER encoded. 63 rather
+than 64 keeps the value positive without the leading zero byte an ASN.1 INTEGER
+would otherwise need.
+
+The ST 430-1 schema and its three imports are vendored in schemas/ so
+`kdm_required_extensions_pass_the_st_430_1_xsd` runs offline rather than behind an
+env var. `real_kdms_pass_the_same_schema` puts real KDMs through the same
+extraction and schema, gated on POSTKIT_SAMPLE_KDMS since the samples live outside
+the repo. The vendored ETM schema needed one repair: the published transcription
+wraps the UUID pattern across a line break inside a character class, which libxml2
+reads as a literal space and rejects.
 
 ## App-side dedup: all landed
 

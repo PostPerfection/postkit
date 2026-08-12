@@ -108,6 +108,22 @@ fn generate_rsa_keypair(bits: u32) -> Result<rcgen::KeyPair, String> {
     rcgen::KeyPair::from_pem(&pem).map_err(|e| format!("rcgen rejected the RSA key: {e}"))
 }
 
+/// A random certificate serial, as the minimal big-endian DER bytes.
+///
+/// ST 430-2 5.2 requires an unsigned integer of 64 bits or less and DCI CTP
+/// 2.1.4 fails anything larger, but rcgen defaults to 20 bytes of a public key
+/// hash, so the serial has to be set rather than left to it. 63 bits keeps the
+/// value positive without the leading zero byte a full 64-bit value would need.
+fn certificate_serial() -> Result<rcgen::SerialNumber, String> {
+    let mut bytes: [u8; 8] = rand_bytes()?;
+    bytes[0] &= 0x7f;
+    let first_significant = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
+    Ok(rcgen::SerialNumber::from_slice(&bytes[first_significant..]))
+}
+
 /// Generate a new X.509 certificate + private key.
 pub fn generate_certificate(opts: &CertOptions) -> i32 {
     use rcgen::{
@@ -137,6 +153,14 @@ pub fn generate_certificate(opts: &CertOptions) -> i32 {
             DnValue::Utf8String(opts.country.clone()),
         );
     }
+
+    params.serial_number = match certificate_serial() {
+        Ok(serial) => Some(serial),
+        Err(e) => {
+            tracing::error!("{e}");
+            return -1;
+        }
+    };
 
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now;
@@ -616,6 +640,13 @@ pub struct KdmConfig {
     /// callers are byte-identical.
     #[serde(default)]
     pub format: KdmFormat,
+    /// Certificates of the playback devices this KDM is restricted to, listed by
+    /// thumbprint in AuthorizedDeviceInfo. Empty emits the DCI assume-trust
+    /// thumbprint instead, which places no device restriction. The recipient's
+    /// own certificate does not belong here: ISDCF Doc 5 deprecates the
+    /// formulation that included it.
+    #[serde(default)]
+    pub device_cert_files: Vec<PathBuf>,
 }
 
 /// A caller-supplied content key placed in a KDM, binding it to an already
@@ -659,6 +690,14 @@ const KDM_TIMESTAMP_LEN: usize = 25;
 
 /// XML Encryption 1.0 5.4.2, mandated by DCI CTP 3.4.12.
 const KDM_ENCRYPTION_METHOD: &str = "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p";
+
+/// DCI DCSS 9.4.3.5 "assume trust" thumbprint: base64 SHA-1 of the empty string.
+///
+/// A DeviceList holding only this value tells the security manager the trusted
+/// device requirement is already met. The rule is exclusive: put any real
+/// thumbprint alongside it and assume-trust stops applying, so this value is
+/// used alone or not at all.
+const ASSUME_TRUST_THUMBPRINT: &str = "2jmj7l5rSw0yVb/vlWAYkK/YBwk=";
 
 // SMPTE 430-3 ETM ds:Signature profile. Every URI below is what libdcp emits
 // in src/encrypted_kdm.cc / src/certificate_chain.cc for a KDM (distinct from
@@ -893,19 +932,21 @@ fn resolve_valid_from(valid_from: &str) -> String {
 }
 
 /// SMPTE ST 430-1 6.1: a KDM's MessageType is always this fixed URI. The ISDCF
-/// "formulation" (modified-transitional-1, dci-any, ...) selects optional
-/// AuthenticatedPublic extensions (AuthorizedDeviceInfo, ForensicMarkFlagList),
-/// not the MessageType; those are not emitted, so formulation has no structural
-/// effect yet. Emitting a per-formulation MessageType (the previous behaviour)
-/// produced a URI compliant gear does not recognise as a KDM.
+/// "formulation" (modified-transitional-1, dci-any, ...) is a shorthand for a
+/// combination of ContentAuthenticator and DeviceList contents, not a
+/// MessageType, and the device list is chosen by `device_cert_files` instead, so
+/// formulation has no structural effect. Emitting a per-formulation MessageType
+/// (the previous behaviour) produced a URI compliant gear does not recognise as
+/// a KDM.
 const KDM_MESSAGE_TYPE: &str = "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type";
 
 /// Assemble a signed SMPTE 430-1 KDM carrying `keys`, encrypting each key block
 /// to `recipient` with `signer`'s thumbprint embedded.
 ///
 /// `config` is used only for the signer identity handed to `build_signature`
-/// (its cert, key and chain); every other field of the KDM comes from the
-/// explicit arguments so this core serves both fresh generation and re-wrap.
+/// (its cert, key and chain), the output format, the annotation and the
+/// authorized device list; every other field of the KDM comes from the explicit
+/// arguments so this core serves both fresh generation and re-wrap.
 #[allow(clippy::too_many_arguments)]
 fn build_kdm_xml(
     config: &KdmConfig,
@@ -978,7 +1019,6 @@ fn build_kdm_xml(
     let recipient_subject = xml_escape(&recipient.subject_dn);
     let recipient_issuer = xml_escape(&recipient.issuer_dn);
     let recipient_serial = xml_escape(&recipient.serial);
-    let signer_subject = xml_escape(&signer.subject_dn);
     let signer_issuer = xml_escape(&signer.issuer_dn);
     let signer_serial = xml_escape(&signer.serial);
 
@@ -993,6 +1033,8 @@ fn build_kdm_xml(
         None => format!("{title} KDM for {recipient_subject}"),
     };
 
+    let authorized_device_info = build_authorized_device_info(&config.device_cert_files)?;
+
     // Inner content of the two authenticated elements the signer references.
     let auth_public_inner = format!(
         r#"
@@ -1000,17 +1042,16 @@ fn build_kdm_xml(
     <MessageType>{message_type}</MessageType>
     <AnnotationText>{annotation}</AnnotationText>
     <IssueDate>{issue_date}</IssueDate>
-    <Signer>
-      <X509IssuerName>{signer_issuer}</X509IssuerName>
-      <X509SerialNumber>{signer_serial}</X509SerialNumber>
-      <X509SubjectName>{signer_subject}</X509SubjectName>
+    <Signer xmlns:ds="{DSIG_NS}">
+      <ds:X509IssuerName>{signer_issuer}</ds:X509IssuerName>
+      <ds:X509SerialNumber>{signer_serial}</ds:X509SerialNumber>
     </Signer>
     <RequiredExtensions>
       <KDMRequiredExtensions xmlns="{kdm_ns}">
         <Recipient>
-          <X509IssuerSerial>
-            <X509IssuerName>{recipient_issuer}</X509IssuerName>
-            <X509SerialNumber>{recipient_serial}</X509SerialNumber>
+          <X509IssuerSerial xmlns:ds="{DSIG_NS}">
+            <ds:X509IssuerName>{recipient_issuer}</ds:X509IssuerName>
+            <ds:X509SerialNumber>{recipient_serial}</ds:X509SerialNumber>
           </X509IssuerSerial>
           <X509SubjectName>{recipient_subject}</X509SubjectName>
         </Recipient>
@@ -1018,7 +1059,7 @@ fn build_kdm_xml(
         <ContentTitleText>{title}</ContentTitleText>
         <ContentKeysNotValidBefore>{not_before}</ContentKeysNotValidBefore>
         <ContentKeysNotValidAfter>{not_after}</ContentKeysNotValidAfter>
-        <KeyIdList>
+{authorized_device_info}        <KeyIdList>
 {typed_key_ids}        </KeyIdList>
       </KDMRequiredExtensions>
     </RequiredExtensions>
@@ -1099,6 +1140,12 @@ pub struct RewrapConfig {
     pub valid_from: String,
     /// Empty to preserve the DKDM's ContentKeysNotValidAfter.
     pub valid_to: String,
+    /// Certificates of the playback devices the re-wrapped KDM is restricted to.
+    /// Empty emits the DCI assume-trust thumbprint. The source DKDM's device
+    /// list is never carried over, because it names the DKDM recipient's devices
+    /// rather than the new recipient's.
+    #[serde(default)]
+    pub device_cert_files: Vec<PathBuf>,
 }
 
 /// Re-wrap a DKDM: decrypt its content keys with the DKDM recipient's private
@@ -1182,11 +1229,12 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
     let message_type = parsed.message_type.as_deref().unwrap_or(KDM_MESSAGE_TYPE);
     let content_title = parsed.content_title.as_deref().unwrap_or("");
 
-    // build_kdm_xml reads only the signer identity from the config.
+    // build_kdm_xml reads only the signer identity and the device list from the config.
     let signer_config = KdmConfig {
         signer_cert_file: config.signer_cert_file.clone(),
         signer_key_file: config.signer_key_file.clone(),
         signer_chain_files: config.signer_chain_files.clone(),
+        device_cert_files: config.device_cert_files.clone(),
         ..Default::default()
     };
 
@@ -1761,15 +1809,68 @@ fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
 /// TBSCertificate (the signed portion), not the whole certificate.
 ///
 /// Matches libdcp's `Certificate::thumbprint()`, which hashes
-/// `i2d_re_X509_tbs` output.
+/// `i2d_re_X509_tbs` output. ST 430-2 5.4 says to exclude the DER tag and
+/// length, but libdcp includes them and is what deployed gear agrees with, so
+/// `tbs_der` is expected to be the complete TBSCertificate encoding.
 fn cert_thumbprint(tbs_der: &[u8]) -> [u8; 20] {
     use sha1::Digest;
     sha1::Sha1::digest(tbs_der).into()
 }
 
-/// Identity of the entity issuing a KDM.
+/// Certificate thumbprint of one authorized playback device, base64 encoded as
+/// the ST 430-1 Annex B CertificateThumbprint requires.
+fn read_device_thumbprint(cert_path: &Path) -> Result<String, String> {
+    use base64::Engine;
+    use x509_parser::prelude::*;
+
+    let data = std::fs::read(cert_path)
+        .map_err(|e| format!("cannot read device cert {}: {e}", cert_path.display()))?;
+    let (_, pem) = parse_x509_pem(&data)
+        .map_err(|e| format!("device cert {} is not valid PEM: {e}", cert_path.display()))?;
+    let cert = pem.parse_x509().map_err(|e| {
+        format!(
+            "device cert {} is not valid X.509: {e}",
+            cert_path.display()
+        )
+    })?;
+    Ok(base64::engine::general_purpose::STANDARD
+        .encode(cert_thumbprint(cert.tbs_certificate.as_ref())))
+}
+
+/// Build the AuthorizedDeviceInfo element of ST 430-1 Annex B.
+///
+/// With no device certificates the list carries the DCI assume-trust thumbprint
+/// alone, matching libdcp's unrestricted KDM. An empty DeviceList is not an
+/// option: CertificateThumbprint is minOccurs="1".
+fn build_authorized_device_info(device_cert_files: &[PathBuf]) -> Result<String, String> {
+    let mut thumbprints = Vec::with_capacity(device_cert_files.len());
+    for cert_path in device_cert_files {
+        thumbprints.push(read_device_thumbprint(cert_path)?);
+    }
+    if thumbprints.is_empty() {
+        thumbprints.push(ASSUME_TRUST_THUMBPRINT.to_string());
+    }
+
+    // base64 has no character XML would have to escape
+    let entries: String = thumbprints
+        .iter()
+        .map(|t| format!("            <CertificateThumbprint>{t}</CertificateThumbprint>\n"))
+        .collect();
+
+    Ok(format!(
+        r#"        <AuthorizedDeviceInfo>
+          <DeviceListIdentifier>urn:uuid:{device_list_id}</DeviceListIdentifier>
+          <DeviceList>
+{entries}          </DeviceList>
+        </AuthorizedDeviceInfo>
+"#,
+        device_list_id = uuid::Uuid::new_v4(),
+    ))
+}
+
+/// Identity of the entity issuing a KDM. ST 430-3 types the ETM Signer as
+/// `ds:X509IssuerSerialType`, which carries issuer and serial and no subject.
 struct Signer {
-    subject_dn: String,
     issuer_dn: String,
     serial: String,
     thumbprint: [u8; 20],
@@ -1791,7 +1892,6 @@ fn parse_signer(cert_path: &Path) -> Result<Signer, String> {
     })?;
 
     Ok(Signer {
-        subject_dn: cert.subject().to_string(),
         issuer_dn: cert.issuer().to_string(),
         serial: cert.serial.to_str_radix(10),
         thumbprint: cert_thumbprint(cert.tbs_certificate.as_ref()),
@@ -1951,6 +2051,7 @@ mod tests {
             formulation: "dci-any".to_string(),
             content_keys: Vec::new(),
             format: KdmFormat::Smpte,
+            device_cert_files: vec![],
         }
     }
 
@@ -1972,6 +2073,7 @@ mod tests {
             formulation: "dci-any".to_string(),
             content_keys: Vec::new(),
             format: KdmFormat::Smpte,
+            device_cert_files: vec![],
         }
     }
 
@@ -2616,6 +2718,7 @@ mod tests {
             output_file: out.clone(),
             valid_from: String::new(),
             valid_to: String::new(),
+            device_cert_files: vec![],
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
 
@@ -2671,6 +2774,7 @@ mod tests {
             output_file: out.clone(),
             valid_from: String::new(),
             valid_to: String::new(),
+            device_cert_files: vec![],
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
         let new_ct = parse_kdm_xml(&std::fs::read_to_string(&out).unwrap())
@@ -2705,6 +2809,7 @@ mod tests {
             output_file: dir.path().join("out.xml"),
             valid_from: String::new(),
             valid_to: String::new(),
+            device_cert_files: vec![],
         };
         let err = rewrap_dkdm(&config).expect_err("wrong recipient key must fail");
         assert!(
@@ -2750,6 +2855,7 @@ mod tests {
             output_file: out.clone(),
             valid_from: String::new(),
             valid_to: String::new(),
+            device_cert_files: vec![],
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
         assert!(
@@ -2928,5 +3034,341 @@ mod tests {
         assert!(dump.contains("<redacted>"), "content key not redacted");
         let hex: String = content.iter().map(|b| format!("{b:02x}")).collect();
         assert!(!dump.contains(&hex), "content key leaked into Debug");
+    }
+
+    /// The KDMRequiredExtensions element on its own, as a standalone document
+    /// the ST 430-1 schema can be pointed at directly.
+    fn required_extensions_fragment(kdm_xml: &str) -> String {
+        const END_TAG: &str = "</KDMRequiredExtensions>";
+        let start = kdm_xml
+            .find("<KDMRequiredExtensions")
+            .expect("KDMRequiredExtensions start");
+        let end = kdm_xml.find(END_TAG).expect("KDMRequiredExtensions end") + END_TAG.len();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}\n",
+            &kdm_xml[start..end]
+        )
+    }
+
+    fn thumbprints_in(kdm_xml: &str) -> Vec<String> {
+        kdm_xml
+            .match_indices("<CertificateThumbprint>")
+            .map(|(at, tag)| {
+                let rest = &kdm_xml[at + tag.len()..];
+                let end = rest
+                    .find("</CertificateThumbprint>")
+                    .expect("CertificateThumbprint end");
+                rest[..end].to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn assume_trust_thumbprint_is_the_base64_sha1_of_the_empty_string() {
+        use sha1::Digest;
+        let digest: [u8; 20] = sha1::Sha1::digest(b"").into();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD.encode(digest),
+            ASSUME_TRUST_THUMBPRINT
+        );
+    }
+
+    #[test]
+    fn the_certificate_thumbprint_covers_the_der_header_as_libdcp_does() {
+        use sha1::Digest;
+        use x509_parser::prelude::*;
+
+        let f = fixtures();
+        let data = std::fs::read(&f.root).unwrap();
+        let (_, pem) = parse_x509_pem(&data).unwrap();
+        let cert = pem.parse_x509().unwrap();
+        let tbs = cert.tbs_certificate.as_ref();
+
+        // ST 430-2 5.4 says to exclude the DER tag and length; libdcp includes
+        // them and deployed gear agrees with libdcp, so the slice hashed here
+        // must be the complete TBSCertificate encoding.
+        assert_eq!(tbs[0], 0x30, "hashed slice must start at the SEQUENCE tag");
+        assert_eq!(tbs[1] & 0x80, 0x80, "expected a long-form DER length");
+        let length_bytes = (tbs[1] & 0x7f) as usize;
+        let header_len = 2 + length_bytes;
+        let body_len = tbs[2..header_len]
+            .iter()
+            .fold(0usize, |acc, byte| (acc << 8) | *byte as usize);
+        assert_eq!(
+            tbs.len(),
+            header_len + body_len,
+            "hashed slice must be header plus body, not the body alone"
+        );
+
+        let listed = base64::engine::general_purpose::STANDARD
+            .decode(read_device_thumbprint(&f.root).expect("device thumbprint"))
+            .expect("base64");
+        assert_eq!(
+            listed,
+            parse_signer(&f.root).expect("parse signer").thumbprint,
+            "the device list and the 138-byte key block must carry one thumbprint"
+        );
+
+        let without_header: [u8; 20] = sha1::Sha1::digest(&tbs[header_len..]).into();
+        assert_ne!(
+            listed.as_slice(),
+            without_header.as_slice(),
+            "the two readings must differ, else this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn every_kdm_carries_an_authorized_device_info() {
+        let f = fixtures();
+        for format in [KdmFormat::Smpte, KdmFormat::Interop] {
+            let mut config = test_config(f, PathBuf::from("unused"));
+            config.format = format;
+            let kdm = build_kdm(&config).expect("build");
+
+            assert!(
+                kdm.xml.contains("<AuthorizedDeviceInfo>"),
+                "{format:?} KDM must carry AuthorizedDeviceInfo"
+            );
+            assert!(
+                kdm.xml.contains("<DeviceListIdentifier>urn:uuid:"),
+                "{format:?} DeviceListIdentifier must be a urn:uuid"
+            );
+            assert!(
+                !thumbprints_in(&kdm.xml).is_empty(),
+                "{format:?} DeviceList must not be empty"
+            );
+        }
+    }
+
+    #[test]
+    fn authorized_device_info_sits_between_the_validity_window_and_the_key_list() {
+        let f = fixtures();
+        let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
+
+        let not_after = kdm.xml.find("<ContentKeysNotValidAfter>").expect("not after");
+        let device_info = kdm.xml.find("<AuthorizedDeviceInfo>").expect("device info");
+        let key_id_list = kdm.xml.find("<KeyIdList>").expect("key id list");
+        assert!(
+            not_after < device_info && device_info < key_id_list,
+            "ST 430-1 fixes this sequence order"
+        );
+    }
+
+    #[test]
+    fn the_default_device_list_is_the_assume_trust_thumbprint_alone() {
+        let f = fixtures();
+        let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
+        assert_eq!(
+            thumbprints_in(&kdm.xml),
+            vec![ASSUME_TRUST_THUMBPRINT.to_string()],
+            "assume-trust only works when nothing else is listed"
+        );
+    }
+
+    #[test]
+    fn supplied_devices_replace_the_assume_trust_thumbprint() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.device_cert_files = vec![f.signer.clone(), f.intermediate.clone()];
+        let kdm = build_kdm(&config).expect("build");
+
+        let listed = thumbprints_in(&kdm.xml);
+        let expected = vec![
+            read_device_thumbprint(&f.signer).unwrap(),
+            read_device_thumbprint(&f.intermediate).unwrap(),
+        ];
+        assert_eq!(listed, expected, "each device contributes its own thumbprint");
+        assert!(
+            !listed.contains(&ASSUME_TRUST_THUMBPRINT.to_string()),
+            "mixing assume-trust with a real device disables the device restriction"
+        );
+    }
+
+    #[test]
+    fn a_device_cert_that_cannot_be_read_fails_loud() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.device_cert_files = vec![PathBuf::from("/nonexistent/device.pem")];
+        let err = build_kdm(&config).expect_err("must not build with an unreadable device cert");
+        assert!(err.contains("cannot read device cert"), "got: {err}");
+    }
+
+    #[test]
+    fn a_rewrapped_kdm_carries_its_own_device_list() {
+        let f = fixtures();
+        let src_keys = vec![KdmKey {
+            key_type: *b"MDIK",
+            key_id: uuid::Uuid::new_v4(),
+            content_key: [7u8; 16],
+        }];
+        let dkdm_xml = build_stand_in_dkdm(f, &f.signer, &src_keys);
+
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        std::fs::write(&dkdm_path, &dkdm_xml).unwrap();
+
+        let config = RewrapConfig {
+            dkdm_file: dkdm_path,
+            dkdm_recipient_key_file: f.signer_key.clone(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            signer_chain_files: vec![],
+            output_file: dir.path().join("rewrapped.kdm.xml"),
+            valid_from: String::new(),
+            valid_to: String::new(),
+            device_cert_files: vec![f.intermediate.clone()],
+        };
+        let rewrapped = rewrap_dkdm(&config).expect("rewrap");
+        assert_eq!(
+            thumbprints_in(&rewrapped.xml),
+            vec![read_device_thumbprint(&f.intermediate).unwrap()]
+        );
+    }
+
+    /// Path to the vendored ST 430-1 KDM schema and the catalog that maps the
+    /// two W3C imports to their local copies.
+    fn kdm_schema() -> (PathBuf, PathBuf) {
+        let schemas = Path::new(env!("CARGO_MANIFEST_DIR")).join("schemas");
+        (
+            schemas.join("SMPTE-430-1-2006-KDM.xsd"),
+            schemas.join("catalog.xml"),
+        )
+    }
+
+    /// Validate one KDMRequiredExtensions document against the vendored schema.
+    fn xmllint_kdm_schema(fragment_path: &Path) -> std::process::Output {
+        let (schema, catalog) = kdm_schema();
+        std::process::Command::new("xmllint")
+            .env("XML_CATALOG_FILES", &catalog)
+            .args(["--nonet", "--noout", "--schema"])
+            .arg(&schema)
+            .arg(fragment_path)
+            .output()
+            .expect("run xmllint")
+    }
+
+    /// The generated KDMRequiredExtensions against the vendored ST 430-1 schema,
+    /// in both the assume-trust and the listed-device form.
+    #[test]
+    fn kdm_required_extensions_pass_the_st_430_1_xsd() {
+        if !xmllint_available() {
+            eprintln!("skipping: xmllint not installed");
+            return;
+        }
+
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        for (label, devices) in [
+            ("assume-trust", vec![]),
+            ("devices", vec![f.signer.clone(), f.intermediate.clone()]),
+        ] {
+            let mut config = test_config(f, PathBuf::from("unused"));
+            config.device_cert_files = devices;
+            let kdm = build_kdm(&config).expect("build");
+
+            let path = dir.path().join(format!("{label}.xml"));
+            std::fs::write(&path, required_extensions_fragment(&kdm.xml)).unwrap();
+            let out = xmllint_kdm_schema(&path);
+            assert!(
+                out.status.success(),
+                "the {label} KDM must pass the ST 430-1 XSD:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// Real Doremi-signed KDMs through the same extraction and schema, which is
+    /// what proves the schema handling is not merely self-consistent. Gated on
+    /// POSTKIT_SAMPLE_KDMS, a directory of .xml KDMs.
+    #[test]
+    fn real_kdms_pass_the_same_schema() {
+        let Ok(sample_dir) = std::env::var("POSTKIT_SAMPLE_KDMS") else {
+            eprintln!("skipping: set POSTKIT_SAMPLE_KDMS to a directory of real KDMs");
+            return;
+        };
+        if !xmllint_available() {
+            eprintln!("skipping: xmllint not installed");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&sample_dir).expect("read sample dir") {
+            let source = entry.expect("dir entry").path();
+            if source.extension().is_none_or(|e| e != "xml") {
+                continue;
+            }
+            let xml = std::fs::read_to_string(&source).expect("read sample KDM");
+            if !xml.contains("<KDMRequiredExtensions") {
+                continue;
+            }
+
+            let path = dir.path().join(format!("sample{checked}.xml"));
+            std::fs::write(&path, required_extensions_fragment(&xml)).unwrap();
+            let out = xmllint_kdm_schema(&path);
+            assert!(
+                out.status.success(),
+                "real KDM {} must pass the ST 430-1 XSD:\n{}",
+                source.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "POSTKIT_SAMPLE_KDMS held no KDM to check");
+    }
+
+    #[test]
+    fn generated_certificate_serials_fit_the_st_430_2_cap() {
+        use x509_parser::prelude::*;
+
+        let f = fixtures();
+        for cert_path in [&f.root, &f.intermediate, &f.signer] {
+            let data = std::fs::read(cert_path).unwrap();
+            let (_, pem) = parse_x509_pem(&data).unwrap();
+            let cert = pem.parse_x509().unwrap();
+            let decimal = cert.serial.to_str_radix(10);
+
+            // ST 430-2 5.2 caps the serial at an unsigned 64-bit value and DCI
+            // CTP 2.1.4 fails anything larger.
+            decimal.parse::<u64>().unwrap_or_else(|e| {
+                panic!("{} has serial {decimal}, which does not fit 64 bits: {e}", cert_path.display())
+            });
+            assert_ne!(decimal, "0", "{} has a zero serial", cert_path.display());
+        }
+    }
+
+    #[test]
+    fn the_signer_is_an_issuer_and_serial_pair_with_no_subject() {
+        let f = fixtures();
+        let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
+        let signer_start = kdm.xml.find("<Signer ").expect("Signer");
+        let signer_end = kdm.xml.find("</Signer>").expect("Signer end");
+        let signer = &kdm.xml[signer_start..signer_end];
+
+        assert!(signer.contains("<ds:X509IssuerName>"));
+        assert!(signer.contains("<ds:X509SerialNumber>"));
+        assert!(
+            !signer.contains("X509SubjectName"),
+            "ST 430-3 types Signer as ds:X509IssuerSerialType, which has no subject: {signer}"
+        );
+    }
+
+    #[test]
+    fn the_recipient_keeps_its_subject_name_beside_the_issuer_serial() {
+        let f = fixtures();
+        let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
+        let issuer_serial_end = kdm
+            .xml
+            .find("</X509IssuerSerial>")
+            .expect("X509IssuerSerial end");
+        let subject = kdm
+            .xml
+            .find("<X509SubjectName>")
+            .expect("recipient X509SubjectName");
+        assert!(
+            subject > issuer_serial_end,
+            "X509SubjectName is a sibling of X509IssuerSerial, not a child of it"
+        );
     }
 }

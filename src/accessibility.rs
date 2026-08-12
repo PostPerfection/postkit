@@ -29,9 +29,10 @@ const IMF_CORE_CONSTRAINTS_NAMESPACES: [&str; 2] = [
 /// both are caption tracks a viewer selects.
 const CAPTION_SEQUENCE_NAMES: [&str; 2] = ["HearingImpairedCaptionsSequence", "CDPSequence"];
 
-/// ST 2067-2 VisuallyImpairedTextSequence carries text a renderer speaks for
-/// visually impaired viewers. That is not the VI-N narration channel, so it is
-/// worth reporting but settles no track.
+/// Appended to the AudioDescription evidence, because a
+/// VisuallyImpairedTextSequence is not the VI-N narration channel and settles
+/// nothing about it. The text track is reported on its own as
+/// VisuallyImpairedText.
 const VISUALLY_IMPAIRED_TEXT_NOTE: &str = ", and a VisuallyImpairedTextSequence was read, which carries text rather than a narration channel";
 
 /// ISDCF Doc 13 §5.2 requires this MCA tag symbol on the sound channel carrying
@@ -49,13 +50,14 @@ const VISUALLY_IMPAIRED_CHANNEL_TOKEN: &str = "VIN";
 /// MainSoundConfiguration writes silent fill channels as this placeholder.
 const SILENT_CHANNEL_TOKEN: &str = "-";
 
-const ALL_TRACKS: [AccessibilityTrack; 6] = [
+const ALL_TRACKS: [AccessibilityTrack; 7] = [
     AccessibilityTrack::AudioDescription,
     AccessibilityTrack::HearingImpaired,
     AccessibilityTrack::SignLanguage,
     AccessibilityTrack::OpenCaptions,
     AccessibilityTrack::ClosedCaptions,
     AccessibilityTrack::Commentary,
+    AccessibilityTrack::VisuallyImpairedText,
 ];
 
 /// Accessibility standard to check against.
@@ -71,8 +73,10 @@ pub enum AccessibilityStandard {
     Ofcom,
 }
 
-/// Accessibility track type.
+/// Accessibility track type. Non-exhaustive, because a new standard or a new
+/// schema revision can name a track this list does not have yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum AccessibilityTrack {
     /// Visually-impaired narration carried as a sound channel, declared as the
     /// VI-N channel of the ST 429-16 MainSoundConfiguration.
@@ -93,6 +97,16 @@ pub enum AccessibilityTrack {
     /// declares one, and commentary can also ride an ordinary audio track, so
     /// this is never reported absent.
     Commentary,
+    /// Timed text describing the picture for visually impaired viewers,
+    /// declared as an ST 2067-2 VisuallyImpairedTextSequence.
+    ///
+    /// Deliberately not AudioDescription, and the two must not be merged. This
+    /// is text a renderer speaks aloud at playback, while AudioDescription is a
+    /// narration channel already carried as audio in the sound essence. They
+    /// are declared by different structures, and a package can carry either one
+    /// without the other, so reading one as the other would report a track the
+    /// package does not have.
+    VisuallyImpairedText,
 }
 
 /// Severity of an accessibility finding.
@@ -173,8 +187,9 @@ impl AccessibilityResult {
 /// asset under a reel's AssetList, the HI and VI-N channel labels of the
 /// ST 429-16 MainSoundConfiguration, and the ISDCF Doc 13 sign-language
 /// ExtensionMetadata scope. From an IMF CPL: the ST 2067-2
-/// HearingImpairedCaptionsSequence, CDPSequence and CommentarySequence elements
-/// under a ST 2067-3 SequenceList, in either the 2016 or the 2020 namespace.
+/// HearingImpairedCaptionsSequence, CDPSequence, CommentarySequence and
+/// VisuallyImpairedTextSequence elements under a ST 2067-3 SequenceList, in
+/// either the 2016 or the 2020 namespace.
 ///
 /// When no composition declares a MainSoundConfiguration, the sound MXF headers
 /// are opened and the sound tracks are settled from their ST 377-4 MCA label
@@ -559,6 +574,7 @@ fn detect_track(track: AccessibilityTrack, evidence: &PackageEvidence) -> TrackD
             "captions burned into the picture are not declared anywhere in a package".to_string(),
         ),
         AccessibilityTrack::Commentary => commentary_status(evidence),
+        AccessibilityTrack::VisuallyImpairedText => visually_impaired_text_status(evidence),
     };
     TrackDetection {
         track,
@@ -618,6 +634,33 @@ fn commentary_status(evidence: &PackageEvidence) -> (TrackStatus, String) {
     (
         TrackStatus::Undeterminable,
         "only an ST 2067-2 CommentarySequence declares commentary, and commentary can also ride an ordinary audio track, so its absence settles nothing".to_string(),
+    )
+}
+
+/// Only an IMF SequenceList can declare this track, so a DCP composition leaves
+/// it undeterminable however completely it describes its reels.
+fn visually_impaired_text_status(evidence: &PackageEvidence) -> (TrackStatus, String) {
+    if evidence.visually_impaired_text_sequences > 0 {
+        return (
+            TrackStatus::Present,
+            format!(
+                "{} ST 2067-2 VisuallyImpairedTextSequence element(s) under a SequenceList",
+                evidence.visually_impaired_text_sequences
+            ),
+        );
+    }
+    if evidence.sequence_lists > 0 {
+        return (
+            TrackStatus::Absent,
+            format!(
+                "no VisuallyImpairedTextSequence in the {} SequenceList read",
+                evidence.sequence_lists
+            ),
+        );
+    }
+    (
+        TrackStatus::Undeterminable,
+        "only an ST 2067-2 VisuallyImpairedTextSequence declares this track, and no SequenceList could be read".to_string(),
     )
 }
 
@@ -768,6 +811,11 @@ fn requirement(standard: AccessibilityStandard, track: AccessibilityTrack) -> Re
             "COM-1",
             "Commentary track",
             "Confirm the commentary track against the source deliverable",
+        ),
+        AccessibilityTrack::VisuallyImpairedText => (
+            "VIT-1",
+            "Visually impaired text track",
+            "Add an ST 2067-2 VisuallyImpairedTextSequence to the composition",
         ),
     };
     Requirement {
@@ -1435,6 +1483,66 @@ mod tests {
             detection.evidence.contains("VisuallyImpairedTextSequence"),
             "evidence should say why the text track settles nothing: {}",
             detection.evidence
+        );
+        assert_eq!(
+            result.track_status(AccessibilityTrack::VisuallyImpairedText),
+            TrackStatus::Present,
+            "the sequence settles its own track"
+        );
+    }
+
+    #[test]
+    fn visually_impaired_text_is_read_from_its_sequence_in_both_schema_revisions() {
+        for namespace in [IMF_2016_NAMESPACE, IMF_2020_NAMESPACE] {
+            let dir = package(&imf_cpl(
+                namespace,
+                "Feature",
+                &sequence("cc", "VisuallyImpairedTextSequence"),
+                "",
+            ));
+            assert_eq!(
+                status(dir.path(), AccessibilityTrack::VisuallyImpairedText),
+                TrackStatus::Present,
+                "{namespace}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sequence_list_without_the_text_sequence_reports_it_absent() {
+        let dir = package(&imf_cpl(IMF_2016_NAMESPACE, "Feature", "", ""));
+        assert_eq!(
+            status(dir.path(), AccessibilityTrack::VisuallyImpairedText),
+            TrackStatus::Absent
+        );
+    }
+
+    #[test]
+    fn visually_impaired_text_in_a_foreign_namespace_is_not_a_track() {
+        let dir = package(&imf_cpl(
+            IMF_2016_NAMESPACE,
+            "Feature",
+            &sequence("vendor", "VisuallyImpairedTextSequence"),
+            "",
+        ));
+        assert_eq!(
+            status(dir.path(), AccessibilityTrack::VisuallyImpairedText),
+            TrackStatus::Absent
+        );
+    }
+
+    #[test]
+    fn a_dcp_composition_leaves_visually_impaired_text_undeterminable() {
+        // no DCP structure declares the ST 2067-2 sequence, so a fully described
+        // reel is not evidence that the track is missing
+        let dir = package(&cpl(
+            "Feature",
+            Some("51/L,R,C,LFE,Ls,Rs,HI,VIN"),
+            CLOSED_CAPTION_ASSET,
+        ));
+        assert_eq!(
+            status(dir.path(), AccessibilityTrack::VisuallyImpairedText),
+            TrackStatus::Undeterminable
         );
     }
 

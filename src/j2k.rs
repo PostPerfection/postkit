@@ -307,18 +307,14 @@ fn count_tile_parts(data: &[u8]) -> u32 {
     count
 }
 
-/// Compute DCI max bitrate for a given resolution.
-pub fn dci_max_bitrate_mbps(width: u32) -> f64 {
-    if width > 2048 {
-        500.0 // 4K
-    } else {
-        250.0 // 2K
-    }
-}
+/// DCI maximum bit rate for J2K picture essence, in Mb/s.
+///
+/// No 4K branch on purpose: DCSS 4.3.3 caps a 4K frame at the same 1,302,083
+/// bytes as 24 fps 2K, and the 500 widely used for 4K has no source.
+pub const DCI_MAX_BITRATE_MBPS: f64 = 250.0;
 
 /// Analyse bitrate of a sequence of J2K files.
-pub fn analyse_bitrate(j2k_files: &[std::path::PathBuf], fps: f64, width: u32) -> BitrateAnalysis {
-    let max_allowed = dci_max_bitrate_mbps(width);
+pub fn analyse_bitrate(j2k_files: &[std::path::PathBuf], fps: f64) -> BitrateAnalysis {
     let mut frames = Vec::with_capacity(j2k_files.len());
     let mut total_bits = 0u64;
     let mut max_bps = 0.0f64;
@@ -343,7 +339,7 @@ pub fn analyse_bitrate(j2k_files: &[std::path::PathBuf], fps: f64, width: u32) -
         if mbps < min_bps {
             min_bps = mbps;
         }
-        if mbps > max_allowed {
+        if mbps > DCI_MAX_BITRATE_MBPS {
             over_limit.push(fb.clone());
         }
         frames.push(fb);
@@ -365,7 +361,7 @@ pub fn analyse_bitrate(j2k_files: &[std::path::PathBuf], fps: f64, width: u32) -
         avg_bitrate_mbps: avg,
         max_bitrate_mbps: max_bps,
         min_bitrate_mbps: min_bps,
-        dci_max_mbps: max_allowed,
+        dci_max_mbps: DCI_MAX_BITRATE_MBPS,
         dci_compliant: over_limit.is_empty(),
         over_limit_frames: over_limit,
     }
@@ -377,7 +373,7 @@ pub fn read_mxf_j2k_frame(path: &Path, frame: u32) -> Result<Vec<u8>, String> {
     let s = path.to_str().ok_or("non-UTF-8 MXF path")?;
     let mut reader = asdcplib::jp2k::MxfReader::new();
     reader.open_read(s).map_err(|e| format!("open MXF: {e}"))?;
-    // DCI caps a frame near 1.3 MB (2K) / 2.6 MB (4K); 16 MiB is safe headroom.
+    // DCI caps a frame at 1,302,083 bytes, 2K and 4K alike; 16 MiB is headroom.
     let mut buf = vec![0u8; 16 * 1024 * 1024];
     let n = reader
         .read_frame(frame, &mut buf, None, None)
@@ -485,9 +481,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dci_limits() {
-        assert_eq!(dci_max_bitrate_mbps(2048), 250.0);
-        assert_eq!(dci_max_bitrate_mbps(4096), 500.0);
+    fn the_dci_limit_matches_the_dcss_per_frame_byte_caps() {
+        // DCSS 4.3.3 states the cap as bytes per frame, not a rate: 1,302,083 at
+        // 24 fps for 2K and 4K alike, and 651,041 at 48 fps.
+        for (bytes_per_frame, fps) in [(1_302_083.0, 24.0), (651_041.0, 48.0)] {
+            let mbps = bytes_per_frame * fps * 8.0 / 1_000_000.0;
+            assert!((mbps - DCI_MAX_BITRATE_MBPS).abs() < 0.001);
+        }
     }
 
     #[test]
