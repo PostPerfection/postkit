@@ -99,9 +99,9 @@ impl Default for ConformOptions {
     }
 }
 
-/// Parse a timeline file. EDL (CMX 3600) and FCP7/Resolve XML (xmeml) are
-/// parsed for real. AAF fails loud (binary format, out of scope). OTIO lives in
-/// the otioz_import module.
+/// Parse a timeline file. EDL (CMX 3600), FCP7/Resolve XML (xmeml) and FCP X
+/// fcpxml are parsed for real. AAF fails loud (binary format, out of scope).
+/// OTIO lives in the otioz_import module.
 pub fn parse_timeline(file: &Path) -> Result<Timeline, ConformError> {
     match detect_timeline_format(file) {
         TimelineFormat::EdlCmx3600 => Ok(parse_edl(file)),
@@ -131,19 +131,18 @@ struct ClipAccum {
 }
 
 /// Parse an XML timeline. Handles the FCP7 / DaVinci Resolve XML interchange
-/// (xmeml), whose integer frame counts map directly onto EditEvent. FCP X
-/// fcpxml uses rational-time strings and is not supported.
+/// (xmeml), whose integer frame counts map directly onto EditEvent, and FCP X
+/// fcpxml, whose rational-second times are converted to frames with the
+/// sequence frame rate.
 fn parse_xml_timeline(file: &Path) -> Result<Timeline, ConformError> {
     let content = std::fs::read_to_string(file)?;
     if content.contains("<xmeml") {
         parse_xmeml(&content)
     } else if content.contains("<fcpxml") {
-        Err(ConformError::Unsupported(
-            "FCPXML (Final Cut Pro X) not supported; export as FCP7 XML (xmeml)".to_string(),
-        ))
+        parse_fcpxml(&content)
     } else {
         Err(ConformError::Xml(
-            "not a recognised XML timeline (expected an <xmeml> root)".to_string(),
+            "not a recognised XML timeline (expected an <xmeml> or <fcpxml> root)".to_string(),
         ))
     }
 }
@@ -273,6 +272,226 @@ fn parse_xmeml(content: &str) -> Result<Timeline, ConformError> {
         return Err(ConformError::NoEvents);
     }
     Ok(timeline)
+}
+
+const FCPXML_FALLBACK_FRAME_RATE: f64 = 24.0;
+const UNNAMED_REEL_NAME: &str = "AX";
+
+/// An `<asset>` declared in an fcpxml `<resources>` block.
+#[derive(Default)]
+struct FcpxmlAsset {
+    name: String,
+    has_video: bool,
+    has_audio: bool,
+}
+
+/// A clip on the primary storyline, times kept as raw rational-second strings
+/// until the sequence frame rate is known.
+struct FcpxmlClip {
+    element_name: String,
+    asset_reference: String,
+    clip_name: String,
+    offset: String,
+    duration: String,
+    start: String,
+    /// srcEnable: "all", "audio" or "video".
+    enabled_sources: String,
+}
+
+/// Parse an fcpxml rational-second time ("0s", "5s", "1001/24000s") to seconds.
+fn parse_fcpxml_seconds(value: &str) -> Option<f64> {
+    let value = value.trim().strip_suffix('s')?;
+    match value.split_once('/') {
+        Some((numerator, denominator)) => {
+            let numerator: f64 = numerator.trim().parse().ok()?;
+            let denominator: f64 = denominator.trim().parse().ok()?;
+            if denominator == 0.0 {
+                return None;
+            }
+            Some(numerator / denominator)
+        }
+        None => value.parse().ok(),
+    }
+}
+
+fn seconds_to_frames(seconds: f64, frame_rate: f64) -> u32 {
+    (seconds * frame_rate).round() as u32
+}
+
+fn attribute(element: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+    element.attributes().flatten().find_map(|a| {
+        if local_name(a.key.as_ref()) != name {
+            return None;
+        }
+        a.unescape_value().ok().map(|v| v.into_owned())
+    })
+}
+
+fn attribute_flag(element: &quick_xml::events::BytesStart, name: &str) -> bool {
+    attribute(element, name).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn parse_fcpxml(content: &str) -> Result<Timeline, ConformError> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+    use std::collections::HashMap;
+
+    let mut reader = Reader::from_str(content);
+    let mut frame_rate_by_format_id: HashMap<String, f64> = HashMap::new();
+    let mut asset_by_id: HashMap<String, FcpxmlAsset> = HashMap::new();
+    let mut clips: Vec<FcpxmlClip> = Vec::new();
+    let mut sequence_format_id = String::new();
+    let mut title = String::new();
+    let mut depth: usize = 0;
+    let mut spine_depth: Option<usize> = None;
+    let mut spine_seen = false;
+    // compound clips are defined in <resources> with a spine of their own
+    let mut resources_depth: Option<usize> = None;
+
+    loop {
+        let event = reader
+            .read_event()
+            .map_err(|e| ConformError::Xml(e.to_string()))?;
+
+        if let Event::Start(element) | Event::Empty(element) = &event {
+            let name = local_name(element.name().as_ref());
+            match name.as_str() {
+                "format" => {
+                    if let (Some(id), Some(rate)) = (
+                        attribute(element, "id"),
+                        attribute(element, "frameDuration")
+                            .as_deref()
+                            .and_then(parse_fcpxml_seconds)
+                            .filter(|seconds| *seconds > 0.0)
+                            .map(|seconds| 1.0 / seconds),
+                    ) {
+                        frame_rate_by_format_id.insert(id, rate);
+                    }
+                }
+                "asset" => {
+                    if let Some(id) = attribute(element, "id") {
+                        asset_by_id.insert(
+                            id,
+                            FcpxmlAsset {
+                                name: attribute(element, "name").unwrap_or_default(),
+                                has_video: attribute_flag(element, "hasVideo"),
+                                has_audio: attribute_flag(element, "hasAudio"),
+                            },
+                        );
+                    }
+                }
+                "project" => {
+                    if title.is_empty() {
+                        title = attribute(element, "name").unwrap_or_default();
+                    }
+                }
+                "resources" => {
+                    if resources_depth.is_none() && matches!(&event, Event::Start(_)) {
+                        resources_depth = Some(depth);
+                    }
+                }
+                "sequence" => {
+                    if resources_depth.is_none() && sequence_format_id.is_empty() {
+                        sequence_format_id = attribute(element, "format").unwrap_or_default();
+                    }
+                }
+                "spine" => {
+                    if resources_depth.is_none() && !spine_seen && matches!(&event, Event::Start(_))
+                    {
+                        spine_seen = true;
+                        spine_depth = Some(depth);
+                    }
+                }
+                "asset-clip" | "video" | "audio"
+                    if spine_depth.is_some_and(|spine| depth == spine + 1) =>
+                {
+                    clips.push(FcpxmlClip {
+                        element_name: name,
+                        asset_reference: attribute(element, "ref").unwrap_or_default(),
+                        clip_name: attribute(element, "name").unwrap_or_default(),
+                        offset: attribute(element, "offset").unwrap_or_default(),
+                        duration: attribute(element, "duration").unwrap_or_default(),
+                        start: attribute(element, "start").unwrap_or_default(),
+                        enabled_sources: attribute(element, "srcEnable").unwrap_or_default(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        match event {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if spine_depth == Some(depth) {
+                    spine_depth = None;
+                }
+                if resources_depth == Some(depth) {
+                    resources_depth = None;
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    let frame_rate = frame_rate_by_format_id
+        .get(&sequence_format_id)
+        .copied()
+        .unwrap_or(FCPXML_FALLBACK_FRAME_RATE);
+
+    let events = clips
+        .iter()
+        .enumerate()
+        .map(|(index, clip)| {
+            let asset = asset_by_id.get(&clip.asset_reference);
+            let seconds = |value: &str| parse_fcpxml_seconds(value).unwrap_or(0.0);
+            let record_in = seconds_to_frames(seconds(&clip.offset), frame_rate);
+            let source_in = seconds_to_frames(seconds(&clip.start), frame_rate);
+            let length = seconds_to_frames(seconds(&clip.duration), frame_rate);
+            let reel_name = [
+                asset.map(|a| a.name.as_str()).unwrap_or_default(),
+                clip.clip_name.as_str(),
+                clip.asset_reference.as_str(),
+            ]
+            .into_iter()
+            .find(|candidate| !candidate.is_empty())
+            .unwrap_or(UNNAMED_REEL_NAME)
+            .to_string();
+            let track_type = match clip.element_name.as_str() {
+                "video" => "V",
+                "audio" => "A",
+                _ => match (clip.enabled_sources.as_str(), asset) {
+                    ("audio", _) => "A",
+                    ("video", _) => "V",
+                    (_, Some(a)) if a.has_audio && !a.has_video => "A",
+                    _ => "V",
+                },
+            };
+            EditEvent {
+                event_number: index as u32 + 1,
+                reel_name,
+                track_type: track_type.to_string(),
+                source_in,
+                source_out: source_in + length,
+                record_in,
+                record_out: record_in + length,
+                transition: "CUT".to_string(),
+                comment: String::new(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if events.is_empty() {
+        return Err(ConformError::NoEvents);
+    }
+
+    Ok(Timeline {
+        title,
+        frame_rate,
+        format: TimelineFormat::XmlFcpx,
+        events,
+    })
 }
 
 /// Parse a CMX 3600 EDL file.
@@ -553,19 +772,189 @@ mod tests {
         assert!(matches!(err, ConformError::AafNotImplemented));
     }
 
-    #[test]
-    fn test_parse_fcpxml_unsupported() {
+    fn write_timeline(name: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("proj.fcpxml");
-        std::fs::write(
-            &path,
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn test_parse_fcpxml_seconds() {
+        assert_eq!(parse_fcpxml_seconds("0s"), Some(0.0));
+        assert_eq!(parse_fcpxml_seconds("5s"), Some(5.0));
+        assert_eq!(parse_fcpxml_seconds("100/2400s"), Some(1.0 / 24.0));
+        let ntsc = parse_fcpxml_seconds("1001/24000s").unwrap();
+        assert!((ntsc - 1001.0 / 24000.0).abs() < 1e-12);
+        assert_eq!(parse_fcpxml_seconds("1/0s"), None);
+        assert_eq!(parse_fcpxml_seconds("notatime"), None);
+        assert_eq!(parse_fcpxml_seconds("12"), None);
+        assert_eq!(parse_fcpxml_seconds(""), None);
+    }
+
+    #[test]
+    fn test_parse_fcpxml() {
+        // 24 fps sequence. Clip one sits at 1s for 5s, sourced from 150s in.
+        // Clip two sits at 7s for 3s with no explicit source start.
+        let (_dir, path) = write_timeline(
+            "proj.fcpxml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" name="FFVideoFormat1080p24" frameDuration="100/2400s" width="1920" height="1080"/>
+    <asset id="r2" name="REEL001" start="0s" duration="3600/24s" hasVideo="1" hasAudio="1" format="r1">
+      <media-rep kind="original-media" src="file:///media/REEL001.mov"/>
+    </asset>
+    <asset id="r3" name="REEL002" start="0s" duration="1200/24s" hasVideo="1" format="r1"/>
+    <media id="r4" name="Compound Clip">
+      <sequence format="r1" duration="48/24s">
+        <spine>
+          <asset-clip ref="r3" offset="0s" name="Nested" duration="48/24s"/>
+        </spine>
+      </sequence>
+    </media>
+  </resources>
+  <library>
+    <event name="Test Event">
+      <project name="My FCPX Cut">
+        <sequence format="r1" duration="240/24s" tcStart="0s" tcFormat="NDF">
+          <spine>
+            <gap name="Gap" offset="0s" duration="24/24s"/>
+            <asset-clip ref="r2" offset="24/24s" name="Clip One" start="3600/24s" duration="120/24s" format="r1"/>
+            <title name="Card" offset="144/24s" duration="24/24s"/>
+            <asset-clip ref="r3" offset="168/24s" name="Clip Two" duration="72/24s" format="r1"/>
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert_eq!(tl.format, TimelineFormat::XmlFcpx);
+        assert_eq!(tl.title, "My FCPX Cut");
+        assert_eq!(tl.frame_rate, 24.0);
+        assert_eq!(tl.events.len(), 2);
+
+        assert_eq!(tl.events[0].event_number, 1);
+        assert_eq!(tl.events[0].reel_name, "REEL001");
+        assert_eq!(tl.events[0].track_type, "V");
+        assert_eq!(tl.events[0].transition, "CUT");
+        assert_eq!(tl.events[0].record_in, 24);
+        assert_eq!(tl.events[0].record_out, 144);
+        assert_eq!(tl.events[0].source_in, 3600);
+        assert_eq!(tl.events[0].source_out, 3720);
+
+        assert_eq!(tl.events[1].event_number, 2);
+        assert_eq!(tl.events[1].reel_name, "REEL002");
+        assert_eq!(tl.events[1].record_in, 168);
+        assert_eq!(tl.events[1].record_out, 240);
+        assert_eq!(tl.events[1].source_in, 0);
+        assert_eq!(tl.events[1].source_out, 72);
+    }
+
+    #[test]
+    fn test_parse_fcpxml_track_types() {
+        let (_dir, path) = write_timeline(
+            "av.fcpxml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.11">
+  <resources>
+    <format id="r1" frameDuration="1001/24000s" width="1920" height="1080"/>
+    <asset id="r2" name="PICTURE" hasVideo="1" videoSources="1" format="r1">
+      <media-rep kind="original-media" src="file:///media/PICTURE.mov"/>
+    </asset>
+    <asset id="r3" name="DIALOGUE" hasAudio="1" audioSources="1" audioChannels="2" audioRate="48000">
+      <media-rep kind="original-media" src="file:///media/DIALOGUE.wav"/>
+    </asset>
+    <asset id="r4" name="SYNC_TAKE" hasVideo="1" hasAudio="1" audioSources="1" format="r1">
+      <media-rep kind="original-media" src="file:///media/SYNC_TAKE.mov"/>
+    </asset>
+  </resources>
+  <project name="AV Cut">
+    <sequence format="r1" duration="168168/24000s" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
+      <spine>
+        <asset-clip ref="r2" offset="0s" name="Picture" duration="48048/24000s"/>
+        <asset-clip ref="r3" offset="48048/24000s" name="Dialogue" duration="48048/24000s"/>
+        <audio ref="r3" offset="96096/24000s" name="Room Tone" duration="24024/24000s" role="dialogue"/>
+        <video ref="r2" offset="120120/24000s" name="Insert" duration="24024/24000s"/>
+        <asset-clip ref="r4" offset="144144/24000s" name="Wild Track" duration="24024/24000s" srcEnable="audio"/>
+      </spine>
+    </sequence>
+  </project>
+</fcpxml>"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert_eq!(tl.title, "AV Cut");
+        assert!((tl.frame_rate - 24000.0 / 1001.0).abs() < 1e-9);
+        let track_types: Vec<&str> = tl.events.iter().map(|e| e.track_type.as_str()).collect();
+        assert_eq!(track_types, vec!["V", "A", "A", "V", "A"]);
+        assert_eq!(tl.events[2].reel_name, "DIALOGUE");
+        assert_eq!(tl.events[2].record_in, 96);
+        assert_eq!(tl.events[2].record_out, 120);
+        assert_eq!(tl.events[4].reel_name, "SYNC_TAKE");
+    }
+
+    #[test]
+    fn test_parse_fcpxml_resolve_export() {
+        // FCPXML 1.8 shape: src on the asset itself, unreduced "0/1s" times.
+        // 30 fps, so 3600s = 108000 frames and 301/30s = 301 frames.
+        let (_dir, path) = write_timeline(
+            "resolve.fcpxml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.8">
+  <resources>
+    <format name="FFVideoFormat1080p30" frameDuration="1/30s" id="r0" height="1080" width="1920"/>
+    <asset hasVideo="1" name="demo.mp4" hasAudio="1" audioSources="1" audioChannels="1" id="r1" duration="301/30s" start="0/1s" src="file:///media/V1-0001_demo.mov" format="r0"/>
+    <asset hasVideo="1" name="demo.mp4" hasAudio="1" audioSources="1" audioChannels="1" id="r2" duration="39/1s" start="0/1s" src="file:///media/V1-0002_demo.mov" format="r0"/>
+  </resources>
+  <library>
+    <event name="Timeline 1 (Resolve)">
+      <project name="Timeline 1 (Resolve)">
+        <sequence tcFormat="NDF" tcStart="3600/1s" duration="2641/30s" format="r0">
+          <spine>
+            <asset-clip name="demo.mp4" tcFormat="NDF" duration="301/30s" ref="r1" start="0/1s" enabled="1" offset="3600/1s" format="r0"/>
+            <asset-clip name="demo.mp4" tcFormat="NDF" duration="39/1s" ref="r2" start="0/1s" enabled="1" offset="108301/30s" format="r0"/>
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert_eq!(tl.format, TimelineFormat::XmlFcpx);
+        assert_eq!(tl.frame_rate, 30.0);
+        assert_eq!(tl.events.len(), 2);
+        assert_eq!(tl.events[0].record_in, 108000);
+        assert_eq!(tl.events[0].record_out, 108301);
+        assert_eq!(tl.events[0].source_in, 0);
+        assert_eq!(tl.events[0].source_out, 301);
+        assert_eq!(tl.events[1].record_in, 108301);
+        assert_eq!(tl.events[1].record_out, 109471);
+        assert_eq!(tl.events[1].reel_name, "demo.mp4");
+    }
+
+    #[test]
+    fn test_parse_fcpxml_without_clips() {
+        let (_dir, path) = write_timeline(
+            "empty.fcpxml",
             r#"<?xml version="1.0"?><fcpxml version="1.10"></fcpxml>"#,
-        )
-        .unwrap();
-        assert!(matches!(
-            parse_timeline(&path),
-            Err(ConformError::Unsupported(_))
-        ));
+        );
+        assert!(matches!(parse_timeline(&path), Err(ConformError::NoEvents)));
+    }
+
+    #[test]
+    fn test_parse_unknown_xml_root() {
+        let (_dir, path) = write_timeline(
+            "other.xml",
+            r#"<?xml version="1.0"?><timeline><clip/></timeline>"#,
+        );
+        assert!(matches!(parse_timeline(&path), Err(ConformError::Xml(_))));
     }
 
     #[test]

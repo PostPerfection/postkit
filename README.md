@@ -16,7 +16,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `burnin` | Subtitle/watermark burn-in |
 | `certificate` | X.509 certificate generation and trust management |
 | `colour` | Colour conversion via ffmpeg (Rec.709, P3, Rec.2020); wide-gamut/log spaces need a LUT. Also the DCI X'Y'Z' → sRGB display transform (`XyzToSrgb`, inverse of the DCDM encode) and an optional monitor-ICC path (`XyzToIcc`, `icc` feature) |
-| `conform` | EDL and FCP7/Resolve XML (xmeml) timeline import and reel assembly (AAF not supported) |
+| `conform` | EDL, FCP7/Resolve XML (xmeml) and FCP X (fcpxml) timeline import and reel assembly (AAF not supported) |
 | `cpl_annotation` | CPL annotation and revision metadata |
 | `cpl_xml` | String-level CPL/OPL XML tag read/write helpers |
 | `crossfade` | Equal-power PCM crossfade join (cos/sin gains, constant power) |

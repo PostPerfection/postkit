@@ -24,7 +24,7 @@ Encoding:
 - prores: ProRes probe and extraction arg builders
 
 Timeline and ingest:
-- conform: CMX 3600 EDL and FCP7 xmeml import, reel assembly (AAF rejected loudly)
+- conform: CMX 3600 EDL, FCP7 xmeml and FCP X fcpxml import, reel assembly (AAF rejected loudly). The fcpxml path walks the primary storyline `<spine>` only, converting rational-second offset/start/duration to frames with the sequence format's frameDuration; gaps, titles, lanes, compound and nested clips are skipped
 - edl_import, otioz_import: EDL/FCP XML and OTIO/OTIOZ parsing
 - ingest: camera format detection (ARRI/RED/BRAW/CRM magic bytes); transcodes ffmpeg-decodable inputs (ProRes, DNxHR) and rejects true camera RAW loudly (stock ffmpeg cannot decode it)
 - timecode: SMPTE timecode/framerate math (single home for it)
