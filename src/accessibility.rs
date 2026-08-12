@@ -1,8 +1,9 @@
 //! Structural accessibility probe for a DCP or IMP.
 //!
 //! Every verdict here rests on a named element or attribute in the composition
-//! playlist. Nothing is inferred from free text, so an annotation that happens to
-//! mention captions or a director never counts as a track.
+//! playlist, or on an ST 377-4 MCA label in the sound MXF header. Nothing is
+//! inferred from free text, so an annotation that happens to mention captions or
+//! a director never counts as a track.
 
 use quick_xml::NsReader;
 use quick_xml::events::{BytesStart, Event};
@@ -32,6 +33,11 @@ const CAPTION_SEQUENCE_NAMES: [&str; 2] = ["HearingImpairedCaptionsSequence", "C
 /// visually impaired viewers. That is not the VI-N narration channel, so it is
 /// worth reporting but settles no track.
 const VISUALLY_IMPAIRED_TEXT_NOTE: &str = ", and a VisuallyImpairedTextSequence was read, which carries text rather than a narration channel";
+
+/// ISDCF Doc 13 §5.2 requires this MCA tag symbol on the sound channel carrying
+/// a sign-language video stream, where §5.1 only recommends the extension
+/// metadata. Doc 13 defines no MainSoundConfiguration token for it.
+const SIGN_LANGUAGE_TAG_SYMBOL: &str = "SLVS";
 
 /// ST 429-16 MainSoundConfiguration channel token for the hearing-impaired mix.
 const HEARING_IMPAIRED_CHANNEL_TOKEN: &str = "HI";
@@ -170,10 +176,13 @@ impl AccessibilityResult {
 /// HearingImpairedCaptionsSequence, CDPSequence and CommentarySequence elements
 /// under a ST 2067-3 SequenceList, in either the 2016 or the 2020 namespace.
 ///
-/// No essence is opened, so anything recorded only in the sound MXF's MCA
-/// subdescriptors or in the picture itself is reported as undeterminable rather
-/// than absent. The same goes for a track whose carrier the composition does not
-/// enumerate, such as sound channels in an IMF CPL.
+/// When no composition declares a MainSoundConfiguration, the sound MXF headers
+/// are opened and the sound tracks are settled from their ST 377-4 MCA label
+/// subdescriptors instead. Only the header is read, and a file that cannot be
+/// resolved, opened or labelled leaves its tracks undeterminable rather than
+/// absent. Picture essence is never opened, so anything recorded only in the
+/// picture stays undeterminable, as does a track whose carrier the composition
+/// does not enumerate.
 ///
 /// `compliant` is true only when every track the standard requires was
 /// positively found. It is not a certified compliance verdict, and it is never
@@ -281,10 +290,14 @@ struct PackageEvidence {
     /// Channel tokens of every MainSoundConfiguration read, silent fill removed.
     /// None means no composition declared a sound configuration.
     sound_channels: Option<Vec<String>>,
+    /// MCA tag symbols read from the sound MXFs the compositions reference.
+    /// Empty means none could be read, which settles nothing either way.
+    mca_tag_symbols: Vec<String>,
 }
 
 fn read_package_evidence(package_dir: &std::path::Path) -> PackageEvidence {
     let mut evidence = PackageEvidence::default();
+    let mut main_sound_ids: Vec<String> = Vec::new();
     let Ok(entries) = std::fs::read_dir(package_dir) else {
         return evidence;
     };
@@ -319,10 +332,37 @@ fn read_package_evidence(package_dir: &std::path::Path) -> PackageEvidence {
                     .get_or_insert_with(Vec::new)
                     .extend(composition.sound_channels);
             }
+            main_sound_ids.extend(composition.main_sound_ids);
         }
     }
 
+    // read the labels even when a MainSoundConfiguration settled the sound
+    // channels, because SLVS has no configuration token and only the MCA labels
+    // can rule a sign-language channel in or out
+    evidence.mca_tag_symbols = read_mca_tag_symbols(package_dir, &main_sound_ids);
+
     evidence
+}
+
+/// MCA tag symbols carried by the sound MXFs the compositions reference. Empty
+/// when no sound file could be resolved, opened, or read, and empty too when the
+/// files carry no MCA labels at all, because an unlabelled MXF settles nothing.
+fn read_mca_tag_symbols(package_dir: &std::path::Path, main_sound_ids: &[String]) -> Vec<String> {
+    let mut symbols = Vec::new();
+    for id in main_sound_ids {
+        let Some(path) = crate::assetmap::resolve(package_dir, id) else {
+            continue;
+        };
+        let mut reader = asdcplib::pcm::MxfReader::new();
+        if reader.open_read(&path.to_string_lossy()).is_err() {
+            continue;
+        }
+        let Ok(labels) = reader.mca_label_subdescriptors() else {
+            continue;
+        };
+        symbols.extend(labels.into_iter().map(|label| label.tag_symbol));
+    }
+    symbols
 }
 
 #[derive(Debug, Default)]
@@ -335,6 +375,7 @@ struct CompositionEvidence {
     visually_impaired_text_sequences: usize,
     sign_language_extensions: usize,
     sound_channels: Vec<String>,
+    main_sound_ids: Vec<String>,
 }
 
 /// Read one CPL. Returns None when the document is not a composition playlist or
@@ -367,6 +408,12 @@ fn read_composition(xml: &str) -> Option<CompositionEvidence> {
                 if stack.last().is_some_and(|n| n == "MainSoundConfiguration") {
                     let value = text.unescape().ok()?;
                     evidence.sound_channels.extend(channel_tokens(&value));
+                }
+                if is_main_sound_id(&stack) {
+                    let value = text.unescape().ok()?;
+                    if let Some(id) = bare_uuid(&value) {
+                        evidence.main_sound_ids.push(id);
+                    }
                 }
             }
             Event::End(_) => {
@@ -417,6 +464,20 @@ fn record_element(
         "VisuallyImpairedTextSequence" => evidence.visually_impaired_text_sequences += 1,
         _ => {}
     }
+}
+
+/// True at the text of a `<MainSound>` asset's own `<Id>`.
+fn is_main_sound_id(stack: &[String]) -> bool {
+    stack.last().is_some_and(|n| n == "Id")
+        && stack.len() >= 2
+        && stack[stack.len() - 2] == "MainSound"
+}
+
+fn bare_uuid(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    let bare = trimmed.strip_prefix("urn:uuid:").unwrap_or(trimmed);
+    let is_uuid = bare.len() == 36 && bare.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-');
+    is_uuid.then(|| bare.to_ascii_lowercase())
 }
 
 fn is_child_of(stack: &[String], parent: &str) -> bool {
@@ -477,6 +538,7 @@ fn detect_track(track: AccessibilityTrack, evidence: &PackageEvidence) -> TrackD
                 evidence,
                 VISUALLY_IMPAIRED_CHANNEL_TOKEN,
                 McaTagSymbol::Vi.tag_name(),
+                McaTagSymbol::Vi.symbol_string(),
             );
             if status == TrackStatus::Undeterminable
                 && evidence.visually_impaired_text_sequences > 0
@@ -489,6 +551,7 @@ fn detect_track(track: AccessibilityTrack, evidence: &PackageEvidence) -> TrackD
             evidence,
             HEARING_IMPAIRED_CHANNEL_TOKEN,
             McaTagSymbol::Hi.tag_name(),
+            McaTagSymbol::Hi.symbol_string(),
         ),
         AccessibilityTrack::SignLanguage => sign_language_status(evidence),
         AccessibilityTrack::OpenCaptions => (
@@ -562,11 +625,13 @@ fn sound_channel_status(
     evidence: &PackageEvidence,
     token: &str,
     channel_name: &str,
+    tag_symbol: &str,
 ) -> (TrackStatus, String) {
     let Some(channels) = evidence.sound_channels.as_ref() else {
-        return (
-            TrackStatus::Undeterminable,
-            "no ST 429-16 MainSoundConfiguration could be read, and the sound MXF's MCA labels are not opened".to_string(),
+        return mca_label_status(
+            evidence,
+            tag_symbol,
+            &format!("no ST 429-16 MainSoundConfiguration could be read, and {channel_name}"),
         );
     };
     if channels.iter().any(|c| c == token) {
@@ -582,6 +647,35 @@ fn sound_channel_status(
     }
 }
 
+/// Settle a track from the sound MXF's MCA tag symbols. `subject` names what the
+/// labels were searched for, and reads as the start of the evidence sentence.
+fn mca_label_status(
+    evidence: &PackageEvidence,
+    tag_symbol: &str,
+    subject: &str,
+) -> (TrackStatus, String) {
+    if evidence.mca_tag_symbols.is_empty() {
+        return (
+            TrackStatus::Undeterminable,
+            format!("{subject} could not be read from the sound MXF's MCA labels either"),
+        );
+    }
+    if evidence.mca_tag_symbols.iter().any(|s| s == tag_symbol) {
+        (
+            TrackStatus::Present,
+            format!("the sound MXF carries an ST 377-4 {tag_symbol} MCA label"),
+        )
+    } else {
+        (
+            TrackStatus::Absent,
+            format!(
+                "{subject} is not among the sound MXF's MCA labels ({})",
+                evidence.mca_tag_symbols.join(", ")
+            ),
+        )
+    }
+}
+
 fn sign_language_status(evidence: &PackageEvidence) -> (TrackStatus, String) {
     if evidence.sign_language_extensions > 0 {
         return (
@@ -589,9 +683,10 @@ fn sign_language_status(evidence: &PackageEvidence) -> (TrackStatus, String) {
             "ISDCF Doc 13 SignLanguageVideo extension metadata".to_string(),
         );
     }
-    (
-        TrackStatus::Undeterminable,
-        "the ISDCF Doc 13 extension metadata is optional, so its absence does not rule a sign-language program out".to_string(),
+    mca_label_status(
+        evidence,
+        SIGN_LANGUAGE_TAG_SYMBOL,
+        "the ISDCF Doc 13 extension metadata is optional and absent, and a sign-language video channel",
     )
 }
 
@@ -841,6 +936,141 @@ mod tests {
 
     fn status(dir: &Path, track: AccessibilityTrack) -> TrackStatus {
         check_accessibility(dir, AccessibilityStandard::Cvaa).track_status(track)
+    }
+
+    /// The MainSound asset id the `cpl` helper writes.
+    const MAIN_SOUND_ID: &str = "1e0f0b1a-0000-4000-8000-000000000004";
+
+    /// Wrap a real PCM MXF carrying `mca_config` into the package and register it
+    /// in the ASSETMAP. The file is deliberately not named after its asset id,
+    /// which is what forces the lookup to go through the ASSETMAP.
+    fn add_sound_mxf(package: &Path, channels: u16, mca_config: &str) {
+        let wav = package.parent().unwrap().join("source.wav");
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: 48000,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let frames = 48000;
+        crate::wav_io::write_interleaved(&wav, spec, &vec![0.0; channels as usize * frames])
+            .unwrap();
+
+        let mut asset_uuid = [0u8; 16];
+        for (byte, pair) in asset_uuid
+            .iter_mut()
+            .zip(MAIN_SOUND_ID.replace('-', "").as_bytes().chunks(2))
+        {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+
+        let result = crate::mxf_wrap::mxf_wrap(&crate::mxf_wrap::MxfWrapOptions {
+            input_files: vec![wav],
+            output: package.join("audio_track.mxf"),
+            essence_type: crate::mxf_wrap::EssenceType::Pcm,
+            standard: crate::mxf_wrap::MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: Some(mca_config.to_string()),
+            resource_ids: vec![],
+            hdr: None,
+            asset_uuid: Some(asset_uuid),
+        });
+        assert!(result.success, "sound wrap failed: {}", result.error);
+
+        std::fs::write(
+            package.join("ASSETMAP.xml"),
+            format!(
+                r#"<AssetMap><AssetList>
+                  <Asset><Id>urn:uuid:{MAIN_SOUND_ID}</Id>
+                    <ChunkList><Chunk><Path>audio_track.mxf</Path></Chunk></ChunkList></Asset>
+                </AssetList></AssetMap>"#
+            ),
+        )
+        .unwrap();
+    }
+
+    /// A package whose CPL declares no MainSoundConfiguration, so the sound
+    /// tracks can only be settled from the MXF's MCA labels.
+    fn package_without_sound_configuration() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("dcp");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(package.join("CPL_test.xml"), cpl("Feature", None, "")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn mca_labels_settle_the_sound_tracks_when_the_cpl_declares_no_configuration() {
+        let dir = package_without_sound_configuration();
+        let package = dir.path().join("dcp");
+        add_sound_mxf(&package, 9, "51(L,R,C,LFE,Ls,Rs),HI,VIN,SLVS");
+
+        for track in [
+            AccessibilityTrack::AudioDescription,
+            AccessibilityTrack::HearingImpaired,
+            AccessibilityTrack::SignLanguage,
+        ] {
+            assert_eq!(
+                status(&package, track),
+                TrackStatus::Present,
+                "{track:?} should be read off the MCA labels"
+            );
+        }
+    }
+
+    #[test]
+    fn mca_labels_without_the_accessibility_channels_report_absent() {
+        let dir = package_without_sound_configuration();
+        let package = dir.path().join("dcp");
+        add_sound_mxf(&package, 6, "51(L,R,C,LFE,Ls,Rs)");
+
+        for track in [
+            AccessibilityTrack::AudioDescription,
+            AccessibilityTrack::HearingImpaired,
+            AccessibilityTrack::SignLanguage,
+        ] {
+            assert_eq!(
+                status(&package, track),
+                TrackStatus::Absent,
+                "{track:?} should be absent against a labelled 5.1 MXF"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sound_mxf_that_cannot_be_resolved_leaves_the_tracks_undeterminable() {
+        let dir = package_without_sound_configuration();
+        let package = dir.path().join("dcp");
+
+        for track in [
+            AccessibilityTrack::AudioDescription,
+            AccessibilityTrack::HearingImpaired,
+            AccessibilityTrack::SignLanguage,
+        ] {
+            assert_eq!(status(&package, track), TrackStatus::Undeterminable);
+        }
+    }
+
+    #[test]
+    fn the_sound_configuration_wins_over_the_mca_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("dcp");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(
+            package.join("CPL_test.xml"),
+            cpl("Feature", Some("51(L,R,C,LFE,Ls,Rs)"), ""),
+        )
+        .unwrap();
+        add_sound_mxf(&package, 9, "51(L,R,C,LFE,Ls,Rs),HI,VIN,SLVS");
+
+        assert_eq!(
+            status(&package, AccessibilityTrack::HearingImpaired),
+            TrackStatus::Absent,
+            "a MainSoundConfiguration without HI settles the track on its own"
+        );
     }
 
     #[test]

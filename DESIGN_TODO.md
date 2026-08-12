@@ -19,6 +19,33 @@
 
 # Done
 
+## 2026-08-12
+
+MCA-labelled accessibility tracks (src/accessibility.rs): the probe settles
+AudioDescription, HearingImpaired and SignLanguage from the sound MXF's ST 377-4
+MCA tag symbols (`chVIN`, `chHI`, `SLVS`) via
+`pcm::MxfReader::mca_label_subdescriptors`, which needed the asdcplib pin at
+4f137a0. The three-state contract is unchanged: a tag symbol read means Present,
+labels read without the relevant symbol means Absent, and a sound file that
+cannot be resolved, opened or labelled leaves the track Undeterminable.
+
+A MainSoundConfiguration still wins for the HI and VIN channels, but the labels
+are read even when one is present, because SLVS has no configuration token and
+the labels are the only thing that can rule a sign-language channel out. Verified
+against a real dcpwizard `--sign-language-video` package with the ISDCF
+ExtensionMetadata stripped, which reports Present off the SLVS label alone.
+
+ISDCF Doc 13 §5.2 requires the SLVS tag symbol on the MCA Audio Channel Label
+Subdescriptor and §5.1 only recommends the ExtensionMetadata, so the MCA label is
+the normative declaration and the CPL extension is the optional hint. Doc 13
+defines no MainSoundConfiguration token for sign language, so the probe does not
+look for one. dcpdoctor's `SOUND_CHANNEL_LABELS` accepts `SLVS` and `Sign` in a
+configuration slot, but that list mirrors DCP-o-matic rather than Doc 13.
+
+Sound files resolve through the ASSETMAP (new src/assetmap.rs, shared with
+preview) rather than by reading an id out of a filename, which only holds for
+packages some tools build.
+
 ## App-side dedup: all landed
 
 hash (dcpdoctor hash.rs adapts `postkit::hash::hash_file`), imfwizard to_dcp.rs

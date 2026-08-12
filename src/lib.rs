@@ -1,4 +1,5 @@
 pub mod accessibility;
+pub mod assetmap;
 pub mod burnin;
 pub mod certificate;
 pub mod colour;

@@ -429,16 +429,8 @@ fn resolve_via_cpl(cpl: &Path) -> Result<PathBuf, PreviewError> {
 }
 
 fn find_assetmap(dir: &Path) -> Result<PathBuf, PreviewError> {
-    for name in ["ASSETMAP.xml", "ASSETMAP"] {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Ok(p);
-        }
-    }
-    Err(PreviewError::Resolve(format!(
-        "no ASSETMAP in {}",
-        dir.display()
-    )))
+    crate::assetmap::find(dir)
+        .ok_or_else(|| PreviewError::Resolve(format!("no ASSETMAP in {}", dir.display())))
 }
 
 /// Bare UUID of the first `<MainPicture>` (any namespace prefix) in a CPL.
@@ -452,15 +444,7 @@ fn first_main_picture_id(cpl: &str) -> Option<String> {
 
 /// Map bare asset UUID → relative path from an ASSETMAP.
 fn parse_assetmap(path: &Path) -> Result<std::collections::HashMap<String, String>, PreviewError> {
-    let text = std::fs::read_to_string(path)?;
-    let re = regex::Regex::new(
-        r"(?s)<(?:\w+:)?Asset\b.*?<(?:\w+:)?Id>\s*(?:urn:uuid:)?([0-9a-fA-F-]{36})\s*</(?:\w+:)?Id>.*?<(?:\w+:)?Path>\s*([^<]+?)\s*</(?:\w+:)?Path>",
-    )
-    .map_err(|e| PreviewError::Resolve(format!("assetmap regex: {e}")))?;
-    let mut map = std::collections::HashMap::new();
-    for c in re.captures_iter(&text) {
-        map.insert(c[1].to_ascii_lowercase(), c[2].to_string());
-    }
+    let map = crate::assetmap::parse(path);
     if map.is_empty() {
         return Err(PreviewError::Resolve(format!(
             "no assets parsed from {}",
