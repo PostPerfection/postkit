@@ -3145,7 +3145,10 @@ mod tests {
         let f = fixtures();
         let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
 
-        let not_after = kdm.xml.find("<ContentKeysNotValidAfter>").expect("not after");
+        let not_after = kdm
+            .xml
+            .find("<ContentKeysNotValidAfter>")
+            .expect("not after");
         let device_info = kdm.xml.find("<AuthorizedDeviceInfo>").expect("device info");
         let key_id_list = kdm.xml.find("<KeyIdList>").expect("key id list");
         assert!(
@@ -3177,7 +3180,10 @@ mod tests {
             read_device_thumbprint(&f.signer).unwrap(),
             read_device_thumbprint(&f.intermediate).unwrap(),
         ];
-        assert_eq!(listed, expected, "each device contributes its own thumbprint");
+        assert_eq!(
+            listed, expected,
+            "each device contributes its own thumbprint"
+        );
         assert!(
             !listed.contains(&ASSUME_TRUST_THUMBPRINT.to_string()),
             "mixing assume-trust with a real device disables the device restriction"
@@ -3332,7 +3338,10 @@ mod tests {
             // ST 430-2 5.2 caps the serial at an unsigned 64-bit value and DCI
             // CTP 2.1.4 fails anything larger.
             decimal.parse::<u64>().unwrap_or_else(|e| {
-                panic!("{} has serial {decimal}, which does not fit 64 bits: {e}", cert_path.display())
+                panic!(
+                    "{} has serial {decimal}, which does not fit 64 bits: {e}",
+                    cert_path.display()
+                )
             });
             assert_ne!(decimal, "0", "{} has a zero serial", cert_path.display());
         }
