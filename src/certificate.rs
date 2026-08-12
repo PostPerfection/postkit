@@ -176,7 +176,7 @@ pub fn generate_certificate(opts: &CertOptions) -> i32 {
             params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         }
         CertType::Leaf | CertType::Signer => {
-            params.is_ca = IsCa::NoCa;
+            params.is_ca = IsCa::ExplicitNoCa;
             params.key_usages = vec![
                 KeyUsagePurpose::DigitalSignature,
                 KeyUsagePurpose::ContentCommitment,
@@ -2412,6 +2412,43 @@ mod tests {
             over_tbs, over_full,
             "TBS and full-cert hashes must differ, else the test proves nothing"
         );
+    }
+
+    /// ST 430-2 wants Basic Constraints and Key Usage on every certificate in the
+    /// chain, the leaf included. rcgen writes no extensions at all for
+    /// `IsCa::NoCa`, so the leaf came out bare and validators rejected it.
+    #[test]
+    fn every_generated_certificate_carries_basic_constraints_and_key_usage() {
+        use x509_parser::prelude::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(generate_chain("Acme", dir.path()), 0, "chain generation");
+
+        for name in ["root.pem", "intermediate.pem", "signer.pem"] {
+            let data = std::fs::read(dir.path().join(name)).unwrap();
+            let (_, pem) = parse_x509_pem(&data).unwrap();
+            let cert = pem.parse_x509().unwrap();
+
+            let basic = cert
+                .basic_constraints()
+                .unwrap_or_else(|e| panic!("{name} basic constraints: {e}"))
+                .unwrap_or_else(|| panic!("{name} has no Basic Constraints extension"));
+            let usage = cert
+                .key_usage()
+                .unwrap_or_else(|e| panic!("{name} key usage: {e}"))
+                .unwrap_or_else(|| panic!("{name} has no Key Usage extension"));
+
+            if name == "signer.pem" {
+                assert!(!basic.value.ca, "the leaf must say CA:FALSE");
+                assert!(
+                    usage.value.digital_signature(),
+                    "the leaf signs documents, so it needs digitalSignature"
+                );
+            } else {
+                assert!(basic.value.ca, "{name} must say CA:TRUE");
+                assert!(usage.value.key_cert_sign(), "{name} must sign certificates");
+            }
+        }
     }
 
     #[test]

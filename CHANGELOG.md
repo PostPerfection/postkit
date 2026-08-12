@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Generated signer certificates were missing two required extensions
+
+Regenerate any chain postkit produced earlier. Every leaf certificate came out
+with no Basic Constraints and no Key Usage extension, which ST 430-2 requires,
+so validators reject a package signed with one. rcgen writes no extensions at
+all for `IsCa::NoCa`, and the leaf was the only certificate using it, so root
+and intermediate were always correct and only the signer was affected.
+
 ### KDMs written before this release were schema-invalid
 
 Regenerate any KDM postkit produced earlier. Three defects broke it against the
