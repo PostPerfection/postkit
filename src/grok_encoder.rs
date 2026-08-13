@@ -299,7 +299,10 @@ where
         // Drop our copy so writer sees hangup when all encoder threads finish
         drop(writer_tx);
 
-        // Producer loop — feed frames into the bounded queue
+        // Producer loop — feed frames into the bounded queue. Queue
+        // backpressure paces this loop at encode speed, so it reports progress
+        // too: the wait loop below only covers the final queue drain.
+        let mut last_progress = std::time::Instant::now();
         loop {
             if cancel.load(Ordering::Relaxed) || error_flag.load(Ordering::Relaxed) {
                 break;
@@ -312,6 +315,22 @@ where
                     }
                 }
                 None => break,
+            }
+
+            if last_progress.elapsed().as_millis() >= 200 {
+                last_progress = std::time::Instant::now();
+                let done = frames_encoded.load(Ordering::Relaxed);
+                let elapsed = encode_start.elapsed().as_secs_f64();
+                on_progress(EncodeProgress {
+                    frames_encoded: done,
+                    total_frames,
+                    fps: if elapsed > 0.0 {
+                        done as f64 / elapsed
+                    } else {
+                        0.0
+                    },
+                    elapsed_secs: elapsed,
+                });
             }
         }
 
