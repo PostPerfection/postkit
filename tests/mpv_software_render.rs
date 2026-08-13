@@ -1,4 +1,4 @@
-#![cfg(feature = "libmpv")]
+#![cfg(all(target_os = "linux", feature = "libmpv"))]
 
 use postkit::mpv_render::MpvRenderPlayer;
 use std::path::PathBuf;
