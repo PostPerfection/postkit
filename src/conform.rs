@@ -60,6 +60,10 @@ pub struct EditEvent {
     /// connected above it, negative below. Always 0 for EDL and xmeml.
     #[serde(default)]
     pub lane: i32,
+    /// Constant clip gain as a linear amplitude multiplier. None when the
+    /// timeline format carries no gain or the clip has unity gain.
+    #[serde(default)]
+    pub gain_factor: Option<f64>,
 }
 
 /// Parsed timeline.
@@ -821,6 +825,7 @@ fn parse_fcpxml(content: &str) -> Result<Timeline, ConformError> {
                 transition: "CUT".to_string(),
                 comment: String::new(),
                 lane: clip.lane,
+                gain_factor: None,
             }
         })
         .collect();
@@ -1066,6 +1071,7 @@ fn parse_otio(file: &Path) -> Result<Timeline, ConformError> {
                 transition: "CUT".to_string(),
                 comment: clip.target_url.clone(),
                 lane: 0,
+                gain_factor: None,
             }
         })
         .collect();
@@ -1140,6 +1146,7 @@ fn parse_edl(file: &Path) -> Timeline {
                 transition: caps[4].to_string(),
                 comment: std::mem::take(&mut last_comment),
                 lane: 0,
+                gain_factor: None,
             };
             timeline.events.push(event);
         }
