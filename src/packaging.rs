@@ -443,6 +443,11 @@ pub struct ImfCpl {
     /// Essence descriptors carrying per-track audio MCA/soundfield/language
     /// labelling and image color/HDR-WCG metadata. Empty keeps output unchanged.
     pub essence_descriptors: Vec<ImfEssenceDescriptor>,
+    /// Maximum content light level in cd/m^2, written as an ST 2067-21
+    /// ExtensionProperties element. None keeps the output unchanged.
+    pub max_cll: Option<u16>,
+    /// Maximum frame-average light level in cd/m^2, same placement as `max_cll`.
+    pub max_fall: Option<u16>,
 }
 
 impl ImfCpl {
@@ -501,6 +506,17 @@ impl ImfCpl {
             "    <cc:ApplicationIdentification>{}</cc:ApplicationIdentification>",
             ns::APP2E
         );
+        // ST 2067-21 puts content light levels here, each carrying its own
+        // namespace declaration so an absent pair leaves the CPL untouched.
+        for (element, value) in [("MaxCLL", self.max_cll), ("MaxFALL", self.max_fall)] {
+            if let Some(nits) = value {
+                let _ = writeln!(
+                    xml,
+                    "    <app2e:{element} xmlns:app2e=\"{}\">{nits}</app2e:{element}>",
+                    ns::APP2E
+                );
+            }
+        }
         xml.push_str("  </ExtensionProperties>\n");
         xml.push_str("  <SegmentList>\n");
         xml.push_str("    <Segment>\n");
@@ -1080,6 +1096,8 @@ mod tests {
             ],
             languages: vec![],
             essence_descriptors: vec![],
+            max_cll: None,
+            max_fall: None,
         };
         let xml = cpl.to_xml();
         assert!(xml.contains(ns::APP2E));
@@ -1091,6 +1109,70 @@ mod tests {
         let img = xml.find("MainImageSequence").unwrap();
         let aud = xml.find("MainAudioSequence").unwrap();
         assert!(img < aud, "image track should be written before audio");
+    }
+
+    /// The whole `<ExtensionProperties>` block including its trailing newline.
+    fn extension_properties(xml: &str) -> &str {
+        let open = xml.find("  <ExtensionProperties>").unwrap();
+        let close = xml.find("  </ExtensionProperties>\n").unwrap();
+        &xml[open..close + "  </ExtensionProperties>\n".len()]
+    }
+
+    /// ST 2067-21 carries MaxCLL/MaxFALL as CPL ExtensionProperties, siblings of
+    /// ApplicationIdentification. Photon only schema-validates them (unsignedShort),
+    /// it never compares them against the essence.
+    #[test]
+    fn imf_cpl_writes_content_light_levels() {
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            max_cll: Some(993),
+            max_fall: Some(362),
+            ..Default::default()
+        };
+        let app2e = ns::APP2E;
+        assert_eq!(
+            extension_properties(&cpl.to_xml()),
+            format!(
+                "  <ExtensionProperties>\n\
+                 \x20   <cc:ApplicationIdentification>{app2e}</cc:ApplicationIdentification>\n\
+                 \x20   <app2e:MaxCLL xmlns:app2e=\"{app2e}\">993</app2e:MaxCLL>\n\
+                 \x20   <app2e:MaxFALL xmlns:app2e=\"{app2e}\">362</app2e:MaxFALL>\n\
+                 \x20 </ExtensionProperties>\n"
+            )
+        );
+
+        // absent light levels leave the block byte-identical to what it always was
+        let plain = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            extension_properties(&plain.to_xml()),
+            format!(
+                "  <ExtensionProperties>\n\
+                 \x20   <cc:ApplicationIdentification>{app2e}</cc:ApplicationIdentification>\n\
+                 \x20 </ExtensionProperties>\n"
+            )
+        );
+    }
+
+    /// Either light level alone is legal and writes only its own element.
+    #[test]
+    fn imf_cpl_writes_max_fall_without_max_cll() {
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            max_fall: Some(1),
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        assert!(xml.contains("<app2e:MaxFALL"));
+        assert!(!xml.contains("MaxCLL"));
     }
 
     /// Compact but structurally real audio essence descriptor body: a
@@ -1246,6 +1328,8 @@ mod tests {
                 id: se.into(),
                 body: sample_audio_descriptor_body("de-DE"),
             }],
+            max_cll: Some(993),
+            max_fall: Some(362),
             ..Default::default()
         };
 
@@ -1253,6 +1337,16 @@ mod tests {
         let cpl_path = dir.path().join("CPL_lang_mca.xml");
         std::fs::write(&cpl_path, cpl.to_xml()).unwrap();
 
+        // ExtensionProperties is xs:any processContents="lax", so MaxCLL/MaxFALL are
+        // only really checked when the app2e schema is among the imports.
+        let app2e_import = match walk(root, "app2e-2016.xsd") {
+            Some(p) => format!(
+                "\n  <xs:import namespace=\"{}\" schemaLocation=\"{}\"/>",
+                ns::APP2E,
+                p.display()
+            ),
+            None => String::new(),
+        };
         let driver = dir.path().join("driver.xsd");
         std::fs::write(
             &driver,
@@ -1260,7 +1354,7 @@ mod tests {
                 r#"<?xml version="1.0"?>
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
   <xs:import namespace="http://www.smpte-ra.org/schemas/2067-3/2016" schemaLocation="{cpl}"/>
-  <xs:import namespace="http://www.w3.org/2000/09/xmldsig#" schemaLocation="{dsig}"/>
+  <xs:import namespace="http://www.w3.org/2000/09/xmldsig#" schemaLocation="{dsig}"/>{app2e_import}
 </xs:schema>"#,
                 cpl = cpl_xsd.display(),
                 dsig = dsig_xsd.display(),
