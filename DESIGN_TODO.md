@@ -13,9 +13,15 @@
   in CI. Both embeds run live on Fedora/Wayland with good performance,
   MPV_RENDER_PARAM_FLIP_Y set (GtkGLArea's FBO is y-flipped, without it video
   renders upside down). Engine: postkit src/mpv_render behind the default-off
-  libmpv feature, spawned-mpv path intact as fallback; the wizards' default-off
-  embedded-preview feature only takes effect on linux, elsewhere the spawned
-  player is used. Host glue in each wizard's gui/src-tauri/src/preview_surface.rs.
+  libmpv feature. As of a65ef22 that module builds on every platform, not just
+  linux: it is gated on the feature alone, and build.rs links it through
+  pkg-config on unix (linux and macos both, homebrew's mpv ships mpv.pc) and
+  through an MPV_LIB_DIR search path on windows. Windows needs an import library
+  in that directory, mpv.lib for msvc (gendef plus lib.exe over libmpv-2.dll) or
+  libmpv.dll.a for mingw. The module type-checks for windows-msvc, windows-gnu
+  and aarch64-apple-darwin, but nothing about linking or running off linux is
+  verified. Host glue moves out of each wizard into a crate in guikit, see the
+  guikit phase 2 entry in the wizards' DESIGN_TODO.
   imfwizard no longer crashes at launch: tauri-runtime-wry
   undecorated_resizing.rs unwraps the window child and finds the embed's
   GtkOverlay, so imfwizard builds its window and webview in code with
@@ -26,8 +32,11 @@
   requires LC_NUMERIC "C" before mpv_create. Remaining, untested by hand:
   closing the preview panel (shrinks the GL area to 1x1, the render loop must
   keep answering), and no automated orientation check exists (framebuffer
-  readback returns black), so eyeball after any render change. When finished,
-  fold into DESIGN.md and delete this entry.
+  readback returns black), so eyeball after any render change. Remaining work
+  proper: the macos and windows host surfaces, which is where the cross-platform
+  embed actually lands. Neither can be compiled or run on the linux dev machine,
+  so CI is the only check and both should be expected to need a pass on real
+  hardware. When finished, fold into DESIGN.md and delete this entry.
   Hardware acceleration reality: rendering and colour transforms run as GPU
   shaders, hwdec (VAAPI over EGL) accelerates H.264/HEVC/AV1 sources. J2K stays
   CPU-decoded: no GPU has fixed-function J2K, that is what the GPU decode item
