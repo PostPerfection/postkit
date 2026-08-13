@@ -1,18 +1,36 @@
 # Planned
 
-- Embedded playback via the libmpv render API, for both wizard GUIs (next session).
-  Native Wayland has no foreign-window reparenting, so the spawned mpv preview can
-  never sit inside the tauri window: mpv --wid is X11/Windows only, which is why
-  every embedding attempt failed on Fedora/Wayland. The route that works is linking
-  libmpv and drawing through mpv_render_context into a GtkGLArea placed next to the
-  webview in the tauri gtk window. In-process rendering, so the no-embedding rule
-  never applies. The reusable half (library control, render loop) replaces the
-  process-spawning side of the mpv module here; each wizard hosts the GL area in
-  its own tauri glue, mirroring how preview_server.rs is duplicated today.
-  Rendering and colour transforms run as GPU shaders, and hwdec (VAAPI over EGL)
-  accelerates H.264/HEVC/AV1 sources. J2K stays CPU-decoded: no GPU has
-  fixed-function J2K, that is what the GPU decode item below is for, and it would
-  hand frames to this same GL surface, so build this first.
+- Embedded playback via the libmpv render API, for both wizard GUIs. In progress,
+  partly landed. Native Wayland has no foreign-window reparenting, so the spawned
+  mpv preview can never sit inside the tauri window: mpv --wid is X11/Windows
+  only. The route that works is linking libmpv (mpv-libs-devel, pkg-config "mpv",
+  2.5.0 on the dev machine) and drawing through mpv_render_context into a
+  GtkGLArea placed next to the webview in the tauri gtk window; the GL area must
+  use the exact gtk crate versions tao links. The engine half lives in postkit
+  (replacing the process-spawning side of the mpv module); each wizard hosts the
+  GL area in its own tauri glue, mirroring how preview_server.rs is duplicated.
+  State: engine plus the dcpwizard embed run live on Fedora/Wayland with good
+  performance, MPV_RENDER_PARAM_FLIP_Y set (GtkGLArea's FBO is y-flipped,
+  without it video renders upside down). Work-in-progress commits live in
+  all three postkit checkouts (400b283). Engine: postkit src/mpv_render behind
+  the default-off libmpv feature, spawned-mpv path intact as fallback; GUIs gain
+  a default-off embedded-preview feature, host glue in each wizard's
+  gui/src-tauri/src/preview_surface.rs. Evidence recorded: hwdec-current vaapi
+  (needs MPV_RENDER_PARAM_WL_DISPLAY or decode silently falls back), zero
+  dropped frames, less CPU than the floating window; libmpv requires LC_NUMERIC
+  "C" before mpv_create. Remaining: imfwizard crashes at launch,
+  tauri-runtime-wry undecorated_resizing.rs unwraps the window child and finds
+  the embed's GtkOverlay (dcpwizard's window config dodges that path), so the
+  GL area must be inserted without disturbing the widget wry expects as the
+  window's direct child. Also untested by hand: closing the preview panel
+  (shrinks the GL area to 1x1, the render loop must keep answering), and no
+  automated orientation check exists (framebuffer readback returns black), so
+  eyeball after any render change. When finished, fold into DESIGN.md and
+  delete this entry.
+  Hardware acceleration reality: rendering and colour transforms run as GPU
+  shaders, hwdec (VAAPI over EGL) accelerates H.264/HEVC/AV1 sources. J2K stays
+  CPU-decoded: no GPU has fixed-function J2K, that is what the GPU decode item
+  below is for, and it would hand frames to this same GL surface.
 - GPU J2K decode path. Prerequisite for real-time preview and for the features that
   gate on it: SDI output, and the dcpdoctor/wizard player controls (loop dom#2700,
   speed dom#2917, markers dom#2893, waveform dom#3091, 3D view modes
