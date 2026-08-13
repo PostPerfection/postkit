@@ -24,8 +24,9 @@ Encoding:
 - prores: ProRes probe and extraction arg builders
 
 Timeline and ingest:
-- conform: CMX 3600 EDL, FCP7 xmeml and FCP X fcpxml import, reel assembly (AAF rejected loudly here, dcpwizard routes AAF through libaaf before postkit). The fcpxml path builds a document tree and places clips recursively (child record time is parent record zero plus child offset minus parent start, visible range intersected with the parent's slice), so connected clips in lanes, compound clips, nested and sync clips, connected storylines and clips attached to gaps all resolve. `EditEvent.lane` orders flattened lanes and `Timeline.skipped` names every construct with no source clip behind it (titles, captions, generators, transitions, multicam, auditions), nothing is dropped silently
-- edl_import, otioz_import: EDL/FCP XML and OTIO/OTIOZ parsing
+- conform: CMX 3600 EDL, FCP7 xmeml, FCP X fcpxml and OTIO import, reel assembly (AAF rejected loudly here, dcpwizard routes AAF through libaaf before postkit). The fcpxml path builds a document tree and places clips recursively (child record time is parent record zero plus child offset minus parent start, visible range intersected with the parent's slice), so connected clips in lanes, compound clips, nested and sync clips, connected storylines and clips attached to gaps all resolve. The OTIO path parses the JSON with serde_json, takes the sequence rate from `global_start_time` (else the first source_range rate), accumulates per-track record positions, and names reels by the media target_url basename. `EditEvent.lane` orders flattened lanes, `EditEvent.gain_factor` carries a constant clip gain multiplier for formats that have one (AAF today), and `Timeline.skipped` names every construct with no source clip behind it (titles, captions, generators, transitions, multicam, auditions), nothing is dropped silently
+- edl_import: standalone EDL/FCP XML parsing
+- otioz_import: OTIOZ bundle extraction (zip walk, media extraction); the timeline inside parses through conform's OTIO parser
 - ingest: camera format detection (ARRI/RED/BRAW/CRM magic bytes); transcodes ffmpeg-decodable inputs (ProRes, DNxHR) and rejects true camera RAW loudly (stock ffmpeg cannot decode it)
 - timecode: SMPTE timecode/framerate math (single home for it)
 - subtitle_retime: TTML/SRT framerate retiming, plus a standalone SRT cue parser
