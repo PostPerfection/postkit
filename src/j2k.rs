@@ -407,8 +407,9 @@ pub struct MxfBitrateStats {
     pub max_bitrate_mbps: f64,
 }
 
-/// Analyse per-frame bitrate of a JP2K picture MXF via the asdcplib reader.
-/// Reads each frame's stored size (unencrypted; ciphertext frame sizes match
+/// Analyse per-frame bitrate of an AS-DCP (OP-Atom) JP2K picture MXF via the
+/// asdcplib reader, which is how a DCP wraps monoscopic picture essence. Reads
+/// each frame's stored size (unencrypted; ciphertext frame sizes match
 /// plaintext) and derives the DCI-relevant peak/avg bitrate.
 pub fn analyse_mxf_bitrate(mxf_path: &Path) -> MxfBitrateStats {
     let mut stats = MxfBitrateStats::default();
@@ -432,10 +433,56 @@ pub fn analyse_mxf_bitrate(mxf_path: &Path) -> MxfBitrateStats {
         }
     };
 
-    stats.frame_count = desc.container_duration;
-    stats.width = desc.stored_width;
-    stats.height = desc.stored_height;
-    stats.frame_rate = desc.edit_rate.numerator as f64 / desc.edit_rate.denominator.max(1) as f64;
+    measure_frames(&desc, |index, buf| {
+        reader.read_frame(index, buf, None, None).ok()
+    })
+}
+
+/// Same, for AS-02 wrapped picture essence, which is what an IMP carries. Kept
+/// separate from the AS-DCP reader rather than chained behind it: the AS-02
+/// reader also opens stereoscopic AS-DCP essence and reports one eye per frame,
+/// so a caller with 3D essence has to reach its own 3D reader first.
+pub fn analyse_as02_mxf_bitrate(mxf_path: &Path) -> MxfBitrateStats {
+    let mut stats = MxfBitrateStats::default();
+
+    let Some(path_str) = mxf_path.to_str() else {
+        stats.error = "non-UTF-8 MXF path".into();
+        return stats;
+    };
+
+    let mut reader = asdcplib::as02::jp2k::MxfReader::new();
+    if let Err(e) = reader.open_read(path_str) {
+        stats.error = format!("Failed to open AS-02 MXF: {e}");
+        return stats;
+    }
+
+    let desc = match reader.picture_descriptor() {
+        Ok(d) => d,
+        Err(e) => {
+            stats.error = format!("Failed to read AS-02 picture descriptor: {e}");
+            return stats;
+        }
+    };
+
+    measure_frames(&desc, |index, buf| {
+        reader.read_frame(index, buf, None, None).ok()
+    })
+}
+
+/// Read every frame of an open picture essence and turn the stored frame sizes
+/// into bitrate statistics. `read_frame` yields one frame's size, or None at the
+/// first frame that cannot be read, which ends the walk.
+fn measure_frames(
+    desc: &asdcplib::jp2k::PictureDescriptor,
+    mut read_frame: impl FnMut(u32, &mut [u8]) -> Option<usize>,
+) -> MxfBitrateStats {
+    let mut stats = MxfBitrateStats {
+        frame_count: desc.container_duration,
+        width: desc.stored_width,
+        height: desc.stored_height,
+        frame_rate: desc.edit_rate.numerator as f64 / desc.edit_rate.denominator.max(1) as f64,
+        ..Default::default()
+    };
 
     if stats.frame_count == 0 || stats.frame_rate <= 0.0 {
         stats.error = "Invalid frame count or rate".into();
@@ -444,12 +491,13 @@ pub fn analyse_mxf_bitrate(mxf_path: &Path) -> MxfBitrateStats {
 
     stats.min_frame_bytes = u64::MAX;
     let mut buf = vec![0u8; 16 * 1024 * 1024];
+    let mut frames_read = 0u32;
 
     for i in 0..stats.frame_count {
-        let frame_size = match reader.read_frame(i, &mut buf, None, None) {
-            Ok(sz) => sz as u64,
-            Err(_) => break,
+        let Some(frame_size) = read_frame(i, &mut buf) else {
+            break;
         };
+        let frame_size = frame_size as u64;
         stats.total_bytes += frame_size;
         if frame_size > stats.max_frame_bytes {
             stats.max_frame_bytes = frame_size;
@@ -458,10 +506,15 @@ pub fn analyse_mxf_bitrate(mxf_path: &Path) -> MxfBitrateStats {
         if frame_size < stats.min_frame_bytes {
             stats.min_frame_bytes = frame_size;
         }
+        frames_read += 1;
     }
 
-    if stats.min_frame_bytes == u64::MAX {
+    // a reader that opens the wrapping but reads no frame has measured nothing,
+    // so the caller can fall through to the other wrapping.
+    if frames_read == 0 {
         stats.min_frame_bytes = 0;
+        stats.error = "No frames could be read".into();
+        return stats;
     }
 
     let frame_duration_sec = 1.0 / stats.frame_rate;
