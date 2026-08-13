@@ -1187,6 +1187,49 @@ mod tests {
 
     #[cfg(feature = "grok-ffi")]
     #[test]
+    fn the_default_bitrate_target_stays_under_the_dci_cap() {
+        // rate allocation lands a frame either side of the target, so the
+        // shipped target needs room under the cap. noise is incompressible
+        // enough to hit the rate ceiling on every frame.
+        let (w, h) = (2048u32, 1080u32);
+        let mut state = 7u32;
+        let data: Vec<u8> = (0..(w * h * 6))
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let frame = RawFrame::Packed {
+            data,
+            width: w,
+            height: h,
+            precision: 16,
+            index: 0,
+        };
+        initialize(0);
+
+        const DEFAULT_TARGET_MBPS: f64 = 230.0;
+        const FPS: u32 = 24;
+        let raw_bits = w as f64 * h as f64 * 36.0;
+        let params = CompressParams {
+            compression_ratio: raw_bits / (DEFAULT_TARGET_MBPS * 1_000_000.0 / FPS as f64),
+            apply_xyz_transform: true,
+            frame_rate: FPS as u16,
+            ..CompressParams::default()
+        };
+
+        let mut buf = Vec::new();
+        let bytes = compress_frame_grok(&frame, &params, &mut buf).unwrap();
+        let cap = crate::j2k::dci_codestream_byte_cap(FPS);
+        assert!(
+            (bytes.len() as u64) <= cap,
+            "{} bytes exceeds the {cap} byte DCI cap",
+            bytes.len()
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
     fn overlapping_pipelines_share_the_inline_pool() {
         // pipelines resize grok's global pool; unguarded, one pipeline's exit
         // destroys the executor another's codecs are running on (segfault).

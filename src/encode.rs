@@ -1015,5 +1015,4 @@ mod tests {
         assert!(error.contains("2048 bytes"), "{error}");
         assert!(check_codestream_size(&dir.path().join("missing.j2c"), 2048).is_err());
     }
-
 }

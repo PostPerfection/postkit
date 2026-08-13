@@ -313,6 +313,12 @@ fn count_tile_parts(data: &[u8]) -> u32 {
 /// bytes as 24 fps 2K, and the 500 widely used for 4K has no source.
 pub const DCI_MAX_BITRATE_MBPS: f64 = 250.0;
 
+/// The DCI per-frame codestream byte cap at `fps`: 250 Mb/s spread over one
+/// second of frames, 1,302,083 bytes at 24 fps.
+pub fn dci_codestream_byte_cap(fps: u32) -> u64 {
+    31_250_000 / fps.max(1) as u64
+}
+
 /// Analyse bitrate of a sequence of J2K files.
 pub fn analyse_bitrate(j2k_files: &[std::path::PathBuf], fps: f64) -> BitrateAnalysis {
     let mut frames = Vec::with_capacity(j2k_files.len());
@@ -541,6 +547,8 @@ mod tests {
             let mbps = bytes_per_frame * fps * 8.0 / 1_000_000.0;
             assert!((mbps - DCI_MAX_BITRATE_MBPS).abs() < 0.001);
         }
+        assert_eq!(dci_codestream_byte_cap(24), 1_302_083);
+        assert_eq!(dci_codestream_byte_cap(48), 651_041);
     }
 
     #[test]
