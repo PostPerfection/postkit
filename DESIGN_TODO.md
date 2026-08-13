@@ -1,5 +1,18 @@
 # Planned
 
+- Embedded playback via the libmpv render API, for both wizard GUIs (next session).
+  Native Wayland has no foreign-window reparenting, so the spawned mpv preview can
+  never sit inside the tauri window: mpv --wid is X11/Windows only, which is why
+  every embedding attempt failed on Fedora/Wayland. The route that works is linking
+  libmpv and drawing through mpv_render_context into a GtkGLArea placed next to the
+  webview in the tauri gtk window. In-process rendering, so the no-embedding rule
+  never applies. The reusable half (library control, render loop) replaces the
+  process-spawning side of the mpv module here; each wizard hosts the GL area in
+  its own tauri glue, mirroring how preview_server.rs is duplicated today.
+  Rendering and colour transforms run as GPU shaders, and hwdec (VAAPI over EGL)
+  accelerates H.264/HEVC/AV1 sources. J2K stays CPU-decoded: no GPU has
+  fixed-function J2K, that is what the GPU decode item below is for, and it would
+  hand frames to this same GL surface, so build this first.
 - GPU J2K decode path. Prerequisite for real-time preview and for the features that
   gate on it: SDI output, and the dcpdoctor/wizard player controls (loop dom#2700,
   speed dom#2917, markers dom#2893, waveform dom#3091, 3D view modes
