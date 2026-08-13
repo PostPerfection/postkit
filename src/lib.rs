@@ -25,7 +25,7 @@ pub mod mca;
 pub mod metadata_edit;
 pub mod mid_side;
 pub mod mpv;
-#[cfg(all(target_os = "linux", feature = "libmpv"))]
+#[cfg(feature = "libmpv")]
 pub mod mpv_render;
 pub mod mxf_wrap;
 pub mod otioz_import;
