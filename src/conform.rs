@@ -11,6 +11,10 @@ pub enum ConformError {
          export the edit as CMX 3600 EDL or FCP7 XML instead)"
     )]
     AafNotImplemented,
+    /// Reported by an application that does read AAF, since the timeline types
+    /// it fills in are these.
+    #[error("AAF import failed: {0}")]
+    Aaf(String),
     #[error("Unsupported timeline format: {0}")]
     Unsupported(String),
     #[error("XML parse error: {0}")]
@@ -50,6 +54,10 @@ pub struct EditEvent {
     /// "CUT", "DISSOLVE"
     pub transition: String,
     pub comment: String,
+    /// fcpxml lane the clip came from: 0 is the primary storyline, positive is
+    /// connected above it, negative below. Always 0 for EDL and xmeml.
+    #[serde(default)]
+    pub lane: i32,
 }
 
 /// Parsed timeline.
@@ -59,6 +67,10 @@ pub struct Timeline {
     pub frame_rate: f64,
     pub format: TimelineFormat,
     pub events: Vec<EditEvent>,
+    /// Timeline constructs that carry no source clip a reel plan could hold,
+    /// one line each with the reason. Never silently dropped.
+    #[serde(default)]
+    pub skipped: Vec<String>,
 }
 
 impl Default for Timeline {
@@ -68,6 +80,7 @@ impl Default for Timeline {
             frame_rate: 24.0,
             format: TimelineFormat::Unknown,
             events: Vec::new(),
+            skipped: Vec::new(),
         }
     }
 }
@@ -255,7 +268,7 @@ fn parse_xmeml(content: &str) -> Result<Timeline, ConformError> {
                         record_in: c.rec_in,
                         record_out: c.rec_out,
                         transition: "CUT".to_string(),
-                        comment: String::new(),
+                        ..Default::default()
                     });
                 }
                 stack.pop();
@@ -276,26 +289,17 @@ fn parse_xmeml(content: &str) -> Result<Timeline, ConformError> {
 
 const FCPXML_FALLBACK_FRAME_RATE: f64 = 24.0;
 const UNNAMED_REEL_NAME: &str = "AX";
+/// A compound clip chain longer than this is a mistake or a reference cycle the
+/// per-branch check cannot see.
+const FCPXML_MAX_NESTING_DEPTH: usize = 16;
 
 /// An `<asset>` declared in an fcpxml `<resources>` block.
 #[derive(Default)]
 struct FcpxmlAsset {
     name: String,
+    start_seconds: f64,
     has_video: bool,
     has_audio: bool,
-}
-
-/// A clip on the primary storyline, times kept as raw rational-second strings
-/// until the sequence frame rate is known.
-struct FcpxmlClip {
-    element_name: String,
-    asset_reference: String,
-    clip_name: String,
-    offset: String,
-    duration: String,
-    start: String,
-    /// srcEnable: "all", "audio" or "video".
-    enabled_sources: String,
 }
 
 /// Parse an fcpxml rational-second time ("0s", "5s", "1001/24000s") to seconds.
@@ -315,119 +319,96 @@ fn parse_fcpxml_seconds(value: &str) -> Option<f64> {
 }
 
 fn seconds_to_frames(seconds: f64, frame_rate: f64) -> u32 {
-    (seconds * frame_rate).round() as u32
+    (seconds * frame_rate).round().max(0.0) as u32
 }
 
-fn attribute(element: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
-    element.attributes().flatten().find_map(|a| {
-        if local_name(a.key.as_ref()) != name {
-            return None;
-        }
-        a.unescape_value().ok().map(|v| v.into_owned())
-    })
+/// One fcpxml element with its attributes and children. Timeline content nests
+/// (clips connected in lanes, compound clips holding a sequence of their own),
+/// so the document is read into a tree and walked rather than streamed.
+struct FcpxmlElement {
+    name: String,
+    attributes: Vec<(String, String)>,
+    children: Vec<FcpxmlElement>,
 }
 
-fn attribute_flag(element: &quick_xml::events::BytesStart, name: &str) -> bool {
-    attribute(element, name).is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+impl FcpxmlElement {
+    fn attribute(&self, name: &str) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn flag(&self, name: &str) -> bool {
+        self.attribute(name)
+            .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    }
+
+    fn seconds(&self, name: &str) -> Option<f64> {
+        self.attribute(name).and_then(parse_fcpxml_seconds)
+    }
+
+    fn lane(&self) -> i32 {
+        self.attribute("lane")
+            .and_then(|v| v.parse::<i32>().ok())
+            .unwrap_or(0)
+    }
+
+    fn child(&self, name: &str) -> Option<&FcpxmlElement> {
+        self.children.iter().find(|child| child.name == name)
+    }
 }
 
-fn parse_fcpxml(content: &str) -> Result<Timeline, ConformError> {
+fn fcpxml_element_head(element: &quick_xml::events::BytesStart) -> FcpxmlElement {
+    FcpxmlElement {
+        name: local_name(element.name().as_ref()),
+        attributes: element
+            .attributes()
+            .flatten()
+            .filter_map(|attribute| {
+                let value = attribute.unescape_value().ok()?.into_owned();
+                Some((local_name(attribute.key.as_ref()), value))
+            })
+            .collect(),
+        children: Vec::new(),
+    }
+}
+
+/// Read the whole document into a tree. Text nodes are dropped: fcpxml carries
+/// everything this parser needs in attributes.
+fn read_fcpxml_tree(content: &str) -> Result<FcpxmlElement, ConformError> {
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
-    use std::collections::HashMap;
 
     let mut reader = Reader::from_str(content);
-    let mut frame_rate_by_format_id: HashMap<String, f64> = HashMap::new();
-    let mut asset_by_id: HashMap<String, FcpxmlAsset> = HashMap::new();
-    let mut clips: Vec<FcpxmlClip> = Vec::new();
-    let mut sequence_format_id = String::new();
-    let mut title = String::new();
-    let mut depth: usize = 0;
-    let mut spine_depth: Option<usize> = None;
-    let mut spine_seen = false;
-    // compound clips are defined in <resources> with a spine of their own
-    let mut resources_depth: Option<usize> = None;
+    let mut open = vec![FcpxmlElement {
+        name: "fcpxml-document".to_string(),
+        attributes: Vec::new(),
+        children: Vec::new(),
+    }];
 
     loop {
-        let event = reader
+        match reader
             .read_event()
-            .map_err(|e| ConformError::Xml(e.to_string()))?;
-
-        if let Event::Start(element) | Event::Empty(element) = &event {
-            let name = local_name(element.name().as_ref());
-            match name.as_str() {
-                "format" => {
-                    if let (Some(id), Some(rate)) = (
-                        attribute(element, "id"),
-                        attribute(element, "frameDuration")
-                            .as_deref()
-                            .and_then(parse_fcpxml_seconds)
-                            .filter(|seconds| *seconds > 0.0)
-                            .map(|seconds| 1.0 / seconds),
-                    ) {
-                        frame_rate_by_format_id.insert(id, rate);
-                    }
+            .map_err(|e| ConformError::Xml(e.to_string()))?
+        {
+            Event::Start(element) => open.push(fcpxml_element_head(&element)),
+            Event::Empty(element) => {
+                let leaf = fcpxml_element_head(&element);
+                match open.last_mut() {
+                    Some(parent) => parent.children.push(leaf),
+                    None => return Err(ConformError::Xml("element outside the root".to_string())),
                 }
-                "asset" => {
-                    if let Some(id) = attribute(element, "id") {
-                        asset_by_id.insert(
-                            id,
-                            FcpxmlAsset {
-                                name: attribute(element, "name").unwrap_or_default(),
-                                has_video: attribute_flag(element, "hasVideo"),
-                                has_audio: attribute_flag(element, "hasAudio"),
-                            },
-                        );
-                    }
-                }
-                "project" => {
-                    if title.is_empty() {
-                        title = attribute(element, "name").unwrap_or_default();
-                    }
-                }
-                "resources" => {
-                    if resources_depth.is_none() && matches!(&event, Event::Start(_)) {
-                        resources_depth = Some(depth);
-                    }
-                }
-                "sequence" => {
-                    if resources_depth.is_none() && sequence_format_id.is_empty() {
-                        sequence_format_id = attribute(element, "format").unwrap_or_default();
-                    }
-                }
-                "spine" => {
-                    if resources_depth.is_none() && !spine_seen && matches!(&event, Event::Start(_))
-                    {
-                        spine_seen = true;
-                        spine_depth = Some(depth);
-                    }
-                }
-                "asset-clip" | "video" | "audio"
-                    if spine_depth.is_some_and(|spine| depth == spine + 1) =>
-                {
-                    clips.push(FcpxmlClip {
-                        element_name: name,
-                        asset_reference: attribute(element, "ref").unwrap_or_default(),
-                        clip_name: attribute(element, "name").unwrap_or_default(),
-                        offset: attribute(element, "offset").unwrap_or_default(),
-                        duration: attribute(element, "duration").unwrap_or_default(),
-                        start: attribute(element, "start").unwrap_or_default(),
-                        enabled_sources: attribute(element, "srcEnable").unwrap_or_default(),
-                    });
-                }
-                _ => {}
             }
-        }
-
-        match event {
-            Event::Start(_) => depth += 1,
             Event::End(_) => {
-                depth = depth.saturating_sub(1);
-                if spine_depth == Some(depth) {
-                    spine_depth = None;
-                }
-                if resources_depth == Some(depth) {
-                    resources_depth = None;
+                let finished = open.pop();
+                match (finished, open.last_mut()) {
+                    (Some(finished), Some(parent)) => parent.children.push(finished),
+                    _ => {
+                        return Err(ConformError::Xml(
+                            "closing tag with no matching open tag".to_string(),
+                        ));
+                    }
                 }
             }
             Event::Eof => break,
@@ -435,52 +416,414 @@ fn parse_fcpxml(content: &str) -> Result<Timeline, ConformError> {
         }
     }
 
-    let frame_rate = frame_rate_by_format_id
-        .get(&sequence_format_id)
+    match open.len() {
+        1 => open
+            .pop()
+            .ok_or_else(|| ConformError::Xml("empty document".to_string())),
+        remaining => Err(ConformError::Xml(format!(
+            "{} unclosed element(s)",
+            remaining - 1
+        ))),
+    }
+}
+
+/// The `<resources>` declarations a clip can point at: formats carry the frame
+/// rate, assets the media name, media elements the sequence behind a compound
+/// clip.
+#[derive(Default)]
+struct FcpxmlResources<'a> {
+    frame_rate_by_format_id: std::collections::HashMap<String, f64>,
+    asset_by_id: std::collections::HashMap<String, FcpxmlAsset>,
+    media_by_id: std::collections::HashMap<String, &'a FcpxmlElement>,
+}
+
+fn collect_fcpxml_resources<'a>(element: &'a FcpxmlElement, into: &mut FcpxmlResources<'a>) {
+    for child in &element.children {
+        match child.name.as_str() {
+            "format" => {
+                if let (Some(id), Some(rate)) = (
+                    child.attribute("id"),
+                    child
+                        .seconds("frameDuration")
+                        .filter(|seconds| *seconds > 0.0)
+                        .map(|seconds| 1.0 / seconds),
+                ) {
+                    into.frame_rate_by_format_id.insert(id.to_string(), rate);
+                }
+            }
+            "asset" => {
+                if let Some(id) = child.attribute("id") {
+                    into.asset_by_id.insert(
+                        id.to_string(),
+                        FcpxmlAsset {
+                            name: child.attribute("name").unwrap_or_default().to_string(),
+                            start_seconds: child.seconds("start").unwrap_or(0.0),
+                            has_video: child.flag("hasVideo"),
+                            has_audio: child.flag("hasAudio"),
+                        },
+                    );
+                }
+            }
+            "media" => {
+                if let Some(id) = child.attribute("id") {
+                    into.media_by_id.insert(id.to_string(), child);
+                }
+            }
+            _ => {}
+        }
+        collect_fcpxml_resources(child, into);
+    }
+}
+
+/// Depth-first search for the first `<name>` element outside `<resources>`, so
+/// a compound clip's own sequence is never mistaken for the project's.
+fn find_fcpxml_element<'a>(element: &'a FcpxmlElement, name: &str) -> Option<&'a FcpxmlElement> {
+    for child in &element.children {
+        if child.name == "resources" {
+            continue;
+        }
+        if child.name == name {
+            return Some(child);
+        }
+        if let Some(found) = find_fcpxml_element(child, name) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// What a timeline element contributes to a flat reel plan.
+enum FcpxmlElementKind {
+    /// References an `<asset>`, so it becomes one edit event. May carry clips
+    /// connected to it in lanes.
+    AssetBacked,
+    /// Holds its content in its children and contributes nothing itself.
+    Container,
+    /// `<ref-clip>`: stands in for the sequence of the `<media>` it references.
+    CompoundReference,
+    /// Empty time, but connected clips still hang off it.
+    Gap,
+    /// Nothing in a reel plan can stand in for it. The text is the reason.
+    Unmappable(&'static str),
+}
+
+fn fcpxml_element_kind(name: &str) -> Option<FcpxmlElementKind> {
+    use FcpxmlElementKind::*;
+    Some(match name {
+        "asset-clip" | "video" | "audio" => AssetBacked,
+        "clip" | "sync-clip" | "spine" => Container,
+        "ref-clip" => CompoundReference,
+        "gap" => Gap,
+        "title" | "caption" | "generator" => {
+            Unmappable("generated in the editor, there is no source media to conform")
+        }
+        "mc-clip" => Unmappable(
+            "multicam angle selection has no flat equivalent, flatten it in the editor and re-export",
+        ),
+        "audition" => Unmappable("audition alternatives, pick one in the editor and re-export"),
+        "transition" => {
+            Unmappable("a transition is not a source clip, conform assembles cuts only")
+        }
+        _ => return None,
+    })
+}
+
+/// Where a container's own time base sits on the record timeline, and which
+/// slice of that time base its parent actually shows.
+#[derive(Clone, Copy)]
+struct FcpxmlWindow {
+    record_of_local_zero: f64,
+    start: f64,
+    end: f64,
+    lane: i32,
+}
+
+/// A clip resolved to the record timeline, still in seconds because fcpxml
+/// times are rate-independent and only the sequence rate turns them to frames.
+struct FcpxmlResolvedClip {
+    reel_name: String,
+    track_type: &'static str,
+    lane: i32,
+    record_in_seconds: f64,
+    source_in_seconds: f64,
+    length_seconds: f64,
+}
+
+struct FcpxmlWalk<'a> {
+    resources: &'a FcpxmlResources<'a>,
+    clips: Vec<FcpxmlResolvedClip>,
+    skipped: Vec<String>,
+    /// Media ids being expanded right now, so a compound clip that contains
+    /// itself is reported instead of recursing until the stack runs out.
+    expanding: Vec<String>,
+}
+
+impl<'a> FcpxmlWalk<'a> {
+    fn skip(&mut self, element: &FcpxmlElement, reason: &str) {
+        let note = match element.attribute("name").filter(|n| !n.is_empty()) {
+            Some(name) => format!("<{}> \"{name}\": {reason}", element.name),
+            None => format!("<{}>: {reason}", element.name),
+        };
+        tracing::warn!("fcpxml: skipped {note}");
+        self.skipped.push(note);
+    }
+
+    /// The clip's start inside the media it references. An absent `start` means
+    /// the media's own beginning, which for an asset is its `start` and for a
+    /// compound clip the inner sequence's `tcStart`.
+    fn media_start(&self, element: &FcpxmlElement) -> f64 {
+        if let Some(start) = element.seconds("start") {
+            return start;
+        }
+        let Some(reference) = element.attribute("ref") else {
+            return 0.0;
+        };
+        if let Some(asset) = self.resources.asset_by_id.get(reference) {
+            return asset.start_seconds;
+        }
+        self.resources
+            .media_by_id
+            .get(reference)
+            .and_then(|media| media.child("sequence"))
+            .and_then(|sequence| sequence.seconds("tcStart"))
+            .unwrap_or(0.0)
+    }
+
+    /// The part of `element` its parent actually shows, in the parent's time
+    /// base. None when the parent trimmed all of it away.
+    fn visible_range(&self, element: &FcpxmlElement, window: &FcpxmlWindow) -> Option<(f64, f64)> {
+        let offset = element.seconds("offset").unwrap_or(0.0);
+        let duration = element.seconds("duration").unwrap_or(f64::INFINITY);
+        let start = offset.max(window.start);
+        let end = (offset + duration).min(window.end);
+        (end > start).then_some((start, end))
+    }
+
+    /// The time base of `element`'s own content, given the slice of it visible
+    /// in the parent.
+    fn inner_window(
+        &self,
+        element: &FcpxmlElement,
+        window: &FcpxmlWindow,
+        (visible_start, visible_end): (f64, f64),
+        lane: i32,
+    ) -> FcpxmlWindow {
+        let offset = element.seconds("offset").unwrap_or(0.0);
+        let start = self.media_start(element);
+        let inner_start = start + (visible_start - offset);
+        FcpxmlWindow {
+            record_of_local_zero: window.record_of_local_zero + offset - start,
+            start: inner_start,
+            end: inner_start + (visible_end - visible_start),
+            lane,
+        }
+    }
+
+    fn walk_children(
+        &mut self,
+        container: &'a FcpxmlElement,
+        window: FcpxmlWindow,
+        depth: usize,
+        connected_only: bool,
+    ) {
+        for child in &container.children {
+            // inside a clip, a child without a lane is one of that clip's own
+            // components (its audio role, its video), not a separate clip
+            if connected_only && child.lane() == 0 {
+                continue;
+            }
+            self.place(child, window, depth);
+        }
+    }
+
+    fn place(&mut self, element: &'a FcpxmlElement, window: FcpxmlWindow, depth: usize) {
+        let Some(kind) = fcpxml_element_kind(&element.name) else {
+            return;
+        };
+        let Some(visible) = self.visible_range(element, &window) else {
+            return;
+        };
+        if depth >= FCPXML_MAX_NESTING_DEPTH {
+            self.skip(
+                element,
+                &format!("nested more than {FCPXML_MAX_NESTING_DEPTH} levels deep"),
+            );
+            return;
+        }
+        let lane = match element.lane() {
+            0 => window.lane,
+            lane => lane,
+        };
+        let inner = self.inner_window(element, &window, visible, lane);
+        match kind {
+            FcpxmlElementKind::AssetBacked => {
+                // an asset-clip pointing at a <media> is a compound clip too
+                if element
+                    .attribute("ref")
+                    .is_some_and(|reference| self.resources.media_by_id.contains_key(reference))
+                {
+                    self.expand_compound(element, inner, depth);
+                } else {
+                    self.emit(element, &window, visible, lane);
+                }
+                self.walk_children(element, inner, depth + 1, true);
+            }
+            FcpxmlElementKind::CompoundReference => {
+                self.expand_compound(element, inner, depth);
+                self.walk_children(element, inner, depth + 1, true);
+            }
+            FcpxmlElementKind::Container => self.walk_children(element, inner, depth + 1, false),
+            FcpxmlElementKind::Gap => self.walk_children(element, inner, depth + 1, true),
+            FcpxmlElementKind::Unmappable(reason) => self.skip(element, reason),
+        }
+    }
+
+    /// Walk the spine of the `<media>` sequence `element` references, placing
+    /// its clips on the record timeline as if they were spelled out here.
+    fn expand_compound(&mut self, element: &'a FcpxmlElement, window: FcpxmlWindow, depth: usize) {
+        let Some(reference) = element.attribute("ref") else {
+            self.skip(element, "no ref attribute, nothing to expand");
+            return;
+        };
+        let Some(media) = self.resources.media_by_id.get(reference).copied() else {
+            self.skip(
+                element,
+                &format!("references \"{reference}\", which no <media> in <resources> declares"),
+            );
+            return;
+        };
+        if self.expanding.iter().any(|open| open == reference) {
+            self.skip(
+                element,
+                &format!("compound clip \"{reference}\" contains itself"),
+            );
+            return;
+        }
+        let Some(sequence) = media.child("sequence") else {
+            let reason = match media.child("multicam") {
+                Some(_) => "multicam media, angle selection has no flat equivalent",
+                None => "referenced media holds no sequence",
+            };
+            self.skip(element, reason);
+            return;
+        };
+        let Some(spine) = sequence.child("spine") else {
+            self.skip(element, "compound clip sequence has no spine");
+            return;
+        };
+        self.expanding.push(reference.to_string());
+        self.walk_children(spine, window, depth + 1, false);
+        self.expanding.pop();
+    }
+
+    fn emit(
+        &mut self,
+        element: &FcpxmlElement,
+        window: &FcpxmlWindow,
+        (visible_start, visible_end): (f64, f64),
+        lane: i32,
+    ) {
+        let reference = element.attribute("ref").unwrap_or_default();
+        let asset = self.resources.asset_by_id.get(reference);
+        let reel_name = [
+            asset.map(|a| a.name.as_str()).unwrap_or_default(),
+            element.attribute("name").unwrap_or_default(),
+            reference,
+        ]
+        .into_iter()
+        .find(|candidate| !candidate.is_empty())
+        .unwrap_or(UNNAMED_REEL_NAME)
+        .to_string();
+        let track_type = match element.name.as_str() {
+            "video" => "V",
+            "audio" => "A",
+            _ => match (element.attribute("srcEnable").unwrap_or_default(), asset) {
+                ("audio", _) => "A",
+                ("video", _) => "V",
+                (_, Some(asset)) if asset.has_audio && !asset.has_video => "A",
+                _ => "V",
+            },
+        };
+        let length = visible_end - visible_start;
+        let offset = element.seconds("offset").unwrap_or(0.0);
+        self.clips.push(FcpxmlResolvedClip {
+            reel_name,
+            track_type,
+            lane,
+            record_in_seconds: window.record_of_local_zero + visible_start,
+            source_in_seconds: self.media_start(element) + (visible_start - offset),
+            length_seconds: if length.is_finite() { length } else { 0.0 },
+        });
+    }
+}
+
+fn parse_fcpxml(content: &str) -> Result<Timeline, ConformError> {
+    let document = read_fcpxml_tree(content)?;
+    let mut resources = FcpxmlResources::default();
+    collect_fcpxml_resources(&document, &mut resources);
+
+    let title = find_fcpxml_element(&document, "project")
+        .and_then(|project| project.attribute("name"))
+        .unwrap_or_default()
+        .to_string();
+    let Some(sequence) = find_fcpxml_element(&document, "sequence") else {
+        return Err(ConformError::NoEvents);
+    };
+    let frame_rate = sequence
+        .attribute("format")
+        .and_then(|id| resources.frame_rate_by_format_id.get(id))
         .copied()
         .unwrap_or(FCPXML_FALLBACK_FRAME_RATE);
 
-    let events = clips
+    let mut walk = FcpxmlWalk {
+        resources: &resources,
+        clips: Vec::new(),
+        skipped: Vec::new(),
+        expanding: Vec::new(),
+    };
+    if let Some(spine) = sequence.child("spine") {
+        walk.walk_children(
+            spine,
+            FcpxmlWindow {
+                record_of_local_zero: 0.0,
+                start: 0.0,
+                end: f64::INFINITY,
+                lane: 0,
+            },
+            0,
+            false,
+        );
+    }
+
+    // spine order is not record order once lanes and compound clips are flattened
+    walk.clips.sort_by(|a, b| {
+        a.record_in_seconds
+            .total_cmp(&b.record_in_seconds)
+            .then(a.lane.cmp(&b.lane))
+    });
+
+    let events: Vec<EditEvent> = walk
+        .clips
         .iter()
         .enumerate()
         .map(|(index, clip)| {
-            let asset = asset_by_id.get(&clip.asset_reference);
-            let seconds = |value: &str| parse_fcpxml_seconds(value).unwrap_or(0.0);
-            let record_in = seconds_to_frames(seconds(&clip.offset), frame_rate);
-            let source_in = seconds_to_frames(seconds(&clip.start), frame_rate);
-            let length = seconds_to_frames(seconds(&clip.duration), frame_rate);
-            let reel_name = [
-                asset.map(|a| a.name.as_str()).unwrap_or_default(),
-                clip.clip_name.as_str(),
-                clip.asset_reference.as_str(),
-            ]
-            .into_iter()
-            .find(|candidate| !candidate.is_empty())
-            .unwrap_or(UNNAMED_REEL_NAME)
-            .to_string();
-            let track_type = match clip.element_name.as_str() {
-                "video" => "V",
-                "audio" => "A",
-                _ => match (clip.enabled_sources.as_str(), asset) {
-                    ("audio", _) => "A",
-                    ("video", _) => "V",
-                    (_, Some(a)) if a.has_audio && !a.has_video => "A",
-                    _ => "V",
-                },
-            };
+            let record_in = seconds_to_frames(clip.record_in_seconds, frame_rate);
+            let source_in = seconds_to_frames(clip.source_in_seconds, frame_rate);
+            let length = seconds_to_frames(clip.length_seconds, frame_rate);
             EditEvent {
                 event_number: index as u32 + 1,
-                reel_name,
-                track_type: track_type.to_string(),
+                reel_name: clip.reel_name.clone(),
+                track_type: clip.track_type.to_string(),
                 source_in,
                 source_out: source_in + length,
                 record_in,
                 record_out: record_in + length,
                 transition: "CUT".to_string(),
                 comment: String::new(),
+                lane: clip.lane,
             }
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     if events.is_empty() {
         return Err(ConformError::NoEvents);
@@ -491,6 +834,7 @@ fn parse_fcpxml(content: &str) -> Result<Timeline, ConformError> {
         frame_rate,
         format: TimelineFormat::XmlFcpx,
         events,
+        skipped: walk.skipped,
     })
 }
 
@@ -550,6 +894,7 @@ fn parse_edl(file: &Path) -> Timeline {
                 record_out: tc_to_frames(&caps[8], timeline.frame_rate as u32),
                 transition: caps[4].to_string(),
                 comment: std::mem::take(&mut last_comment),
+                lane: 0,
             };
             timeline.events.push(event);
         }
@@ -937,6 +1282,216 @@ mod tests {
         assert_eq!(tl.events[1].record_in, 108301);
         assert_eq!(tl.events[1].record_out, 109471);
         assert_eq!(tl.events[1].reel_name, "demo.mp4");
+    }
+
+    /// Every clip in the lane fixtures below, as (reel, track, lane, record in,
+    /// record out, source in, source out).
+    fn clip_rows(timeline: &Timeline) -> Vec<(&str, &str, i32, u32, u32, u32, u32)> {
+        timeline
+            .events
+            .iter()
+            .map(|e| {
+                (
+                    e.reel_name.as_str(),
+                    e.track_type.as_str(),
+                    e.lane,
+                    e.record_in,
+                    e.record_out,
+                    e.source_in,
+                    e.source_out,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_fcpxml_connected_clips_in_lanes() {
+        // 24 fps. MAIN runs the first 8s of the spine from 10s into its source,
+        // with BROLL connected above it and MUSIC below. CARD is connected to a
+        // gap, which FCP gives a start of 3600s, so its offset is 3601s.
+        let (_dir, path) = write_timeline(
+            "lanes.fcpxml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" frameDuration="1/24s" width="1920" height="1080"/>
+    <asset id="r2" name="MAIN" start="0s" duration="600/24s" hasVideo="1" hasAudio="1" format="r1"/>
+    <asset id="r3" name="BROLL" start="0s" duration="600/24s" hasVideo="1" format="r1"/>
+    <asset id="r4" name="MUSIC" start="0s" duration="600/24s" hasAudio="1" audioSources="1"/>
+    <asset id="r5" name="CARD" start="0s" duration="600/24s" hasVideo="1" format="r1"/>
+  </resources>
+  <project name="Lanes">
+    <sequence format="r1" duration="288/24s" tcStart="0s" tcFormat="NDF">
+      <spine>
+        <asset-clip ref="r2" name="Main" offset="0s" start="10s" duration="8s">
+          <asset-clip ref="r3" name="Broll" lane="1" offset="12s" duration="2s"/>
+          <audio ref="r4" name="Music" lane="-1" offset="10s" duration="8s"/>
+        </asset-clip>
+        <gap name="Gap" offset="8s" start="3600s" duration="4s">
+          <asset-clip ref="r5" name="Card" lane="1" offset="3601s" duration="2s"/>
+        </gap>
+      </spine>
+    </sequence>
+  </project>
+</fcpxml>"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert!(tl.skipped.is_empty(), "unexpected skips: {:?}", tl.skipped);
+        assert_eq!(
+            clip_rows(&tl),
+            vec![
+                ("MUSIC", "A", -1, 0, 192, 0, 192),
+                ("MAIN", "V", 0, 0, 192, 240, 432),
+                ("BROLL", "V", 1, 48, 96, 0, 48),
+                ("CARD", "V", 1, 216, 264, 0, 48),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_fcpxml_compound_clip() {
+        // 24 fps. The ref-clip shows the compound from 3s in for 4s, so it cuts
+        // the tail off INSERT_A and the head off INSERT_B.
+        let (_dir, path) = write_timeline(
+            "compound.fcpxml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" frameDuration="1/24s" width="1920" height="1080"/>
+    <asset id="r2" name="OPENING" start="0s" duration="600/24s" hasVideo="1" format="r1"/>
+    <asset id="r3" name="INSERT_A" start="0s" duration="600/24s" hasVideo="1" format="r1"/>
+    <asset id="r4" name="INSERT_B" start="0s" duration="600/24s" hasVideo="1" format="r1"/>
+    <media id="r10" name="Montage">
+      <sequence format="r1" duration="10s" tcStart="0s" tcFormat="NDF">
+        <spine>
+          <asset-clip ref="r3" name="A" offset="0s" duration="4s"/>
+          <asset-clip ref="r4" name="B" offset="4s" start="2s" duration="6s"/>
+        </spine>
+      </sequence>
+    </media>
+  </resources>
+  <project name="Compound">
+    <sequence format="r1" duration="144/24s" tcStart="0s" tcFormat="NDF">
+      <spine>
+        <asset-clip ref="r2" name="Opening" offset="0s" duration="2s"/>
+        <ref-clip ref="r10" name="Montage" offset="2s" start="3s" duration="4s"/>
+      </spine>
+    </sequence>
+  </project>
+</fcpxml>"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert!(tl.skipped.is_empty(), "unexpected skips: {:?}", tl.skipped);
+        assert_eq!(tl.title, "Compound");
+        assert_eq!(
+            clip_rows(&tl),
+            vec![
+                ("OPENING", "V", 0, 0, 48, 0, 48),
+                ("INSERT_A", "V", 0, 48, 72, 72, 96),
+                ("INSERT_B", "V", 0, 72, 144, 48, 120),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_fcpxml_nested_clips() {
+        // A <clip> and a <sync-clip> hold their media in child elements rather
+        // than referencing an asset themselves.
+        let (_dir, path) = write_timeline(
+            "nested.fcpxml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" frameDuration="1/24s" width="1920" height="1080"/>
+    <asset id="r2" name="PICTURE" start="0s" duration="600/24s" hasVideo="1" format="r1"/>
+    <asset id="r3" name="NARRATION" start="0s" duration="600/24s" hasAudio="1" audioSources="1"/>
+    <asset id="r4" name="SYNC_PICTURE" start="0s" duration="600/24s" hasVideo="1" format="r1"/>
+    <asset id="r5" name="SYNC_SOUND" start="0s" duration="600/24s" hasAudio="1" audioSources="1"/>
+  </resources>
+  <project name="Nested">
+    <sequence format="r1" duration="168/24s" tcStart="0s" tcFormat="NDF">
+      <spine>
+        <clip name="Nested" offset="0s" start="0s" duration="4s">
+          <video ref="r2" offset="0s" start="5s" duration="4s"/>
+          <audio ref="r3" lane="-1" offset="0s" start="5s" duration="4s"/>
+        </clip>
+        <sync-clip name="Sync" offset="4s" start="0s" duration="3s">
+          <asset-clip ref="r4" offset="0s" duration="3s"/>
+          <audio ref="r5" lane="-1" offset="0s" duration="3s"/>
+        </sync-clip>
+      </spine>
+    </sequence>
+  </project>
+</fcpxml>"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert!(tl.skipped.is_empty(), "unexpected skips: {:?}", tl.skipped);
+        assert_eq!(
+            clip_rows(&tl),
+            vec![
+                ("NARRATION", "A", -1, 0, 96, 120, 216),
+                ("PICTURE", "V", 0, 0, 96, 120, 216),
+                ("SYNC_SOUND", "A", -1, 96, 168, 0, 72),
+                ("SYNC_PICTURE", "V", 0, 96, 168, 0, 72),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_fcpxml_skips_name_the_construct() {
+        let (_dir, path) = write_timeline(
+            "skips.fcpxml",
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" frameDuration="1/24s" width="1920" height="1080"/>
+    <asset id="r2" name="SHOT" start="0s" duration="600/24s" hasVideo="1" format="r1"/>
+    <media id="r30" name="Loop">
+      <sequence format="r1" duration="1s" tcStart="0s">
+        <spine>
+          <ref-clip ref="r30" name="Inner Loop" offset="0s" duration="1s"/>
+        </spine>
+      </sequence>
+    </media>
+  </resources>
+  <project name="Skips">
+    <sequence format="r1" duration="216/24s" tcStart="0s" tcFormat="NDF">
+      <spine>
+        <asset-clip ref="r2" name="Shot" offset="0s" duration="2s"/>
+        <title name="Card" offset="2s" duration="1s"/>
+        <transition name="Cross Dissolve" offset="2s" duration="1s"/>
+        <mc-clip ref="r40" name="Multicam" offset="3s" duration="2s"/>
+        <audition offset="5s" duration="2s">
+          <asset-clip ref="r2" name="Take 1" offset="5s" duration="2s"/>
+        </audition>
+        <ref-clip ref="r99" name="Missing" offset="7s" duration="1s"/>
+        <ref-clip ref="r30" name="Loop" offset="8s" duration="1s"/>
+      </spine>
+    </sequence>
+  </project>
+</fcpxml>"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert_eq!(clip_rows(&tl), vec![("SHOT", "V", 0, 0, 48, 0, 48)]);
+        let skipped = tl.skipped.join("\n");
+        for expected in [
+            "<title> \"Card\": generated in the editor",
+            "<transition> \"Cross Dissolve\": a transition is not a source clip",
+            "<mc-clip> \"Multicam\": multicam angle selection",
+            "<audition>: audition alternatives",
+            "<ref-clip> \"Missing\": references \"r99\", which no <media>",
+            "<ref-clip> \"Inner Loop\": compound clip \"r30\" contains itself",
+        ] {
+            assert!(
+                skipped.contains(expected),
+                "missing skip {expected:?} in:\n{skipped}"
+            );
+        }
+        assert_eq!(tl.skipped.len(), 6, "{skipped}");
     }
 
     #[test]
