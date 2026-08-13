@@ -19,6 +19,8 @@ pub enum ConformError {
     Unsupported(String),
     #[error("XML parse error: {0}")]
     Xml(String),
+    #[error("OTIO JSON parse error: {0}")]
+    Json(String),
     #[error("No edit events found in timeline")]
     NoEvents,
 }
@@ -112,9 +114,9 @@ impl Default for ConformOptions {
     }
 }
 
-/// Parse a timeline file. EDL (CMX 3600), FCP7/Resolve XML (xmeml) and FCP X
-/// fcpxml are parsed for real. AAF fails loud (binary format, out of scope).
-/// OTIO lives in the otioz_import module.
+/// Parse a timeline file. EDL (CMX 3600), FCP7/Resolve XML (xmeml), FCP X
+/// fcpxml and OTIO (OpenTimelineIO JSON) are parsed for real. AAF fails loud
+/// (binary format, out of scope).
 pub fn parse_timeline(file: &Path) -> Result<Timeline, ConformError> {
     match detect_timeline_format(file) {
         TimelineFormat::EdlCmx3600 => Ok(parse_edl(file)),
@@ -122,9 +124,7 @@ pub fn parse_timeline(file: &Path) -> Result<Timeline, ConformError> {
             parse_xml_timeline(file)
         }
         TimelineFormat::Aaf => Err(ConformError::AafNotImplemented),
-        TimelineFormat::Otio => Err(ConformError::Unsupported(
-            "OTIO: use the otioz_import module".to_string(),
-        )),
+        TimelineFormat::Otio => parse_otio(file),
         TimelineFormat::Unknown => Err(ConformError::Unsupported(
             "unrecognised timeline file".to_string(),
         )),
@@ -838,6 +838,251 @@ fn parse_fcpxml(content: &str) -> Result<Timeline, ConformError> {
     })
 }
 
+const OTIO_FALLBACK_FRAME_RATE: f64 = 24.0;
+/// A Track with no `kind` is a video track, same as OpenTimelineIO's default.
+const OTIO_DEFAULT_TRACK_KIND: &str = "Video";
+
+/// One OTIO clip resolved to the record timeline. Shared with otioz_import so
+/// there is a single OTIO parser.
+pub(crate) struct OtioClip {
+    pub name: String,
+    pub target_url: String,
+    /// The track's `kind`: "Video", "Audio", or anything else the file carries.
+    pub track_kind: String,
+    /// "V", "A1", "A2", ...
+    pub track_type: String,
+    pub record_in: u32,
+    pub source_in: u32,
+    pub duration: u32,
+}
+
+/// An OTIO document read into the parts a reel plan needs.
+pub(crate) struct OtioDocument {
+    pub title: String,
+    pub frame_rate: f64,
+    pub clips: Vec<OtioClip>,
+    pub skipped: Vec<String>,
+}
+
+/// What a track child contributes to a flat reel plan.
+enum OtioItemKind {
+    Clip,
+    /// Empty time, so it moves the record position and nothing else.
+    Gap,
+    /// Nothing in a reel plan can stand in for it. `reason` says why, and a
+    /// transition is the one that leaves the record position where it was: it
+    /// overlaps its neighbours rather than taking a slot of its own.
+    Unmappable {
+        reason: &'static str,
+        takes_record_time: bool,
+    },
+}
+
+fn otio_item_kind(schema: &str) -> OtioItemKind {
+    use OtioItemKind::*;
+    match schema.split('.').next().unwrap_or_default() {
+        "Clip" => Clip,
+        "Gap" => Gap,
+        "Transition" => Unmappable {
+            reason: "a transition is not a source clip, conform assembles cuts only",
+            takes_record_time: false,
+        },
+        "Stack" => Unmappable {
+            reason: "a nested stack has no flat equivalent, flatten it and re-export",
+            takes_record_time: true,
+        },
+        _ => Unmappable {
+            reason: "unrecognised OTIO schema",
+            takes_record_time: true,
+        },
+    }
+}
+
+fn otio_children(node: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    node.get("children")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+}
+
+fn otio_tracks(root: &serde_json::Value) -> impl Iterator<Item = &serde_json::Value> {
+    root.get("tracks").into_iter().flat_map(otio_children)
+}
+
+fn otio_string<'a>(node: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    node.get(key)
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
+/// The rate of a RationalTime, ignoring the zero a partial export can leave.
+fn otio_rate(time: Option<&serde_json::Value>) -> Option<f64> {
+    time?
+        .get("rate")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|rate| *rate > 0.0)
+}
+
+/// A RationalTime in sequence frames. A time with no rate of its own is already
+/// counted in sequence frames.
+fn otio_frames(time: Option<&serde_json::Value>, frame_rate: f64) -> u32 {
+    let Some(time) = time else {
+        return 0;
+    };
+    let value = time
+        .get("value")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let rate = otio_rate(Some(time)).unwrap_or(frame_rate);
+    (value / rate * frame_rate).round().max(0.0) as u32
+}
+
+fn otio_source_time<'a>(item: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    item.get("source_range")?.get(key)
+}
+
+fn otio_sequence_frame_rate(root: &serde_json::Value) -> f64 {
+    if let Some(rate) = otio_rate(root.get("global_start_time")) {
+        return rate;
+    }
+    otio_tracks(root)
+        .flat_map(otio_children)
+        .find_map(|item| {
+            otio_rate(otio_source_time(item, "start_time"))
+                .or_else(|| otio_rate(otio_source_time(item, "duration")))
+        })
+        .unwrap_or(OTIO_FALLBACK_FRAME_RATE)
+}
+
+/// The file name a reel plan matches media by, from a `target_url` that may be
+/// a bare path or a file:// URL.
+fn otio_basename(target_url: &str) -> &str {
+    target_url.rsplit(['/', '\\']).next().unwrap_or(target_url)
+}
+
+/// Read an OTIO (OpenTimelineIO JSON) document. Every field is optional in
+/// practice, so a missing one degrades to a default rather than failing.
+pub(crate) fn read_otio(content: &str) -> Result<OtioDocument, ConformError> {
+    let root: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| ConformError::Json(e.to_string()))?;
+    let frame_rate = otio_sequence_frame_rate(&root);
+    let mut document = OtioDocument {
+        title: otio_string(&root, "name").unwrap_or_default().to_string(),
+        frame_rate,
+        clips: Vec::new(),
+        skipped: Vec::new(),
+    };
+    let mut audio_tracks = 0u32;
+
+    for track in otio_tracks(&root) {
+        let track_kind = otio_string(track, "kind").unwrap_or(OTIO_DEFAULT_TRACK_KIND);
+        let track_type = if track_kind == "Audio" {
+            audio_tracks += 1;
+            format!("A{audio_tracks}")
+        } else {
+            "V".to_string()
+        };
+        let mut record_in = 0u32;
+
+        for item in otio_children(track) {
+            let schema = otio_string(item, "OTIO_SCHEMA").unwrap_or_default();
+            let name = otio_string(item, "name").unwrap_or_default();
+            let duration = otio_frames(otio_source_time(item, "duration"), frame_rate);
+            let kind = otio_item_kind(schema);
+
+            let skip_reason = match kind {
+                OtioItemKind::Clip => {
+                    let target_url = item
+                        .get("media_reference")
+                        .and_then(|reference| otio_string(reference, "target_url"))
+                        .unwrap_or_default();
+                    if name.is_empty() && target_url.is_empty() {
+                        Some("no media reference and no name, there is nothing to match media by")
+                    } else {
+                        document.clips.push(OtioClip {
+                            name: name.to_string(),
+                            target_url: target_url.to_string(),
+                            track_kind: track_kind.to_string(),
+                            track_type: track_type.clone(),
+                            record_in,
+                            source_in: otio_frames(
+                                otio_source_time(item, "start_time"),
+                                frame_rate,
+                            ),
+                            duration,
+                        });
+                        None
+                    }
+                }
+                OtioItemKind::Gap => None,
+                OtioItemKind::Unmappable { reason, .. } => Some(reason),
+            };
+
+            if let Some(reason) = skip_reason {
+                let note = match name.is_empty() {
+                    true => format!("{schema}: {reason}"),
+                    false => format!("{schema} \"{name}\": {reason}"),
+                };
+                tracing::warn!("otio: skipped {note}");
+                document.skipped.push(note);
+            }
+
+            let takes_record_time = !matches!(
+                kind,
+                OtioItemKind::Unmappable {
+                    takes_record_time: false,
+                    ..
+                }
+            );
+            if takes_record_time {
+                record_in += duration;
+            }
+        }
+    }
+
+    Ok(document)
+}
+
+fn parse_otio(file: &Path) -> Result<Timeline, ConformError> {
+    let document = read_otio(&std::fs::read_to_string(file)?)?;
+    let events: Vec<EditEvent> = document
+        .clips
+        .iter()
+        .enumerate()
+        .map(|(index, clip)| {
+            let reel_name = match clip.target_url.is_empty() {
+                true => clip.name.clone(),
+                false => otio_basename(&clip.target_url).to_string(),
+            };
+            EditEvent {
+                event_number: index as u32 + 1,
+                reel_name,
+                track_type: clip.track_type.clone(),
+                source_in: clip.source_in,
+                source_out: clip.source_in + clip.duration,
+                record_in: clip.record_in,
+                record_out: clip.record_in + clip.duration,
+                transition: "CUT".to_string(),
+                comment: clip.target_url.clone(),
+                lane: 0,
+            }
+        })
+        .collect();
+
+    if events.is_empty() {
+        return Err(ConformError::NoEvents);
+    }
+
+    Ok(Timeline {
+        title: document.title,
+        frame_rate: document.frame_rate,
+        format: TimelineFormat::Otio,
+        events,
+        skipped: document.skipped,
+    })
+}
+
 /// Parse a CMX 3600 EDL file.
 fn parse_edl(file: &Path) -> Timeline {
     let content = match std::fs::read_to_string(file) {
@@ -1510,6 +1755,198 @@ mod tests {
             r#"<?xml version="1.0"?><timeline><clip/></timeline>"#,
         );
         assert!(matches!(parse_timeline(&path), Err(ConformError::Xml(_))));
+    }
+
+    /// Every event as (reel, track type, record in, record out, source in,
+    /// source out).
+    fn otio_rows(timeline: &Timeline) -> Vec<(&str, &str, u32, u32, u32, u32)> {
+        timeline
+            .events
+            .iter()
+            .map(|e| {
+                (
+                    e.reel_name.as_str(),
+                    e.track_type.as_str(),
+                    e.record_in,
+                    e.record_out,
+                    e.source_in,
+                    e.source_out,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_parse_otio_tracks_and_gap() {
+        // 25 fps from global_start_time. The video track runs a clip sourced
+        // from 100 frames in, a 10 frame gap, then a second clip.
+        let (_dir, path) = write_timeline(
+            "cut.otio",
+            r#"{
+  "OTIO_SCHEMA": "Timeline.1",
+  "name": "OTIO Cut",
+  "global_start_time": { "OTIO_SCHEMA": "RationalTime.1", "value": 0.0, "rate": 25.0 },
+  "tracks": {
+    "OTIO_SCHEMA": "Stack.1",
+    "children": [
+      {
+        "OTIO_SCHEMA": "Track.1",
+        "kind": "Video",
+        "children": [
+          { "OTIO_SCHEMA": "Clip.1", "name": "shot_01",
+            "source_range": { "OTIO_SCHEMA": "TimeRange.1",
+              "start_time": { "OTIO_SCHEMA": "RationalTime.1", "value": 100.0, "rate": 25.0 },
+              "duration": { "OTIO_SCHEMA": "RationalTime.1", "value": 50.0, "rate": 25.0 } },
+            "media_reference": { "OTIO_SCHEMA": "ExternalReference.1",
+              "target_url": "file:///media/shot_01.mov" } },
+          { "OTIO_SCHEMA": "Gap.1", "name": "filler",
+            "source_range": { "OTIO_SCHEMA": "TimeRange.1",
+              "start_time": { "value": 0.0, "rate": 25.0 },
+              "duration": { "value": 10.0, "rate": 25.0 } } },
+          { "OTIO_SCHEMA": "Clip.1", "name": "shot_02",
+            "source_range": { "OTIO_SCHEMA": "TimeRange.1",
+              "start_time": { "value": 0.0, "rate": 25.0 },
+              "duration": { "value": 24.0, "rate": 50.0 } },
+            "media_reference": { "target_url": "media/shot_02.mxf" } }
+        ]
+      },
+      {
+        "OTIO_SCHEMA": "Track.1",
+        "kind": "Audio",
+        "children": [
+          { "OTIO_SCHEMA": "Clip.1", "name": "dialogue",
+            "source_range": { "start_time": { "value": 0.0, "rate": 25.0 },
+              "duration": { "value": 60.0, "rate": 25.0 } },
+            "media_reference": { "target_url": "media/dialogue.wav" } }
+        ]
+      },
+      {
+        "OTIO_SCHEMA": "Track.1",
+        "kind": "Audio",
+        "children": [
+          { "OTIO_SCHEMA": "Clip.1", "name": "music",
+            "source_range": { "start_time": { "value": 12.0, "rate": 25.0 },
+              "duration": { "value": 70.0, "rate": 25.0 } },
+            "media_reference": { "target_url": "media/music.wav" } }
+        ]
+      }
+    ]
+  }
+}"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert_eq!(tl.format, TimelineFormat::Otio);
+        assert_eq!(tl.title, "OTIO Cut");
+        assert_eq!(tl.frame_rate, 25.0);
+        assert!(tl.skipped.is_empty(), "unexpected skips: {:?}", tl.skipped);
+        assert_eq!(
+            otio_rows(&tl),
+            vec![
+                ("shot_01.mov", "V", 0, 50, 100, 150),
+                // 24 units at 50 fps is 12 frames of a 25 fps sequence
+                ("shot_02.mxf", "V", 60, 72, 0, 12),
+                ("dialogue.wav", "A1", 0, 60, 0, 60),
+                ("music.wav", "A2", 0, 70, 12, 82),
+            ]
+        );
+        assert_eq!(tl.events[0].event_number, 1);
+        assert_eq!(tl.events[3].event_number, 4);
+        assert_eq!(tl.events[0].transition, "CUT");
+        assert_eq!(tl.events[0].comment, "file:///media/shot_01.mov");
+    }
+
+    #[test]
+    fn test_parse_otio_skips_name_the_construct() {
+        // No global_start_time, so the rate comes from the first source_range.
+        let (_dir, path) = write_timeline(
+            "skips.otio",
+            r#"{
+  "OTIO_SCHEMA": "Timeline.1",
+  "name": "Skips",
+  "tracks": { "OTIO_SCHEMA": "Stack.1", "children": [
+    { "OTIO_SCHEMA": "Track.1", "kind": "Video", "children": [
+      { "OTIO_SCHEMA": "Clip.1", "name": "shot_01",
+        "source_range": { "start_time": { "value": 0.0, "rate": 30.0 },
+          "duration": { "value": 30.0, "rate": 30.0 } },
+        "media_reference": { "target_url": "shot_01.mov" } },
+      { "OTIO_SCHEMA": "Transition.1", "name": "Cross Dissolve",
+        "source_range": { "duration": { "value": 12.0, "rate": 30.0 } } },
+      { "OTIO_SCHEMA": "Clip.1",
+        "source_range": { "duration": { "value": 15.0, "rate": 30.0 } },
+        "media_reference": { "OTIO_SCHEMA": "MissingReference.1" } },
+      { "OTIO_SCHEMA": "Stack.1", "name": "Nested",
+        "source_range": { "duration": { "value": 5.0, "rate": 30.0 } } },
+      { "OTIO_SCHEMA": "Clip.1", "name": "tail",
+        "source_range": { "duration": { "value": 10.0, "rate": 30.0 } },
+        "media_reference": { "target_url": "tail.mov" } }
+    ] }
+  ] }
+}"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert_eq!(tl.frame_rate, 30.0);
+        // the transition takes no record time, the unnamed clip and the nested
+        // stack do
+        assert_eq!(
+            otio_rows(&tl),
+            vec![
+                ("shot_01.mov", "V", 0, 30, 0, 30),
+                ("tail.mov", "V", 50, 60, 0, 10),
+            ]
+        );
+        let skipped = tl.skipped.join("\n");
+        for expected in [
+            "Transition.1 \"Cross Dissolve\": a transition is not a source clip",
+            "Clip.1: no media reference and no name",
+            "Stack.1 \"Nested\": a nested stack has no flat equivalent",
+        ] {
+            assert!(
+                skipped.contains(expected),
+                "missing skip {expected:?} in:\n{skipped}"
+            );
+        }
+        assert_eq!(tl.skipped.len(), 3, "{skipped}");
+    }
+
+    #[test]
+    fn test_parse_otio_reel_name_falls_back_to_clip_name() {
+        let (_dir, path) = write_timeline(
+            "named.otio",
+            r#"{
+  "OTIO_SCHEMA": "Timeline.1",
+  "tracks": { "children": [
+    { "OTIO_SCHEMA": "Track.1", "children": [
+      { "OTIO_SCHEMA": "Clip.1", "name": "REEL001",
+        "source_range": { "duration": { "value": 24.0 } },
+        "media_reference": { "OTIO_SCHEMA": "MissingReference.1" } }
+    ] }
+  ] }
+}"#,
+        );
+
+        let tl = parse_timeline(&path).unwrap();
+        assert_eq!(tl.title, "");
+        // no rate anywhere, so the times are already sequence frames
+        assert_eq!(tl.frame_rate, 24.0);
+        assert_eq!(otio_rows(&tl), vec![("REEL001", "V", 0, 24, 0, 24)]);
+        assert_eq!(tl.events[0].comment, "");
+    }
+
+    #[test]
+    fn test_parse_otio_without_clips() {
+        let (_dir, path) = write_timeline(
+            "empty.otio",
+            r#"{ "OTIO_SCHEMA": "Timeline.1", "tracks": { "children": [] } }"#,
+        );
+        assert!(matches!(parse_timeline(&path), Err(ConformError::NoEvents)));
+    }
+
+    #[test]
+    fn test_parse_otio_invalid_json() {
+        let (_dir, path) = write_timeline("bad.otio", "not json at all");
+        assert!(matches!(parse_timeline(&path), Err(ConformError::Json(_))));
     }
 
     #[test]

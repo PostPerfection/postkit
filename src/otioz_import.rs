@@ -17,6 +17,8 @@ pub enum OtiozError {
     NoContent,
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Otio(#[from] crate::conform::ConformError),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,7 +113,17 @@ pub fn import_otioz(opts: &OtiozImportOptions) -> Result<OtiozImportResult, Otio
         String::from_utf8_lossy(&buf).to_string()
     };
 
-    let clips = parse_otio_json(&otio_content);
+    let clips: Vec<OtiozClip> = crate::conform::read_otio(&otio_content)?
+        .clips
+        .into_iter()
+        .map(|clip| OtiozClip {
+            name: clip.name,
+            media_reference: clip.target_url,
+            start_time: clip.record_in as f64,
+            duration: clip.duration as f64,
+            track_kind: clip.track_kind,
+        })
+        .collect();
 
     let mut video_tracks = 0u32;
     let mut audio_tracks = 0u32;
@@ -213,73 +225,35 @@ fn list_zip_entries(path: &Path) -> Result<Vec<ZipLocalHeader>, std::io::Error> 
     Ok(entries)
 }
 
-fn parse_otio_json(json: &str) -> Vec<OtiozClip> {
-    let mut clips = Vec::new();
-    let clip_marker = "\"OTIO_SCHEMA\": \"Clip.";
-
-    let mut pos = 0;
-    while let Some(found) = json[pos..].find(clip_marker) {
-        let abs_pos = pos + found;
-        let block_end = (abs_pos + 2000).min(json.len());
-        let block = &json[abs_pos..block_end];
-
-        let name = extract_json_string(block, "name").unwrap_or_default();
-        let duration = extract_json_number(block, "value").unwrap_or(0.0);
-        let media_ref = extract_json_string(block, "target_url").unwrap_or_default();
-
-        let preceding = &json[..abs_pos];
-        let video_pos = preceding.rfind("\"kind\": \"Video\"");
-        let audio_pos = preceding.rfind("\"kind\": \"Audio\"");
-
-        let track_kind = match (video_pos, audio_pos) {
-            (Some(v), Some(a)) if v > a => "Video",
-            (Some(_), None) => "Video",
-            _ => "Audio",
-        }
-        .to_string();
-
-        clips.push(OtiozClip {
-            name,
-            media_reference: media_ref,
-            start_time: 0.0,
-            duration,
-            track_kind,
-        });
-
-        pos = abs_pos + 10;
-    }
-
-    clips
-}
-
-fn extract_json_string(block: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{key}\": \"");
-    let start = block.find(&pattern)? + pattern.len();
-    let end = block[start..].find('"')? + start;
-    Some(block[start..end].to_string())
-}
-
-fn extract_json_number(block: &str, key: &str) -> Option<f64> {
-    let pattern = format!("\"{key}\": ");
-    let start = block.find(&pattern)? + pattern.len();
-    let end = block[start..]
-        .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .unwrap_or(block[start..].len())
-        + start;
-    block[start..end].parse().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Import an .otio document and return just the clips.
+    fn import_clips(otio: &str) -> Vec<OtiozClip> {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("timeline.otio");
+        fs::write(&input, otio).unwrap();
+        let opts = OtiozImportOptions {
+            input_file: input,
+            output_dir: PathBuf::new(),
+            extract_media: false,
+            generate_cpl: false,
+            title: String::new(),
+            fps: 24.0,
+        };
+        import_otioz(&opts).unwrap().clips
+    }
+
     #[test]
-    fn test_parse_otio_json_video_clip() {
-        let json = r#"{
+    fn test_import_video_clip() {
+        let clips = import_clips(
+            r#"{
             "OTIO_SCHEMA": "Timeline.1",
             "tracks": {
                 "children": [{
+                    "OTIO_SCHEMA": "Track.1",
                     "kind": "Video",
                     "children": [{
                         "OTIO_SCHEMA": "Clip.1",
@@ -296,9 +270,8 @@ mod tests {
                     }]
                 }]
             }
-        }"#;
-
-        let clips = parse_otio_json(json);
+        }"#,
+        );
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].name, "shot_01");
         assert_eq!(clips[0].duration, 48.0);
@@ -307,11 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_otio_json_audio_clip() {
-        let json = r#"{
+    fn test_import_audio_clip() {
+        let clips = import_clips(
+            r#"{
             "OTIO_SCHEMA": "Timeline.1",
             "tracks": {
                 "children": [{
+                    "OTIO_SCHEMA": "Track.1",
                     "kind": "Audio",
                     "children": [{
                         "OTIO_SCHEMA": "Clip.2",
@@ -328,30 +303,51 @@ mod tests {
                     }]
                 }]
             }
-        }"#;
-
-        let clips = parse_otio_json(json);
+        }"#,
+        );
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].track_kind, "Audio");
     }
 
     #[test]
-    fn test_parse_otio_json_multiple_clips() {
-        let json = r#"{
+    fn test_import_multiple_clips_carry_record_start() {
+        let clips = import_clips(
+            r#"{
             "OTIO_SCHEMA": "Timeline.1",
             "tracks": { "children": [{
+                "OTIO_SCHEMA": "Track.1",
                 "kind": "Video",
                 "children": [
                     { "OTIO_SCHEMA": "Clip.1", "name": "clip_a", "source_range": { "duration": { "OTIO_SCHEMA": "RationalTime.1", "value": 24.0 } }, "media_reference": { "target_url": "a.mxf" } },
+                    { "OTIO_SCHEMA": "Gap.1", "source_range": { "duration": { "value": 6.0 } } },
                     { "OTIO_SCHEMA": "Clip.1", "name": "clip_b", "source_range": { "duration": { "OTIO_SCHEMA": "RationalTime.1", "value": 48.0 } }, "media_reference": { "target_url": "b.mxf" } }
                 ]
             }]}
-        }"#;
-
-        let clips = parse_otio_json(json);
+        }"#,
+        );
         assert_eq!(clips.len(), 2);
         assert_eq!(clips[0].name, "clip_a");
+        assert_eq!(clips[0].start_time, 0.0);
         assert_eq!(clips[1].name, "clip_b");
+        assert_eq!(clips[1].start_time, 30.0);
+    }
+
+    #[test]
+    fn test_import_invalid_json_fails() {
+        let tmp = TempDir::new().unwrap();
+        let input = tmp.path().join("bad.otio");
+        fs::write(&input, "not json at all").unwrap();
+
+        let opts = OtiozImportOptions {
+            input_file: input,
+            output_dir: PathBuf::new(),
+            extract_media: false,
+            generate_cpl: false,
+            title: String::new(),
+            fps: 24.0,
+        };
+
+        assert!(matches!(import_otioz(&opts), Err(OtiozError::Otio(_))));
     }
 
     #[test]
