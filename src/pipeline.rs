@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::encode::{
     InputType, ParallelProgress, SourceColour, StreamEncodeOptions, StreamProgress,
-    check_codestream_size, encode_parallel, find_compressor, stream_encode,
+    check_codestream_size, encode_parallel, stream_encode_inprocess,
 };
 
 /// Progress information emitted during encode.
@@ -149,8 +149,6 @@ pub fn run_encode_with_options(
 
     match input_type {
         InputType::Video => {
-            let (compressor_path, lib_dir) = find_compressor().ok_or("grk_compress not found")?;
-
             let opts = StreamEncodeOptions {
                 input: video.to_path_buf(),
                 output_dir: j2k_dir.clone(),
@@ -159,10 +157,8 @@ pub fn run_encode_with_options(
                 codeblock_size: 32,
                 progression: "CPRL".to_string(),
                 fps,
-                compressor_path,
-                lib_dir,
                 source_colour: options.source_colour.clone(),
-                codestream_byte_cap: options.codestream_byte_cap,
+                ..StreamEncodeOptions::default()
             };
 
             on_progress(&PipelineProgress {
@@ -175,7 +171,7 @@ pub fn run_encode_with_options(
                 percent: 0.0,
             });
 
-            let result = stream_encode(&opts, cancel, pause, |p: StreamProgress| {
+            let result = stream_encode_inprocess(&opts, cancel, pause, |p: StreamProgress| {
                 let percent = if p.total_frames > 0 {
                     (p.frame as f64 / p.total_frames as f64) * 100.0
                 } else {
@@ -266,11 +262,7 @@ pub fn run_encode_with_options(
         _ => j2k_dir,
     };
 
-    // stream_encode caps each frame as it writes it, so only the paths that did
-    // not go through it are left to check here.
-    if let Some(cap) = options.codestream_byte_cap
-        && input_type != InputType::Video
-    {
+    if let Some(cap) = options.codestream_byte_cap {
         check_codestream_dir(&final_j2k_dir, cap)?;
     }
 

@@ -435,17 +435,9 @@ fn compress_frame_grok(
 
     let width = frame.width();
     let height = frame.height();
-    // dci cinema profiles require 12-bit unsigned samples; grok rejects
-    // anything deeper, so round down to 12 bits here
-    let is_cinema = params.profile == 0x0003 || params.profile == 0x0004;
-    let shift = if is_cinema && frame.precision() > 12 {
-        (frame.precision() - 12) as u32
-    } else {
-        0
-    };
-    let precision = frame.precision() - shift as u8;
-    let half = if shift > 0 { 1i32 << (shift - 1) } else { 0 };
-    let max = (1i32 << precision) - 1;
+    // grok reduces deeper samples to the 12 bits cinema profiles require,
+    // fused with its X'Y'Z' transform, so frames pass through at full precision
+    let precision = frame.precision();
 
     // Ensure buffer is large enough for this frame
     let needed = (width as usize) * (height as usize) * 3 * 2;
@@ -493,13 +485,7 @@ fn compress_frame_grok(
                     for y in 0..h {
                         let dst_row = comp_data.add(y * stride);
                         let src_row = &src[y * w..(y + 1) * w];
-                        if shift == 0 {
-                            ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, w);
-                        } else {
-                            for (x, sample) in src_row.iter().enumerate() {
-                                *dst_row.add(x) = ((sample + half) >> shift).min(max);
-                            }
-                        }
+                        ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, w);
                     }
                 }
             }
@@ -526,9 +512,9 @@ fn compress_frame_grok(
                         let r = ((data[off] as i32) << 8) | (data[off + 1] as i32);
                         let g = ((data[off + 2] as i32) << 8) | (data[off + 3] as i32);
                         let b = ((data[off + 4] as i32) << 8) | (data[off + 5] as i32);
-                        *r_data.add(row_offset + x) = ((r + half) >> shift).min(max);
-                        *g_data.add(row_offset + x) = ((g + half) >> shift).min(max);
-                        *b_data.add(row_offset + x) = ((b + half) >> shift).min(max);
+                        *r_data.add(row_offset + x) = r;
+                        *g_data.add(row_offset + x) = g;
+                        *b_data.add(row_offset + x) = b;
                     }
                 }
             }
@@ -867,7 +853,7 @@ where
     let grk_bin = grk_compress_bin.to_path_buf();
 
     // Build CLI args from params
-    let cinema_flag: Vec<String> = if params.profile == 0x0003 {
+    let mut cinema_flag: Vec<String> = if params.profile == 0x0003 {
         vec![
             "-w".to_string(),
             params.frame_rate.to_string(),
@@ -890,6 +876,9 @@ where
             "CPRL".to_string(),
         ]
     };
+    if params.apply_xyz_transform {
+        cinema_flag.push("--xyz".to_string());
+    }
 
     // Worker threads: each picks a frame from the queue, spawns grk_compress
     std::thread::scope(|s| {
@@ -921,7 +910,6 @@ where
                             .arg("-o")
                             .arg(&output_path)
                             .args(&cinema_flag)
-                            .arg("-quiet")
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
                             .status();
@@ -1159,8 +1147,8 @@ mod tests {
     #[cfg(feature = "grok-ffi")]
     #[test]
     fn cinema_profile_survives_16_bit_input() {
-        // grok strips rsiz to 0 unless samples are 12-bit; the encoder must
-        // downshift 16-bit ffmpeg output or the wrap-side dci check rejects it
+        // cinema profiles require 12-bit samples, grok reduces deeper input
+        // itself (needs grok >= 20.3.10)
         let (w, h) = (128u32, 128u32);
         let frame = RawFrame::Packed {
             data: vec![0x80u8; (w * h * 6) as usize],

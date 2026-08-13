@@ -271,7 +271,7 @@ fn which_compressor() -> Option<PathBuf> {
 
 // ─── Streaming encode (ffmpeg → raw pipe → grk_compress) ──────────────────
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -308,22 +308,6 @@ pub(crate) fn decode_filters(fps: u32, source_colour: &SourceColour) -> String {
         SourceColour::DciLut(lut) => format!("fps={fps},lut3d={}", lut.display()),
         _ => format!("fps={fps}"),
     }
-}
-
-/// The grok-pipeline entry points always run the DCDM X'Y'Z' transform and never
-/// size-check a frame, so they refuse options only `stream_encode` can honour.
-pub(crate) fn unsupported_hdr_options(
-    opts: &StreamEncodeOptions,
-    entry_point: &str,
-) -> Option<String> {
-    if !opts.source_colour.applies_xyz_transform() {
-        return Some(format!(
-            "{entry_point} always applies the DCDM X'Y'Z' transform: use stream_encode for {:?} sources",
-            opts.source_colour
-        ));
-    }
-    opts.codestream_byte_cap
-        .map(|cap| format!("{entry_point} cannot hold frames under a {cap} byte codestream cap"))
 }
 
 /// Reject a written codestream that exceeds the per-frame byte cap (DCI caps
@@ -365,10 +349,6 @@ pub struct StreamEncodeOptions {
     /// Colour the decoded frames carry, which decides the encoder transform.
     #[serde(default)]
     pub source_colour: SourceColour,
-    /// Per-codestream byte cap. A frame over it fails the encode. None leaves
-    /// frame size to the compression ratio alone.
-    #[serde(default)]
-    pub codestream_byte_cap: Option<u64>,
 }
 
 impl Default for StreamEncodeOptions {
@@ -384,7 +364,6 @@ impl Default for StreamEncodeOptions {
             compressor_path: PathBuf::new(),
             lib_dir: None,
             source_colour: SourceColour::DisplayRgb,
-            codestream_byte_cap: None,
         }
     }
 }
@@ -469,254 +448,6 @@ pub fn probe_video(input: &Path) -> (u32, u32, u64) {
     (width, height, frame_count)
 }
 
-/// Stream-encode a video file to J2K without intermediate files.
-///
-/// Pipes raw 16-bit RGB frames from ffmpeg directly to grk_compress stdin.
-/// Calls `on_progress` periodically with current status.
-/// Respects `cancel` flag to abort early.
-/// Respects `pause` flag to pause between frames.
-pub fn stream_encode<F>(
-    opts: &StreamEncodeOptions,
-    cancel: &Arc<AtomicBool>,
-    pause: &Arc<AtomicBool>,
-    mut on_progress: F,
-) -> EncodeResult
-where
-    F: FnMut(StreamProgress),
-{
-    let (width, height, total_frames) = probe_video(&opts.input);
-    if width == 0 || height == 0 {
-        return EncodeResult {
-            success: false,
-            error: "Could not determine video dimensions".to_string(),
-            ..Default::default()
-        };
-    }
-
-    let frame_size = (width as usize) * (height as usize) * 3 * 2; // 16-bit RGB
-
-    let compressor = if opts.compressor_path.as_os_str().is_empty() {
-        find_compressor().map(|(p, _)| p)
-    } else {
-        Some(opts.compressor_path.clone())
-    };
-    let Some(compressor) = compressor else {
-        return EncodeResult {
-            success: false,
-            error: "grk_compress not found".to_string(),
-            ..Default::default()
-        };
-    };
-
-    if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
-        return EncodeResult {
-            success: false,
-            error: format!("Failed to create output directory: {e}"),
-            ..Default::default()
-        };
-    }
-
-    if let SourceColour::DciLut(lut) = &opts.source_colour
-        && !lut.is_file()
-    {
-        return EncodeResult {
-            success: false,
-            error: format!("HDR-to-DCI LUT not found: {}", lut.display()),
-            ..Default::default()
-        };
-    }
-
-    // Start ffmpeg
-    let filters = decode_filters(opts.fps, &opts.source_colour);
-    let mut ffmpeg = match std::process::Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(&opts.input)
-        .args([
-            "-vf", &filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: format!("Failed to start ffmpeg: {e}"),
-                ..Default::default()
-            };
-        }
-    };
-
-    let mut ffmpeg_stdout = match ffmpeg.stdout.take() {
-        Some(s) => s,
-        None => {
-            return EncodeResult {
-                success: false,
-                error: "Failed to capture ffmpeg stdout".to_string(),
-                ..Default::default()
-            };
-        }
-    };
-
-    let mut frame_buf = vec![0u8; frame_size];
-    let mut encoded: u64 = 0;
-    let encode_start = std::time::Instant::now();
-    let raw_fmt = format!("{},{},3,16,u", width, height);
-
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            kill_child(&mut ffmpeg);
-            return EncodeResult {
-                success: false,
-                error: "Cancelled".to_string(),
-                frames_encoded: encoded,
-                output_dir: opts.output_dir.clone(),
-            };
-        }
-        while pause.load(Ordering::Relaxed) {
-            if cancel.load(Ordering::Relaxed) {
-                kill_child(&mut ffmpeg);
-                return EncodeResult {
-                    success: false,
-                    error: "Cancelled".to_string(),
-                    frames_encoded: encoded,
-                    output_dir: opts.output_dir.clone(),
-                };
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-
-        match read_exact_or_eof(&mut ffmpeg_stdout, &mut frame_buf) {
-            ReadResult::Ok => {}
-            ReadResult::Eof => break,
-            ReadResult::Err(e) => {
-                kill_child(&mut ffmpeg);
-                return EncodeResult {
-                    success: false,
-                    error: format!("Read error: {e}"),
-                    frames_encoded: encoded,
-                    output_dir: opts.output_dir.clone(),
-                };
-            }
-        }
-
-        let output_frame = opts.output_dir.join(format!("frame_{:08}.j2c", encoded));
-
-        let mut cmd = std::process::Command::new(&compressor);
-        if let Some(ref ld) = opts.lib_dir {
-            cmd.env("LD_LIBRARY_PATH", ld);
-        }
-        cmd.args(["--in-fmt", "raw"])
-            .arg("-F")
-            .arg(&raw_fmt)
-            .arg("-o")
-            .arg(&output_frame)
-            .arg("-r")
-            .arg(format!("{}", opts.compression_ratio))
-            .arg("-n")
-            .arg(format!("{}", opts.num_resolutions))
-            .arg("-b")
-            .arg(format!("{},{}", opts.codeblock_size, opts.codeblock_size))
-            .arg("-p")
-            .arg(&opts.progression);
-        if opts.source_colour.applies_xyz_transform() {
-            cmd.arg("--xyz");
-        }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-
-        let mut grk = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                kill_child(&mut ffmpeg);
-                return EncodeResult {
-                    success: false,
-                    error: format!("Failed to start compressor: {e}"),
-                    frames_encoded: encoded,
-                    output_dir: opts.output_dir.clone(),
-                };
-            }
-        };
-
-        if let Some(mut stdin) = grk.stdin.take()
-            && let Err(e) = stdin.write_all(&frame_buf)
-        {
-            kill_child(&mut ffmpeg);
-            return EncodeResult {
-                success: false,
-                error: format!("Pipe error frame {encoded}: {e}"),
-                frames_encoded: encoded,
-                output_dir: opts.output_dir.clone(),
-            };
-        }
-
-        // wait_with_output drains stderr while waiting; a plain wait() deadlocks
-        // as soon as a verbose frame fills the pipe buffer
-        let grk_out = match grk.wait_with_output() {
-            Ok(o) => o,
-            Err(e) => {
-                kill_child(&mut ffmpeg);
-                return EncodeResult {
-                    success: false,
-                    error: format!("Compressor wait error: {e}"),
-                    frames_encoded: encoded,
-                    output_dir: opts.output_dir.clone(),
-                };
-            }
-        };
-
-        if !grk_out.status.success() {
-            let stderr_out = String::from_utf8_lossy(&grk_out.stderr);
-            kill_child(&mut ffmpeg);
-            return EncodeResult {
-                success: false,
-                error: format!("Encode failed frame {encoded}: {stderr_out}"),
-                frames_encoded: encoded,
-                output_dir: opts.output_dir.clone(),
-            };
-        }
-
-        if let Some(cap) = opts.codestream_byte_cap
-            && let Err(e) = check_codestream_size(&output_frame, cap)
-        {
-            kill_child(&mut ffmpeg);
-            return EncodeResult {
-                success: false,
-                error: e,
-                frames_encoded: encoded,
-                output_dir: opts.output_dir.clone(),
-            };
-        }
-
-        encoded += 1;
-
-        if encoded.is_multiple_of(5) || encoded == total_frames {
-            let elapsed = encode_start.elapsed().as_secs_f64();
-            on_progress(StreamProgress {
-                frame: encoded,
-                total_frames,
-                fps: if elapsed > 0.0 {
-                    encoded as f64 / elapsed
-                } else {
-                    0.0
-                },
-                elapsed_secs: elapsed,
-            });
-        }
-    }
-
-    let _ = ffmpeg.wait();
-
-    EncodeResult {
-        success: true,
-        error: String::new(),
-        frames_encoded: encoded,
-        output_dir: opts.output_dir.clone(),
-    }
-}
-
 pub(crate) enum ReadResult {
     Ok,
     Eof,
@@ -759,6 +490,7 @@ fn kill_child(child: &mut Child) {
 pub fn stream_encode_inprocess<F>(
     opts: &StreamEncodeOptions,
     cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
     mut on_progress: F,
 ) -> EncodeResult
 where
@@ -766,10 +498,12 @@ where
 {
     use crate::grok_encoder::{self, CompressParams, RawFrame};
 
-    if let Some(error) = unsupported_hdr_options(opts, "stream_encode_inprocess") {
+    if let SourceColour::DciLut(lut) = &opts.source_colour
+        && !lut.is_file()
+    {
         return EncodeResult {
             success: false,
-            error,
+            error: format!("HDR-to-DCI LUT not found: {}", lut.display()),
             ..Default::default()
         };
     }
@@ -794,19 +528,12 @@ where
     let frame_size = (width as usize) * (height as usize) * 3 * 2; // 16-bit RGB
 
     // Start ffmpeg: decode to raw 16-bit big-endian RGB
-    let fps_filter = format!("fps={}", opts.fps);
+    let filters = decode_filters(opts.fps, &opts.source_colour);
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(&opts.input)
         .args([
-            "-vf",
-            &fps_filter,
-            "-pix_fmt",
-            "rgb48be",
-            "-f",
-            "rawvideo",
-            "-an",
-            "pipe:1",
+            "-vf", &filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -838,7 +565,7 @@ where
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
         frame_rate: opts.fps as u16,
-        apply_xyz_transform: true,
+        apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         ..CompressParams::default()
     };
 
@@ -854,6 +581,12 @@ where
         total_frames,
         cancel,
         || {
+            while pause.load(Ordering::Relaxed) {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
@@ -912,10 +645,12 @@ where
 {
     use crate::grok_encoder;
 
-    if let Some(error) = unsupported_hdr_options(opts, "stream_encode_subprocess") {
+    if let SourceColour::DciLut(lut) = &opts.source_colour
+        && !lut.is_file()
+    {
         return EncodeResult {
             success: false,
-            error,
+            error: format!("HDR-to-DCI LUT not found: {}", lut.display()),
             ..Default::default()
         };
     }
@@ -940,19 +675,12 @@ where
     let frame_size = (width as usize) * (height as usize) * 3 * 2;
 
     // Start ffmpeg
-    let fps_filter = format!("fps={}", opts.fps);
+    let filters = decode_filters(opts.fps, &opts.source_colour);
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(&opts.input)
         .args([
-            "-vf",
-            &fps_filter,
-            "-pix_fmt",
-            "rgb48be",
-            "-f",
-            "rawvideo",
-            "-an",
-            "pipe:1",
+            "-vf", &filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -984,7 +712,7 @@ where
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
         frame_rate: opts.fps as u16,
-        apply_xyz_transform: true,
+        apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         ..grok_encoder::CompressParams::default()
     };
 
@@ -1288,17 +1016,4 @@ mod tests {
         assert!(check_codestream_size(&dir.path().join("missing.j2c"), 2048).is_err());
     }
 
-    #[test]
-    fn the_grok_pipeline_entry_points_refuse_hdr_options() {
-        let mut opts = StreamEncodeOptions::default();
-        assert!(unsupported_hdr_options(&opts, "stream_encode_subprocess").is_none());
-
-        opts.source_colour = SourceColour::AlreadyPq;
-        let error = unsupported_hdr_options(&opts, "stream_encode_subprocess").unwrap();
-        assert!(error.contains("stream_encode"), "{error}");
-
-        opts.source_colour = SourceColour::DisplayRgb;
-        opts.codestream_byte_cap = Some(2_343_750);
-        assert!(unsupported_hdr_options(&opts, "stream_encode_inprocess").is_some());
-    }
 }
