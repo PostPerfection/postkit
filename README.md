@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/PostPerfection/postkit/actions/workflows/ci.yml/badge.svg)](https://github.com/PostPerfection/postkit/actions/workflows/ci.yml)
 
-Version 0.5 encodes JPEG 2000 via optional Grok FFI (`grok-ffi`). Tests without `grok-ffi` use the real disabled-feature path and do not require developer-local media.
+Version 0.6 encodes JPEG 2000 via optional Grok FFI (`grok-ffi`). Tests without `grok-ffi` use the real disabled-feature path and do not require developer-local media.
 
 Shared library for DCP Wizard, IMF Wizard, and DCP Doctor, common post-production functionality.
 
