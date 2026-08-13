@@ -1,9 +1,11 @@
 //! Reusable enveloped XML digital signatures.
 //!
-//! One signing implementation for the whole crate, using the SMPTE 430-3 KDM
-//! profile: inclusive Canonical XML 1.0, RSASSA-PKCS1-v1_5 over SHA-256, and
-//! SHA-256 reference digests. The KDM signer in `certificate.rs` builds its
-//! document body then calls `sign_enveloped`, so there is no second signer.
+//! One signing implementation for the whole crate, defaulting to the SMPTE
+//! 430-3 KDM profile: inclusive Canonical XML 1.0, RSASSA-PKCS1-v1_5 over
+//! SHA-256, and SHA-256 reference digests. `SignatureProfile::RsaSha1` selects
+//! the SHA-1 pair instead, which is the only thing legacy Interop playback gear
+//! accepts on a DCP. The KDM signer in `certificate.rs` builds its document body
+//! then calls `sign_enveloped`, so there is no second signer.
 //!
 //! Verification reads the declared DigestMethod (per Reference) and
 //! SignatureMethod (in SignedInfo) and dispatches on them, so it also accepts
@@ -124,6 +126,25 @@ fn sign_enveloped_with(
     Ok(out)
 }
 
+/// The digest and signature algorithm pair a document is signed with. SMPTE
+/// DCPs and every KDM are rsa-sha256. Real Interop DCPs are rsa-sha1, and the
+/// legacy players that read them accept nothing else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SignatureProfile {
+    #[default]
+    RsaSha256,
+    RsaSha1,
+}
+
+impl SignatureProfile {
+    fn algorithms(self) -> (DigestAlg, RsaSigAlg) {
+        match self {
+            Self::RsaSha256 => (DigestAlg::Sha256, RsaSigAlg::Sha256),
+            Self::RsaSha1 => (DigestAlg::Sha1, RsaSigAlg::Sha1),
+        }
+    }
+}
+
 /// Sign an XML document with the standard whole-document enveloped signature
 /// profile (W3C XML-DSig, SMPTE 2067-3 IMF CPL/PKL): one `<ds:Reference URI="">`
 /// whose transforms are enveloped-signature then inclusive C14N, digesting the
@@ -135,7 +156,18 @@ fn sign_enveloped_with(
 /// then equals the original unsigned document, and the reference digest is over
 /// `c14n(unsigned document root)`.
 pub fn sign_document_enveloped(xml: &str, signer: &XmlSigner) -> Result<String, String> {
-    sign_document_enveloped_with(xml, signer, DigestAlg::Sha256, RsaSigAlg::Sha256)
+    sign_document_enveloped_as(xml, signer, SignatureProfile::RsaSha256)
+}
+
+/// Whole-document enveloped signature under a chosen algorithm profile,
+/// otherwise identical to `sign_document_enveloped`.
+pub fn sign_document_enveloped_as(
+    xml: &str,
+    signer: &XmlSigner,
+    profile: SignatureProfile,
+) -> Result<String, String> {
+    let (digest_alg, sig_alg) = profile.algorithms();
+    sign_document_enveloped_with(xml, signer, digest_alg, sig_alg)
 }
 
 /// Internal whole-document signer parameterized by digest and signature
@@ -1155,6 +1187,31 @@ fn cert_key_info(cert_path: &Path) -> Result<CertKeyInfo, String> {
     })
 }
 
+/// The optional `<Signer>` element a DCP's CPL and PKL carry beside their
+/// ds:Signature, naming the signing certificate by issuer and serial.
+///
+/// ST 429-7 and ST 429-8 (and their Interop counterparts) type `Signer` as
+/// `ds:KeyInfoType`, so it wraps the issuer/serial pair in a `ds:X509Data`,
+/// unlike the KDM's ETM `Signer` which is a bare `ds:X509IssuerSerialType`.
+/// `xmlns:ds` is declared on the element itself rather than inherited from the
+/// root, so the element stays valid when a tool reads it on its own.
+///
+/// Emit it before signing: the enveloped reference covers the whole document,
+/// so a `Signer` added afterwards would break the digest.
+pub fn dcp_signer_element(cert_file: &Path) -> Result<String, String> {
+    let meta = cert_key_info(cert_file)?;
+    Ok(format!(
+        r#"<Signer xmlns:ds="{DSIG_NS}"><ds:X509Data xmlns:ds="{DSIG_NS}">
+      <ds:X509IssuerSerial>
+        <ds:X509IssuerName>{issuer}</ds:X509IssuerName>
+        <ds:X509SerialNumber>{serial}</ds:X509SerialNumber>
+      </ds:X509IssuerSerial>
+    </ds:X509Data></Signer>"#,
+        issuer = crate::packaging::escape_xml(&meta.issuer_dn),
+        serial = meta.serial,
+    ))
+}
+
 /// Extract the RSA public key from a certificate, rejecting non-RSA keys.
 fn cert_rsa_public_key(cert_path: &Path) -> Result<rsa::RsaPublicKey, String> {
     use rsa::pkcs8::DecodePublicKey;
@@ -1484,6 +1541,86 @@ mod tests {
         verify_enveloped(&signed, "Id", None).expect("sha1 by-id signature must verify");
         let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
         assert!(verify_enveloped(&tampered, "Id", None).is_err());
+    }
+
+    #[test]
+    fn the_rsa_sha1_profile_signs_what_interop_players_expect() {
+        let c = chain();
+        let signed =
+            sign_document_enveloped_as(&cpl_doc(), &leaf_signer(c), SignatureProfile::RsaSha1)
+                .expect("sign with the rsa-sha1 profile");
+        assert!(signed.contains(r#"Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1""#));
+        assert!(signed.contains(r#"Algorithm="http://www.w3.org/2000/09/xmldsig#sha1""#));
+        verify_document_enveloped(&signed, Some(&c.signer)).expect("rsa-sha1 must verify");
+
+        let smpte =
+            sign_document_enveloped_as(&cpl_doc(), &leaf_signer(c), SignatureProfile::RsaSha256)
+                .expect("sign with the rsa-sha256 profile");
+        assert_eq!(
+            smpte,
+            sign_document_enveloped(&cpl_doc(), &leaf_signer(c)).expect("default profile"),
+            "the default profile must stay rsa-sha256"
+        );
+    }
+
+    #[test]
+    fn the_rsa_sha1_profile_verifies_with_xmlsec1() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let signed =
+            sign_document_enveloped_as(&cpl_doc(), &leaf_signer(c), SignatureProfile::RsaSha1)
+                .expect("sign with the rsa-sha1 profile");
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("cpl-sha1.xml");
+        std::fs::write(&out, &signed).unwrap();
+
+        let result = xmlsec1_verify_no_id(&out, &c.root);
+        let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+        eprintln!(
+            "xmlsec1 --verify (rsa-sha1):\n  status: {}\n  stderr: {}",
+            result.status,
+            stderr.trim(),
+        );
+        // OpenSSL 3 under a default crypto policy refuses RSA over SHA-1
+        // outright, so the tool cannot judge this document either way.
+        if stderr.contains("invalid digest") {
+            eprintln!("skipping: this OpenSSL build will not verify rsa-sha1");
+            return;
+        }
+        assert!(
+            result.status.success(),
+            "xmlsec1 must verify an rsa-sha1 enveloped document"
+        );
+
+        let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
+        std::fs::write(&out, &tampered).unwrap();
+        assert!(
+            !xmlsec1_verify_no_id(&out, &c.root).status.success(),
+            "xmlsec1 must reject a tampered rsa-sha1 document"
+        );
+    }
+
+    #[test]
+    fn the_dcp_signer_element_names_the_certificate_by_issuer_and_serial() {
+        let c = chain();
+        let element = dcp_signer_element(&c.signer).expect("build the Signer element");
+        assert!(element.starts_with(&format!(r#"<Signer xmlns:ds="{DSIG_NS}">"#)));
+        assert!(element.contains(&format!(r#"<ds:X509Data xmlns:ds="{DSIG_NS}">"#)));
+        assert!(element.contains("<ds:X509IssuerSerial>"));
+        assert!(element.contains("<ds:X509IssuerName>"));
+        assert!(element.contains("<ds:X509SerialNumber>"));
+        assert!(
+            !element.contains("X509SubjectName"),
+            "real DCPs name the signer by issuer and serial only: {element}"
+        );
+
+        // The issuer and serial must be the signing certificate's own, which is
+        // what ds:KeyInfo already embeds for the leaf.
+        let meta = cert_key_info(&c.signer).unwrap();
+        assert!(element.contains(&format!("<ds:X509SerialNumber>{}<", meta.serial)));
     }
 
     #[test]
