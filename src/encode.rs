@@ -276,6 +276,71 @@ use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// What colour the source frames carry when they reach the J2K compressor.
+///
+/// The DCDM X'Y'Z' transform is applied if and only if this is `DisplayRgb`, so
+/// essence that a caller later labels ST 2084 PQ can never hold frames the
+/// encoder transformed itself.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SourceColour {
+    /// Display RGB. The compressor runs the DCDM X'Y'Z' transform.
+    #[default]
+    DisplayRgb,
+    /// HDR source converted to DCI X'Y'Z' by this 3D LUT during decode, so the
+    /// compressor applies no further transform.
+    DciLut(PathBuf),
+    /// Source is already DCI X'Y'Z' with the ST 2084 PQ transfer function, and
+    /// is compressed untransformed.
+    AlreadyPq,
+}
+
+impl SourceColour {
+    /// Whether the compressor has to run the DCDM X'Y'Z' transform.
+    pub fn applies_xyz_transform(&self) -> bool {
+        matches!(self, SourceColour::DisplayRgb)
+    }
+}
+
+/// The ffmpeg filter chain for a stream decode: the output frame rate, plus the
+/// HDR-to-DCI LUT when the source needs one.
+pub(crate) fn decode_filters(fps: u32, source_colour: &SourceColour) -> String {
+    match source_colour {
+        SourceColour::DciLut(lut) => format!("fps={fps},lut3d={}", lut.display()),
+        _ => format!("fps={fps}"),
+    }
+}
+
+/// The grok-pipeline entry points always run the DCDM X'Y'Z' transform and never
+/// size-check a frame, so they refuse options only `stream_encode` can honour.
+pub(crate) fn unsupported_hdr_options(
+    opts: &StreamEncodeOptions,
+    entry_point: &str,
+) -> Option<String> {
+    if !opts.source_colour.applies_xyz_transform() {
+        return Some(format!(
+            "{entry_point} always applies the DCDM X'Y'Z' transform: use stream_encode for {:?} sources",
+            opts.source_colour
+        ));
+    }
+    opts.codestream_byte_cap
+        .map(|cap| format!("{entry_point} cannot hold frames under a {cap} byte codestream cap"))
+}
+
+/// Reject a written codestream that exceeds the per-frame byte cap (DCI caps
+/// each codestream, and the HDR Addendum raises the cap rather than removing it).
+pub(crate) fn check_codestream_size(frame: &Path, cap: u64) -> Result<(), String> {
+    let size = std::fs::metadata(frame)
+        .map_err(|e| format!("cannot size {}: {e}", frame.display()))?
+        .len();
+    if size > cap {
+        return Err(format!(
+            "codestream {} is {size} bytes, over the {cap} byte per-frame cap: lower the bitrate",
+            frame.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Options for streaming encode (video → J2K without intermediate files).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEncodeOptions {
@@ -297,6 +362,13 @@ pub struct StreamEncodeOptions {
     pub compressor_path: PathBuf,
     /// Library directory for LD_LIBRARY_PATH (if needed)
     pub lib_dir: Option<PathBuf>,
+    /// Colour the decoded frames carry, which decides the encoder transform.
+    #[serde(default)]
+    pub source_colour: SourceColour,
+    /// Per-codestream byte cap. A frame over it fails the encode. None leaves
+    /// frame size to the compression ratio alone.
+    #[serde(default)]
+    pub codestream_byte_cap: Option<u64>,
 }
 
 impl Default for StreamEncodeOptions {
@@ -311,6 +383,8 @@ impl Default for StreamEncodeOptions {
             fps: 24,
             compressor_path: PathBuf::new(),
             lib_dir: None,
+            source_colour: SourceColour::DisplayRgb,
+            codestream_byte_cap: None,
         }
     }
 }
@@ -442,20 +516,23 @@ where
         };
     }
 
+    if let SourceColour::DciLut(lut) = &opts.source_colour
+        && !lut.is_file()
+    {
+        return EncodeResult {
+            success: false,
+            error: format!("HDR-to-DCI LUT not found: {}", lut.display()),
+            ..Default::default()
+        };
+    }
+
     // Start ffmpeg
-    let fps_filter = format!("fps={}", opts.fps);
+    let filters = decode_filters(opts.fps, &opts.source_colour);
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(&opts.input)
         .args([
-            "-vf",
-            &fps_filter,
-            "-pix_fmt",
-            "rgb48be",
-            "-f",
-            "rawvideo",
-            "-an",
-            "pipe:1",
+            "-vf", &filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -542,9 +619,11 @@ where
             .arg("-b")
             .arg(format!("{},{}", opts.codeblock_size, opts.codeblock_size))
             .arg("-p")
-            .arg(&opts.progression)
-            .arg("--xyz")
-            .stdin(Stdio::piped())
+            .arg(&opts.progression);
+        if opts.source_colour.applies_xyz_transform() {
+            cmd.arg("--xyz");
+        }
+        cmd.stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
 
@@ -594,6 +673,18 @@ where
             return EncodeResult {
                 success: false,
                 error: format!("Encode failed frame {encoded}: {stderr_out}"),
+                frames_encoded: encoded,
+                output_dir: opts.output_dir.clone(),
+            };
+        }
+
+        if let Some(cap) = opts.codestream_byte_cap
+            && let Err(e) = check_codestream_size(&output_frame, cap)
+        {
+            kill_child(&mut ffmpeg);
+            return EncodeResult {
+                success: false,
+                error: e,
                 frames_encoded: encoded,
                 output_dir: opts.output_dir.clone(),
             };
@@ -674,6 +765,14 @@ where
     F: FnMut(StreamProgress),
 {
     use crate::grok_encoder::{self, CompressParams, RawFrame};
+
+    if let Some(error) = unsupported_hdr_options(opts, "stream_encode_inprocess") {
+        return EncodeResult {
+            success: false,
+            error,
+            ..Default::default()
+        };
+    }
 
     let (width, height, total_frames) = probe_video(&opts.input);
     if width == 0 || height == 0 {
@@ -812,6 +911,14 @@ where
     F: FnMut(StreamProgress),
 {
     use crate::grok_encoder;
+
+    if let Some(error) = unsupported_hdr_options(opts, "stream_encode_subprocess") {
+        return EncodeResult {
+            success: false,
+            error,
+            ..Default::default()
+        };
+    }
 
     let (width, height, total_frames) = probe_video(&opts.input);
     if width == 0 || height == 0 {
@@ -1140,5 +1247,58 @@ where
         error: String::new(),
         frames_encoded: total,
         output_dir: output_dir.to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_display_rgb_gets_the_xyz_transform() {
+        assert!(SourceColour::DisplayRgb.applies_xyz_transform());
+        assert!(!SourceColour::AlreadyPq.applies_xyz_transform());
+        assert!(
+            !SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")).applies_xyz_transform()
+        );
+    }
+
+    #[test]
+    fn the_lut_source_decodes_through_lut3d() {
+        assert_eq!(decode_filters(24, &SourceColour::DisplayRgb), "fps=24");
+        assert_eq!(decode_filters(25, &SourceColour::AlreadyPq), "fps=25");
+        assert_eq!(
+            decode_filters(
+                48,
+                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube"))
+            ),
+            "fps=48,lut3d=/luts/hdr_to_dci.cube"
+        );
+    }
+
+    #[test]
+    fn a_frame_over_the_cap_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("frame_00000000.j2c");
+        std::fs::write(&frame, vec![0u8; 2048]).unwrap();
+
+        assert!(check_codestream_size(&frame, 2048).is_ok());
+        let error = check_codestream_size(&frame, 2047).unwrap_err();
+        assert!(error.contains("2048 bytes"), "{error}");
+        assert!(check_codestream_size(&dir.path().join("missing.j2c"), 2048).is_err());
+    }
+
+    #[test]
+    fn the_grok_pipeline_entry_points_refuse_hdr_options() {
+        let mut opts = StreamEncodeOptions::default();
+        assert!(unsupported_hdr_options(&opts, "stream_encode_subprocess").is_none());
+
+        opts.source_colour = SourceColour::AlreadyPq;
+        let error = unsupported_hdr_options(&opts, "stream_encode_subprocess").unwrap();
+        assert!(error.contains("stream_encode"), "{error}");
+
+        opts.source_colour = SourceColour::DisplayRgb;
+        opts.codestream_byte_cap = Some(2_343_750);
+        assert!(unsupported_hdr_options(&opts, "stream_encode_inprocess").is_some());
     }
 }

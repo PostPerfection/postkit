@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::encode::{
-    InputType, ParallelProgress, StreamEncodeOptions, StreamProgress, encode_parallel,
-    find_compressor, stream_encode,
+    InputType, ParallelProgress, SourceColour, StreamEncodeOptions, StreamProgress,
+    check_codestream_size, encode_parallel, find_compressor, stream_encode,
 };
 
 /// Progress information emitted during encode.
@@ -79,7 +79,59 @@ pub fn run_encode_with_ratio(
     on_progress: impl Fn(&PipelineProgress),
     on_log: impl Fn(&str),
 ) -> Result<EncodeResult, String> {
-    let fps = if fps == 0 { 24 } else { fps };
+    run_encode_with_options(
+        video,
+        output_dir,
+        &EncodeRunOptions {
+            compression_ratio,
+            fps,
+            ..EncodeRunOptions::default()
+        },
+        cancel,
+        pause,
+        on_progress,
+        on_log,
+    )
+}
+
+/// Encode settings for one pipeline run.
+pub struct EncodeRunOptions {
+    /// J2K compression ratio (video input only).
+    pub compression_ratio: f64,
+    /// J2K edit rate (0 falls back to 24).
+    pub fps: u32,
+    /// Colour the source frames carry, which decides whether the encoder runs
+    /// the DCDM X'Y'Z' transform or leaves DCI PQ essence alone.
+    pub source_colour: SourceColour,
+    /// Per-codestream byte cap, e.g. the DCI HDR Addendum's raised cap. A frame
+    /// over it fails the run.
+    pub codestream_byte_cap: Option<u64>,
+}
+
+impl Default for EncodeRunOptions {
+    fn default() -> Self {
+        Self {
+            compression_ratio: 10.0,
+            fps: 24,
+            source_colour: SourceColour::DisplayRgb,
+            codestream_byte_cap: None,
+        }
+    }
+}
+
+/// Run the encode pipeline with the full option set, including the HDR source
+/// colour path and a per-codestream byte cap.
+pub fn run_encode_with_options(
+    video: &Path,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    on_progress: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<EncodeResult, String> {
+    let compression_ratio = options.compression_ratio;
+    let fps = if options.fps == 0 { 24 } else { options.fps };
     if !video.exists() {
         return Err(format!("Input not found: {}", video.display()));
     }
@@ -90,6 +142,7 @@ pub fn run_encode_with_ratio(
     let start_time = std::time::Instant::now();
     let input_type = crate::encode::detect_input_type(video);
     on_log(&format!("Input type: {:?}", input_type));
+    reject_unsupported_colour_path(input_type, &options.source_colour)?;
 
     let j2k_dir = output_dir.join("j2k");
     let mut frames_encoded = 0u64;
@@ -108,6 +161,8 @@ pub fn run_encode_with_ratio(
                 fps,
                 compressor_path,
                 lib_dir,
+                source_colour: options.source_colour.clone(),
+                codestream_byte_cap: options.codestream_byte_cap,
             };
 
             on_progress(&PipelineProgress {
@@ -211,6 +266,14 @@ pub fn run_encode_with_ratio(
         _ => j2k_dir,
     };
 
+    // stream_encode caps each frame as it writes it, so only the paths that did
+    // not go through it are left to check here.
+    if let Some(cap) = options.codestream_byte_cap
+        && input_type != InputType::Video
+    {
+        check_codestream_dir(&final_j2k_dir, cap)?;
+    }
+
     let elapsed_secs = start_time.elapsed().as_secs_f64();
 
     Ok(EncodeResult {
@@ -218,4 +281,93 @@ pub fn run_encode_with_ratio(
         frames_encoded,
         elapsed_secs,
     })
+}
+
+/// Refuse a source colour the chosen input branch cannot honour: the image
+/// sequence encoder always applies the DCDM X'Y'Z' transform, and a LUT cannot
+/// be run over frames that are already compressed.
+fn reject_unsupported_colour_path(
+    input_type: InputType,
+    source_colour: &SourceColour,
+) -> Result<(), String> {
+    match (input_type, source_colour) {
+        (InputType::ImageSequence, colour) if !colour.applies_xyz_transform() => Err(format!(
+            "image sequences are always encoded through the DCDM X'Y'Z' transform, so {colour:?} would be mislabelled"
+        )),
+        (InputType::J2kSequence, SourceColour::DciLut(lut)) => Err(format!(
+            "J2K input is already compressed, so the HDR-to-DCI LUT {} cannot be applied",
+            lut.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Hold every codestream in a directory under the per-frame byte cap.
+fn check_codestream_dir(dir: &Path, cap: u64) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.is_file() {
+            check_codestream_size(&path, cap)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_sequences_refuse_an_untransformed_source() {
+        assert!(
+            reject_unsupported_colour_path(InputType::ImageSequence, &SourceColour::DisplayRgb)
+                .is_ok()
+        );
+        assert!(
+            reject_unsupported_colour_path(InputType::ImageSequence, &SourceColour::AlreadyPq)
+                .is_err()
+        );
+        assert!(
+            reject_unsupported_colour_path(
+                InputType::ImageSequence,
+                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn compressed_input_refuses_a_lut_but_takes_pq_frames() {
+        assert!(
+            reject_unsupported_colour_path(
+                InputType::J2kSequence,
+                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+            )
+            .is_err()
+        );
+        assert!(
+            reject_unsupported_colour_path(InputType::J2kSequence, &SourceColour::AlreadyPq)
+                .is_ok()
+        );
+        assert!(
+            reject_unsupported_colour_path(
+                InputType::Video,
+                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_pre_encoded_frame_over_the_cap_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("frame_00000000.j2c"), vec![0u8; 512]).unwrap();
+        std::fs::write(dir.path().join("frame_00000001.j2c"), vec![0u8; 4096]).unwrap();
+
+        assert!(check_codestream_dir(dir.path(), 4096).is_ok());
+        let error = check_codestream_dir(dir.path(), 1024).unwrap_err();
+        assert!(error.contains("frame_00000001.j2c"), "{error}");
+    }
 }
