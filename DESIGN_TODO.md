@@ -33,10 +33,12 @@
   closing the preview panel (shrinks the GL area to 1x1, the render loop must
   keep answering), and no automated orientation check exists (framebuffer
   readback returns black), so eyeball after any render change. Remaining work
-  proper: the macos and windows host surfaces, which is where the cross-platform
-  embed actually lands. Neither can be compiled or run on the linux dev machine,
-  so CI is the only check and both should be expected to need a pass on real
-  hardware. When finished, fold into DESIGN.md and delete this entry.
+  proper: none on the engine side. The macos and windows host surfaces landed
+  in guikit on 2026-08-13 (NSOpenGLView layered over the WKWebView, WS_CHILD
+  window with wgl over the WebView2 child), both wizards pin them and their CI
+  compiles all three platforms. Neither host has run on real hardware, so a
+  hand pass there is the last step. When that passes, fold into DESIGN.md and
+  delete this entry.
   Hardware acceleration reality: rendering and colour transforms run as GPU
   shaders, hwdec (VAAPI over EGL) accelerates H.264/HEVC/AV1 sources. J2K stays
   CPU-decoded: no GPU has fixed-function J2K, that is what the GPU decode item
