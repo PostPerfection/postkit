@@ -1140,13 +1140,15 @@ impl std::fmt::Display for KdmFormat {
     }
 }
 
+/// Case-insensitive, so a command line spelling the format `SMPTE` parses. An
+/// empty value is still an error rather than a silent default.
 impl std::str::FromStr for KdmFormat {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::ALL
             .into_iter()
-            .find(|format| format.as_str() == s)
+            .find(|format| format.as_str().eq_ignore_ascii_case(s))
             .ok_or_else(|| unknown_spelling("KDM format", s, &Self::ALL.map(Self::as_str)))
     }
 }
@@ -1227,13 +1229,15 @@ impl std::fmt::Display for KdmFormulation {
     }
 }
 
+/// Case-insensitive, like [`KdmFormat`]'s. `Deserialize` goes through here, so a
+/// stored formulation reads back whatever case it was written in.
 impl std::str::FromStr for KdmFormulation {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Self::ALL
             .into_iter()
-            .find(|formulation| formulation.as_str() == s)
+            .find(|formulation| formulation.as_str().eq_ignore_ascii_case(s))
             .ok_or_else(|| unknown_spelling("KDM formulation", s, &Self::ALL.map(Self::as_str)))
     }
 }
@@ -4948,10 +4952,26 @@ mod tests {
                 formulation
             );
         }
+        for formulation in KdmFormulation::ALL {
+            assert_eq!(
+                formulation
+                    .as_str()
+                    .to_uppercase()
+                    .parse::<KdmFormulation>()
+                    .unwrap(),
+                formulation,
+                "a command line may spell the formulation in any case"
+            );
+        }
+
         let err = "dci-anything".parse::<KdmFormulation>().unwrap_err();
         for formulation in KdmFormulation::ALL {
             assert!(err.contains(formulation.as_str()), "got: {err}");
         }
+        assert!(
+            "".parse::<KdmFormulation>().is_err(),
+            "an empty value must not default"
+        );
     }
 
     /// Path to the vendored ST 430-1 KDM schema and the catalog that maps the
@@ -5307,12 +5327,21 @@ mod tests {
         for format in KdmFormat::ALL {
             assert_eq!(format.as_str().parse::<KdmFormat>().unwrap(), format);
             assert_eq!(format.to_string(), format.as_str());
+            assert_eq!(
+                format.as_str().to_uppercase().parse::<KdmFormat>().unwrap(),
+                format,
+                "a command line may spell the format in any case"
+            );
         }
 
         let err = "smtpe".parse::<KdmFormat>().unwrap_err();
         for format in KdmFormat::ALL {
             assert!(err.contains(format.as_str()), "got: {err}");
         }
+        assert!(
+            "".parse::<KdmFormat>().is_err(),
+            "an empty value must not default"
+        );
     }
 
     /// The command line spelling is a separate vocabulary from the stored one:

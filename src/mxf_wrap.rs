@@ -60,8 +60,9 @@ pub struct MxfWrapOptions {
     pub fps_den: u32,
     /// Edit rate (frames per partition) for AS-02
     pub partition_size: u32,
-    /// When set, the essence is AES-128 encrypted at wrap time (J2K/PCM only).
-    /// Never serialized: it carries secret key material.
+    /// When set, the essence is AES-128 encrypted at wrap time. Every essence
+    /// type honours it, so no wrap silently ships cleartext under a key the CPL
+    /// claims. Never serialized: it carries secret key material.
     #[serde(skip)]
     pub encryption: Option<MxfEncryption>,
     /// SMPTE 377-4 MCA label config for PCM, asdcp-wrap style, e.g.
@@ -239,10 +240,15 @@ impl TimedTextWriter {
         }
     }
 
-    fn write_timed_text_resource(&mut self, xml: &str) -> asdcplib::Result<()> {
+    fn write_timed_text_resource(
+        &mut self,
+        xml: &str,
+        enc: &mut EssenceCrypto,
+    ) -> asdcplib::Result<()> {
+        let (e, h) = enc.contexts();
         match self {
-            Self::AsDcp(w) => w.write_timed_text_resource(xml, None, None),
-            Self::As02(w) => w.write_timed_text_resource(xml, None, None),
+            Self::AsDcp(w) => w.write_timed_text_resource(xml, e, h),
+            Self::As02(w) => w.write_timed_text_resource(xml, e, h),
         }
     }
 
@@ -251,10 +257,12 @@ impl TimedTextWriter {
         data: &[u8],
         uuid: &[u8; 16],
         mime_type: &str,
+        enc: &mut EssenceCrypto,
     ) -> asdcplib::Result<()> {
+        let (e, h) = enc.contexts();
         match self {
-            Self::AsDcp(w) => w.write_ancillary_resource(data, uuid, mime_type, None, None),
-            Self::As02(w) => w.write_ancillary_resource(data, uuid, mime_type, None, None),
+            Self::AsDcp(w) => w.write_ancillary_resource(data, uuid, mime_type, e, h),
+            Self::As02(w) => w.write_ancillary_resource(data, uuid, mime_type, e, h),
         }
     }
 
@@ -720,7 +728,16 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
     };
     let duration_frames = (end_secs * fps).ceil() as u32;
 
-    let info = make_writer_info(opts.asset_uuid);
+    let mut info = make_writer_info(opts.asset_uuid);
+    let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
+        Ok(c) => c,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
     let desc = asdcplib::timed_text::TimedTextDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         container_duration: duration_frames,
@@ -736,7 +753,7 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    if let Err(e) = writer.write_timed_text_resource(&xml_data) {
+    if let Err(e) = writer.write_timed_text_resource(&xml_data, &mut crypto) {
         return MxfTrackFile {
             error: format!("TimedText write_resource failed: {e}"),
             ..Default::default()
@@ -770,7 +787,9 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
             "png" => "image/png",
             _ => "application/octet-stream",
         };
-        if let Err(e) = writer.write_ancillary_resource(&resource_data, &resource_uuid, mime) {
+        if let Err(e) =
+            writer.write_ancillary_resource(&resource_data, &resource_uuid, mime, &mut crypto)
+        {
             return MxfTrackFile {
                 error: format!("TimedText write_ancillary failed: {e}"),
                 ..Default::default()
@@ -830,7 +849,16 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     }
 
-    let info = make_writer_info(opts.asset_uuid);
+    let mut info = make_writer_info(opts.asset_uuid);
+    let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
+        Ok(c) => c,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
     let desc = asdcplib::atmos::AtmosDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         container_duration: frames.len() as u32,
@@ -853,7 +881,8 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
     }
 
     for frame in &frames {
-        if let Err(e) = writer.write_frame(frame, None, None) {
+        let (enc, hmac) = crypto.contexts();
+        if let Err(e) = writer.write_frame(frame, enc, hmac) {
             return MxfTrackFile {
                 error: format!("Atmos write_frame failed: {e}"),
                 ..Default::default()
@@ -1222,15 +1251,16 @@ mod tests {
     /// A byte run that won't occur in MXF structure, only in our essence.
     const PLAINTEXT_TAG: &[u8] = b"DCPWIZARD_PLAINTEXT_ESSENCE_TAG!";
 
-    fn j2k_opts(
-        input: std::path::PathBuf,
+    fn wrap_opts(
+        essence_type: EssenceType,
+        input_files: Vec<std::path::PathBuf>,
         output: std::path::PathBuf,
         encryption: Option<MxfEncryption>,
     ) -> MxfWrapOptions {
         MxfWrapOptions {
-            input_files: vec![input],
+            input_files,
             output,
-            essence_type: EssenceType::J2k,
+            essence_type,
             standard: MxfStandard::AsDcp,
             fps_num: 24,
             fps_den: 1,
@@ -1241,6 +1271,14 @@ mod tests {
             hdr: None,
             asset_uuid: None,
         }
+    }
+
+    fn j2k_opts(
+        input: std::path::PathBuf,
+        output: std::path::PathBuf,
+        encryption: Option<MxfEncryption>,
+    ) -> MxfWrapOptions {
+        wrap_opts(EssenceType::J2k, vec![input], output, encryption)
     }
 
     #[test]
@@ -1495,6 +1533,16 @@ mod tests {
   </dcst:SubtitleList>\n\
 </dcst:SubtitleReel>\n";
 
+    /// The font id `DCST` references from its LoadFont element, which the wrap
+    /// has to embed the resource under.
+    const DCST_FONT_ID: &str = "22222222-2222-2222-2222-222222222222";
+
+    /// A string only the cleartext subtitle XML can contain.
+    const DCST_MARKER: &[u8] = b"SubtitleReel";
+
+    /// Read buffer for a whole timed-text or Atmos resource in these tests.
+    const RESOURCE_READ_BUFFER_LEN: usize = 64 * 1024;
+
     #[test]
     fn timed_text_embeds_ancillary_font_with_caller_supplied_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -1504,25 +1552,10 @@ mod tests {
         let font = dir.path().join("f.ttf");
         std::fs::write(&font, vec![0u8; 4096]).unwrap();
         let out = dir.path().join("sub.mxf");
-        // the id referenced by LoadFont above
-        let font_id = *uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222")
-            .unwrap()
-            .as_bytes();
+        let font_id = *uuid::Uuid::parse_str(DCST_FONT_ID).unwrap().as_bytes();
 
-        let opts = MxfWrapOptions {
-            input_files: vec![xml, font],
-            output: out.clone(),
-            essence_type: EssenceType::TimedText,
-            standard: MxfStandard::AsDcp,
-            fps_num: 24,
-            fps_den: 1,
-            partition_size: 0,
-            encryption: None,
-            mca_config: None,
-            resource_ids: vec![font_id],
-            hdr: None,
-            asset_uuid: None,
-        };
+        let mut opts = wrap_opts(EssenceType::TimedText, vec![xml, font], out.clone(), None);
+        opts.resource_ids = vec![font_id];
         let result = mxf_wrap(&opts);
         assert!(result.success, "timed text wrap failed: {}", result.error);
         assert_eq!(result.duration, 96, "4.0 s at 24 fps");
@@ -1536,6 +1569,203 @@ mod tests {
             .unwrap();
         let back = String::from_utf8_lossy(&buf[..n]);
         assert!(back.contains("SubtitleReel"), "XML round-trips");
+    }
+
+    /// The AES/HMAC contexts a reader needs to recover essence encrypted under
+    /// `key`, built the same way the wrap builds the writing side.
+    fn read_contexts(
+        key: &[u8; 16],
+    ) -> (
+        asdcplib::crypto::AesDecContext,
+        asdcplib::crypto::HmacContext,
+    ) {
+        let mut dec = asdcplib::crypto::AesDecContext::new();
+        dec.init_key(key).unwrap();
+        let mut hmac = asdcplib::crypto::HmacContext::new();
+        hmac.init_key(key, asdcplib::LabelSet::Smpte).unwrap();
+        (dec, hmac)
+    }
+
+    /// A distinctive essence payload, so an unencrypted wrap is findable in the
+    /// file bytes and an encrypted one provably is not.
+    fn tagged_payload() -> Vec<u8> {
+        const TAG_REPEATS: usize = 128;
+        PLAINTEXT_TAG.repeat(TAG_REPEATS)
+    }
+
+    /// Encryption has to reach the subtitle XML and its ancillary resources, and
+    /// the MXF has to name the KeyId the CPL will claim for the track. Reading
+    /// back under the same key proves the essence was encrypted with it rather
+    /// than merely flagged, and the HMAC proves the integrity side is on.
+    #[test]
+    fn timed_text_encrypts_xml_and_ancillary_resources_under_the_caller_key() {
+        const CONTENT_KEY: [u8; 16] = [0x31; 16];
+        const KEY_ID: [u8; 16] = [0x32; 16];
+
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("sub.xml");
+        std::fs::write(&xml, DCST).unwrap();
+        let font = dir.path().join("f.ttf");
+        let font_data = tagged_payload();
+        std::fs::write(&font, &font_data).unwrap();
+        let font_id = *uuid::Uuid::parse_str(DCST_FONT_ID).unwrap().as_bytes();
+
+        let timed_text_opts = |output: std::path::PathBuf, encryption| {
+            let mut opts = wrap_opts(
+                EssenceType::TimedText,
+                vec![xml.clone(), font.clone()],
+                output,
+                encryption,
+            );
+            opts.resource_ids = vec![font_id];
+            opts
+        };
+
+        let plain_out = dir.path().join("plain.mxf");
+        let plain = mxf_wrap(&timed_text_opts(plain_out.clone(), None));
+        assert!(plain.success, "cleartext wrap failed: {}", plain.error);
+        let plain_bytes = std::fs::read(&plain_out).unwrap();
+        assert!(
+            contains(&plain_bytes, DCST_MARKER) && contains(&plain_bytes, PLAINTEXT_TAG),
+            "the cleartext wrap should store XML and font verbatim"
+        );
+        let mut plain_reader = asdcplib::timed_text::MxfReader::new();
+        plain_reader
+            .open_read(&plain_out.to_string_lossy())
+            .unwrap();
+        assert!(
+            !plain_reader.writer_info().unwrap().encrypted_essence,
+            "an unencrypted wrap must not claim encrypted essence"
+        );
+
+        let enc_out = dir.path().join("enc.mxf");
+        let enc = mxf_wrap(&timed_text_opts(
+            enc_out.clone(),
+            Some(MxfEncryption {
+                content_key: CONTENT_KEY,
+                key_id: KEY_ID,
+            }),
+        ));
+        assert!(enc.success, "encrypted wrap failed: {}", enc.error);
+
+        let enc_bytes = std::fs::read(&enc_out).unwrap();
+        assert!(
+            !contains(&enc_bytes, DCST_MARKER),
+            "subtitle XML survived into the encrypted MXF: it was not encrypted"
+        );
+        assert!(
+            !contains(&enc_bytes, PLAINTEXT_TAG),
+            "font resource survived into the encrypted MXF: it was not encrypted"
+        );
+
+        let mut reader = asdcplib::timed_text::MxfReader::new();
+        reader.open_read(&enc_out.to_string_lossy()).unwrap();
+        let info = reader.writer_info().unwrap();
+        assert!(info.encrypted_essence, "essence is flagged encrypted");
+        assert!(info.uses_hmac, "integrity protection is on");
+        assert_eq!(
+            info.cryptographic_key_id, KEY_ID,
+            "the MXF names the KeyId the CPL will claim"
+        );
+
+        // reading back under the same key: only the real key recovers this, so it
+        // is the key the essence was encrypted with
+        let (mut dec, mut hmac) = read_contexts(&CONTENT_KEY);
+        let mut buf = vec![0u8; RESOURCE_READ_BUFFER_LEN];
+        let n = reader
+            .read_timed_text_resource(&mut buf, Some(&mut dec), Some(&mut hmac))
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&buf[..n]),
+            DCST,
+            "decrypted subtitle XML"
+        );
+
+        // wrap_timed_text opens without declaring its resources, so no reader can
+        // locate the font: the same wrap without it sizes what the font added
+        let no_font_out = dir.path().join("enc_no_font.mxf");
+        let mut no_font_opts = timed_text_opts(
+            no_font_out.clone(),
+            Some(MxfEncryption {
+                content_key: CONTENT_KEY,
+                key_id: KEY_ID,
+            }),
+        );
+        no_font_opts.input_files = vec![xml];
+        no_font_opts.resource_ids = vec![];
+        let no_font = mxf_wrap(&no_font_opts);
+        assert!(no_font.success, "wrap failed: {}", no_font.error);
+        assert!(
+            enc_bytes.len() >= std::fs::read(&no_font_out).unwrap().len() + font_data.len(),
+            "the font resource is still in the encrypted MXF, just not in the clear"
+        );
+    }
+
+    /// Same contract for Atmos: the key reaches the essence, the KeyId in the MXF
+    /// is the one the CPL will claim, and the HMAC is written.
+    #[test]
+    fn atmos_encrypts_frames_under_the_caller_key() {
+        const CONTENT_KEY: [u8; 16] = [0x41; 16];
+        const KEY_ID: [u8; 16] = [0x42; 16];
+
+        let dir = tempfile::tempdir().unwrap();
+        let frame_path = dir.path().join("a.dat");
+        let frame_data = tagged_payload();
+        std::fs::write(&frame_path, &frame_data).unwrap();
+
+        let plain_out = dir.path().join("plain.mxf");
+        let plain = mxf_wrap(&wrap_opts(
+            EssenceType::Atmos,
+            vec![frame_path.clone()],
+            plain_out.clone(),
+            None,
+        ));
+        assert!(plain.success, "cleartext wrap failed: {}", plain.error);
+        assert!(
+            contains(&std::fs::read(&plain_out).unwrap(), PLAINTEXT_TAG),
+            "the cleartext wrap should store the frame verbatim"
+        );
+        let mut plain_reader = asdcplib::atmos::MxfReader::new();
+        plain_reader
+            .open_read(&plain_out.to_string_lossy())
+            .unwrap();
+        assert!(
+            !plain_reader.writer_info().unwrap().encrypted_essence,
+            "an unencrypted wrap must not claim encrypted essence"
+        );
+
+        let enc_out = dir.path().join("enc.mxf");
+        let enc = mxf_wrap(&wrap_opts(
+            EssenceType::Atmos,
+            vec![frame_path],
+            enc_out.clone(),
+            Some(MxfEncryption {
+                content_key: CONTENT_KEY,
+                key_id: KEY_ID,
+            }),
+        ));
+        assert!(enc.success, "encrypted wrap failed: {}", enc.error);
+        assert!(
+            !contains(&std::fs::read(&enc_out).unwrap(), PLAINTEXT_TAG),
+            "frame survived into the encrypted MXF: it was not encrypted"
+        );
+
+        let mut reader = asdcplib::atmos::MxfReader::new();
+        reader.open_read(&enc_out.to_string_lossy()).unwrap();
+        let info = reader.writer_info().unwrap();
+        assert!(info.encrypted_essence, "essence is flagged encrypted");
+        assert!(info.uses_hmac, "integrity protection is on");
+        assert_eq!(
+            info.cryptographic_key_id, KEY_ID,
+            "the MXF names the KeyId the CPL will claim"
+        );
+
+        let (mut dec, mut hmac) = read_contexts(&CONTENT_KEY);
+        let mut buf = vec![0u8; RESOURCE_READ_BUFFER_LEN];
+        let n = reader
+            .read_frame(0, &mut buf, Some(&mut dec), Some(&mut hmac))
+            .unwrap();
+        assert_eq!(&buf[..n], &frame_data[..], "decrypted Atmos frame");
     }
 
     /// Read the AssetUUID an MXF actually carries, using an independent

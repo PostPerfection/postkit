@@ -1,6 +1,6 @@
 //! AS-02 (IMF) MXF wrapping roundtrip through postkit's public wrap API.
 
-use postkit::mxf_wrap::{EssenceType, MxfStandard, MxfWrapOptions, mxf_wrap};
+use postkit::mxf_wrap::{EssenceType, MxfEncryption, MxfStandard, MxfWrapOptions, mxf_wrap};
 use std::path::PathBuf;
 
 fn temp_path(tag: &str) -> PathBuf {
@@ -160,6 +160,79 @@ fn as02_pcm_roundtrip() {
     assert_eq!(size, frame_size);
     assert_eq!(&buf[..size], &pcm[..frame_size]);
     reader.close().unwrap();
+
+    std::fs::remove_file(&input).ok();
+    std::fs::remove_file(&output).ok();
+}
+
+/// IMF subtitles reach the same encryption path as the DCP ones, so an
+/// encrypted AS-02 wrap must not leave the XML readable in the file.
+#[test]
+fn as02_timed_text_encrypts_the_subtitle_xml() {
+    const CONTENT_KEY: [u8; 16] = [0x51; 16];
+    const KEY_ID: [u8; 16] = [0x52; 16];
+    const DCST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<dcst:SubtitleReel xmlns:dcst=\"http://www.smpte-ra.org/schemas/428-7/2010/DCST\">\n\
+  <dcst:Id>urn:uuid:11111111-1111-1111-1111-111111111111</dcst:Id>\n\
+  <dcst:ContentTitleText>t</dcst:ContentTitleText>\n\
+  <dcst:IssueDate>2020-01-01T00:00:00+00:00</dcst:IssueDate>\n\
+  <dcst:EditRate>24 1</dcst:EditRate>\n\
+  <dcst:TimeCodeRate>24</dcst:TimeCodeRate>\n\
+  <dcst:SubtitleList>\n\
+    <dcst:Font ID=\"f1\">\n\
+      <dcst:Subtitle SpotNumber=\"1\" TimeIn=\"00:00:01:00\" TimeOut=\"00:00:04:00\">\n\
+        <dcst:Text>hi</dcst:Text>\n\
+      </dcst:Subtitle>\n\
+    </dcst:Font>\n\
+  </dcst:SubtitleList>\n\
+</dcst:SubtitleReel>\n";
+    const MARKER: &[u8] = b"SubtitleReel";
+
+    let input = temp_path("sub.xml");
+    std::fs::write(&input, DCST).unwrap();
+    let output = temp_path("sub.mxf");
+    let result = mxf_wrap(&MxfWrapOptions {
+        input_files: vec![input.clone()],
+        output: output.clone(),
+        essence_type: EssenceType::TimedText,
+        standard: MxfStandard::As02,
+        fps_num: 24,
+        fps_den: 1,
+        partition_size: 1,
+        encryption: Some(MxfEncryption {
+            content_key: CONTENT_KEY,
+            key_id: KEY_ID,
+        }),
+        mca_config: None,
+        resource_ids: vec![],
+        hdr: None,
+        asset_uuid: None,
+    });
+    assert!(result.success, "wrap failed: {}", result.error);
+
+    let bytes = std::fs::read(&output).unwrap();
+    assert!(
+        !bytes.windows(MARKER.len()).any(|w| w == MARKER),
+        "subtitle XML survived into the encrypted AS-02 MXF"
+    );
+
+    let mut reader = asdcplib::as02::timed_text::MxfReader::new();
+    reader.open_read(&output.to_string_lossy()).unwrap();
+    let info = reader.writer_info().unwrap();
+    assert!(info.encrypted_essence);
+    assert!(info.uses_hmac);
+    assert_eq!(info.cryptographic_key_id, KEY_ID);
+
+    let mut dec = asdcplib::crypto::AesDecContext::new();
+    dec.init_key(&CONTENT_KEY).unwrap();
+    let mut hmac = asdcplib::crypto::HmacContext::new();
+    hmac.init_key(&CONTENT_KEY, asdcplib::LabelSet::Smpte)
+        .unwrap();
+    let mut buf = vec![0u8; 64 * 1024];
+    let size = reader
+        .read_timed_text_resource(&mut buf, Some(&mut dec), Some(&mut hmac))
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..size]), DCST);
 
     std::fs::remove_file(&input).ok();
     std::fs::remove_file(&output).ok();
