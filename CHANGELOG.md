@@ -47,6 +47,19 @@
   specific RDN first, which is what libdcp writes and what a projector matches a
   KDM recipient against. Reissue any KDM postkit produced earlier.
 
+### Subtitle MXFs written before this release hid their fonts and images
+
+Rebuild any package whose subtitles embed a font or an image. The timed-text
+wrap wrote each resource into the file but never declared it in the header, and
+a reader can only enumerate what the header declares, so the resource count came
+back zero and reading one by its id failed. A player therefore could not find
+the font a DCST asks for by `urn:uuid`, which defeated font subsetting entirely.
+Subtitle MXFs with no embedded resource are byte-for-byte what they were.
+
+AS-02 (IMF) timed text has the same defect and no fix available here, because
+asdcplib exposes no AS-02 entry point that declares the resource list. That wrap
+now refuses fonts and images rather than embedding one nothing can read.
+
 ## 0.6.0 - 2026-08-13
 
 ### Generated signer certificates were missing two required extensions

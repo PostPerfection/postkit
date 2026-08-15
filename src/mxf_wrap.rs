@@ -227,15 +227,24 @@ impl TimedTextWriter {
         }
     }
 
+    /// Open the writer, declaring the ancillary resources the wrap will then
+    /// write. A reader can only enumerate resources declared here, so the list
+    /// has to be complete and in the order the writes follow.
+    ///
+    /// AS-02 has no equivalent entry point in asdcplib, which is why
+    /// `wrap_timed_text` refuses ancillary resources on that standard.
     fn open_write(
         &mut self,
         filename: &str,
         info: &asdcplib::WriterInfo,
         desc: &asdcplib::timed_text::TimedTextDescriptor,
+        resources: &[asdcplib::timed_text::AncillaryResourceInfo],
         header_size: u32,
     ) -> asdcplib::Result<()> {
         match self {
-            Self::AsDcp(w) => w.open_write(filename, info, desc, header_size),
+            Self::AsDcp(w) => {
+                w.open_write_with_resources(filename, info, desc, resources, header_size)
+            }
             Self::As02(w) => w.open_write(filename, info, desc, header_size),
         }
     }
@@ -698,10 +707,86 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
     }
 }
 
+/// A timed-text ancillary resource (font, image) and the identity it is embedded
+/// under. All of it has to be known before the writer opens, because the header
+/// declares the resource list.
+struct AncillaryResource {
+    data: Vec<u8>,
+    uuid: [u8; 16],
+    declared_type: asdcplib::timed_text::MimeType,
+    mime_type: &'static str,
+}
+
+/// File extension to the MIME identity a timed-text resource is embedded under:
+/// the type declared in the header and the string written beside the bytes.
+/// Those two have to agree, so they are chosen together.
+const ANCILLARY_MIME_TYPES: [(&str, asdcplib::timed_text::MimeType, &str); 3] = [
+    (
+        "ttf",
+        asdcplib::timed_text::MimeType::OpenType,
+        "application/x-font-opentype",
+    ),
+    (
+        "otf",
+        asdcplib::timed_text::MimeType::OpenType,
+        "application/x-font-opentype",
+    ),
+    ("png", asdcplib::timed_text::MimeType::Png, "image/png"),
+];
+
+/// What a resource with an unrecognised extension is embedded as.
+const DEFAULT_ANCILLARY_MIME: (asdcplib::timed_text::MimeType, &str) = (
+    asdcplib::timed_text::MimeType::Binary,
+    "application/octet-stream",
+);
+
+/// Read the ancillary resources of a timed-text wrap: every input file after the
+/// subtitle XML.
+fn read_ancillary_resources(opts: &MxfWrapOptions) -> Result<Vec<AncillaryResource>, String> {
+    let mut resources = Vec::new();
+    for (index, path) in opts.input_files.iter().skip(1).enumerate() {
+        let data = std::fs::read(path)
+            .map_err(|e| format!("failed to read resource {}: {e}", path.display()))?;
+        // caller-supplied id so a DCST urn:uuid ref matches the embedded resource
+        let uuid = opts
+            .resource_ids
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
+        let extension = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let (declared_type, mime_type) = ANCILLARY_MIME_TYPES
+            .iter()
+            .find(|(candidate, _, _)| *candidate == extension)
+            .map_or(DEFAULT_ANCILLARY_MIME, |(_, declared, mime)| {
+                (*declared, *mime)
+            });
+        resources.push(AncillaryResource {
+            data,
+            uuid,
+            declared_type,
+            mime_type,
+        });
+    }
+    Ok(resources)
+}
+
 fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
     if opts.input_files.is_empty() {
         return MxfTrackFile {
             error: "no input files".to_string(),
+            ..Default::default()
+        };
+    }
+
+    // an AS-02 resource could be written but never declared, and a reader can
+    // only find a declared one, so refuse rather than embed something unusable
+    if opts.input_files.len() > 1 && opts.standard == MxfStandard::As02 {
+        return MxfTrackFile {
+            error: "AS-02 (IMF) timed text cannot embed fonts or images: asdcplib has no AS-02 entry point that declares them in the header, so no reader could find them".to_string(),
             ..Default::default()
         };
     }
@@ -728,6 +813,16 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
     };
     let duration_frames = (end_secs * fps).ceil() as u32;
 
+    let resources = match read_ancillary_resources(opts) {
+        Ok(r) => r,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
+
     let mut info = make_writer_info(opts.asset_uuid);
     let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
         Ok(c) => c,
@@ -744,9 +839,17 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
         asset_id: info.asset_uuid,
     };
 
+    let declared: Vec<_> = resources
+        .iter()
+        .map(|r| asdcplib::timed_text::AncillaryResourceInfo {
+            uuid: r.uuid,
+            mime_type: r.declared_type,
+        })
+        .collect();
+
     let mut writer = TimedTextWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
-    if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
+    if let Err(e) = writer.open_write(&output_str, &info, &desc, &declared, 16384) {
         return MxfTrackFile {
             error: format!("TimedText open_write failed: {e}"),
             ..Default::default()
@@ -760,36 +863,14 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    // Write ancillary resources (fonts, images) — remaining input files
-    for (i, f) in opts.input_files.iter().skip(1).enumerate() {
-        let resource_data = match std::fs::read(f) {
-            Ok(d) => d,
-            Err(e) => {
-                return MxfTrackFile {
-                    error: format!("failed to read resource {}: {e}", f.display()),
-                    ..Default::default()
-                };
-            }
-        };
-        // caller-supplied id so a DCST urn:uuid ref matches the embedded resource
-        let resource_uuid = opts
-            .resource_ids
-            .get(i)
-            .copied()
-            .unwrap_or_else(|| *uuid::Uuid::new_v4().as_bytes());
-        let ext = f
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        let mime = match ext.as_str() {
-            "ttf" | "otf" => "application/x-font-opentype",
-            "png" => "image/png",
-            _ => "application/octet-stream",
-        };
-        if let Err(e) =
-            writer.write_ancillary_resource(&resource_data, &resource_uuid, mime, &mut crypto)
-        {
+    // in declaration order: the header lists them in the order they are written
+    for resource in &resources {
+        if let Err(e) = writer.write_ancillary_resource(
+            &resource.data,
+            &resource.uuid,
+            resource.mime_type,
+            &mut crypto,
+        ) {
             return MxfTrackFile {
                 error: format!("TimedText write_ancillary failed: {e}"),
                 ..Default::default()
@@ -1543,19 +1624,61 @@ mod tests {
     /// Read buffer for a whole timed-text or Atmos resource in these tests.
     const RESOURCE_READ_BUFFER_LEN: usize = 64 * 1024;
 
-    #[test]
-    fn timed_text_embeds_ancillary_font_with_caller_supplied_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let xml = dir.path().join("sub.xml");
-        std::fs::write(&xml, DCST).unwrap();
-        // a stand-in font resource; the wrapper stores bytes verbatim
-        let font = dir.path().join("f.ttf");
-        std::fs::write(&font, vec![0u8; 4096]).unwrap();
-        let out = dir.path().join("sub.mxf");
-        let font_id = *uuid::Uuid::parse_str(DCST_FONT_ID).unwrap().as_bytes();
+    /// The id of the image resource in the two-resource tests. Unlike the font it
+    /// is not referenced from `DCST`, since the MXF side is what is under test.
+    const DCST_IMAGE_ID: &str = "33333333-3333-3333-3333-333333333333";
 
-        let mut opts = wrap_opts(EssenceType::TimedText, vec![xml, font], out.clone(), None);
-        opts.resource_ids = vec![font_id];
+    /// Stand-in font and image resources. Distinct contents and lengths, so a
+    /// wrap that mixed the two up could not pass. The font carries the plaintext
+    /// tag, which is also what an encrypted wrap has to hide.
+    fn font_bytes() -> Vec<u8> {
+        tagged_payload()
+    }
+
+    fn image_bytes() -> Vec<u8> {
+        vec![0xb2; 2048]
+    }
+
+    /// A subtitle wrap with a font and an image, as dcpwizard produces after font
+    /// subsetting.
+    fn timed_text_with_resources(
+        dir: &std::path::Path,
+        output: std::path::PathBuf,
+        encryption: Option<MxfEncryption>,
+    ) -> MxfWrapOptions {
+        let xml = dir.join("sub.xml");
+        std::fs::write(&xml, DCST).unwrap();
+        let font = dir.join("f.ttf");
+        std::fs::write(&font, font_bytes()).unwrap();
+        let image = dir.join("i.png");
+        std::fs::write(&image, image_bytes()).unwrap();
+
+        let mut opts = wrap_opts(
+            EssenceType::TimedText,
+            vec![xml, font, image],
+            output,
+            encryption,
+        );
+        opts.resource_ids = vec![
+            *uuid::Uuid::parse_str(DCST_FONT_ID).unwrap().as_bytes(),
+            *uuid::Uuid::parse_str(DCST_IMAGE_ID).unwrap().as_bytes(),
+        ];
+        opts
+    }
+
+    /// A font a player cannot find is a font that is not there: the subtitle MXF
+    /// has to declare its resources in the header, under the ids the DCST refers
+    /// to, so a reader can enumerate and read them back.
+    #[test]
+    fn timed_text_embeds_fonts_and_images_a_reader_can_find() {
+        use asdcplib::timed_text::MimeType;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sub.mxf");
+        let opts = timed_text_with_resources(dir.path(), out.clone(), None);
+        let font_id = opts.resource_ids[0];
+        let image_id = opts.resource_ids[1];
+
         let result = mxf_wrap(&opts);
         assert!(result.success, "timed text wrap failed: {}", result.error);
         assert_eq!(result.duration, 96, "4.0 s at 24 fps");
@@ -1563,12 +1686,32 @@ mod tests {
         // the primary timed-text resource round-trips out of the MXF
         let mut reader = asdcplib::timed_text::MxfReader::new();
         reader.open_read(&out.to_string_lossy()).unwrap();
-        let mut buf = vec![0u8; 64 * 1024];
+        let mut buf = vec![0u8; RESOURCE_READ_BUFFER_LEN];
         let n = reader
             .read_timed_text_resource(&mut buf, None, None)
             .unwrap();
         let back = String::from_utf8_lossy(&buf[..n]);
         assert!(back.contains("SubtitleReel"), "XML round-trips");
+
+        assert_eq!(
+            reader.ancillary_resource_count().unwrap(),
+            2,
+            "both resources are declared in the header"
+        );
+        let declared = [
+            (font_id, MimeType::OpenType, font_bytes()),
+            (image_id, MimeType::Png, image_bytes()),
+        ];
+        for (index, (id, mime_type, data)) in declared.into_iter().enumerate() {
+            let info = reader.ancillary_resource_info(index).unwrap();
+            assert_eq!(info.uuid, id, "resource {index} is declared under its id");
+            assert_eq!(info.mime_type, mime_type, "resource {index} MIME type");
+
+            let n = reader
+                .read_ancillary_resource(&id, &mut buf, None, None)
+                .unwrap();
+            assert_eq!(&buf[..n], &data[..], "resource {index} round-trips");
+        }
     }
 
     /// The AES/HMAC contexts a reader needs to recover essence encrypted under
@@ -1603,26 +1746,13 @@ mod tests {
         const KEY_ID: [u8; 16] = [0x32; 16];
 
         let dir = tempfile::tempdir().unwrap();
-        let xml = dir.path().join("sub.xml");
-        std::fs::write(&xml, DCST).unwrap();
-        let font = dir.path().join("f.ttf");
-        let font_data = tagged_payload();
-        std::fs::write(&font, &font_data).unwrap();
-        let font_id = *uuid::Uuid::parse_str(DCST_FONT_ID).unwrap().as_bytes();
-
-        let timed_text_opts = |output: std::path::PathBuf, encryption| {
-            let mut opts = wrap_opts(
-                EssenceType::TimedText,
-                vec![xml.clone(), font.clone()],
-                output,
-                encryption,
-            );
-            opts.resource_ids = vec![font_id];
-            opts
-        };
 
         let plain_out = dir.path().join("plain.mxf");
-        let plain = mxf_wrap(&timed_text_opts(plain_out.clone(), None));
+        let plain = mxf_wrap(&timed_text_with_resources(
+            dir.path(),
+            plain_out.clone(),
+            None,
+        ));
         assert!(plain.success, "cleartext wrap failed: {}", plain.error);
         let plain_bytes = std::fs::read(&plain_out).unwrap();
         assert!(
@@ -1639,13 +1769,17 @@ mod tests {
         );
 
         let enc_out = dir.path().join("enc.mxf");
-        let enc = mxf_wrap(&timed_text_opts(
+        let opts = timed_text_with_resources(
+            dir.path(),
             enc_out.clone(),
             Some(MxfEncryption {
                 content_key: CONTENT_KEY,
                 key_id: KEY_ID,
             }),
-        ));
+        );
+        let font_id = opts.resource_ids[0];
+        let image_id = opts.resource_ids[1];
+        let enc = mxf_wrap(&opts);
         assert!(enc.success, "encrypted wrap failed: {}", enc.error);
 
         let enc_bytes = std::fs::read(&enc_out).unwrap();
@@ -1681,24 +1815,17 @@ mod tests {
             "decrypted subtitle XML"
         );
 
-        // wrap_timed_text opens without declaring its resources, so no reader can
-        // locate the font: the same wrap without it sizes what the font added
-        let no_font_out = dir.path().join("enc_no_font.mxf");
-        let mut no_font_opts = timed_text_opts(
-            no_font_out.clone(),
-            Some(MxfEncryption {
-                content_key: CONTENT_KEY,
-                key_id: KEY_ID,
-            }),
+        assert_eq!(
+            reader.ancillary_resource_count().unwrap(),
+            2,
+            "encryption does not cost the resource declarations"
         );
-        no_font_opts.input_files = vec![xml];
-        no_font_opts.resource_ids = vec![];
-        let no_font = mxf_wrap(&no_font_opts);
-        assert!(no_font.success, "wrap failed: {}", no_font.error);
-        assert!(
-            enc_bytes.len() >= std::fs::read(&no_font_out).unwrap().len() + font_data.len(),
-            "the font resource is still in the encrypted MXF, just not in the clear"
-        );
+        for (id, data) in [(font_id, font_bytes()), (image_id, image_bytes())] {
+            let n = reader
+                .read_ancillary_resource(&id, &mut buf, Some(&mut dec), Some(&mut hmac))
+                .unwrap();
+            assert_eq!(&buf[..n], &data[..], "decrypted ancillary resource");
+        }
     }
 
     /// Same contract for Atmos: the key reaches the essence, the KeyId in the MXF

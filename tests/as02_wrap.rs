@@ -3,6 +3,25 @@
 use postkit::mxf_wrap::{EssenceType, MxfEncryption, MxfStandard, MxfWrapOptions, mxf_wrap};
 use std::path::PathBuf;
 
+/// A one-subtitle DCST, the smallest input the timed-text wrap accepts.
+const DCST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<dcst:SubtitleReel xmlns:dcst=\"http://www.smpte-ra.org/schemas/428-7/2010/DCST\">\n\
+  <dcst:Id>urn:uuid:11111111-1111-1111-1111-111111111111</dcst:Id>\n\
+  <dcst:ContentTitleText>t</dcst:ContentTitleText>\n\
+  <dcst:IssueDate>2020-01-01T00:00:00+00:00</dcst:IssueDate>\n\
+  <dcst:EditRate>24 1</dcst:EditRate>\n\
+  <dcst:TimeCodeRate>24</dcst:TimeCodeRate>\n\
+  <dcst:SubtitleList>\n\
+    <dcst:Font ID=\"f1\">\n\
+      <dcst:Subtitle SpotNumber=\"1\" TimeIn=\"00:00:01:00\" TimeOut=\"00:00:04:00\">\n\
+        <dcst:Text>hi</dcst:Text>\n\
+      </dcst:Subtitle>\n\
+    </dcst:Font>\n\
+  </dcst:SubtitleList>\n\
+</dcst:SubtitleReel>\n";
+/// A string only the cleartext subtitle XML can contain.
+const MARKER: &[u8] = b"SubtitleReel";
+
 fn temp_path(tag: &str) -> PathBuf {
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -171,22 +190,6 @@ fn as02_pcm_roundtrip() {
 fn as02_timed_text_encrypts_the_subtitle_xml() {
     const CONTENT_KEY: [u8; 16] = [0x51; 16];
     const KEY_ID: [u8; 16] = [0x52; 16];
-    const DCST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-<dcst:SubtitleReel xmlns:dcst=\"http://www.smpte-ra.org/schemas/428-7/2010/DCST\">\n\
-  <dcst:Id>urn:uuid:11111111-1111-1111-1111-111111111111</dcst:Id>\n\
-  <dcst:ContentTitleText>t</dcst:ContentTitleText>\n\
-  <dcst:IssueDate>2020-01-01T00:00:00+00:00</dcst:IssueDate>\n\
-  <dcst:EditRate>24 1</dcst:EditRate>\n\
-  <dcst:TimeCodeRate>24</dcst:TimeCodeRate>\n\
-  <dcst:SubtitleList>\n\
-    <dcst:Font ID=\"f1\">\n\
-      <dcst:Subtitle SpotNumber=\"1\" TimeIn=\"00:00:01:00\" TimeOut=\"00:00:04:00\">\n\
-        <dcst:Text>hi</dcst:Text>\n\
-      </dcst:Subtitle>\n\
-    </dcst:Font>\n\
-  </dcst:SubtitleList>\n\
-</dcst:SubtitleReel>\n";
-    const MARKER: &[u8] = b"SubtitleReel";
 
     let input = temp_path("sub.xml");
     std::fs::write(&input, DCST).unwrap();
@@ -236,6 +239,46 @@ fn as02_timed_text_encrypts_the_subtitle_xml() {
 
     std::fs::remove_file(&input).ok();
     std::fs::remove_file(&output).ok();
+}
+
+/// asdcplib has no AS-02 entry point that declares ancillary resources in the
+/// header, and an undeclared resource is one no reader can find. Refusing beats
+/// embedding a font the player will never see.
+#[test]
+fn as02_timed_text_refuses_ancillary_resources() {
+    let xml = temp_path("sub-with-font.xml");
+    std::fs::write(&xml, DCST).unwrap();
+    let font = temp_path("f.ttf");
+    std::fs::write(&font, vec![0xa1u8; 4096]).unwrap();
+    let output = temp_path("sub-with-font.mxf");
+
+    let result = mxf_wrap(&MxfWrapOptions {
+        input_files: vec![xml.clone(), font.clone()],
+        output: output.clone(),
+        essence_type: EssenceType::TimedText,
+        standard: MxfStandard::As02,
+        fps_num: 24,
+        fps_den: 1,
+        partition_size: 1,
+        encryption: None,
+        mca_config: None,
+        resource_ids: vec![],
+        hdr: None,
+        asset_uuid: None,
+    });
+    assert!(!result.success);
+    assert!(
+        result.error.contains("cannot embed fonts or images"),
+        "error was: {}",
+        result.error
+    );
+    assert!(
+        !output.exists(),
+        "a refused wrap must not leave a file behind"
+    );
+
+    std::fs::remove_file(&xml).ok();
+    std::fs::remove_file(&font).ok();
 }
 
 #[test]
