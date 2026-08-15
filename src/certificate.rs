@@ -64,28 +64,33 @@ pub struct CertInfo {
     pub key_bits: u32,
     pub is_ca: bool,
     pub is_expired: bool,
-    pub thumbprint_sha1: String,
+    /// Base64 SMPTE ST 430-2 thumbprint, the value a KDM lists as
+    /// CertificateThumbprint. Empty when the certificate could not be parsed.
+    pub thumbprint: String,
 }
 
 /// A trusted device entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrustedDevice {
     pub name: String,
+    /// Base64 SMPTE ST 430-2 thumbprint, the same spelling a KDM carries.
     pub thumbprint: String,
     pub certificate_path: PathBuf,
 }
 
+/// Application directory under the XDG data dir.
+const DATA_DIR_NAME: &str = "postkit";
+/// Trusted device store, under `DATA_DIR_NAME`.
+const TRUSTED_DEVICES_DIR_NAME: &str = "trusted_devices";
+/// The store keeps a copy of each device certificate beside its record.
+const CERTIFICATE_EXTENSION: &str = "pem";
+/// The record itself, one `TrustedDevice` per file.
+const DEVICE_RECORD_EXTENSION: &str = "json";
+
 /// Get the trusted devices directory (XDG data or fallback).
 fn trusted_devices_dir() -> PathBuf {
     let base = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("postkit").join("trusted_devices")
-}
-
-/// Compute SHA-1 thumbprint of DER-encoded certificate bytes.
-fn sha1_thumbprint(der_bytes: &[u8]) -> String {
-    use sha1::Digest;
-    let hash = sha1::Sha1::digest(der_bytes);
-    hash.iter().map(|b| format!("{b:02x}")).collect()
+    base.join(DATA_DIR_NAME).join(TRUSTED_DEVICES_DIR_NAME)
 }
 
 /// Generate an RSA key pair for rcgen to sign with.
@@ -390,7 +395,7 @@ pub fn read_certificate(cert_path: &Path) -> CertInfo {
     let now = x509_parser::time::ASN1Time::now();
     let is_expired = cert.validity().not_after < now;
 
-    let thumbprint = sha1_thumbprint(&pem.contents);
+    let thumbprint = thumbprint_base64(&cert_thumbprint(cert.tbs_certificate.as_ref()));
 
     CertInfo {
         subject_cn,
@@ -401,7 +406,7 @@ pub fn read_certificate(cert_path: &Path) -> CertInfo {
         key_bits,
         is_ca,
         is_expired,
-        thumbprint_sha1: thumbprint,
+        thumbprint,
     }
 }
 
@@ -497,33 +502,44 @@ fn validate_chain_inner(chain: &[PathBuf]) -> Result<usize, String> {
 
 /// Add a trusted device.
 pub fn add_trusted_device(cert_path: &Path, name: &str) -> i32 {
-    let dir = trusted_devices_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
+    add_trusted_device_in(&trusted_devices_dir(), cert_path, name)
+}
+
+fn add_trusted_device_in(dir: &Path, cert_path: &Path, name: &str) -> i32 {
+    if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::error!("failed to create trusted devices dir: {e}");
         return -1;
     }
+    migrate_trusted_devices(dir);
 
     let info = read_certificate(cert_path);
-    if info.thumbprint_sha1.is_empty() {
+    if info.thumbprint.is_empty() {
         tracing::error!("failed to read certificate for trusted device");
         return -1;
     }
+    let stem = match read_cert_thumbprint(cert_path) {
+        Ok(digest) => thumbprint_stem(&digest),
+        Err(e) => {
+            tracing::error!("{e}");
+            return -1;
+        }
+    };
 
     let device = TrustedDevice {
         name: name.to_string(),
-        thumbprint: info.thumbprint_sha1.clone(),
+        thumbprint: info.thumbprint.clone(),
         certificate_path: cert_path.to_path_buf(),
     };
 
     // Copy cert to trusted devices dir
-    let dest = dir.join(format!("{}.pem", info.thumbprint_sha1));
+    let dest = dir.join(format!("{stem}.{CERTIFICATE_EXTENSION}"));
     if let Err(e) = std::fs::copy(cert_path, &dest) {
         tracing::error!("failed to copy certificate: {e}");
         return -1;
     }
 
     // Write metadata JSON
-    let meta_path = dir.join(format!("{}.json", info.thumbprint_sha1));
+    let meta_path = dir.join(format!("{stem}.{DEVICE_RECORD_EXTENSION}"));
     let json = match serde_json::to_string_pretty(&device) {
         Ok(j) => j,
         Err(e) => {
@@ -536,51 +552,48 @@ pub fn add_trusted_device(cert_path: &Path, name: &str) -> i32 {
         return -1;
     }
 
-    tracing::info!("added trusted device '{}' ({})", name, info.thumbprint_sha1);
+    tracing::info!("added trusted device '{}' ({})", name, info.thumbprint);
     0
 }
 
 /// List all trusted devices.
 pub fn list_trusted_devices() -> Vec<TrustedDevice> {
-    let dir = trusted_devices_dir();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut devices = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("json")
-            && let Ok(data) = std::fs::read_to_string(&path)
-            && let Ok(device) = serde_json::from_str::<TrustedDevice>(&data)
-        {
-            devices.push(device);
-        }
-    }
-    devices
+    list_trusted_devices_in(&trusted_devices_dir())
 }
 
-/// Remove a trusted device by thumbprint.
-pub fn remove_trusted_device(thumbprint: &str) -> i32 {
-    let dir = trusted_devices_dir();
-    let pem_path = dir.join(format!("{thumbprint}.pem"));
-    let json_path = dir.join(format!("{thumbprint}.json"));
+fn list_trusted_devices_in(dir: &Path) -> Vec<TrustedDevice> {
+    migrate_trusted_devices(dir);
+    trusted_device_records(dir)
+        .into_iter()
+        .map(|(_, device)| device)
+        .collect()
+}
 
+/// Remove a trusted device by its base64 ST 430-2 thumbprint.
+pub fn remove_trusted_device(thumbprint: &str) -> i32 {
+    remove_trusted_device_in(&trusted_devices_dir(), thumbprint)
+}
+
+fn remove_trusted_device_in(dir: &Path, thumbprint: &str) -> i32 {
+    migrate_trusted_devices(dir);
+
+    // Matched against the stored records rather than by rebuilding a file name,
+    // so the displayed thumbprint stays the only thing a caller has to know.
     let mut removed = false;
-    if pem_path.exists() {
-        if let Err(e) = std::fs::remove_file(&pem_path) {
-            tracing::error!("failed to remove {}: {e}", pem_path.display());
-            return -1;
+    for (json_path, device) in trusted_device_records(dir) {
+        if device.thumbprint != thumbprint {
+            continue;
         }
-        removed = true;
-    }
-    if json_path.exists() {
-        if let Err(e) = std::fs::remove_file(&json_path) {
-            tracing::error!("failed to remove {}: {e}", json_path.display());
-            return -1;
+        for path in [json_path.with_extension(CERTIFICATE_EXTENSION), json_path] {
+            if !path.exists() {
+                continue;
+            }
+            if let Err(e) = std::fs::remove_file(&path) {
+                tracing::error!("failed to remove {}: {e}", path.display());
+                return -1;
+            }
+            removed = true;
         }
-        removed = true;
     }
 
     if removed {
@@ -590,6 +603,103 @@ pub fn remove_trusted_device(thumbprint: &str) -> i32 {
         tracing::warn!("trusted device not found: {thumbprint}");
         -1
     }
+}
+
+/// Every readable record in the store, paired with the path it was read from.
+fn trusted_device_records(dir: &Path) -> Vec<(PathBuf, TrustedDevice)> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some(DEVICE_RECORD_EXTENSION)
+            && let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(device) = serde_json::from_str::<TrustedDevice>(&data)
+        {
+            records.push((path, device));
+        }
+    }
+    records
+}
+
+/// Bring the store up to the current thumbprint spelling before it is used.
+///
+/// Both the record's thumbprint and the file stem are recomputed from the stored
+/// certificate, so a store already in that form is untouched and a run
+/// interrupted halfway is finished on the next pass. Nothing here can fail the
+/// operation the caller actually asked for: every problem is logged and skipped.
+fn migrate_trusted_devices(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let mut orphans = 0;
+    for entry in entries.flatten() {
+        let json_path = entry.path();
+        if json_path.extension().and_then(|e| e.to_str()) != Some(DEVICE_RECORD_EXTENSION) {
+            continue;
+        }
+        let pem_path = json_path.with_extension(CERTIFICATE_EXTENSION);
+        if !pem_path.exists() {
+            orphans += 1;
+            continue;
+        }
+        if let Err(e) = migrate_trusted_device(&json_path, &pem_path) {
+            tracing::warn!(
+                "leaving trusted device {} as it is: {e}",
+                json_path.display()
+            );
+        }
+    }
+
+    if orphans > 0 {
+        tracing::warn!(
+            "{orphans} trusted device record(s) in {} have no certificate beside them, \
+             so their thumbprint cannot be checked",
+            dir.display()
+        );
+    }
+}
+
+fn migrate_trusted_device(json_path: &Path, pem_path: &Path) -> Result<(), String> {
+    let data = std::fs::read_to_string(json_path)
+        .map_err(|e| format!("cannot read {}: {e}", json_path.display()))?;
+    let mut device: TrustedDevice = serde_json::from_str(&data)
+        .map_err(|e| format!("cannot parse {}: {e}", json_path.display()))?;
+
+    let digest = read_cert_thumbprint(pem_path)?;
+    let thumbprint = thumbprint_base64(&digest);
+    let stem = thumbprint_stem(&digest);
+
+    let stem_is_current = json_path.file_stem().and_then(|s| s.to_str()) == Some(stem.as_str());
+    if stem_is_current && device.thumbprint == thumbprint {
+        return Ok(());
+    }
+
+    let dir = json_path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", json_path.display()))?;
+    let new_json_path = dir.join(format!("{stem}.{DEVICE_RECORD_EXTENSION}"));
+    if !stem_is_current {
+        std::fs::rename(
+            pem_path,
+            dir.join(format!("{stem}.{CERTIFICATE_EXTENSION}")),
+        )
+        .map_err(|e| format!("cannot rename {}: {e}", pem_path.display()))?;
+        std::fs::rename(json_path, &new_json_path)
+            .map_err(|e| format!("cannot rename {}: {e}", json_path.display()))?;
+    }
+
+    device.thumbprint = thumbprint;
+    let json = serde_json::to_string_pretty(&device)
+        .map_err(|e| format!("cannot serialize {}: {e}", new_json_path.display()))?;
+    std::fs::write(&new_json_path, json)
+        .map_err(|e| format!("cannot write {}: {e}", new_json_path.display()))?;
+
+    tracing::info!("migrated trusted device '{}' to {stem}", device.name);
+    Ok(())
 }
 
 /// KDM output format: modern SMPTE (ST 430-1) or legacy Interop (pre-SMPTE).
@@ -604,6 +714,98 @@ pub enum KdmFormat {
     #[default]
     Smpte,
     Interop,
+}
+
+/// ISDCF Doc 5 KDM formulation: which devices the KDM names and whether it
+/// carries a ContentAuthenticator.
+///
+/// The two choices are tabulated in libdcp's `EncryptedKDM::EncryptedKDM`
+/// (encrypted_kdm.cc), which is what deployed gear was built against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KdmFormulation {
+    #[default]
+    ModifiedTransitional1,
+    MultipleModifiedTransitional1,
+    DciAny,
+    DciSpecific,
+}
+
+impl KdmFormulation {
+    const ALL: [Self; 4] = [
+        Self::ModifiedTransitional1,
+        Self::MultipleModifiedTransitional1,
+        Self::DciAny,
+        Self::DciSpecific,
+    ];
+
+    /// The ISDCF spelling. The only place these strings exist: `FromStr` and
+    /// both serde impls go through here.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ModifiedTransitional1 => "modified-transitional-1",
+            Self::MultipleModifiedTransitional1 => "multiple-modified-transitional-1",
+            Self::DciAny => "dci-any",
+            Self::DciSpecific => "dci-specific",
+        }
+    }
+
+    /// True when the DeviceList carries the caller's device certificates, false
+    /// when it carries the assume-trust thumbprint alone.
+    fn lists_supplied_devices(self) -> bool {
+        matches!(
+            self,
+            Self::MultipleModifiedTransitional1 | Self::DciSpecific
+        )
+    }
+
+    /// True when the KDM carries a ContentAuthenticator element.
+    fn carries_content_authenticator(self) -> bool {
+        matches!(self, Self::DciAny | Self::DciSpecific)
+    }
+
+    /// The formulation with the same ContentAuthenticator choice and the other
+    /// device-list rule, named when a caller's device list contradicts theirs.
+    fn device_list_counterpart(self) -> Self {
+        match self {
+            Self::ModifiedTransitional1 => Self::MultipleModifiedTransitional1,
+            Self::MultipleModifiedTransitional1 => Self::ModifiedTransitional1,
+            Self::DciAny => Self::DciSpecific,
+            Self::DciSpecific => Self::DciAny,
+        }
+    }
+}
+
+impl std::fmt::Display for KdmFormulation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for KdmFormulation {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|formulation| formulation.as_str() == s)
+            .ok_or_else(|| {
+                let known: Vec<&str> = Self::ALL.iter().map(|f| f.as_str()).collect();
+                format!("unknown KDM formulation '{s}', expected one of {known:?}")
+            })
+    }
+}
+
+impl Serialize for KdmFormulation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for KdmFormulation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let spelling = String::deserialize(deserializer)?;
+        spelling.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 /// KDM generation configuration.
@@ -629,7 +831,11 @@ pub struct KdmConfig {
     pub output_file: PathBuf,
     pub valid_from: String,
     pub valid_to: String,
-    pub formulation: String,
+    /// ISDCF formulation. Chooses whether a ContentAuthenticator is emitted, and
+    /// has to agree with `device_cert_files`: the two device-listing
+    /// formulations need certificates, the other two reject them.
+    #[serde(default)]
+    pub formulation: KdmFormulation,
     /// Content keys to carry, taken from the DCP's keys file so the KDM unlocks
     /// the essence that was actually encrypted. Empty makes `build_kdm` mint one
     /// fresh MDIK key (useful only for a test/DKDM with no bound DCP). Never
@@ -706,6 +912,11 @@ const ASSUME_TRUST_THUMBPRINT: &str = "2jmj7l5rSw0yVb/vlWAYkK/YBwk=";
 const ETM_NS: &str = "http://www.smpte-ra.org/schemas/430-3/2006/ETM";
 const KDM_NS: &str = "http://www.smpte-ra.org/schemas/430-1/2006/KDM";
 const ENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
+/// The two KDMRequiredExtensions elements the formulation decides, named once
+/// because they are both written here and read back when a KDM is compared.
+const CERTIFICATE_THUMBPRINT_ELEMENT: &str = "CertificateThumbprint";
+const CONTENT_AUTHENTICATOR_ELEMENT: &str = "ContentAuthenticator";
+
 /// Id attribute values on the two authenticated elements. The ds:Reference
 /// URIs point at these, and a verifier resolves them via the Id attribute.
 const AUTH_PUBLIC_ID: &str = "ID_AuthenticatedPublic";
@@ -741,7 +952,7 @@ fn check_kdm_timestamp(label: &str, value: &str) -> Result<(), String> {
 #[allow(clippy::too_many_arguments)]
 fn build_kdm_key_block(
     format: KdmFormat,
-    signer_thumbprint: &[u8; 20],
+    signer_thumbprint: &[u8; CERT_THUMBPRINT_LEN],
     cpl_id: &uuid::Uuid,
     key_type: &[u8; 4],
     key_id: &uuid::Uuid,
@@ -933,20 +1144,43 @@ fn resolve_valid_from(valid_from: &str) -> String {
 
 /// SMPTE ST 430-1 6.1: a KDM's MessageType is always this fixed URI. The ISDCF
 /// "formulation" (modified-transitional-1, dci-any, ...) is a shorthand for a
-/// combination of ContentAuthenticator and DeviceList contents, not a
-/// MessageType, and the device list is chosen by `device_cert_files` instead, so
-/// formulation has no structural effect. Emitting a per-formulation MessageType
-/// (the previous behaviour) produced a URI compliant gear does not recognise as
-/// a KDM.
+/// combination of ContentAuthenticator presence and DeviceList contents, not a
+/// MessageType, so it changes those two elements and never this one. Emitting a
+/// per-formulation MessageType (the previous behaviour) produced a URI compliant
+/// gear does not recognise as a KDM.
 const KDM_MESSAGE_TYPE: &str = "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type";
+
+/// Reject a formulation that contradicts the device list, rather than silently
+/// dropping certificates the caller supplied (which is what libdcp does).
+fn check_formulation_devices(
+    formulation: KdmFormulation,
+    device_cert_files: &[PathBuf],
+) -> Result<(), String> {
+    let counterpart = formulation.device_list_counterpart();
+    match (
+        formulation.lists_supplied_devices(),
+        device_cert_files.is_empty(),
+    ) {
+        (false, false) => Err(format!(
+            "formulation {formulation} lists no devices, but {} device certificate(s) \
+             were supplied; use {counterpart} to list them",
+            device_cert_files.len()
+        )),
+        (true, true) => Err(format!(
+            "formulation {formulation} needs at least one device certificate; \
+             use {counterpart} for a KDM with no device restriction"
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// Assemble a signed SMPTE 430-1 KDM carrying `keys`, encrypting each key block
 /// to `recipient` with `signer`'s thumbprint embedded.
 ///
 /// `config` is used only for the signer identity handed to `build_signature`
-/// (its cert, key and chain), the output format, the annotation and the
-/// authorized device list; every other field of the KDM comes from the explicit
-/// arguments so this core serves both fresh generation and re-wrap.
+/// (its cert, key and chain), the output format, the annotation, the formulation
+/// and the authorized device list; every other field of the KDM comes from the
+/// explicit arguments so this core serves both fresh generation and re-wrap.
 #[allow(clippy::too_many_arguments)]
 fn build_kdm_xml(
     config: &KdmConfig,
@@ -964,6 +1198,7 @@ fn build_kdm_xml(
     if keys.is_empty() {
         return Err("a KDM must carry at least one content key".into());
     }
+    check_formulation_devices(config.formulation, &config.device_cert_files)?;
 
     let now = chrono::Utc::now();
     let message_id = uuid::Uuid::new_v4();
@@ -1035,6 +1270,18 @@ fn build_kdm_xml(
 
     let authorized_device_info = build_authorized_device_info(&config.device_cert_files)?;
 
+    // libdcp calls this approximate and it is: strictly the ContentAuthenticator
+    // is a thumbprint of one of the CPL signer certificates, which is this
+    // certificate only when the entity signing the KDM also signed the CPL.
+    let content_authenticator = if config.formulation.carries_content_authenticator() {
+        format!(
+            "        <{CONTENT_AUTHENTICATOR_ELEMENT}>{}</{CONTENT_AUTHENTICATOR_ELEMENT}>\n",
+            thumbprint_base64(&signer.thumbprint)
+        )
+    } else {
+        String::new()
+    };
+
     // Inner content of the two authenticated elements the signer references.
     let auth_public_inner = format!(
         r#"
@@ -1057,7 +1304,7 @@ fn build_kdm_xml(
         </Recipient>
         <CompositionPlaylistId>urn:uuid:{cpl_uuid}</CompositionPlaylistId>
         <ContentTitleText>{title}</ContentTitleText>
-        <ContentKeysNotValidBefore>{not_before}</ContentKeysNotValidBefore>
+{content_authenticator}        <ContentKeysNotValidBefore>{not_before}</ContentKeysNotValidBefore>
         <ContentKeysNotValidAfter>{not_after}</ContentKeysNotValidAfter>
 {authorized_device_info}        <KeyIdList>
 {typed_key_ids}        </KeyIdList>
@@ -1146,6 +1393,11 @@ pub struct RewrapConfig {
     /// rather than the new recipient's.
     #[serde(default)]
     pub device_cert_files: Vec<PathBuf>,
+    /// ISDCF formulation of the re-wrapped KDM, with the same rules as
+    /// `KdmConfig.formulation`. Not taken from the source DKDM, which carries no
+    /// formulation of its own.
+    #[serde(default)]
+    pub formulation: KdmFormulation,
 }
 
 /// Re-wrap a DKDM: decrypt its content keys with the DKDM recipient's private
@@ -1229,12 +1481,14 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
     let message_type = parsed.message_type.as_deref().unwrap_or(KDM_MESSAGE_TYPE);
     let content_title = parsed.content_title.as_deref().unwrap_or("");
 
-    // build_kdm_xml reads only the signer identity and the device list from the config.
+    // build_kdm_xml reads only the signer identity, the device list and the
+    // formulation from the config.
     let signer_config = KdmConfig {
         signer_cert_file: config.signer_cert_file.clone(),
         signer_key_file: config.signer_key_file.clone(),
         signer_chain_files: config.signer_chain_files.clone(),
         device_cert_files: config.device_cert_files.clone(),
+        formulation: config.formulation,
         ..Default::default()
     };
 
@@ -1805,6 +2059,9 @@ fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
     Err(format!("Cannot parse duration: '{s}'"))
 }
 
+/// Length of an ST 430-2 thumbprint: SHA-1 is a 160-bit digest.
+const CERT_THUMBPRINT_LEN: usize = 20;
+
 /// Certificate thumbprint per SMPTE ST 430-2: SHA-1 over the DER-encoded
 /// TBSCertificate (the signed portion), not the whole certificate.
 ///
@@ -1812,15 +2069,25 @@ fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
 /// `i2d_re_X509_tbs` output. ST 430-2 5.4 says to exclude the DER tag and
 /// length, but libdcp includes them and is what deployed gear agrees with, so
 /// `tbs_der` is expected to be the complete TBSCertificate encoding.
-fn cert_thumbprint(tbs_der: &[u8]) -> [u8; 20] {
+fn cert_thumbprint(tbs_der: &[u8]) -> [u8; CERT_THUMBPRINT_LEN] {
     use sha1::Digest;
     sha1::Sha1::digest(tbs_der).into()
 }
 
-/// Certificate thumbprint of one authorized playback device, base64 encoded as
-/// the ST 430-1 Annex B CertificateThumbprint requires.
-fn read_device_thumbprint(cert_path: &Path) -> Result<String, String> {
+/// The thumbprint as ST 430-1 spells it in XML: base64.
+fn thumbprint_base64(thumbprint: &[u8; CERT_THUMBPRINT_LEN]) -> String {
     use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(thumbprint)
+}
+
+/// The same thumbprint as a trusted-device file stem: hex, because the base64
+/// spelling contains '/'.
+fn thumbprint_stem(thumbprint: &[u8; CERT_THUMBPRINT_LEN]) -> String {
+    hex::encode(thumbprint)
+}
+
+/// Read a certificate file and compute its ST 430-2 thumbprint.
+fn read_cert_thumbprint(cert_path: &Path) -> Result<[u8; CERT_THUMBPRINT_LEN], String> {
     use x509_parser::prelude::*;
 
     let data = std::fs::read(cert_path)
@@ -1833,8 +2100,13 @@ fn read_device_thumbprint(cert_path: &Path) -> Result<String, String> {
             cert_path.display()
         )
     })?;
-    Ok(base64::engine::general_purpose::STANDARD
-        .encode(cert_thumbprint(cert.tbs_certificate.as_ref())))
+    Ok(cert_thumbprint(cert.tbs_certificate.as_ref()))
+}
+
+/// Certificate thumbprint of one authorized playback device, base64 encoded as
+/// the ST 430-1 Annex B CertificateThumbprint requires.
+fn read_device_thumbprint(cert_path: &Path) -> Result<String, String> {
+    Ok(thumbprint_base64(&read_cert_thumbprint(cert_path)?))
 }
 
 /// Build the AuthorizedDeviceInfo element of ST 430-1 Annex B.
@@ -1854,7 +2126,11 @@ fn build_authorized_device_info(device_cert_files: &[PathBuf]) -> Result<String,
     // base64 has no character XML would have to escape
     let entries: String = thumbprints
         .iter()
-        .map(|t| format!("            <CertificateThumbprint>{t}</CertificateThumbprint>\n"))
+        .map(|t| {
+            format!(
+                "            <{CERTIFICATE_THUMBPRINT_ELEMENT}>{t}</{CERTIFICATE_THUMBPRINT_ELEMENT}>\n"
+            )
+        })
         .collect();
 
     Ok(format!(
@@ -1873,7 +2149,7 @@ fn build_authorized_device_info(device_cert_files: &[PathBuf]) -> Result<String,
 struct Signer {
     issuer_dn: String,
     serial: String,
-    thumbprint: [u8; 20],
+    thumbprint: [u8; CERT_THUMBPRINT_LEN],
 }
 
 /// Parse the signer certificate for the identity and thumbprint the key block needs.
@@ -2048,11 +2324,25 @@ mod tests {
             output_file: out,
             valid_from: "now".to_string(),
             valid_to: "7 days".to_string(),
-            formulation: "dci-any".to_string(),
+            formulation: KdmFormulation::DciAny,
             content_keys: Vec::new(),
             format: KdmFormat::Smpte,
             device_cert_files: vec![],
         }
+    }
+
+    /// A config for one formulation, with the device list that formulation
+    /// requires: the two device-listing ones need certificates, the other two
+    /// reject them.
+    fn formulation_config(f: &Fixtures, formulation: KdmFormulation) -> KdmConfig {
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.formulation = formulation;
+        config.device_cert_files = if formulation.lists_supplied_devices() {
+            vec![f.signer.clone(), f.intermediate.clone()]
+        } else {
+            vec![]
+        };
+        config
     }
 
     // Realistic signer: the leaf signs, KeyInfo embeds leaf + intermediate +
@@ -2070,7 +2360,7 @@ mod tests {
             output_file: out,
             valid_from: "now".to_string(),
             valid_to: "7 days".to_string(),
-            formulation: "dci-any".to_string(),
+            formulation: KdmFormulation::DciAny,
             content_keys: Vec::new(),
             format: KdmFormat::Smpte,
             device_cert_files: vec![],
@@ -2533,9 +2823,8 @@ mod tests {
         // SMPTE ST 430-1: MessageType is a fixed URI; formulation must not
         // change it. Regression guard against emitting #kdm-key-type-dci-any etc.
         let f = fixtures();
-        for formulation in ["modified-transitional-1", "dci-any", "dci-specific"] {
-            let mut cfg = test_config(f, PathBuf::from("unused"));
-            cfg.formulation = formulation.to_string();
+        for formulation in KdmFormulation::ALL {
+            let cfg = formulation_config(f, formulation);
             let kdm = build_kdm(&cfg).expect("build kdm");
             assert!(
                 kdm.xml
@@ -2560,6 +2849,40 @@ mod tests {
             xmlsec1_verify(&out, &f.root),
             "xmlsec1 must verify the signed KDM against the trusted root"
         );
+    }
+
+    /// ContentAuthenticator sits inside the signed AuthenticatedPublic, so the
+    /// signature has to still verify with it there.
+    #[test]
+    fn a_kdm_carrying_a_content_authenticator_verifies_with_xmlsec1() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        for formulation in [KdmFormulation::DciAny, KdmFormulation::DciSpecific] {
+            let out = dir.path().join(format!("{formulation}.kdm.xml"));
+            let mut config = chain_signed_config(f, out.clone());
+            config.formulation = formulation;
+            config.device_cert_files = if formulation.lists_supplied_devices() {
+                vec![f.intermediate.clone()]
+            } else {
+                vec![]
+            };
+            generate_kdm(&config).expect("generate signed kdm");
+
+            let xml = std::fs::read_to_string(&out).expect("kdm written");
+            assert_eq!(
+                content_authenticators_in(&xml),
+                vec![expected_thumbprint(&config.signer_cert_file)],
+                "{formulation} must authenticate with the signer leaf's thumbprint"
+            );
+            assert!(
+                xmlsec1_verify(&out, &f.root),
+                "{formulation} must still verify against the trusted root"
+            );
+        }
     }
 
     #[test]
@@ -2756,6 +3079,7 @@ mod tests {
             valid_from: String::new(),
             valid_to: String::new(),
             device_cert_files: vec![],
+            formulation: KdmFormulation::default(),
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
 
@@ -2812,6 +3136,7 @@ mod tests {
             valid_from: String::new(),
             valid_to: String::new(),
             device_cert_files: vec![],
+            formulation: KdmFormulation::default(),
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
         let new_ct = parse_kdm_xml(&std::fs::read_to_string(&out).unwrap())
@@ -2847,6 +3172,7 @@ mod tests {
             valid_from: String::new(),
             valid_to: String::new(),
             device_cert_files: vec![],
+            formulation: KdmFormulation::default(),
         };
         let err = rewrap_dkdm(&config).expect_err("wrong recipient key must fail");
         assert!(
@@ -2893,6 +3219,7 @@ mod tests {
             valid_from: String::new(),
             valid_to: String::new(),
             device_cert_files: vec![],
+            formulation: KdmFormulation::default(),
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
         assert!(
@@ -3087,17 +3414,27 @@ mod tests {
         )
     }
 
-    fn thumbprints_in(kdm_xml: &str) -> Vec<String> {
-        kdm_xml
-            .match_indices("<CertificateThumbprint>")
+    /// Text of every occurrence of one element, in document order.
+    fn elements_in(xml: &str, name: &str) -> Vec<String> {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        xml.match_indices(&open)
             .map(|(at, tag)| {
-                let rest = &kdm_xml[at + tag.len()..];
+                let rest = &xml[at + tag.len()..];
                 let end = rest
-                    .find("</CertificateThumbprint>")
-                    .expect("CertificateThumbprint end");
+                    .find(&close)
+                    .unwrap_or_else(|| panic!("unterminated {name}"));
                 rest[..end].to_string()
             })
             .collect()
+    }
+
+    fn thumbprints_in(kdm_xml: &str) -> Vec<String> {
+        elements_in(kdm_xml, CERTIFICATE_THUMBPRINT_ELEMENT)
+    }
+
+    fn content_authenticators_in(kdm_xml: &str) -> Vec<String> {
+        elements_in(kdm_xml, CONTENT_AUTHENTICATOR_ELEMENT)
     }
 
     #[test]
@@ -3155,6 +3492,42 @@ mod tests {
     }
 
     #[test]
+    fn cert_info_carries_the_thumbprint_a_kdm_lists() {
+        use sha1::Digest;
+        use x509_parser::prelude::*;
+
+        let f = fixtures();
+        let info = read_certificate(&f.intermediate);
+
+        let mut config = formulation_config(f, KdmFormulation::MultipleModifiedTransitional1);
+        config.device_cert_files = vec![f.intermediate.clone()];
+        let kdm = build_kdm(&config).expect("build");
+        assert_eq!(
+            thumbprints_in(&kdm.xml),
+            vec![info.thumbprint.clone()],
+            "the displayed thumbprint and the one a KDM lists must be one value"
+        );
+
+        let data = std::fs::read(&f.intermediate).unwrap();
+        let (_, pem) = parse_x509_pem(&data).unwrap();
+        let whole_der: [u8; CERT_THUMBPRINT_LEN] = sha1::Sha1::digest(&pem.contents).into();
+        assert_ne!(
+            info.thumbprint,
+            thumbprint_base64(&whole_der),
+            "a hash over the whole certificate is not the ST 430-2 thumbprint"
+        );
+    }
+
+    /// Downstream code reads an empty thumbprint as "not a valid certificate".
+    #[test]
+    fn an_unparsable_certificate_has_an_empty_thumbprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-cert.pem");
+        std::fs::write(&path, b"not a certificate").unwrap();
+        assert!(read_certificate(&path).thumbprint.is_empty());
+    }
+
+    #[test]
     fn every_kdm_carries_an_authorized_device_info() {
         let f = fixtures();
         for format in [KdmFormat::Smpte, KdmFormat::Interop] {
@@ -3205,17 +3578,33 @@ mod tests {
         );
     }
 
+    /// The ST 430-2 thumbprint of a certificate, computed here rather than
+    /// through the code under test, so a hash over the wrong bytes fails.
+    fn expected_thumbprint(cert_path: &Path) -> String {
+        use sha1::Digest;
+        use x509_parser::prelude::*;
+
+        let data = std::fs::read(cert_path).expect("read cert");
+        let (_, pem) = parse_x509_pem(&data).expect("parse PEM");
+        let cert = pem.parse_x509().expect("parse X.509");
+        let digest: [u8; 20] = sha1::Sha1::digest(cert.tbs_certificate.as_ref()).into();
+        base64::engine::general_purpose::STANDARD.encode(digest)
+    }
+
     #[test]
     fn supplied_devices_replace_the_assume_trust_thumbprint() {
         let f = fixtures();
-        let mut config = test_config(f, PathBuf::from("unused"));
-        config.device_cert_files = vec![f.signer.clone(), f.intermediate.clone()];
+        let config = formulation_config(f, KdmFormulation::MultipleModifiedTransitional1);
+        assert_eq!(
+            config.device_cert_files,
+            vec![f.signer.clone(), f.intermediate.clone()]
+        );
         let kdm = build_kdm(&config).expect("build");
 
         let listed = thumbprints_in(&kdm.xml);
         let expected = vec![
-            read_device_thumbprint(&f.signer).unwrap(),
-            read_device_thumbprint(&f.intermediate).unwrap(),
+            expected_thumbprint(&f.signer),
+            expected_thumbprint(&f.intermediate),
         ];
         assert_eq!(
             listed, expected,
@@ -3230,7 +3619,7 @@ mod tests {
     #[test]
     fn a_device_cert_that_cannot_be_read_fails_loud() {
         let f = fixtures();
-        let mut config = test_config(f, PathBuf::from("unused"));
+        let mut config = formulation_config(f, KdmFormulation::DciSpecific);
         config.device_cert_files = vec![PathBuf::from("/nonexistent/device.pem")];
         let err = build_kdm(&config).expect_err("must not build with an unreadable device cert");
         assert!(err.contains("cannot read device cert"), "got: {err}");
@@ -3261,12 +3650,323 @@ mod tests {
             valid_from: String::new(),
             valid_to: String::new(),
             device_cert_files: vec![f.intermediate.clone()],
+            formulation: KdmFormulation::MultipleModifiedTransitional1,
         };
         let rewrapped = rewrap_dkdm(&config).expect("rewrap");
         assert_eq!(
             thumbprints_in(&rewrapped.xml),
-            vec![read_device_thumbprint(&f.intermediate).unwrap()]
+            vec![expected_thumbprint(&f.intermediate)]
         );
+    }
+
+    /// KDMs written by DCP-o-matic 2.18.39 (libdcp), one per formulation, with
+    /// `dcpomatic2_kdm_cli -F <formulation> -T certs/intermediate.pem`. Signer
+    /// and recipient are both certs/leaf.pem. A second implementation's output
+    /// is the oracle here: nothing in these tests is a transcribed value.
+    fn dcp_o_matic_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("dcp-o-matic-2.18.39")
+    }
+
+    fn dcp_o_matic_cert(name: &str) -> PathBuf {
+        dcp_o_matic_dir()
+            .join("certs")
+            .join(format!("{name}.{CERTIFICATE_EXTENSION}"))
+    }
+
+    fn dcp_o_matic_kdm(formulation: KdmFormulation) -> String {
+        let path = dcp_o_matic_dir().join(format!("kdm-{formulation}.xml"));
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// Every thumbprint DCP-o-matic wrote must come back out of postkit's own
+    /// hashing of the same certificates, and each formulation must carry the
+    /// elements libdcp gives it.
+    #[test]
+    fn postkit_hashes_certificates_the_way_dcp_o_matic_does() {
+        for formulation in KdmFormulation::ALL {
+            let reference = dcp_o_matic_kdm(formulation);
+
+            let expected_devices = if formulation.lists_supplied_devices() {
+                vec![read_device_thumbprint(&dcp_o_matic_cert("intermediate")).unwrap()]
+            } else {
+                vec![ASSUME_TRUST_THUMBPRINT.to_string()]
+            };
+            assert_eq!(
+                thumbprints_in(&reference),
+                expected_devices,
+                "{formulation} device list"
+            );
+
+            let expected_authenticator = if formulation.carries_content_authenticator() {
+                vec![read_device_thumbprint(&dcp_o_matic_cert("leaf")).unwrap()]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                content_authenticators_in(&reference),
+                expected_authenticator,
+                "{formulation} ContentAuthenticator: it is the signer leaf's thumbprint, \
+                 present only for the dci formulations"
+            );
+        }
+    }
+
+    /// The same comparison the other way round: postkit's KDM for the same
+    /// inputs lists what DCP-o-matic listed. The fixtures ship no private key,
+    /// so postkit signs with its own leaf and only the presence of
+    /// ContentAuthenticator can be compared, its value being that other signer.
+    #[test]
+    fn postkit_writes_the_device_list_dcp_o_matic_wrote() {
+        let f = fixtures();
+        for formulation in KdmFormulation::ALL {
+            let reference = dcp_o_matic_kdm(formulation);
+
+            let mut config = test_config(f, PathBuf::from("unused"));
+            config.formulation = formulation;
+            config.recipient_cert_file = dcp_o_matic_cert("leaf");
+            config.device_cert_files = if formulation.lists_supplied_devices() {
+                vec![dcp_o_matic_cert("intermediate")]
+            } else {
+                vec![]
+            };
+            let kdm = build_kdm(&config).expect("build");
+
+            assert_eq!(
+                thumbprints_in(&kdm.xml),
+                thumbprints_in(&reference),
+                "{formulation} device list must match DCP-o-matic's"
+            );
+
+            let expected_authenticator = if formulation.carries_content_authenticator() {
+                vec![expected_thumbprint(&config.signer_cert_file)]
+            } else {
+                vec![]
+            };
+            assert_eq!(
+                content_authenticators_in(&kdm.xml),
+                expected_authenticator,
+                "{formulation} ContentAuthenticator"
+            );
+            assert_eq!(
+                content_authenticators_in(&kdm.xml).len(),
+                content_authenticators_in(&reference).len(),
+                "{formulation} must carry a ContentAuthenticator exactly when DCP-o-matic does"
+            );
+        }
+    }
+
+    #[test]
+    fn a_formulation_that_contradicts_the_device_list_is_rejected() {
+        let f = fixtures();
+        for formulation in KdmFormulation::ALL {
+            let mut config = formulation_config(f, formulation);
+            // The device list the formulation forbids: none where it needs one,
+            // one where it allows none.
+            config.device_cert_files = if formulation.lists_supplied_devices() {
+                vec![]
+            } else {
+                vec![f.intermediate.clone()]
+            };
+
+            let err = build_kdm(&config)
+                .expect_err("a formulation contradicting the device list must not build");
+            assert!(err.contains(formulation.as_str()), "got: {err}");
+            assert!(
+                err.contains(formulation.device_list_counterpart().as_str()),
+                "the error must name the formulation to use instead, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rewrap_formulation_that_contradicts_the_device_list_is_rejected() {
+        let f = fixtures();
+        let src_keys = vec![KdmKey {
+            key_type: *b"MDIK",
+            key_id: uuid::Uuid::new_v4(),
+            content_key: [9u8; 16],
+        }];
+        let dkdm_xml = build_stand_in_dkdm(f, &f.signer, &src_keys);
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        std::fs::write(&dkdm_path, &dkdm_xml).unwrap();
+
+        let config = RewrapConfig {
+            dkdm_file: dkdm_path,
+            dkdm_recipient_key_file: f.signer_key.clone(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            signer_chain_files: vec![],
+            output_file: dir.path().join("rewrapped.kdm.xml"),
+            valid_from: String::new(),
+            valid_to: String::new(),
+            device_cert_files: vec![f.intermediate.clone()],
+            formulation: KdmFormulation::ModifiedTransitional1,
+        };
+        let err = rewrap_dkdm(&config).expect_err("re-wrap must not drop the device list either");
+        assert!(
+            err.contains("multiple-modified-transitional-1"),
+            "got: {err}"
+        );
+    }
+
+    /// Write a store entry in the layout used before the ST 430-2 thumbprint:
+    /// the file stem and the record both hex SHA-1 over the whole DER.
+    fn write_old_layout_device(store: &Path, cert_path: &Path, name: &str) -> String {
+        use sha1::Digest;
+        use x509_parser::prelude::*;
+
+        let data = std::fs::read(cert_path).unwrap();
+        let (_, pem) = parse_x509_pem(&data).unwrap();
+        let old_thumbprint = hex::encode(sha1::Sha1::digest(&pem.contents));
+
+        std::fs::create_dir_all(store).unwrap();
+        std::fs::copy(
+            cert_path,
+            store.join(format!("{old_thumbprint}.{CERTIFICATE_EXTENSION}")),
+        )
+        .unwrap();
+        let device = TrustedDevice {
+            name: name.to_string(),
+            thumbprint: old_thumbprint.clone(),
+            certificate_path: cert_path.to_path_buf(),
+        };
+        std::fs::write(
+            store.join(format!("{old_thumbprint}.{DEVICE_RECORD_EXTENSION}")),
+            serde_json::to_string_pretty(&device).unwrap(),
+        )
+        .unwrap();
+        old_thumbprint
+    }
+
+    /// File name and content of everything in the store, for comparing one pass
+    /// against the next.
+    fn store_contents(store: &Path) -> Vec<(String, String)> {
+        let mut files: Vec<(String, String)> = std::fs::read_dir(store)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&path).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn the_store_migrates_old_thumbprints_and_then_leaves_them_alone() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(TRUSTED_DEVICES_DIR_NAME);
+        let old_thumbprint = write_old_layout_device(&store, &f.signer, "Screen 1");
+
+        let devices = list_trusted_devices_in(&store);
+        assert_eq!(devices.len(), 1, "the record must survive migration");
+        assert_eq!(
+            devices[0].thumbprint,
+            expected_thumbprint(&f.signer),
+            "the record must carry the ST 430-2 thumbprint"
+        );
+        assert_eq!(
+            devices[0].name, "Screen 1",
+            "migration must not lose fields"
+        );
+
+        let expected_stem = hex::encode(
+            base64::engine::general_purpose::STANDARD
+                .decode(expected_thumbprint(&f.signer))
+                .unwrap(),
+        );
+        let migrated = store_contents(&store);
+        assert_eq!(
+            migrated.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            vec![
+                &format!("{expected_stem}.{DEVICE_RECORD_EXTENSION}"),
+                &format!("{expected_stem}.{CERTIFICATE_EXTENSION}"),
+            ],
+            "both files must be renamed to the hex spelling of the new thumbprint"
+        );
+        assert_ne!(
+            expected_stem, old_thumbprint,
+            "else this test proves nothing"
+        );
+
+        list_trusted_devices_in(&store);
+        assert_eq!(
+            store_contents(&store),
+            migrated,
+            "a second pass must change nothing"
+        );
+    }
+
+    #[test]
+    fn a_record_with_no_certificate_beside_it_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(TRUSTED_DEVICES_DIR_NAME);
+        std::fs::create_dir_all(&store).unwrap();
+        let device = TrustedDevice {
+            name: "Orphan".to_string(),
+            thumbprint: "whatever-was-stored".to_string(),
+            certificate_path: PathBuf::from("/gone.pem"),
+        };
+        let path = store.join(format!("orphan.{DEVICE_RECORD_EXTENSION}"));
+        std::fs::write(&path, serde_json::to_string_pretty(&device).unwrap()).unwrap();
+        let before = store_contents(&store);
+
+        let listed = list_trusted_devices_in(&store);
+        assert_eq!(listed.len(), 1, "the record is still listed");
+        assert_eq!(listed[0].thumbprint, "whatever-was-stored");
+        assert_eq!(store_contents(&store), before, "nothing may be rewritten");
+    }
+
+    #[test]
+    fn a_device_is_added_and_removed_by_its_st_430_2_thumbprint() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(TRUSTED_DEVICES_DIR_NAME);
+
+        assert_eq!(add_trusted_device_in(&store, &f.signer, "Screen 2"), 0);
+        let thumbprint = expected_thumbprint(&f.signer);
+        assert_eq!(
+            list_trusted_devices_in(&store)
+                .iter()
+                .map(|d| d.thumbprint.clone())
+                .collect::<Vec<_>>(),
+            vec![thumbprint.clone()]
+        );
+
+        assert_eq!(remove_trusted_device_in(&store, &thumbprint), 0);
+        assert!(list_trusted_devices_in(&store).is_empty());
+        assert!(
+            store_contents(&store).is_empty(),
+            "the certificate copy must go with the record"
+        );
+        assert_eq!(
+            remove_trusted_device_in(&store, &thumbprint),
+            -1,
+            "removing what is not there must fail"
+        );
+    }
+
+    #[test]
+    fn every_isdcf_formulation_spelling_round_trips() {
+        for formulation in KdmFormulation::ALL {
+            assert_eq!(
+                formulation.as_str().parse::<KdmFormulation>().unwrap(),
+                formulation
+            );
+        }
+        let err = "dci-anything".parse::<KdmFormulation>().unwrap_err();
+        for formulation in KdmFormulation::ALL {
+            assert!(err.contains(formulation.as_str()), "got: {err}");
+        }
     }
 
     /// Path to the vendored ST 430-1 KDM schema and the catalog that maps the
@@ -3292,7 +3992,8 @@ mod tests {
     }
 
     /// The generated KDMRequiredExtensions against the vendored ST 430-1 schema,
-    /// in both the assume-trust and the listed-device form.
+    /// once per formulation, so both device-list forms and both
+    /// ContentAuthenticator forms are covered.
     #[test]
     fn kdm_required_extensions_pass_the_st_430_1_xsd() {
         if !xmllint_available() {
@@ -3302,13 +4003,9 @@ mod tests {
 
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
-        for (label, devices) in [
-            ("assume-trust", vec![]),
-            ("devices", vec![f.signer.clone(), f.intermediate.clone()]),
-        ] {
-            let mut config = test_config(f, PathBuf::from("unused"));
-            config.device_cert_files = devices;
-            let kdm = build_kdm(&config).expect("build");
+        for formulation in KdmFormulation::ALL {
+            let label = formulation.as_str();
+            let kdm = build_kdm(&formulation_config(f, formulation)).expect("build");
 
             let path = dir.path().join(format!("{label}.xml"));
             std::fs::write(&path, required_extensions_fragment(&kdm.xml)).unwrap();

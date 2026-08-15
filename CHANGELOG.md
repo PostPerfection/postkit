@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- One certificate thumbprint everywhere: `CertInfo.thumbprint` and
+  `TrustedDevice.thumbprint` carry the base64 ST 430-2 value a KDM lists, and
+  existing trusted-device stores migrate themselves on first use.
+- `KdmConfig.formulation` is a typed `KdmFormulation` that emits
+  `ContentAuthenticator` for the dci formulations and rejects a device list its
+  formulation would discard, instead of being read by nothing.
+
 ## 0.6.0 - 2026-08-13
 
 ### Generated signer certificates were missing two required extensions

@@ -72,6 +72,36 @@
 
 # Done
 
+## 2026-08-15
+
+One thumbprint (src/certificate.rs): the whole-certificate hex SHA-1 is gone.
+`CertInfo.thumbprint` and `TrustedDevice.thumbprint` now hold the base64 ST 430-2
+thumbprint computed through the same `cert_thumbprint` the KDM writer uses, so a
+displayed value and a KDM value can no longer differ. An empty thumbprint stays
+the "not a valid certificate" sentinel `read_certificate` returns on any parse
+failure. The trusted-device store keeps the same digest in two spellings, base64
+in the record and hex as the file stem, because base64 contains `/`; both come
+from `thumbprint_base64` and `thumbprint_stem` over one digest. Old stores are
+migrated in place on every access by recomputing thumbprint and stem from the
+stored PEM, which is idempotent and needs no schema marker; a record with no
+certificate beside it cannot be recomputed and is left alone. Migration never
+fails the operation that triggered it. `remove_trusted_device` takes the base64
+thumbprint and finds the files by reading the records, not by rebuilding a name.
+
+`KdmConfig.formulation` is the typed `KdmFormulation` (ISDCF spellings via
+`FromStr` and serde), and it now does something: it decides whether
+ContentAuthenticator is emitted (present for `dci-any` and `dci-specific`), which
+is the signer leaf's base64 ST 430-2 thumbprint, placed between ContentTitleText
+and ContentKeysNotValidBefore for SMPTE and Interop alike. libdcp calls that
+element approximate, since strictly it names a CPL signer certificate, the same
+certificate only when one entity signs both. A formulation that contradicts
+`device_cert_files` is an error naming the formulation to use instead, in
+`build_kdm` and `rewrap_dkdm` both: libdcp falls back silently in both
+directions, and DCP-o-matic accepting `-T` under a formulation that discards it
+is exactly the trap this refuses to copy. Four DCP-o-matic 2.18.39 KDMs, one per
+formulation, are vendored under tests/fixtures/ as the cross-implementation
+oracle for both the thumbprint values and the presence table.
+
 ## 2026-08-12
 
 MCA-labelled accessibility tracks (src/accessibility.rs): the probe settles
@@ -129,17 +159,15 @@ exclusivity is normative: listing any real thumbprint beside it disables
 assume-trust entirely, so it is one or the other. An empty DeviceList is not an
 option, CertificateThumbprint is minOccurs="1". The recipient's own certificate is
 deliberately excluded, per ISDCF Doc 5 deprecating the formulation that carried
-it. No formulation enum was added, since the ISDCF formulations are just
-combinations of ContentAuthenticator presence and device list contents.
+it. The ISDCF formulations are combinations of ContentAuthenticator presence and
+device list contents, typed as `KdmFormulation` on 2026-08-15 (below).
 
 CertificateThumbprint is SHA-1 over the complete DER TBSCertificate including the
 SEQUENCE tag and length, the same value the 138-byte key block already carried.
 ST 430-2 5.4 says to exclude the tag and length, but libdcp hashes `i2d_re_X509_tbs`
 output, which includes them, and its KDMs work in the field. Settled by computing
 both readings for a generated certificate and cross-checking against openssl
-asn1parse, which put the TBSCertificate at 535 bytes with a 4-byte header. Note
-this is a third distinct value from `sha1_thumbprint`, which hex encodes a hash of
-the whole certificate for the local trusted-device registry.
+asn1parse, which put the TBSCertificate at 535 bytes with a 4-byte header.
 
 Two older KDM defects surfaced once the schema would compile and are fixed in the
 same change. `Recipient/X509IssuerSerial` children were emitted unprefixed when
