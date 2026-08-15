@@ -27,11 +27,28 @@ pub enum MxfStandard {
 ///
 /// The 16-byte content key encrypts the essence at wrap time; the MXF header
 /// only records `key_id`. Kept out of any serialized form and redacted in Debug
-/// so the key cannot leak through logs or an on-disk options blob.
+/// so the key cannot leak through logs or an on-disk options blob, and zeroed on
+/// drop like the keys recovered from a KDM. A clone owns its own copy and clears
+/// it the same way, so no copy outlives the value it came from.
 #[derive(Clone)]
 pub struct MxfEncryption {
     pub content_key: [u8; 16],
     pub key_id: [u8; 16],
+}
+
+impl MxfEncryption {
+    /// Clear the content key. `key_id` is not secret: it is written into the MXF
+    /// header and named by the CPL.
+    fn clear_content_key(&mut self) {
+        use zeroize::Zeroize;
+        self.content_key.zeroize();
+    }
+}
+
+impl Drop for MxfEncryption {
+    fn drop(&mut self) {
+        self.clear_content_key();
+    }
 }
 
 impl std::fmt::Debug for MxfEncryption {
@@ -1826,6 +1843,28 @@ mod tests {
                 .unwrap();
             assert_eq!(&buf[..n], &data[..], "decrypted ancillary resource");
         }
+    }
+
+    /// Key material must not outlive the wrap in freed memory. Reading a dropped
+    /// value is not something a test can do soundly, so this pins both halves:
+    /// the type clears itself on drop, and what it clears is the content key.
+    #[test]
+    fn the_content_key_is_cleared_on_drop() {
+        assert!(
+            std::mem::needs_drop::<MxfEncryption>(),
+            "MxfEncryption must run a Drop that clears its key"
+        );
+
+        let mut encryption = MxfEncryption {
+            content_key: [0x7f; 16],
+            key_id: [0x11; 16],
+        };
+        encryption.clear_content_key();
+        assert_eq!(encryption.content_key, [0u8; 16], "content key is zeroed");
+        assert_eq!(
+            encryption.key_id, [0x11; 16],
+            "the KeyId is not secret and has to survive"
+        );
     }
 
     /// Same contract for Atmos: the key reaches the essence, the KeyId in the MXF

@@ -25,6 +25,8 @@
   sound already did.
 - `KdmFormat` and `KdmFormulation` parse case-insensitively, so a command line
   may spell them `SMPTE` or `DCI-Any`. An empty value is still an error.
+- `MxfEncryption` zeroes its content key on drop, as the keys recovered from a
+  KDM already did, so wrap keys do not linger in freed memory.
 - Generated certificates are DCI-conformant: every DN value is a
   PrintableString, every tier carries a dnQualifier holding the base64 SHA-1 of
   its public key, the leaf adds `keyEncipherment`, basicConstraints path lengths
