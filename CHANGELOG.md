@@ -2,8 +2,25 @@
 
 ## Unreleased
 
+### Added
+
+- Forensic marking flags: `KdmConfig` and `RewrapConfig` can disable picture
+  marking, audio marking, or audio marking above a given channel, writing the
+  ST 430-1 `ForensicMarkFlagList`. Marking stays on by default, and the element
+  is absent then.
+- `classify_kdm_window` reports whether a KDM validity window sits within,
+  overlaps or falls outside a recipient certificate's own validity.
+
 ### Changed
 
+- Generated certificates are DCI-conformant: every DN value is a
+  PrintableString, every tier carries a dnQualifier holding the base64 SHA-1 of
+  its public key, the leaf adds `keyEncipherment`, basicConstraints path lengths
+  are 3 and 2, both key identifiers are written, and `generate_chain` puts the
+  ST 430-2 role token in each CommonName. Regenerate any chain postkit produced
+  earlier.
+- `build_kdm` and `rewrap_dkdm` refuse a validity window the recipient
+  certificate could never open, and one the signer chain does not fully cover.
 - One certificate thumbprint everywhere: `CertInfo.thumbprint` and
   `TrustedDevice.thumbprint` carry the base64 ST 430-2 value a KDM lists, and
   existing trusted-device stores migrate themselves on first use.

@@ -113,6 +113,71 @@ fn generate_rsa_keypair(bits: u32) -> Result<rcgen::KeyPair, String> {
     rcgen::KeyPair::from_pem(&pem).map_err(|e| format!("rcgen rejected the RSA key: {e}"))
 }
 
+/// ST 430-2 5.3.1 requires a dnQualifier on every certificate in the chain.
+/// The attribute type is X.520 dnQualifier, OID 2.5.4.46.
+const DN_QUALIFIER_OID: [u64; 4] = [2, 5, 4, 46];
+
+/// ST 430-2 5.3.1 CommonName role token, the text before the first '.'. A CA
+/// carries no role, which is why its CommonName starts with the separator; a
+/// content signer carries "CS".
+const CN_ROLE_CERTIFICATE_AUTHORITY: &str = "";
+const CN_ROLE_CONTENT_SIGNER: &str = "CS";
+/// The standard a ST 430-2 CommonName names between the entity and the tier.
+const CN_STANDARD_TOKEN: &str = "smpte-430-2";
+const CN_TIER_ROOT: &str = "ROOT";
+const CN_TIER_INTERMEDIATE: &str = "INTERMEDIATE";
+const CN_TIER_LEAF: &str = "LEAF";
+
+/// basicConstraints path lengths, as libdcp writes them in
+/// `certificate_chain.cc`: three CAs may sit below the root, two below the
+/// intermediate, and the leaf is not a CA at all.
+const ROOT_PATH_LEN_CONSTRAINT: u8 = 3;
+const INTERMEDIATE_PATH_LEN_CONSTRAINT: u8 = 2;
+
+/// A ST 430-2 5.3.1 CommonName: role token, entity, standard, tier.
+fn common_name(role: &str, organization: &str, tier: &str) -> String {
+    format!("{role}.{organization}.{CN_STANDARD_TOKEN}.{tier}")
+}
+
+/// ST 430-2 5.3 requires every DN value to be an ASN.1 PrintableString, and
+/// DCP-o-matic rejects a signer chain that uses UTF8String instead
+/// (`Config::check_certificates`). Anything outside that charset has to fail
+/// rather than silently fall back to a type deployed gear will not take.
+fn printable_dn_value(label: &str, value: &str) -> Result<rcgen::DnValue, String> {
+    rcgen::PrintableString::try_from(value.to_string())
+        .map(rcgen::DnValue::PrintableString)
+        .map_err(|e| {
+            format!(
+                "{label} '{value}' cannot be encoded as the ASN.1 PrintableString \
+                 ST 430-2 5.3 requires: {e}"
+            )
+        })
+}
+
+/// The ST 430-2 5.3.1 public key digest: SHA-1 over the public key BIT STRING
+/// payload of a DER SubjectPublicKeyInfo. This is the dnQualifier value, and
+/// libdcp uses the same bytes as the subjectKeyIdentifier.
+///
+/// libdcp's `public_key_digest` hashes `i2d_RSA_PUBKEY` output from byte 24
+/// with an admitted "reasons that are not entirely clear"; 24 is the header
+/// length for a 2048-bit RSA key only, so the payload is parsed out here.
+fn public_key_digest(spki_der: &[u8]) -> Result<[u8; CERT_THUMBPRINT_LEN], String> {
+    use sha1::Digest;
+    use x509_parser::prelude::*;
+
+    let (_, spki) = SubjectPublicKeyInfo::from_der(spki_der)
+        .map_err(|e| format!("cannot parse the SubjectPublicKeyInfo: {e}"))?;
+    Ok(sha1::Sha1::digest(&spki.subject_public_key.data).into())
+}
+
+/// The dnQualifier spelling of that digest: base64, unescaped. libdcp's
+/// `escape_digest` backslash-escapes '/' and '+' only to get the value past the
+/// openssl config parser; what lands in the certificate is the plain base64.
+fn public_key_digest_base64(spki_der: &[u8]) -> Result<String, String> {
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(public_key_digest(spki_der)?))
+}
+
 /// A random certificate serial, as the minimal big-endian DER bytes.
 ///
 /// ST 430-2 5.2 requires an unsigned integer of 64 bits or less and DCI CTP
@@ -130,34 +195,79 @@ fn certificate_serial() -> Result<rcgen::SerialNumber, String> {
 }
 
 /// Generate a new X.509 certificate + private key.
+///
+/// `opts.common_name` is written verbatim. ST 430-2 5.3.1 wants a role token
+/// before the first '.' ("CS" for a content signer, empty for a CA), so a
+/// caller building a DCI chain by hand has to spell that itself; `generate_chain`
+/// does it for the chain it builds.
 pub fn generate_certificate(opts: &CertOptions) -> i32 {
     use rcgen::{
-        BasicConstraints, CertificateParams, DnType, DnValue, IsCa, KeyPair, KeyUsagePurpose,
+        BasicConstraints, CertificateParams, DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
     };
 
-    let mut params = CertificateParams::default();
-    params.distinguished_name.push(
-        DnType::CommonName,
-        DnValue::Utf8String(opts.common_name.clone()),
-    );
+    let key_pair = match generate_rsa_keypair(opts.key_bits) {
+        Ok(kp) => kp,
+        Err(e) => {
+            tracing::error!("failed to generate RSA key pair: {e}");
+            return -1;
+        }
+    };
+    let public_key_der = key_pair.public_key_der();
+    let key_digest = match public_key_digest(&public_key_der) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("{e}");
+            return -1;
+        }
+    };
+    let dn_qualifier = match public_key_digest_base64(&public_key_der) {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::error!("{e}");
+            return -1;
+        }
+    };
+
+    let mut dn_values = vec![("CommonName", DnType::CommonName, &opts.common_name)];
     if !opts.organization.is_empty() {
-        params.distinguished_name.push(
+        dn_values.push((
+            "OrganizationName",
             DnType::OrganizationName,
-            DnValue::Utf8String(opts.organization.clone()),
-        );
+            &opts.organization,
+        ));
     }
     if !opts.organizational_unit.is_empty() {
-        params.distinguished_name.push(
+        dn_values.push((
+            "OrganizationalUnitName",
             DnType::OrganizationalUnitName,
-            DnValue::Utf8String(opts.organizational_unit.clone()),
-        );
+            &opts.organizational_unit,
+        ));
     }
     if !opts.country.is_empty() {
-        params.distinguished_name.push(
-            DnType::CountryName,
-            DnValue::Utf8String(opts.country.clone()),
-        );
+        dn_values.push(("CountryName", DnType::CountryName, &opts.country));
     }
+    dn_values.push((
+        "dnQualifier",
+        DnType::CustomDnType(DN_QUALIFIER_OID.to_vec()),
+        &dn_qualifier,
+    ));
+
+    let mut params = CertificateParams::default();
+    for (label, dn_type, value) in dn_values {
+        match printable_dn_value(label, value) {
+            Ok(dn_value) => params.distinguished_name.push(dn_type, dn_value),
+            Err(e) => {
+                tracing::error!("{e}");
+                return -1;
+            }
+        }
+    }
+
+    // The subjectKeyIdentifier is the same digest as the dnQualifier, which is
+    // what openssl's "hash" method gives libdcp, and it becomes the child's
+    // authorityKeyIdentifier when this certificate signs one.
+    params.key_identifier_method = KeyIdMethod::PreSpecified(key_digest.to_vec());
+    params.use_authority_key_identifier_extension = true;
 
     params.serial_number = match certificate_serial() {
         Ok(serial) => Some(serial),
@@ -173,29 +283,25 @@ pub fn generate_certificate(opts: &CertOptions) -> i32 {
 
     match opts.cert_type {
         CertType::Root => {
-            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.is_ca = IsCa::Ca(BasicConstraints::Constrained(ROOT_PATH_LEN_CONSTRAINT));
             params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         }
         CertType::Intermediate => {
-            params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            params.is_ca = IsCa::Ca(BasicConstraints::Constrained(
+                INTERMEDIATE_PATH_LEN_CONSTRAINT,
+            ));
             params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         }
         CertType::Leaf | CertType::Signer => {
             params.is_ca = IsCa::ExplicitNoCa;
+            // keyEncipherment is what lets a KDM's content key be RSA-wrapped to
+            // this certificate; libdcp pairs it with digitalSignature.
             params.key_usages = vec![
                 KeyUsagePurpose::DigitalSignature,
-                KeyUsagePurpose::ContentCommitment,
+                KeyUsagePurpose::KeyEncipherment,
             ];
         }
     }
-
-    let key_pair = match generate_rsa_keypair(opts.key_bits) {
-        Ok(kp) => kp,
-        Err(e) => {
-            tracing::error!("failed to generate RSA key pair: {e}");
-            return -1;
-        }
-    };
 
     let cert = if opts.cert_type == CertType::Root {
         // Self-signed
@@ -280,7 +386,7 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
     // Root CA
     let root_opts = CertOptions {
         cert_type: CertType::Root,
-        common_name: format!("{organization} Root CA"),
+        common_name: common_name(CN_ROLE_CERTIFICATE_AUTHORITY, organization, CN_TIER_ROOT),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
         validity_days: 3650 * 3, // 30 years
@@ -295,7 +401,11 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
     // Intermediate CA
     let inter_opts = CertOptions {
         cert_type: CertType::Intermediate,
-        common_name: format!("{organization} Intermediate CA"),
+        common_name: common_name(
+            CN_ROLE_CERTIFICATE_AUTHORITY,
+            organization,
+            CN_TIER_INTERMEDIATE,
+        ),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
         validity_days: 3650 * 2, // 20 years
@@ -312,7 +422,7 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
     // Signer (leaf)
     let signer_opts = CertOptions {
         cert_type: CertType::Signer,
-        common_name: format!("{organization} Signer"),
+        common_name: common_name(CN_ROLE_CONTENT_SIGNER, organization, CN_TIER_LEAF),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
         validity_days: 3650,
@@ -410,13 +520,141 @@ pub fn read_certificate(cert_path: &Path) -> CertInfo {
     }
 }
 
+/// A KDM's content-key validity window, as the two ST 430-1 timestamps carry it.
+#[derive(Debug, Clone, Copy)]
+struct KdmWindow {
+    not_before: chrono::DateTime<chrono::Utc>,
+    not_after: chrono::DateTime<chrono::Utc>,
+}
+
+impl KdmWindow {
+    /// Both bounds have to be the exact ST 430-1 spelling, so the key block's
+    /// own check runs here and a bad value fails before any crypto is done.
+    fn parse(not_before: &str, not_after: &str) -> Result<Self, String> {
+        check_kdm_timestamp("ContentKeysNotValidBefore", not_before)?;
+        check_kdm_timestamp("ContentKeysNotValidAfter", not_after)?;
+        let parse_one = |label: &str, value: &str| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|t| t.with_timezone(&chrono::Utc))
+                .map_err(|e| format!("{label} is not a valid RFC 3339 timestamp ('{value}'): {e}"))
+        };
+        Ok(Self {
+            not_before: parse_one("ContentKeysNotValidBefore", not_before)?,
+            not_after: parse_one("ContentKeysNotValidAfter", not_after)?,
+        })
+    }
+}
+
+/// Where a KDM's validity window sits relative to a certificate's own validity.
+///
+/// The three cases are DCP-o-matic's `check_kdm_and_certificate_validity_periods`
+/// (`kdm_util.cc`), which hard-errors on `OutsideCertificate` and warns on
+/// `OverlapsCertificate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KdmWindowOverlap {
+    /// The certificate covers the whole window.
+    WithinCertificate,
+    /// The certificate covers part of the window: the KDM opens for less time
+    /// than it claims.
+    OverlapsCertificate,
+    /// The two share no time at all: the KDM can never open.
+    OutsideCertificate,
+}
+
+/// An X.509 validity bound as a UTC instant.
+fn certificate_validity_timestamp(
+    time: x509_parser::prelude::ASN1Time,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let seconds = time.timestamp();
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .ok_or_else(|| format!("certificate validity timestamp {seconds} is out of range"))
+}
+
+/// The UTC date that bound falls on, for the day-granularity comparison libdcp
+/// makes against a KDM window.
+fn certificate_validity_date(
+    time: x509_parser::prelude::ASN1Time,
+) -> Result<chrono::NaiveDate, String> {
+    Ok(certificate_validity_timestamp(time)?.date_naive())
+}
+
+fn classify_window(recipient: &Recipient, window: &KdmWindow) -> KdmWindowOverlap {
+    if recipient.not_before <= window.not_before && recipient.not_after >= window.not_after {
+        return KdmWindowOverlap::WithinCertificate;
+    }
+    if recipient.not_before.max(window.not_before) < recipient.not_after.min(window.not_after) {
+        return KdmWindowOverlap::OverlapsCertificate;
+    }
+    KdmWindowOverlap::OutsideCertificate
+}
+
+/// Classify a KDM validity window against the recipient certificate it would be
+/// issued to, without generating anything.
+///
+/// `build_kdm` refuses `OutsideCertificate` on its own; this is here so a caller
+/// can show the answer up front and warn on `OverlapsCertificate`, which is
+/// legal but means the KDM stops working before its stated end.
+pub fn classify_kdm_window(
+    recipient_cert_file: &Path,
+    valid_from: &str,
+    valid_to: &str,
+) -> Result<KdmWindowOverlap, String> {
+    let recipient = parse_recipient(recipient_cert_file)?;
+    let not_valid_before = resolve_valid_from(valid_from);
+    let not_valid_after = parse_validity_end(valid_to, &not_valid_before)?;
+    let window = KdmWindow::parse(&not_valid_before, &not_valid_after)?;
+    Ok(classify_window(&recipient, &window))
+}
+
+/// The two validity checks every KDM has to pass before it is worth building:
+/// the recipient has to be able to open it at all, and the signer chain has to
+/// cover the whole window.
+///
+/// An overlap is only warned about, matching `kdm_cli.cc`, because a KDM that
+/// works for part of its stated window is still useful.
+fn check_kdm_window(
+    recipient: &Recipient,
+    recipient_cert_file: &Path,
+    signer_cert_file: &Path,
+    signer_chain_files: &[PathBuf],
+    window: &KdmWindow,
+) -> Result<(), String> {
+    match classify_window(recipient, window) {
+        KdmWindowOverlap::WithinCertificate => {}
+        KdmWindowOverlap::OverlapsCertificate => tracing::warn!(
+            "the recipient certificate {} does not cover the whole KDM validity window, \
+             so the KDM will stop working before {}",
+            recipient_cert_file.display(),
+            window.not_after
+        ),
+        KdmWindowOverlap::OutsideCertificate => {
+            return Err(format!(
+                "the KDM validity window {} to {} lies entirely outside the validity of the \
+                 recipient certificate {}, so the KDM could never open",
+                window.not_before,
+                window.not_after,
+                recipient_cert_file.display()
+            ));
+        }
+    }
+
+    // libdcp throws BadKDMDateError here rather than emitting a KDM the signer
+    // chain cannot vouch for. Reusing the chain walk means the issuer linkage
+    // and signatures are checked at the same time.
+    let mut chain = vec![signer_cert_file.to_path_buf()];
+    chain.extend(signer_chain_files.iter().cloned());
+    validate_chain_inner(&chain, Some(window))
+        .map_err(|e| format!("the signer chain cannot issue this KDM: {e}"))?;
+    Ok(())
+}
+
 /// Validate a certificate chain, leaf first, root last.
 ///
 /// Verifies the issuer signature on every certificate cryptographically. A
 /// signature algorithm that x509-parser/ring cannot check is reported as a
 /// failure, never as a pass.
 pub fn validate_chain(chain: &[PathBuf]) -> i32 {
-    match validate_chain_inner(chain) {
+    match validate_chain_inner(chain, None) {
         Ok(n) => {
             tracing::info!("certificate chain valid ({n} certificates)");
             0
@@ -428,7 +666,13 @@ pub fn validate_chain(chain: &[PathBuf]) -> i32 {
     }
 }
 
-fn validate_chain_inner(chain: &[PathBuf]) -> Result<usize, String> {
+/// The chain walk behind `validate_chain`. With `kdm_window` set it also
+/// applies the check libdcp makes before it encrypts a KDM: every certificate
+/// from leaf to root must cover the whole window.
+fn validate_chain_inner(
+    chain: &[PathBuf],
+    kdm_window: Option<&KdmWindow>,
+) -> Result<usize, String> {
     use x509_parser::prelude::*;
 
     if chain.is_empty() {
@@ -460,6 +704,32 @@ fn validate_chain_inner(chain: &[PathBuf]) -> Result<usize, String> {
         }
         if cert.validity().not_before > now {
             return Err(format!("certificate not yet valid: {}", path.display()));
+        }
+    }
+
+    // libdcp (decrypted_kdm.cc, comparators in util.cc) compares at day
+    // granularity and counts an equal day as a failure, so a certificate minted
+    // today cannot sign a KDM whose window starts today.
+    if let Some(window) = kdm_window {
+        let window_start = window.not_before.date_naive();
+        let window_end = window.not_after.date_naive();
+        for (cert, path) in certs.iter().zip(chain) {
+            let cert_start = certificate_validity_date(cert.validity().not_before)?;
+            let cert_end = certificate_validity_date(cert.validity().not_after)?;
+            if cert_start >= window_start {
+                return Err(format!(
+                    "certificate {} starts on {cert_start}, not before the day the KDM \
+                     validity window starts ({window_start})",
+                    path.display()
+                ));
+            }
+            if cert_end <= window_end {
+                return Err(format!(
+                    "certificate {} expires on {cert_end}, not after the day the KDM \
+                     validity window ends ({window_end})",
+                    path.display()
+                ));
+            }
         }
     }
 
@@ -808,6 +1078,30 @@ impl<'de> Deserialize<'de> for KdmFormulation {
     }
 }
 
+/// Whether the picture essence keeps its forensic marking, per the ST 430-1
+/// ForensicMarkFlagList. Press screenings are the usual reason to turn it off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PictureForensicMarking {
+    /// Marking stays on, and no flag is written.
+    #[default]
+    Enabled,
+    /// Marking off on the picture.
+    Disabled,
+}
+
+/// Whether the audio essence keeps its forensic marking. Studios order HI/VI
+/// tracks exempted by naming the channel above which marking stops.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AudioForensicMarking {
+    /// Marking stays on for every channel, and no flag is written.
+    #[default]
+    Enabled,
+    /// Marking off on every channel.
+    Disabled,
+    /// Marking off on the channels above this one, and on below it.
+    DisabledAboveChannel(u32),
+}
+
 /// KDM generation configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KdmConfig {
@@ -853,6 +1147,13 @@ pub struct KdmConfig {
     /// formulation that included it.
     #[serde(default)]
     pub device_cert_files: Vec<PathBuf>,
+    /// Forensic marking of the picture essence. Defaults to Enabled, which
+    /// writes no ForensicMarkFlagList at all.
+    #[serde(default)]
+    pub picture_forensic_marking: PictureForensicMarking,
+    /// Forensic marking of the audio essence, likewise defaulting to Enabled.
+    #[serde(default)]
+    pub audio_forensic_marking: AudioForensicMarking,
 }
 
 /// A caller-supplied content key placed in a KDM, binding it to an already
@@ -904,6 +1205,19 @@ const KDM_ENCRYPTION_METHOD: &str = "http://www.w3.org/2001/04/xmlenc#rsa-oaep-m
 /// thumbprint alongside it and assume-trust stops applying, so this value is
 /// used alone or not at all.
 const ASSUME_TRUST_THUMBPRINT: &str = "2jmj7l5rSw0yVb/vlWAYkK/YBwk=";
+
+/// ST 430-1 Annex C ForensicMarkFlag URIs, as libdcp spells them in
+/// `encrypted_kdm.cc`. Each one turns marking off for its essence type; the
+/// element is absent when marking stays on.
+const FORENSIC_MARK_PICTURE_DISABLE: &str =
+    "http://www.smpte-ra.org/430-1/2006/KDM#mrkflg-picture-disable";
+const FORENSIC_MARK_AUDIO_DISABLE: &str =
+    "http://www.smpte-ra.org/430-1/2006/KDM#mrkflg-audio-disable";
+/// Appended to the audio URI with a channel number when marking stops above
+/// that channel rather than on all of them.
+const FORENSIC_MARK_ABOVE_CHANNEL_SUFFIX: &str = "-above-channel-";
+const FORENSIC_MARK_FLAG_LIST_ELEMENT: &str = "ForensicMarkFlagList";
+const FORENSIC_MARK_FLAG_ELEMENT: &str = "ForensicMarkFlag";
 
 // SMPTE 430-3 ETM ds:Signature profile. Every URI below is what libdcp emits
 // in src/encrypted_kdm.cc / src/certificate_chain.cc for a KDM (distinct from
@@ -1071,6 +1385,14 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
 
     let not_valid_before = resolve_valid_from(&config.valid_from);
     let not_valid_after = parse_validity_end(&config.valid_to, &not_valid_before)?;
+    let window = KdmWindow::parse(&not_valid_before, &not_valid_after)?;
+    check_kdm_window(
+        &recipient,
+        &config.recipient_cert_file,
+        &config.signer_cert_file,
+        &config.signer_chain_files,
+        &window,
+    )?;
 
     // Prefer the caller's keys (from the DCP's keys file) so the KDM unlocks the
     // essence that was actually encrypted; fall back to a fresh MDIK otherwise.
@@ -1178,9 +1500,10 @@ fn check_formulation_devices(
 /// to `recipient` with `signer`'s thumbprint embedded.
 ///
 /// `config` is used only for the signer identity handed to `build_signature`
-/// (its cert, key and chain), the output format, the annotation, the formulation
-/// and the authorized device list; every other field of the KDM comes from the
-/// explicit arguments so this core serves both fresh generation and re-wrap.
+/// (its cert, key and chain), the output format, the annotation, the
+/// formulation, the authorized device list and the forensic marking flags;
+/// every other field of the KDM comes from the explicit arguments so this core
+/// serves both fresh generation and re-wrap.
 #[allow(clippy::too_many_arguments)]
 fn build_kdm_xml(
     config: &KdmConfig,
@@ -1269,6 +1592,10 @@ fn build_kdm_xml(
     };
 
     let authorized_device_info = build_authorized_device_info(&config.device_cert_files)?;
+    let forensic_mark_flag_list = build_forensic_mark_flag_list(
+        config.picture_forensic_marking,
+        config.audio_forensic_marking,
+    );
 
     // libdcp calls this approximate and it is: strictly the ContentAuthenticator
     // is a thumbprint of one of the CPL signer certificates, which is this
@@ -1308,7 +1635,7 @@ fn build_kdm_xml(
         <ContentKeysNotValidAfter>{not_after}</ContentKeysNotValidAfter>
 {authorized_device_info}        <KeyIdList>
 {typed_key_ids}        </KeyIdList>
-      </KDMRequiredExtensions>
+{forensic_mark_flag_list}      </KDMRequiredExtensions>
     </RequiredExtensions>
   "#,
         issue_date = now.format("%Y-%m-%dT%H:%M:%S+00:00"),
@@ -1398,6 +1725,14 @@ pub struct RewrapConfig {
     /// formulation of its own.
     #[serde(default)]
     pub formulation: KdmFormulation,
+    /// Forensic marking of the picture essence in the re-wrapped KDM. Not taken
+    /// from the source DKDM: the marking order belongs to whoever is issuing
+    /// this KDM.
+    #[serde(default)]
+    pub picture_forensic_marking: PictureForensicMarking,
+    /// Forensic marking of the audio essence, on the same terms.
+    #[serde(default)]
+    pub audio_forensic_marking: AudioForensicMarking,
 }
 
 /// Re-wrap a DKDM: decrypt its content keys with the DKDM recipient's private
@@ -1477,18 +1812,29 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         parse_validity_end(&config.valid_to, &not_valid_before)?
     };
 
+    let window = KdmWindow::parse(&not_valid_before, &not_valid_after)?;
+    check_kdm_window(
+        &recipient,
+        &config.recipient_cert_file,
+        &config.signer_cert_file,
+        &config.signer_chain_files,
+        &window,
+    )?;
+
     // Preserve the source MessageType and title.
     let message_type = parsed.message_type.as_deref().unwrap_or(KDM_MESSAGE_TYPE);
     let content_title = parsed.content_title.as_deref().unwrap_or("");
 
-    // build_kdm_xml reads only the signer identity, the device list and the
-    // formulation from the config.
+    // build_kdm_xml reads only the signer identity, the device list, the
+    // formulation and the forensic marking flags from the config.
     let signer_config = KdmConfig {
         signer_cert_file: config.signer_cert_file.clone(),
         signer_key_file: config.signer_key_file.clone(),
         signer_chain_files: config.signer_chain_files.clone(),
         device_cert_files: config.device_cert_files.clone(),
         formulation: config.formulation,
+        picture_forensic_marking: config.picture_forensic_marking,
+        audio_forensic_marking: config.audio_forensic_marking,
         ..Default::default()
     };
 
@@ -2144,6 +2490,50 @@ fn build_authorized_device_info(device_cert_files: &[PathBuf]) -> Result<String,
     ))
 }
 
+/// Build the ForensicMarkFlagList of ST 430-1 Annex C, empty when nothing is
+/// disabled: the element is `minOccurs="0"` and libdcp omits it entirely rather
+/// than writing an empty list.
+///
+/// Picture comes before audio, matching libdcp's order.
+fn build_forensic_mark_flag_list(
+    picture: PictureForensicMarking,
+    audio: AudioForensicMarking,
+) -> String {
+    let picture_flag = match picture {
+        PictureForensicMarking::Enabled => None,
+        PictureForensicMarking::Disabled => Some(FORENSIC_MARK_PICTURE_DISABLE.to_string()),
+    };
+    let audio_flag = match audio {
+        AudioForensicMarking::Enabled => None,
+        // libdcp appends the suffix only above channel zero, so channel 0 says
+        // the same thing as Disabled.
+        AudioForensicMarking::Disabled | AudioForensicMarking::DisabledAboveChannel(0) => {
+            Some(FORENSIC_MARK_AUDIO_DISABLE.to_string())
+        }
+        AudioForensicMarking::DisabledAboveChannel(channel) => Some(format!(
+            "{FORENSIC_MARK_AUDIO_DISABLE}{FORENSIC_MARK_ABOVE_CHANNEL_SUFFIX}{channel}"
+        )),
+    };
+
+    // A URI has no character XML would have to escape.
+    let flags: String = [picture_flag, audio_flag]
+        .into_iter()
+        .flatten()
+        .map(|uri| {
+            format!(
+                "          <{FORENSIC_MARK_FLAG_ELEMENT}>{uri}</{FORENSIC_MARK_FLAG_ELEMENT}>\n"
+            )
+        })
+        .collect();
+    if flags.is_empty() {
+        return String::new();
+    }
+    format!(
+        "        <{FORENSIC_MARK_FLAG_LIST_ELEMENT}>\n\
+         {flags}        </{FORENSIC_MARK_FLAG_LIST_ELEMENT}>\n"
+    )
+}
+
 /// Identity of the entity issuing a KDM. ST 430-3 types the ETM Signer as
 /// `ds:X509IssuerSerialType`, which carries issuer and serial and no subject.
 struct Signer {
@@ -2182,6 +2572,9 @@ struct Recipient {
     issuer_dn: String,
     serial: String,
     public_key: rsa::RsaPublicKey,
+    /// Validity bounds, so a KDM window can be classified against them.
+    not_before: chrono::DateTime<chrono::Utc>,
+    not_after: chrono::DateTime<chrono::Utc>,
 }
 
 /// Parse a recipient certificate: identity plus the RSA key the content key is wrapped to.
@@ -2233,12 +2626,17 @@ fn parse_recipient(cert_path: &Path) -> Result<Recipient, String> {
         )
     })?;
 
+    let not_before = certificate_validity_timestamp(cert.validity().not_before)?;
+    let not_after = certificate_validity_timestamp(cert.validity().not_after)?;
+
     Ok(Recipient {
         subject_dn: cert.subject().to_string(),
         issuer_dn: cert.issuer().to_string(),
         // X509SerialNumber is a decimal integer in XML-DSig
         serial: cert.serial.to_str_radix(10),
         public_key,
+        not_before,
+        not_after,
     })
 }
 
@@ -2272,8 +2670,9 @@ mod tests {
         intermediate: PathBuf,
         signer: PathBuf,
         signer_key: PathBuf,
-        /// Same subject CN as `root`, different key. Used to prove chain
-        /// validation checks signatures and not just names.
+        /// The genuine root's whole distinguished name, dnQualifier included,
+        /// over a different key. Used to prove chain validation checks
+        /// signatures and not just names.
         impostor_root: PathBuf,
     }
 
@@ -2284,18 +2683,16 @@ mod tests {
             let p = dir.path();
             assert_eq!(generate_chain("Acme", p), 0, "chain generation failed");
 
+            // The dnQualifier is derived from the key, so an impostor cannot be
+            // built by asking for the same subject: its DN is copied off the
+            // genuine root and only the key underneath is swapped.
             let impostor_root = p.join("impostor_root.pem");
-            let opts = CertOptions {
-                cert_type: CertType::Root,
-                // identical CN to the genuine root
-                common_name: "Acme Root CA".to_string(),
-                organization: "Acme".to_string(),
-                organizational_unit: "Digital Cinema".to_string(),
-                output_cert: impostor_root.clone(),
-                output_key: p.join("impostor_root.key"),
-                ..Default::default()
-            };
-            assert_eq!(generate_certificate(&opts), 0, "impostor root failed");
+            let genuine_pem = std::fs::read_to_string(p.join("root.pem")).expect("read root");
+            let params =
+                rcgen::CertificateParams::from_ca_cert_pem(&genuine_pem).expect("parse root");
+            let key = generate_rsa_keypair(CertOptions::default().key_bits).expect("impostor key");
+            let cert = params.self_signed(&key).expect("self-sign impostor");
+            std::fs::write(&impostor_root, cert.pem()).expect("write impostor");
 
             Fixtures {
                 root: p.join("root.pem"),
@@ -2307,6 +2704,20 @@ mod tests {
                 _dir: dir,
             }
         })
+    }
+
+    /// A KDM start time one day out. The fixture chain is minted now, and
+    /// libdcp refuses a KDM that starts on the day its signer certificate does,
+    /// so a window starting "now" would be rejected.
+    fn tomorrow() -> String {
+        in_days(1)
+    }
+
+    /// An ST 430-1 timestamp that many days from now.
+    fn in_days(days: i64) -> String {
+        (chrono::Utc::now() + chrono::Duration::days(days))
+            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .to_string()
     }
 
     // Signs with the self-signed root, so KeyInfo needs no chain and the
@@ -2322,12 +2733,14 @@ mod tests {
             signer_key_file: f.root_key.clone(),
             signer_chain_files: vec![],
             output_file: out,
-            valid_from: "now".to_string(),
+            valid_from: tomorrow(),
             valid_to: "7 days".to_string(),
             formulation: KdmFormulation::DciAny,
             content_keys: Vec::new(),
             format: KdmFormat::Smpte,
             device_cert_files: vec![],
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
         }
     }
 
@@ -2358,12 +2771,14 @@ mod tests {
             signer_key_file: f.signer_key.clone(),
             signer_chain_files: vec![f.intermediate.clone(), f.root.clone()],
             output_file: out,
-            valid_from: "now".to_string(),
+            valid_from: tomorrow(),
             valid_to: "7 days".to_string(),
             formulation: KdmFormulation::DciAny,
             content_keys: Vec::new(),
             format: KdmFormat::Smpte,
             device_cert_files: vec![],
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
         }
     }
 
@@ -2741,6 +3156,237 @@ mod tests {
         }
     }
 
+    /// The dnQualifier already in each DCP-o-matic certificate must come back
+    /// out of postkit's own hashing of that same certificate's public key.
+    /// Nothing here is a transcribed value.
+    #[test]
+    fn postkit_computes_the_dn_qualifier_dcp_o_matic_wrote() {
+        use x509_parser::prelude::*;
+
+        for name in ["root", "intermediate", "leaf"] {
+            let data = std::fs::read(dcp_o_matic_cert(name)).unwrap();
+            let (_, pem) = parse_x509_pem(&data).unwrap();
+            let cert = pem.parse_x509().unwrap();
+
+            let computed = public_key_digest_base64(cert.public_key().raw).expect("digest");
+            assert_eq!(
+                subject_dn_qualifier(&cert),
+                Some(computed),
+                "{name}: the dnQualifier is the base64 SHA-1 of the public key"
+            );
+        }
+    }
+
+    /// The dnQualifier value from a certificate's subject, if it carries one.
+    fn subject_dn_qualifier(cert: &x509_parser::certificate::X509Certificate) -> Option<String> {
+        let oid = x509_parser::der_parser::Oid::from(&DN_QUALIFIER_OID).ok()?;
+        cert.subject()
+            .iter_attributes()
+            .find(|attr| *attr.attr_type() == oid)
+            .and_then(|attr| attr.as_str().ok())
+            .map(str::to_string)
+    }
+
+    /// The ASN.1 tag of every value in a distinguished name, in order.
+    fn dn_value_tags(
+        cert: &x509_parser::certificate::X509Certificate,
+    ) -> Vec<x509_parser::der_parser::asn1_rs::Tag> {
+        cert.subject()
+            .iter_attributes()
+            .map(|attr| attr.attr_value().tag())
+            .collect()
+    }
+
+    /// Every tier postkit generates has to have the shape the DCP-o-matic
+    /// certificates have: the same ASN.1 string type throughout the DN, a
+    /// dnQualifier holding the public key digest, the same basicConstraints and
+    /// keyUsage, and both key identifiers.
+    #[test]
+    fn generated_certificates_have_the_structure_the_dcp_o_matic_fixtures_have() {
+        use x509_parser::prelude::*;
+
+        let f = fixtures();
+        for (generated, reference) in [
+            (&f.root, "root"),
+            (&f.intermediate, "intermediate"),
+            (&f.signer, "leaf"),
+        ] {
+            let ours_data = std::fs::read(generated).unwrap();
+            let (_, ours_pem) = parse_x509_pem(&ours_data).unwrap();
+            let ours = ours_pem.parse_x509().unwrap();
+
+            let theirs_data = std::fs::read(dcp_o_matic_cert(reference)).unwrap();
+            let (_, theirs_pem) = parse_x509_pem(&theirs_data).unwrap();
+            let theirs = theirs_pem.parse_x509().unwrap();
+
+            let reference_tag = dn_value_tags(&theirs)[0];
+            for tag in dn_value_tags(&ours) {
+                assert_eq!(
+                    tag, reference_tag,
+                    "{reference}: every DN value must use the ASN.1 string type \
+                     DCP-o-matic uses"
+                );
+            }
+
+            assert_eq!(
+                subject_dn_qualifier(&ours),
+                Some(public_key_digest_base64(ours.public_key().raw).expect("digest")),
+                "{reference}: dnQualifier must hold this certificate's own key digest"
+            );
+
+            let ours_basic = ours.basic_constraints().unwrap().unwrap().value;
+            let theirs_basic = theirs.basic_constraints().unwrap().unwrap().value;
+            assert_eq!(ours_basic.ca, theirs_basic.ca, "{reference}: CA flag");
+            assert_eq!(
+                ours_basic.path_len_constraint, theirs_basic.path_len_constraint,
+                "{reference}: basicConstraints path length"
+            );
+
+            let ours_usage = ours.key_usage().unwrap().unwrap().value;
+            let theirs_usage = theirs.key_usage().unwrap().unwrap().value;
+            assert_eq!(
+                ours_usage.flags, theirs_usage.flags,
+                "{reference}: keyUsage bits"
+            );
+
+            let ski = ours
+                .get_extension_unique(
+                    &x509_parser::oid_registry::OID_X509_EXT_SUBJECT_KEY_IDENTIFIER,
+                )
+                .unwrap()
+                .unwrap_or_else(|| panic!("{reference} has no subjectKeyIdentifier"));
+            let ParsedExtension::SubjectKeyIdentifier(ski) = ski.parsed_extension() else {
+                panic!("{reference} subjectKeyIdentifier did not parse");
+            };
+            assert_eq!(
+                ski.0,
+                public_key_digest(ours.public_key().raw).expect("digest"),
+                "{reference}: the subjectKeyIdentifier is the same digest as the dnQualifier"
+            );
+            assert!(
+                ours.get_extension_unique(
+                    &x509_parser::oid_registry::OID_X509_EXT_AUTHORITY_KEY_IDENTIFIER
+                )
+                .unwrap()
+                .is_some(),
+                "{reference} has no authorityKeyIdentifier"
+            );
+        }
+    }
+
+    /// ST 430-2 5.3.1 puts a role token before the first '.' of a CommonName,
+    /// and a signer's has to differ from its CAs'. DCP-o-matic's certificates
+    /// are the reference for which tokens those are.
+    #[test]
+    fn generated_common_names_carry_the_role_token_dcp_o_matic_uses() {
+        let f = fixtures();
+        for (generated, reference) in [
+            (&f.root, "root"),
+            (&f.intermediate, "intermediate"),
+            (&f.signer, "leaf"),
+        ] {
+            assert_eq!(
+                cn_role(&read_certificate(generated).subject_cn),
+                cn_role(&read_certificate(&dcp_o_matic_cert(reference)).subject_cn),
+                "{reference}: CommonName role token"
+            );
+        }
+        assert_ne!(
+            cn_role(&read_certificate(&f.signer).subject_cn),
+            cn_role(&read_certificate(&f.root).subject_cn),
+            "the signer's role must be distinct from its CAs'"
+        );
+    }
+
+    /// A ST 430-2 CommonName's role token: everything before the first '.'.
+    fn cn_role(common_name: &str) -> &str {
+        common_name.split('.').next().unwrap_or("")
+    }
+
+    /// A fresh self-signed certificate valid for `validity_days` from now, so a
+    /// KDM window can be placed inside, across or beyond its validity.
+    fn short_lived_certificate(dir: &Path, name: &str, validity_days: u32) -> (PathBuf, PathBuf) {
+        let cert = dir.join(format!("{name}.{CERTIFICATE_EXTENSION}"));
+        let key = dir.join(format!("{name}.key"));
+        let opts = CertOptions {
+            cert_type: CertType::Root,
+            common_name: common_name(CN_ROLE_CERTIFICATE_AUTHORITY, name, CN_TIER_ROOT),
+            organization: name.to_string(),
+            validity_days,
+            output_cert: cert.clone(),
+            output_key: key.clone(),
+            ..Default::default()
+        };
+        assert_eq!(generate_certificate(&opts), 0, "{name} generation");
+        (cert, key)
+    }
+
+    #[test]
+    fn a_window_inside_the_recipient_certificate_is_within() {
+        let f = fixtures();
+        assert_eq!(
+            classify_kdm_window(&f.signer, &tomorrow(), "7 days").expect("classify"),
+            KdmWindowOverlap::WithinCertificate
+        );
+    }
+
+    #[test]
+    fn a_window_straddling_the_recipient_certificate_overlaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _) = short_lived_certificate(dir.path(), "straddled", 3);
+        assert_eq!(
+            classify_kdm_window(&cert, &tomorrow(), "7 days").expect("classify"),
+            KdmWindowOverlap::OverlapsCertificate,
+            "a window that outlives the certificate covers only part of itself"
+        );
+    }
+
+    #[test]
+    fn a_window_outside_the_recipient_certificate_is_outside_and_will_not_build() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, _) = short_lived_certificate(dir.path(), "expired-first", 1);
+
+        assert_eq!(
+            classify_kdm_window(&cert, &in_days(10), "7 days").expect("classify"),
+            KdmWindowOverlap::OutsideCertificate
+        );
+
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.recipient_cert_file = cert;
+        config.valid_from = in_days(10);
+        let err = build_kdm(&config).expect_err("a KDM that can never open must not be built");
+        assert!(err.contains("could never open"), "got: {err}");
+    }
+
+    /// libdcp refuses to sign a KDM the signer chain does not outlive.
+    #[test]
+    fn a_signer_chain_that_expires_mid_window_is_rejected() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let (cert, key) = short_lived_certificate(dir.path(), "short-signer", 3);
+
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.signer_cert_file = cert;
+        config.signer_key_file = key;
+        let err = build_kdm(&config).expect_err("a signer that expires mid-window must be refused");
+        assert!(
+            err.contains("the signer chain cannot issue this KDM") && err.contains("expires on"),
+            "got: {err}"
+        );
+    }
+
+    /// The same day-granularity strictness libdcp has: a signer minted today
+    /// cannot issue a KDM that starts today.
+    #[test]
+    fn a_window_starting_the_day_the_signer_does_is_rejected() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.valid_from = "now".to_string();
+        let err = build_kdm(&config).expect_err("a same-day start must be refused");
+        assert!(err.contains("starts on"), "got: {err}");
+    }
+
     #[test]
     fn invalid_recipient_cert_errors() {
         let f = fixtures();
@@ -2975,18 +3621,19 @@ mod tests {
 
     #[test]
     fn chain_with_impostor_root_is_rejected() {
-        // The impostor shares the real root's CN, so the old name-comparison
-        // check passed this. Signature verification must reject it.
+        // The impostor's subject is byte-identical to the real root's, so the
+        // name comparison passes it. Signature verification must reject it.
         let f = fixtures();
         let chain = vec![
             f.signer.clone(),
             f.intermediate.clone(),
             f.impostor_root.clone(),
         ];
-        assert_eq!(
-            validate_chain(&chain),
-            -1,
-            "a root that did not sign the intermediate must be rejected"
+        let err = validate_chain_inner(&chain, None)
+            .expect_err("a root that did not sign the intermediate must be rejected");
+        assert!(
+            err.contains("signature verification failed"),
+            "the impostor must fail the signature check, not a name comparison: {err}"
         );
     }
 
@@ -3023,8 +3670,8 @@ mod tests {
             &cpl,
             "Multi Key Feature",
             "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-any",
-            "2020-01-01T00:00:00+00:00",
-            "2030-01-01T00:00:00+00:00",
+            &tomorrow(),
+            &in_days(30),
             &recipient,
             &signer,
             keys,
@@ -3080,6 +3727,8 @@ mod tests {
             valid_to: String::new(),
             device_cert_files: vec![],
             formulation: KdmFormulation::default(),
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
 
@@ -3137,6 +3786,8 @@ mod tests {
             valid_to: String::new(),
             device_cert_files: vec![],
             formulation: KdmFormulation::default(),
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
         let new_ct = parse_kdm_xml(&std::fs::read_to_string(&out).unwrap())
@@ -3173,6 +3824,8 @@ mod tests {
             valid_to: String::new(),
             device_cert_files: vec![],
             formulation: KdmFormulation::default(),
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
         };
         let err = rewrap_dkdm(&config).expect_err("wrong recipient key must fail");
         assert!(
@@ -3220,6 +3873,8 @@ mod tests {
             valid_to: String::new(),
             device_cert_files: vec![],
             formulation: KdmFormulation::default(),
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
         assert!(
@@ -3651,6 +4306,8 @@ mod tests {
             valid_to: String::new(),
             device_cert_files: vec![f.intermediate.clone()],
             formulation: KdmFormulation::MultipleModifiedTransitional1,
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
         };
         let rewrapped = rewrap_dkdm(&config).expect("rewrap");
         assert_eq!(
@@ -3806,6 +4463,8 @@ mod tests {
             valid_to: String::new(),
             device_cert_files: vec![f.intermediate.clone()],
             formulation: KdmFormulation::ModifiedTransitional1,
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
         };
         let err = rewrap_dkdm(&config).expect_err("re-wrap must not drop the device list either");
         assert!(
@@ -4016,6 +4675,158 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    /// The three states that write a flag, and what each one must put in the
+    /// element.
+    fn forensic_marking_states() -> Vec<(
+        &'static str,
+        PictureForensicMarking,
+        AudioForensicMarking,
+        Vec<String>,
+    )> {
+        vec![
+            (
+                "picture-disabled",
+                PictureForensicMarking::Disabled,
+                AudioForensicMarking::Enabled,
+                vec![FORENSIC_MARK_PICTURE_DISABLE.to_string()],
+            ),
+            (
+                "audio-disabled",
+                PictureForensicMarking::Enabled,
+                AudioForensicMarking::Disabled,
+                vec![FORENSIC_MARK_AUDIO_DISABLE.to_string()],
+            ),
+            (
+                "audio-disabled-above-channel",
+                PictureForensicMarking::Enabled,
+                AudioForensicMarking::DisabledAboveChannel(HI_VI_CHANNEL),
+                vec![format!(
+                    "{FORENSIC_MARK_AUDIO_DISABLE}{FORENSIC_MARK_ABOVE_CHANNEL_SUFFIX}{HI_VI_CHANNEL}"
+                )],
+            ),
+        ]
+    }
+
+    /// The channel a 5.1 mix ends on, so marking off above it exempts the HI/VI
+    /// tracks that follow. Any number would do here; this is a realistic order.
+    const HI_VI_CHANNEL: u32 = 6;
+
+    #[test]
+    fn a_kdm_with_marking_left_on_has_no_forensic_mark_flag_list() {
+        let f = fixtures();
+        let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
+        assert!(
+            !kdm.xml.contains(FORENSIC_MARK_FLAG_LIST_ELEMENT),
+            "the element is minOccurs=0 and must be absent when nothing is disabled"
+        );
+    }
+
+    #[test]
+    fn each_forensic_marking_state_writes_the_flags_libdcp_writes() {
+        let f = fixtures();
+        for (label, picture, audio, expected) in forensic_marking_states() {
+            let mut config = test_config(f, PathBuf::from("unused"));
+            config.picture_forensic_marking = picture;
+            config.audio_forensic_marking = audio;
+            let kdm = build_kdm(&config).expect("build");
+            assert_eq!(
+                elements_in(&kdm.xml, FORENSIC_MARK_FLAG_ELEMENT),
+                expected,
+                "{label} flags"
+            );
+        }
+    }
+
+    /// Both flags at once, in libdcp's order: picture first.
+    #[test]
+    fn picture_and_audio_flags_sit_in_libdcps_order() {
+        let f = fixtures();
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.picture_forensic_marking = PictureForensicMarking::Disabled;
+        config.audio_forensic_marking = AudioForensicMarking::DisabledAboveChannel(HI_VI_CHANNEL);
+        let kdm = build_kdm(&config).expect("build");
+        assert_eq!(
+            elements_in(&kdm.xml, FORENSIC_MARK_FLAG_ELEMENT),
+            vec![
+                FORENSIC_MARK_PICTURE_DISABLE.to_string(),
+                format!(
+                    "{FORENSIC_MARK_AUDIO_DISABLE}{FORENSIC_MARK_ABOVE_CHANNEL_SUFFIX}{HI_VI_CHANNEL}"
+                ),
+            ]
+        );
+    }
+
+    /// Each state through the same ST 430-1 schema the other KDM tests use, so
+    /// the element's position after KeyIdList is checked and not assumed.
+    #[test]
+    fn every_forensic_marking_state_passes_the_st_430_1_xsd() {
+        if !xmllint_available() {
+            eprintln!("skipping: xmllint not installed");
+            return;
+        }
+
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        for (label, picture, audio, _) in forensic_marking_states() {
+            let mut config = test_config(f, PathBuf::from("unused"));
+            config.picture_forensic_marking = picture;
+            config.audio_forensic_marking = audio;
+            let kdm = build_kdm(&config).expect("build");
+
+            let path = dir.path().join(format!("{label}.xml"));
+            std::fs::write(&path, required_extensions_fragment(&kdm.xml)).unwrap();
+            let out = xmllint_kdm_schema(&path);
+            assert!(
+                out.status.success(),
+                "the {label} KDM must pass the ST 430-1 XSD:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// A re-wrapped KDM carries the re-issuer's marking order, not the source
+    /// DKDM's absence of one.
+    #[test]
+    fn a_rewrapped_kdm_carries_its_own_forensic_marking() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        std::fs::write(
+            &dkdm_path,
+            build_stand_in_dkdm(
+                f,
+                &f.signer,
+                &[KdmKey {
+                    key_type: *b"MDIK",
+                    key_id: uuid::Uuid::new_v4(),
+                    content_key: [0x33u8; 16],
+                }],
+            ),
+        )
+        .unwrap();
+
+        let config = RewrapConfig {
+            dkdm_file: dkdm_path,
+            dkdm_recipient_key_file: f.signer_key.clone(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            signer_chain_files: vec![],
+            output_file: PathBuf::from("unused"),
+            valid_from: String::new(),
+            valid_to: String::new(),
+            device_cert_files: vec![],
+            formulation: KdmFormulation::default(),
+            picture_forensic_marking: PictureForensicMarking::Disabled,
+            audio_forensic_marking: AudioForensicMarking::default(),
+        };
+        let kdm = rewrap_dkdm(&config).expect("rewrap");
+        assert_eq!(
+            elements_in(&kdm.xml, FORENSIC_MARK_FLAG_ELEMENT),
+            vec![FORENSIC_MARK_PICTURE_DISABLE.to_string()]
+        );
     }
 
     /// Real Doremi-signed KDMs through the same extraction and schema, which is
