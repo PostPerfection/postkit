@@ -10,6 +10,12 @@
   is absent then.
 - `classify_kdm_window` reports whether a KDM validity window sits within,
   overlaps or falls outside a recipient certificate's own validity.
+- The KDM vocabulary is public, so a command line no longer keeps its own copy:
+  `KdmFormulation::ALL`, `lists_supplied_devices` and `device_list_counterpart`;
+  `FromStr`, `Display` and `ALL` on `KdmFormat`; `forensic_mark_flag_uris`,
+  which renders a marking pair to the ST 430-1 Annex C URIs a KDM carries; and
+  the `ContentAuthenticator`, `CertificateThumbprint`, `ForensicMarkFlagList`
+  and `ForensicMarkFlag` element names.
 
 ### Changed
 
@@ -27,9 +33,10 @@
 - `KdmConfig.formulation` is a typed `KdmFormulation` that emits
   `ContentAuthenticator` for the dci formulations and rejects a device list its
   formulation would discard, instead of being read by nothing.
-- Every tier of a generated chain is valid for 10 years, and any longer validity
-  is refused: DCP-o-matic rejects a signer certificate spanning more than 15.
-  Regenerate any chain postkit produced earlier.
+- Every tier of a generated chain is valid for 10 years, staggered by a day per
+  tier as libdcp does so a parent outlives the child it issued, and any longer
+  validity is refused: DCP-o-matic rejects a signer certificate spanning more
+  than 15. Regenerate any chain postkit produced earlier.
 - `X509SubjectName` and `X509IssuerName` are written in RFC 4514 order, most
   specific RDN first, which is what libdcp writes and what a projector matches a
   KDM recipient against. Reissue any KDM postkit produced earlier.

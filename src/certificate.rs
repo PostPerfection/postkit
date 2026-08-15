@@ -146,6 +146,13 @@ const CERTIFICATE_VALIDITY_YEARS: u32 = 10;
 const DAYS_PER_YEAR: u32 = 365;
 const CERTIFICATE_VALIDITY_DAYS: u32 = CERTIFICATE_VALIDITY_YEARS * DAYS_PER_YEAR;
 
+/// libdcp's `CertificateChain::CertificateChain` staggers a generated chain by a
+/// day per tier. Each tier is minted after the one above it, so equal spans
+/// would leave a child outliving the issuer that vouches for it.
+const ROOT_VALIDITY_DAYS: u32 = CERTIFICATE_VALIDITY_DAYS;
+const INTERMEDIATE_VALIDITY_DAYS: u32 = ROOT_VALIDITY_DAYS - 1;
+const LEAF_VALIDITY_DAYS: u32 = INTERMEDIATE_VALIDITY_DAYS - 1;
+
 /// A ST 430-2 5.3.1 CommonName: role token, entity, standard, tier.
 fn common_name(role: &str, organization: &str, tier: &str) -> String {
     format!("{role}.{organization}.{CN_STANDARD_TOKEN}.{tier}")
@@ -516,7 +523,7 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
         common_name: common_name(CN_ROLE_CERTIFICATE_AUTHORITY, organization, CN_TIER_ROOT),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
-        validity_days: CERTIFICATE_VALIDITY_DAYS,
+        validity_days: ROOT_VALIDITY_DAYS,
         output_cert: output_dir.join("root.pem"),
         output_key: output_dir.join("root.key"),
         ..Default::default()
@@ -535,7 +542,7 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
         ),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
-        validity_days: CERTIFICATE_VALIDITY_DAYS,
+        validity_days: INTERMEDIATE_VALIDITY_DAYS,
         output_cert: output_dir.join("intermediate.pem"),
         output_key: output_dir.join("intermediate.key"),
         issuer_cert: output_dir.join("root.pem"),
@@ -552,7 +559,7 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
         common_name: common_name(CN_ROLE_CONTENT_SIGNER, organization, CN_TIER_LEAF),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
-        validity_days: CERTIFICATE_VALIDITY_DAYS,
+        validity_days: LEAF_VALIDITY_DAYS,
         output_cert: output_dir.join("signer.pem"),
         output_key: output_dir.join("signer.key"),
         issuer_cert: output_dir.join("intermediate.pem"),
@@ -1113,6 +1120,44 @@ pub enum KdmFormat {
     Interop,
 }
 
+impl KdmFormat {
+    /// Every format, for a caller listing the choices on a command line.
+    pub const ALL: [Self; 2] = [Self::Smpte, Self::Interop];
+
+    /// The command line spelling, which `Display` and `FromStr` both go
+    /// through. Serde is derived from the variant names and does not use this.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Smpte => "smpte",
+            Self::Interop => "interop",
+        }
+    }
+}
+
+impl std::fmt::Display for KdmFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for KdmFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|format| format.as_str() == s)
+            .ok_or_else(|| unknown_spelling("KDM format", s, &Self::ALL.map(Self::as_str)))
+    }
+}
+
+/// The error a `FromStr` over a fixed table of spellings returns, naming what
+/// the caller could have written instead. Shared by the two KDM vocabulary
+/// enums so both read the same on a command line.
+fn unknown_spelling(label: &str, spelling: &str, known: &[&str]) -> String {
+    format!("unknown {label} '{spelling}', expected one of {known:?}")
+}
+
 /// ISDCF Doc 5 KDM formulation: which devices the KDM names and whether it
 /// carries a ContentAuthenticator.
 ///
@@ -1128,7 +1173,8 @@ pub enum KdmFormulation {
 }
 
 impl KdmFormulation {
-    const ALL: [Self; 4] = [
+    /// Every formulation, for a caller listing the choices on a command line.
+    pub const ALL: [Self; 4] = [
         Self::ModifiedTransitional1,
         Self::MultipleModifiedTransitional1,
         Self::DciAny,
@@ -1148,7 +1194,10 @@ impl KdmFormulation {
 
     /// True when the DeviceList carries the caller's device certificates, false
     /// when it carries the assume-trust thumbprint alone.
-    fn lists_supplied_devices(self) -> bool {
+    ///
+    /// `KdmConfig::device_cert_files` has to agree with this, so a caller can
+    /// reject the combination and name its own flags before doing any work.
+    pub fn lists_supplied_devices(self) -> bool {
         matches!(
             self,
             Self::MultipleModifiedTransitional1 | Self::DciSpecific
@@ -1162,7 +1211,7 @@ impl KdmFormulation {
 
     /// The formulation with the same ContentAuthenticator choice and the other
     /// device-list rule, named when a caller's device list contradicts theirs.
-    fn device_list_counterpart(self) -> Self {
+    pub fn device_list_counterpart(self) -> Self {
         match self {
             Self::ModifiedTransitional1 => Self::MultipleModifiedTransitional1,
             Self::MultipleModifiedTransitional1 => Self::ModifiedTransitional1,
@@ -1185,10 +1234,7 @@ impl std::str::FromStr for KdmFormulation {
         Self::ALL
             .into_iter()
             .find(|formulation| formulation.as_str() == s)
-            .ok_or_else(|| {
-                let known: Vec<&str> = Self::ALL.iter().map(|f| f.as_str()).collect();
-                format!("unknown KDM formulation '{s}', expected one of {known:?}")
-            })
+            .ok_or_else(|| unknown_spelling("KDM formulation", s, &Self::ALL.map(Self::as_str)))
     }
 }
 
@@ -1343,8 +1389,11 @@ const FORENSIC_MARK_AUDIO_DISABLE: &str =
 /// Appended to the audio URI with a channel number when marking stops above
 /// that channel rather than on all of them.
 const FORENSIC_MARK_ABOVE_CHANNEL_SUFFIX: &str = "-above-channel-";
-const FORENSIC_MARK_FLAG_LIST_ELEMENT: &str = "ForensicMarkFlagList";
-const FORENSIC_MARK_FLAG_ELEMENT: &str = "ForensicMarkFlag";
+/// Element wrapping the marking flags, absent when marking stays on for both
+/// essence types. Public so a caller can assert on a written KDM.
+pub const FORENSIC_MARK_FLAG_LIST_ELEMENT: &str = "ForensicMarkFlagList";
+/// Element holding one flag URI, as `forensic_mark_flag_uris` renders it.
+pub const FORENSIC_MARK_FLAG_ELEMENT: &str = "ForensicMarkFlag";
 
 // SMPTE 430-3 ETM ds:Signature profile. Every URI below is what libdcp emits
 // in src/encrypted_kdm.cc / src/certificate_chain.cc for a KDM (distinct from
@@ -1353,10 +1402,12 @@ const FORENSIC_MARK_FLAG_ELEMENT: &str = "ForensicMarkFlag";
 const ETM_NS: &str = "http://www.smpte-ra.org/schemas/430-3/2006/ETM";
 const KDM_NS: &str = "http://www.smpte-ra.org/schemas/430-1/2006/KDM";
 const ENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
-/// The two KDMRequiredExtensions elements the formulation decides, named once
-/// because they are both written here and read back when a KDM is compared.
-const CERTIFICATE_THUMBPRINT_ELEMENT: &str = "CertificateThumbprint";
-const CONTENT_AUTHENTICATOR_ELEMENT: &str = "ContentAuthenticator";
+/// Element the DeviceList entries go into, one per authorized device (or the
+/// single assume-trust value). Public so a caller can assert on a written KDM.
+pub const CERTIFICATE_THUMBPRINT_ELEMENT: &str = "CertificateThumbprint";
+/// Element naming the certificate whose key the security manager must find in
+/// the CPL signer chain. Present only for the two `dci-*` formulations.
+pub const CONTENT_AUTHENTICATOR_ELEMENT: &str = "ContentAuthenticator";
 /// The two elements a distinguished name goes into, named for the same reason.
 /// The issuer name is an XML-DSig element and carries that namespace's prefix;
 /// the subject name is the KDM's own.
@@ -2622,15 +2673,17 @@ fn build_authorized_device_info(device_cert_files: &[PathBuf]) -> Result<String,
     ))
 }
 
-/// Build the ForensicMarkFlagList of ST 430-1 Annex C, empty when nothing is
-/// disabled: the element is `minOccurs="0"` and libdcp omits it entirely rather
-/// than writing an empty list.
+/// The ST 430-1 Annex C flag URIs a marking pair writes, in the order they go
+/// into the KDM: picture first, matching libdcp. Empty when marking stays on
+/// for both, which is the case where no ForensicMarkFlagList is written at all.
 ///
-/// Picture comes before audio, matching libdcp's order.
-fn build_forensic_mark_flag_list(
+/// These are the `ForensicMarkFlag` elements a generated KDM ends up carrying,
+/// so a caller checking its own output asks here rather than spelling the URIs
+/// out again.
+pub fn forensic_mark_flag_uris(
     picture: PictureForensicMarking,
     audio: AudioForensicMarking,
-) -> String {
+) -> Vec<String> {
     let picture_flag = match picture {
         PictureForensicMarking::Enabled => None,
         PictureForensicMarking::Disabled => Some(FORENSIC_MARK_PICTURE_DISABLE.to_string()),
@@ -2646,11 +2699,19 @@ fn build_forensic_mark_flag_list(
             "{FORENSIC_MARK_AUDIO_DISABLE}{FORENSIC_MARK_ABOVE_CHANNEL_SUFFIX}{channel}"
         )),
     };
+    [picture_flag, audio_flag].into_iter().flatten().collect()
+}
 
+/// Build the ForensicMarkFlagList of ST 430-1 Annex C, empty when nothing is
+/// disabled: the element is `minOccurs="0"` and libdcp omits it entirely rather
+/// than writing an empty list.
+fn build_forensic_mark_flag_list(
+    picture: PictureForensicMarking,
+    audio: AudioForensicMarking,
+) -> String {
     // A URI has no character XML would have to escape.
-    let flags: String = [picture_flag, audio_flag]
+    let flags: String = forensic_mark_flag_uris(picture, audio)
         .into_iter()
-        .flatten()
         .map(|uri| {
             format!(
                 "          <{FORENSIC_MARK_FLAG_ELEMENT}>{uri}</{FORENSIC_MARK_FLAG_ELEMENT}>\n"
@@ -5189,5 +5250,195 @@ mod tests {
             subject > issuer_serial_end,
             "X509SubjectName is a sibling of X509IssuerSerial, not a child of it"
         );
+    }
+
+    /// The four ISDCF names a command line offers under `--formulation`. Spelled
+    /// out here because this is the value the table has to hold, not something
+    /// derived from it.
+    #[test]
+    fn the_public_formulation_table_holds_every_isdcf_name() {
+        let spellings: Vec<&str> = KdmFormulation::ALL.iter().map(|f| f.as_str()).collect();
+        assert_eq!(
+            spellings,
+            vec![
+                "modified-transitional-1",
+                "multiple-modified-transitional-1",
+                "dci-any",
+                "dci-specific",
+            ]
+        );
+    }
+
+    /// A caller validates the formulation against its device list before doing
+    /// any work, so the public predicates have to reach the verdict `build_kdm`
+    /// reaches later. The paths are never opened by this check.
+    #[test]
+    fn the_device_list_predicates_agree_with_what_generation_enforces() {
+        let no_devices: Vec<PathBuf> = vec![];
+        let one_device = vec![PathBuf::from("device.pem")];
+
+        for formulation in KdmFormulation::ALL {
+            let takes_devices = formulation.lists_supplied_devices();
+            assert_eq!(
+                check_formulation_devices(formulation, &one_device).is_ok(),
+                takes_devices,
+                "{formulation} with a device list"
+            );
+            assert_eq!(
+                check_formulation_devices(formulation, &no_devices).is_ok(),
+                !takes_devices,
+                "{formulation} with no device list"
+            );
+
+            let counterpart = formulation.device_list_counterpart();
+            assert_ne!(counterpart, formulation);
+            assert_eq!(
+                counterpart.lists_supplied_devices(),
+                !takes_devices,
+                "the counterpart named in an error must take the device list {formulation} cannot"
+            );
+        }
+    }
+
+    #[test]
+    fn both_kdm_format_spellings_round_trip() {
+        assert_eq!(KdmFormat::Smpte.as_str(), "smpte");
+        assert_eq!(KdmFormat::Interop.as_str(), "interop");
+        for format in KdmFormat::ALL {
+            assert_eq!(format.as_str().parse::<KdmFormat>().unwrap(), format);
+            assert_eq!(format.to_string(), format.as_str());
+        }
+
+        let err = "smtpe".parse::<KdmFormat>().unwrap_err();
+        for format in KdmFormat::ALL {
+            assert!(err.contains(format.as_str()), "got: {err}");
+        }
+    }
+
+    /// The command line spelling is a separate vocabulary from the stored one:
+    /// a preferences file written before `FromStr` existed still reads back.
+    #[test]
+    fn kdm_format_serde_still_uses_the_variant_names() {
+        assert_eq!(
+            serde_json::to_string(&KdmFormat::Interop).unwrap(),
+            "\"Interop\""
+        );
+        assert_eq!(
+            serde_json::from_str::<KdmFormat>("\"Interop\"").unwrap(),
+            KdmFormat::Interop
+        );
+    }
+
+    /// A caller checking its own output asks for the URIs rather than spelling
+    /// them out, so every marking state has to render what the KDM carries.
+    #[test]
+    fn forensic_mark_flag_uris_are_what_a_written_kdm_carries() {
+        let f = fixtures();
+        let states = forensic_marking_states()
+            .into_iter()
+            .map(|(label, picture, audio, _)| (label, picture, audio))
+            .chain([(
+                "picture-and-audio-disabled",
+                PictureForensicMarking::Disabled,
+                AudioForensicMarking::DisabledAboveChannel(HI_VI_CHANNEL),
+            )]);
+        for (label, picture, audio) in states {
+            let mut config = test_config(f, PathBuf::from("unused"));
+            config.picture_forensic_marking = picture;
+            config.audio_forensic_marking = audio;
+            let kdm = build_kdm(&config).expect("build");
+            assert_eq!(
+                forensic_mark_flag_uris(picture, audio),
+                elements_in(&kdm.xml, FORENSIC_MARK_FLAG_ELEMENT),
+                "{label}"
+            );
+        }
+
+        assert!(
+            forensic_mark_flag_uris(
+                PictureForensicMarking::Enabled,
+                AudioForensicMarking::Enabled
+            )
+            .is_empty(),
+            "marking left on writes no flag at all"
+        );
+    }
+
+    /// Each public element name against a KDM built to contain it.
+    #[test]
+    fn the_public_element_names_find_what_a_kdm_is_written_with() {
+        let f = fixtures();
+        let mut config = formulation_config(f, KdmFormulation::DciSpecific);
+        config.picture_forensic_marking = PictureForensicMarking::Disabled;
+        let kdm = build_kdm(&config).expect("build");
+
+        assert_eq!(
+            content_authenticators_in(&kdm.xml),
+            vec![expected_thumbprint(&config.signer_cert_file)],
+            "ContentAuthenticator must find the element dci-specific writes"
+        );
+        assert_eq!(
+            thumbprints_in(&kdm.xml).len(),
+            config.device_cert_files.len(),
+            "CertificateThumbprint must find one element per listed device"
+        );
+        assert_eq!(
+            elements_in(&kdm.xml, FORENSIC_MARK_FLAG_LIST_ELEMENT).len(),
+            1,
+            "ForensicMarkFlagList must find the list a disabled marking writes"
+        );
+        assert_eq!(
+            elements_in(&kdm.xml, FORENSIC_MARK_FLAG_ELEMENT),
+            forensic_mark_flag_uris(
+                config.picture_forensic_marking,
+                config.audio_forensic_marking
+            ),
+            "ForensicMarkFlag must find one element per rendered URI"
+        );
+    }
+
+    /// The validity bounds of a generated certificate.
+    struct CertificateValidity {
+        not_before: chrono::DateTime<chrono::Utc>,
+        not_after: chrono::DateTime<chrono::Utc>,
+    }
+
+    fn certificate_validity(cert_path: &Path) -> CertificateValidity {
+        use x509_parser::prelude::*;
+        let data = std::fs::read(cert_path).expect("read certificate");
+        let (_, pem) = parse_x509_pem(&data).expect("parse PEM");
+        let cert = pem.parse_x509().expect("parse X.509");
+        CertificateValidity {
+            not_before: certificate_validity_timestamp(cert.validity().not_before).unwrap(),
+            not_after: certificate_validity_timestamp(cert.validity().not_after).unwrap(),
+        }
+    }
+
+    /// Each tier is minted after the one above it, so equal spans would leave a
+    /// child outliving the issuer that vouches for it.
+    #[test]
+    fn each_certificate_tier_expires_inside_its_issuer() {
+        let f = fixtures();
+        let root = certificate_validity(&f.root);
+        let intermediate = certificate_validity(&f.intermediate);
+        let leaf = certificate_validity(&f.signer);
+
+        for (child, issuer, label) in [
+            (&intermediate, &root, "the intermediate under the root"),
+            (&leaf, &intermediate, "the leaf under the intermediate"),
+        ] {
+            assert!(
+                child.not_after < issuer.not_after,
+                "{label} must expire first, got {} against {}",
+                child.not_after,
+                issuer.not_after
+            );
+            assert!(
+                child.not_before >= issuer.not_before,
+                "{label} must not start before its issuer, got {} against {}",
+                child.not_before,
+                issuer.not_before
+            );
+        }
     }
 }
