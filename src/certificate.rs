@@ -26,7 +26,7 @@ pub struct CertOptions {
     pub country: String,
     /// RSA key size
     pub key_bits: u32,
-    /// Validity in days (default 10 years)
+    /// Validity in days, defaulting to `CERTIFICATE_VALIDITY_DAYS`
     pub validity_days: u32,
     pub output_cert: PathBuf,
     pub output_key: PathBuf,
@@ -44,7 +44,7 @@ impl Default for CertOptions {
             organizational_unit: String::new(),
             country: "US".to_string(),
             key_bits: 2048,
-            validity_days: 3650,
+            validity_days: CERTIFICATE_VALIDITY_DAYS,
             output_cert: PathBuf::new(),
             output_key: PathBuf::new(),
             issuer_cert: PathBuf::new(),
@@ -134,6 +134,18 @@ const CN_TIER_LEAF: &str = "LEAF";
 const ROOT_PATH_LEN_CONSTRAINT: u8 = 3;
 const INTERMEDIATE_PATH_LEN_CONSTRAINT: u8 = 2;
 
+/// DCP-o-matic's `Config::check_certificates` refuses a signer chain holding a
+/// certificate whose not_after year is more than this many years past its
+/// not_before year.
+const MAX_CERTIFICATE_VALIDITY_YEARS: i32 = 15;
+/// The lifetime every tier of a generated chain gets, matching the
+/// `CERTIFICATE_VALIDITY_PERIOD` DCP-o-matic mints its own chain with.
+const CERTIFICATE_VALIDITY_YEARS: u32 = 10;
+/// Validity is counted in whole days, and a nominal year is enough: the leap
+/// days it ignores only shorten the span the limit above caps.
+const DAYS_PER_YEAR: u32 = 365;
+const CERTIFICATE_VALIDITY_DAYS: u32 = CERTIFICATE_VALIDITY_YEARS * DAYS_PER_YEAR;
+
 /// A ST 430-2 5.3.1 CommonName: role token, entity, standard, tier.
 fn common_name(role: &str, organization: &str, tier: &str) -> String {
     format!("{role}.{organization}.{CN_STANDARD_TOKEN}.{tier}")
@@ -152,6 +164,108 @@ fn printable_dn_value(label: &str, value: &str) -> Result<rcgen::DnValue, String
                  ST 430-2 5.3 requires: {e}"
             )
         })
+}
+
+/// RFC 4514 2 joins RDNs with this, unpadded, most specific first.
+const DN_RDN_SEPARATOR: &str = ",";
+/// RFC 4514 2 joins the attributes inside one multi-valued RDN with this.
+const DN_ATTRIBUTE_SEPARATOR: &str = "+";
+/// RFC 4514 3 short names for the attribute types it names, plus the X.520
+/// dnQualifier ST 430-2 5.3.1 puts on every digital cinema certificate. The
+/// five a DCI certificate can hold are spelled the same by OpenSSL, so libdcp's
+/// output agrees attribute for attribute.
+const DN_ATTRIBUTE_SHORT_NAMES: &[(&[u64], &str)] = &[
+    (&[2, 5, 4, 3], "CN"),
+    (&[2, 5, 4, 6], "C"),
+    (&[2, 5, 4, 7], "L"),
+    (&[2, 5, 4, 8], "ST"),
+    (&[2, 5, 4, 9], "STREET"),
+    (&[2, 5, 4, 10], "O"),
+    (&[2, 5, 4, 11], "OU"),
+    (&DN_QUALIFIER_OID, "dnQualifier"),
+    (&[0, 9, 2342, 19200300, 100, 1, 1], "UID"),
+    (&[0, 9, 2342, 19200300, 100, 1, 25], "DC"),
+];
+/// RFC 4514 3 puts a backslash before an escaped character or its hex pair.
+const DN_ESCAPE: char = '\\';
+/// RFC 4514 3 escapes these wherever they appear in a value.
+const DN_ALWAYS_ESCAPED: &[char] = &['"', '+', ',', ';', '<', '>', '\\'];
+/// RFC 4514 3 escapes these only as the first character of a value.
+const DN_LEADING_ESCAPED: &[char] = &['#', ' '];
+/// RFC 4514 3 escapes a space as the last character of a value too.
+const DN_TRAILING_ESCAPED: char = ' ';
+/// RFC 4514 2.4 marks a hex-encoded AttributeValue with this.
+const DN_HEX_VALUE_PREFIX: &str = "#";
+
+/// Render a distinguished name the way ST 430-1 wants X509SubjectName and
+/// X509IssuerName spelled: RFC 4514, most specific RDN first.
+///
+/// Every DN postkit writes or prints goes through here. x509-parser's own
+/// `Display` walks the DER order and pads the separator, so a projector
+/// matching a KDM recipient against its own certificate would not recognise
+/// the name; libdcp prints these with OpenSSL's `XN_FLAG_RFC2253`, and postkit
+/// has to agree with it byte for byte.
+pub(crate) fn distinguished_name(name: &x509_parser::x509::X509Name<'_>) -> String {
+    let mut rdns: Vec<String> = name
+        .iter_rdn()
+        .map(|rdn| {
+            rdn.iter()
+                .map(render_dn_attribute)
+                .collect::<Vec<_>>()
+                .join(DN_ATTRIBUTE_SEPARATOR)
+        })
+        .collect();
+    rdns.reverse();
+    rdns.join(DN_RDN_SEPARATOR)
+}
+
+/// One `type=value` pair of a distinguished name.
+fn render_dn_attribute(attribute: &x509_parser::x509::AttributeTypeAndValue<'_>) -> String {
+    let oid = attribute.attr_type();
+    match dn_attribute_short_name(oid).zip(attribute.as_str().ok()) {
+        Some((short_name, value)) => format!("{short_name}={}", escape_dn_value(value)),
+        // RFC 4514 2.4: a type with no short name, or a value that is not a
+        // string, is written as the dotted OID and the hex of the value's DER.
+        None => {
+            use x509_parser::der_parser::asn1_rs::ToDer;
+            // A value that was just parsed always re-encodes, and a DN out of a
+            // recipient certificate must not be able to panic the KDM writer.
+            let der = attribute.attr_value().to_der_vec().unwrap_or_default();
+            let hex: String = der.iter().map(|byte| format!("{byte:02X}")).collect();
+            format!("{}={DN_HEX_VALUE_PREFIX}{hex}", oid.to_id_string())
+        }
+    }
+}
+
+/// The RFC 4514 short name for an attribute type, if it has one.
+fn dn_attribute_short_name(oid: &x509_parser::der_parser::Oid<'_>) -> Option<&'static str> {
+    let arcs: Vec<u64> = oid.iter()?.collect();
+    DN_ATTRIBUTE_SHORT_NAMES
+        .iter()
+        .find(|(candidate, _)| *candidate == arcs.as_slice())
+        .map(|(_, short_name)| *short_name)
+}
+
+/// Escape one attribute value per RFC 4514 3.
+fn escape_dn_value(value: &str) -> String {
+    let last = value.chars().count().saturating_sub(1);
+    let mut escaped = String::with_capacity(value.len());
+    for (index, character) in value.chars().enumerate() {
+        let escaped_here = (index == 0 && DN_LEADING_ESCAPED.contains(&character))
+            || (index == last && character == DN_TRAILING_ESCAPED);
+        if DN_ALWAYS_ESCAPED.contains(&character) || escaped_here {
+            escaped.push(DN_ESCAPE);
+            escaped.push(character);
+        } else if character.is_control() {
+            let mut utf8 = [0u8; 4];
+            for byte in character.encode_utf8(&mut utf8).as_bytes() {
+                escaped.push_str(&format!("{DN_ESCAPE}{byte:02X}"));
+            }
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
 }
 
 /// The ST 430-2 5.3.1 public key digest: SHA-1 over the public key BIT STRING
@@ -199,11 +313,25 @@ fn certificate_serial() -> Result<rcgen::SerialNumber, String> {
 /// `opts.common_name` is written verbatim. ST 430-2 5.3.1 wants a role token
 /// before the first '.' ("CS" for a content signer, empty for a CA), so a
 /// caller building a DCI chain by hand has to spell that itself; `generate_chain`
-/// does it for the chain it builds.
+/// does it for the chain it builds. A validity longer than
+/// `MAX_CERTIFICATE_VALIDITY_YEARS` is refused here rather than minted into a
+/// certificate DCP-o-matic would then reject.
 pub fn generate_certificate(opts: &CertOptions) -> i32 {
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
     };
+
+    let not_before = time::OffsetDateTime::now_utc();
+    let not_after = not_before + time::Duration::days(opts.validity_days as i64);
+    let span_years = not_after.year() - not_before.year();
+    if span_years > MAX_CERTIFICATE_VALIDITY_YEARS {
+        tracing::error!(
+            "a validity of {} days spans {span_years} years, and DCP-o-matic refuses \
+             any signer certificate spanning more than {MAX_CERTIFICATE_VALIDITY_YEARS}",
+            opts.validity_days
+        );
+        return -1;
+    }
 
     let key_pair = match generate_rsa_keypair(opts.key_bits) {
         Ok(kp) => kp,
@@ -277,9 +405,8 @@ pub fn generate_certificate(opts: &CertOptions) -> i32 {
         }
     };
 
-    let now = time::OffsetDateTime::now_utc();
-    params.not_before = now;
-    params.not_after = now + time::Duration::days(opts.validity_days as i64);
+    params.not_before = not_before;
+    params.not_after = not_after;
 
     match opts.cert_type {
         CertType::Root => {
@@ -389,7 +516,7 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
         common_name: common_name(CN_ROLE_CERTIFICATE_AUTHORITY, organization, CN_TIER_ROOT),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
-        validity_days: 3650 * 3, // 30 years
+        validity_days: CERTIFICATE_VALIDITY_DAYS,
         output_cert: output_dir.join("root.pem"),
         output_key: output_dir.join("root.key"),
         ..Default::default()
@@ -408,7 +535,7 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
         ),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
-        validity_days: 3650 * 2, // 20 years
+        validity_days: CERTIFICATE_VALIDITY_DAYS,
         output_cert: output_dir.join("intermediate.pem"),
         output_key: output_dir.join("intermediate.key"),
         issuer_cert: output_dir.join("root.pem"),
@@ -425,7 +552,7 @@ pub fn generate_chain(organization: &str, output_dir: &Path) -> i32 {
         common_name: common_name(CN_ROLE_CONTENT_SIGNER, organization, CN_TIER_LEAF),
         organization: organization.to_string(),
         organizational_unit: "Digital Cinema".to_string(),
-        validity_days: 3650,
+        validity_days: CERTIFICATE_VALIDITY_DAYS,
         output_cert: output_dir.join("signer.pem"),
         output_key: output_dir.join("signer.key"),
         issuer_cert: output_dir.join("intermediate.pem"),
@@ -743,16 +870,16 @@ fn validate_chain_inner(
                 format!(
                     "root cert is not self-issued: {} (subject '{}', issuer '{}')",
                     chain[i].display(),
-                    certs[i].subject(),
-                    certs[i].issuer()
+                    distinguished_name(certs[i].subject()),
+                    distinguished_name(certs[i].issuer())
                 )
             } else {
                 format!(
                     "chain broken: issuer of {} ('{}') does not match subject of {} ('{}')",
                     chain[i].display(),
-                    certs[i].issuer(),
+                    distinguished_name(certs[i].issuer()),
                     chain[i + 1].display(),
-                    issuer.subject()
+                    distinguished_name(issuer.subject())
                 )
             });
         }
@@ -1230,6 +1357,11 @@ const ENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
 /// because they are both written here and read back when a KDM is compared.
 const CERTIFICATE_THUMBPRINT_ELEMENT: &str = "CertificateThumbprint";
 const CONTENT_AUTHENTICATOR_ELEMENT: &str = "ContentAuthenticator";
+/// The two elements a distinguished name goes into, named for the same reason.
+/// The issuer name is an XML-DSig element and carries that namespace's prefix;
+/// the subject name is the KDM's own.
+const X509_SUBJECT_NAME_ELEMENT: &str = "X509SubjectName";
+const X509_ISSUER_NAME_ELEMENT: &str = "ds:X509IssuerName";
 
 /// Id attribute values on the two authenticated elements. The ds:Reference
 /// URIs point at these, and a verifier resolves them via the Id attribute.
@@ -1617,17 +1749,17 @@ fn build_kdm_xml(
     <AnnotationText>{annotation}</AnnotationText>
     <IssueDate>{issue_date}</IssueDate>
     <Signer xmlns:ds="{DSIG_NS}">
-      <ds:X509IssuerName>{signer_issuer}</ds:X509IssuerName>
+      <{X509_ISSUER_NAME_ELEMENT}>{signer_issuer}</{X509_ISSUER_NAME_ELEMENT}>
       <ds:X509SerialNumber>{signer_serial}</ds:X509SerialNumber>
     </Signer>
     <RequiredExtensions>
       <KDMRequiredExtensions xmlns="{kdm_ns}">
         <Recipient>
           <X509IssuerSerial xmlns:ds="{DSIG_NS}">
-            <ds:X509IssuerName>{recipient_issuer}</ds:X509IssuerName>
+            <{X509_ISSUER_NAME_ELEMENT}>{recipient_issuer}</{X509_ISSUER_NAME_ELEMENT}>
             <ds:X509SerialNumber>{recipient_serial}</ds:X509SerialNumber>
           </X509IssuerSerial>
-          <X509SubjectName>{recipient_subject}</X509SubjectName>
+          <{X509_SUBJECT_NAME_ELEMENT}>{recipient_subject}</{X509_SUBJECT_NAME_ELEMENT}>
         </Recipient>
         <CompositionPlaylistId>urn:uuid:{cpl_uuid}</CompositionPlaylistId>
         <ContentTitleText>{title}</ContentTitleText>
@@ -2558,7 +2690,7 @@ fn parse_signer(cert_path: &Path) -> Result<Signer, String> {
     })?;
 
     Ok(Signer {
-        issuer_dn: cert.issuer().to_string(),
+        issuer_dn: distinguished_name(cert.issuer()),
         serial: cert.serial.to_str_radix(10),
         thumbprint: cert_thumbprint(cert.tbs_certificate.as_ref()),
     })
@@ -2630,8 +2762,8 @@ fn parse_recipient(cert_path: &Path) -> Result<Recipient, String> {
     let not_after = certificate_validity_timestamp(cert.validity().not_after)?;
 
     Ok(Recipient {
-        subject_dn: cert.subject().to_string(),
-        issuer_dn: cert.issuer().to_string(),
+        subject_dn: distinguished_name(cert.subject()),
+        issuer_dn: distinguished_name(cert.issuer()),
         // X509SerialNumber is a decimal integer in XML-DSig
         serial: cert.serial.to_str_radix(10),
         public_key,
@@ -4369,6 +4501,139 @@ mod tests {
                  present only for the dci formulations"
             );
         }
+    }
+
+    /// The subject and issuer of a fixture certificate, as postkit spells them
+    /// into a KDM: rendered, then XML-escaped exactly as the writer does, so
+    /// the comparison is against the bytes in the file.
+    fn dcp_o_matic_names(name: &str) -> (String, String) {
+        use x509_parser::prelude::*;
+
+        let data = std::fs::read(dcp_o_matic_cert(name)).unwrap();
+        let (_, pem) = parse_x509_pem(&data).unwrap();
+        let cert = pem.parse_x509().unwrap();
+        (
+            xml_escape(&distinguished_name(cert.subject())),
+            xml_escape(&distinguished_name(cert.issuer())),
+        )
+    }
+
+    /// libdcp renders both names with OpenSSL's `XN_FLAG_RFC2253`, so postkit's
+    /// rendering of the very certificates DCP-o-matic held has to equal what it
+    /// wrote, byte for byte. The KDM names the leaf's subject as the recipient,
+    /// and the issuer of each of the three certificates in its ds:KeyInfo.
+    #[test]
+    fn distinguished_names_are_spelled_the_way_dcp_o_matic_wrote_them() {
+        let (leaf_subject, leaf_issuer) = dcp_o_matic_names("leaf");
+        let (_, intermediate_issuer) = dcp_o_matic_names("intermediate");
+        let (_, root_issuer) = dcp_o_matic_names("root");
+
+        // The DER order this starts from is a different string, so the equality
+        // below is discriminating and not just any rendering passing.
+        {
+            use x509_parser::prelude::*;
+            let data = std::fs::read(dcp_o_matic_cert("leaf")).unwrap();
+            let (_, pem) = parse_x509_pem(&data).unwrap();
+            let cert = pem.parse_x509().unwrap();
+            assert_ne!(
+                cert.subject().to_string(),
+                leaf_subject,
+                "x509-parser's DER-order Display must not already be the answer"
+            );
+        }
+
+        for formulation in KdmFormulation::ALL {
+            let reference = dcp_o_matic_kdm(formulation);
+
+            assert_eq!(
+                elements_in(&reference, X509_SUBJECT_NAME_ELEMENT),
+                vec![leaf_subject.clone()],
+                "{formulation} recipient subject name"
+            );
+
+            let mut written = elements_in(&reference, X509_ISSUER_NAME_ELEMENT);
+            written.sort();
+            written.dedup();
+            let mut expected = vec![
+                leaf_issuer.clone(),
+                intermediate_issuer.clone(),
+                root_issuer.clone(),
+            ];
+            expected.sort();
+            expected.dedup();
+            assert_eq!(written, expected, "{formulation} issuer names");
+        }
+    }
+
+    /// RFC 4514 escaping is not exercised by any fixture certificate: they hold
+    /// nothing but PrintableString values with no reserved character in them.
+    #[test]
+    fn a_distinguished_name_value_is_escaped_the_way_rfc_4514_requires() {
+        use x509_parser::prelude::*;
+
+        let f = fixtures();
+        let key_pem = std::fs::read_to_string(&f.root_key).expect("read root key");
+        let key = rcgen::KeyPair::from_pem(&key_pem).expect("parse root key");
+
+        let mut params = rcgen::CertificateParams::default();
+        params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            rcgen::DnValue::Utf8String("#a,b+c\"d\\e<f>g;h ".to_string()),
+        );
+        let cert = params.self_signed(&key).expect("self-sign");
+        let pem_text = cert.pem();
+        let (_, pem) = parse_x509_pem(pem_text.as_bytes()).unwrap();
+        let parsed = pem.parse_x509().unwrap();
+
+        assert_eq!(
+            distinguished_name(parsed.subject()),
+            r#"CN=\#a\,b\+c\"d\\e\<f\>g\;h\ "#,
+            "a leading '#', the separators, and a trailing space all take a backslash"
+        );
+    }
+
+    /// DCP-o-matic refuses a signer chain holding a certificate that spans more
+    /// than `MAX_CERTIFICATE_VALIDITY_YEARS`, which is what its
+    /// `Config::check_certificates` measures on the year fields alone.
+    #[test]
+    fn no_generated_tier_spans_longer_than_dcp_o_matic_accepts() {
+        use x509_parser::prelude::*;
+
+        let f = fixtures();
+        for path in [&f.root, &f.intermediate, &f.signer] {
+            let data = std::fs::read(path).unwrap();
+            let (_, pem) = parse_x509_pem(&data).unwrap();
+            let cert = pem.parse_x509().unwrap();
+
+            let span = cert.validity().not_after.to_datetime().year()
+                - cert.validity().not_before.to_datetime().year();
+            assert!(
+                span <= MAX_CERTIFICATE_VALIDITY_YEARS,
+                "{} spans {span} years, more than the {MAX_CERTIFICATE_VALIDITY_YEARS} \
+                 DCP-o-matic accepts",
+                path.display()
+            );
+        }
+    }
+
+    /// A caller asking for a longer validity by hand has to be refused too, and
+    /// before any key is generated for it.
+    #[test]
+    fn an_over_long_validity_is_refused_rather_than_minted() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = CertOptions {
+            cert_type: CertType::Root,
+            common_name: common_name(CN_ROLE_CERTIFICATE_AUTHORITY, "Acme", CN_TIER_ROOT),
+            validity_days: (MAX_CERTIFICATE_VALIDITY_YEARS as u32 + 1) * DAYS_PER_YEAR,
+            output_cert: dir.path().join("root.pem"),
+            output_key: dir.path().join("root.key"),
+            ..Default::default()
+        };
+        assert_eq!(generate_certificate(&opts), -1);
+        assert!(
+            !opts.output_cert.exists(),
+            "nothing may be written for a validity that will be rejected"
+        );
     }
 
     /// The same comparison the other way round: postkit's KDM for the same

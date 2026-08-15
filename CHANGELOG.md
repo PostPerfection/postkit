@@ -27,6 +27,12 @@
 - `KdmConfig.formulation` is a typed `KdmFormulation` that emits
   `ContentAuthenticator` for the dci formulations and rejects a device list its
   formulation would discard, instead of being read by nothing.
+- Every tier of a generated chain is valid for 10 years, and any longer validity
+  is refused: DCP-o-matic rejects a signer certificate spanning more than 15.
+  Regenerate any chain postkit produced earlier.
+- `X509SubjectName` and `X509IssuerName` are written in RFC 4514 order, most
+  specific RDN first, which is what libdcp writes and what a projector matches a
+  KDM recipient against. Reissue any KDM postkit produced earlier.
 
 ## 0.6.0 - 2026-08-13
 

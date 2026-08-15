@@ -1180,7 +1180,7 @@ fn cert_key_info(cert_path: &Path) -> Result<CertKeyInfo, String> {
     })?;
 
     Ok(CertKeyInfo {
-        issuer_dn: cert.issuer().to_string(),
+        issuer_dn: crate::certificate::distinguished_name(cert.issuer()),
         // X509SerialNumber is a decimal integer in XML-DSig.
         serial: cert.serial.to_str_radix(10),
         der_base64: base64::engine::general_purpose::STANDARD.encode(&pem.contents),
