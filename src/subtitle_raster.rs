@@ -31,10 +31,10 @@ pub const DEFAULT_FONT_SIZE_RATIO: f32 = 1.0 / 22.0;
 
 /// Distance from the anchored edge as a fraction of frame height, used when the
 /// cue carries no vposition.
-const DEFAULT_MARGIN_RATIO: f32 = 0.08;
+pub const DEFAULT_MARGIN_RATIO: f32 = 0.08;
 
 /// Line box height as a multiple of the text height.
-const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.25;
+pub const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.25;
 
 /// Underline thickness as a fraction of the text height.
 const UNDERLINE_THICKNESS_RATIO: f32 = 0.06;
@@ -147,6 +147,12 @@ const PERCENT_DIVISOR: f32 = 100.0;
 /// Text taller than the frame itself, which no caller can mean.
 const MAX_FONT_SIZE_PERCENT: f32 = 100.0;
 
+/// A line box shorter than the text itself, which would overlap the line above.
+const MIN_LINE_HEIGHT_RATIO: f32 = 1.0;
+
+/// Half the frame height, past which the text has crossed the middle.
+const MAX_MARGIN_PERCENT: f32 = 50.0;
+
 /// Refuse a text height, as a percent of the frame height, that nothing can draw.
 pub fn check_font_size_percent(percent: f32) -> Result<(), String> {
     if !percent.is_finite() || percent <= 0.0 || percent > MAX_FONT_SIZE_PERCENT {
@@ -168,6 +174,10 @@ pub struct BurnStyleOverrides {
     pub effect_colour: Option<Rgba>,
     /// Outline thickness as a percent of the text height.
     pub outline_width_percent: Option<f32>,
+    /// Line box height as a multiple of the text height.
+    pub line_height_ratio: Option<f32>,
+    /// Distance from the anchored edge as a percent of the frame height.
+    pub margin_percent: Option<f32>,
     pub x_scale: Option<f32>,
     pub y_scale: Option<f32>,
     pub fade_up_ms: Option<u64>,
@@ -189,6 +199,22 @@ impl BurnStyleOverrides {
                 ));
             }
             style.outline_width_ratio = percent / PERCENT_DIVISOR;
+        }
+        if let Some(ratio) = self.line_height_ratio {
+            if !ratio.is_finite() || ratio < MIN_LINE_HEIGHT_RATIO {
+                return Err(format!(
+                    "a line height is a multiple of the text height of {MIN_LINE_HEIGHT_RATIO} or more, got {ratio}"
+                ));
+            }
+            style.line_height_ratio = ratio;
+        }
+        if let Some(percent) = self.margin_percent {
+            if !percent.is_finite() || !(0.0..=MAX_MARGIN_PERCENT).contains(&percent) {
+                return Err(format!(
+                    "a margin is a percent of the frame height from 0 up to {MAX_MARGIN_PERCENT}, got {percent}"
+                ));
+            }
+            style.margin_ratio = percent / PERCENT_DIVISOR;
         }
         if let Some(colour) = self.colour {
             style.default_colour = colour;
@@ -1707,6 +1733,8 @@ mod tests {
             effect: Some(BurnEffect::Outline),
             effect_colour: Some(blue),
             outline_width_percent: Some(12.5),
+            line_height_ratio: Some(1.5),
+            margin_percent: Some(12.0),
             x_scale: Some(1.5),
             y_scale: Some(0.5),
             fade_up_ms: Some(200),
@@ -1718,6 +1746,8 @@ mod tests {
         assert_eq!(style.effect, BurnEffect::Outline);
         assert_eq!(style.effect_colour, blue);
         assert_eq!(style.outline_width_ratio, 0.125);
+        assert_eq!(style.line_height_ratio, 1.5);
+        assert_eq!(style.margin_ratio, 0.12);
         assert_eq!(style.x_scale, 1.5);
         assert_eq!(style.y_scale, 0.5);
         assert_eq!(style.fade_up_ms, 200);
@@ -1769,6 +1799,27 @@ mod tests {
                 "outline width",
                 BurnStyleOverrides {
                     outline_width_percent: Some(-1.0),
+                    ..BurnStyleOverrides::default()
+                },
+            ),
+            (
+                "line height",
+                BurnStyleOverrides {
+                    line_height_ratio: Some(0.9),
+                    ..BurnStyleOverrides::default()
+                },
+            ),
+            (
+                "margin",
+                BurnStyleOverrides {
+                    margin_percent: Some(-1.0),
+                    ..BurnStyleOverrides::default()
+                },
+            ),
+            (
+                "margin",
+                BurnStyleOverrides {
+                    margin_percent: Some(51.0),
                     ..BurnStyleOverrides::default()
                 },
             ),
