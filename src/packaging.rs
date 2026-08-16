@@ -231,6 +231,15 @@ pub struct DcpCplReel {
     pub sound_hash: Option<String>,
 }
 
+/// One CPL rating (ST 429-7).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DcpRating {
+    /// URI identifying the rating agency.
+    pub agency: String,
+    /// The rating text issued by that agency.
+    pub label: String,
+}
+
 /// A DCP Composition Playlist (ST 429-7 SMPTE or Interop, by `namespace`).
 #[derive(Debug, Clone, Default)]
 pub struct DcpCpl {
@@ -244,6 +253,9 @@ pub struct DcpCpl {
     pub issue_date: String,
     /// Bv2.1 8.1 requires this and requires it to equal the title.
     pub annotation_text: Option<String>,
+    /// LabelText of the ContentVersion element, the title when None.
+    pub content_version_label: Option<String>,
+    pub ratings: Vec<DcpRating>,
     pub reels: Vec<DcpCplReel>,
 }
 
@@ -289,17 +301,29 @@ impl DcpCpl {
             "  <ContentKind>{}</ContentKind>",
             escape_xml(content_kind)
         );
-        // ContentVersion (required by SMPTE) and an empty RatingList (required by
-        // both), synthesized from the CPL id and title.
+        // ContentVersion (required by SMPTE) and RatingList (required by both,
+        // empty when the caller supplies no ratings).
         xml.push_str("  <ContentVersion>\n");
         let _ = writeln!(xml, "    <Id>urn:uuid:{}</Id>", self.uuid);
+        let content_version_label = self.content_version_label.as_deref().unwrap_or(&self.title);
         let _ = writeln!(
             xml,
             "    <LabelText>{}</LabelText>",
-            escape_xml(&self.title)
+            escape_xml(content_version_label)
         );
         xml.push_str("  </ContentVersion>\n");
-        xml.push_str("  <RatingList/>\n");
+        if self.ratings.is_empty() {
+            xml.push_str("  <RatingList/>\n");
+        } else {
+            xml.push_str("  <RatingList>\n");
+            for rating in &self.ratings {
+                xml.push_str("    <Rating>\n");
+                let _ = writeln!(xml, "      <Agency>{}</Agency>", escape_xml(&rating.agency));
+                let _ = writeln!(xml, "      <Label>{}</Label>", escape_xml(&rating.label));
+                xml.push_str("    </Rating>\n");
+            }
+            xml.push_str("  </RatingList>\n");
+        }
         xml.push_str("  <ReelList>\n");
         for (i, reel) in self.reels.iter().enumerate() {
             xml.push_str("    <Reel>\n");
@@ -713,6 +737,8 @@ mod tests {
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
             annotation_text: Some("Test".into()),
+            content_version_label: None,
+            ratings: Vec::new(),
             reels: vec![DcpCplReel {
                 reel_id: "66666666-7777-8888-9999-aaaaaaaaaaaa".into(),
                 picture_id: "77777777-7777-8888-9999-aaaaaaaaaaaa".into(),
@@ -742,6 +768,8 @@ mod tests {
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
             annotation_text: Some("Test".into()),
+            content_version_label: None,
+            ratings: Vec::new(),
             reels: vec![DcpCplReel {
                 reel_id: "66666666-7777-8888-9999-aaaaaaaaaaaa".into(),
                 picture_id: "77777777-7777-8888-9999-aaaaaaaaaaaa".into(),
@@ -1032,6 +1060,8 @@ mod tests {
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
             annotation_text: Some("Test".into()),
+            content_version_label: None,
+            ratings: Vec::new(),
             reels: vec![DcpCplReel {
                 reel_id: "reel".into(),
                 picture_id: "pic".into(),
@@ -1078,6 +1108,68 @@ mod tests {
         assert!(xml.contains("<Hash>cGljdHVyZS1oYXNo</Hash>"));
         assert!(xml.contains("<Hash>c291bmQtaGFzaA==</Hash>"));
         assert!(xml.find("<KeyId>").unwrap() < xml.find("<Hash>").unwrap());
+    }
+
+    #[test]
+    fn dcp_cpl_writes_ratings_in_order() {
+        let cpl = DcpCpl {
+            uuid: "cpl".into(),
+            namespace: ns::CPL_SMPTE.into(),
+            title: "Test".into(),
+            ratings: vec![
+                DcpRating {
+                    agency: "http://www.mpaa.org/2003-ratings".into(),
+                    label: "PG-13".into(),
+                },
+                DcpRating {
+                    agency: "http://rcq.qc.ca/2010-ratings".into(),
+                    label: "13 & over".into(),
+                },
+            ],
+            reels: vec![DcpCplReel {
+                reel_id: "reel".into(),
+                picture_id: "pic".into(),
+                picture_edit_rate_num: 24,
+                picture_edit_rate_den: 1,
+                picture_width: 1998,
+                picture_height: 1080,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        assert!(!xml.contains("<RatingList/>"));
+        let first = "    <Rating>\n      <Agency>http://www.mpaa.org/2003-ratings</Agency>\n      <Label>PG-13</Label>\n    </Rating>\n";
+        let second = "    <Rating>\n      <Agency>http://rcq.qc.ca/2010-ratings</Agency>\n      <Label>13 &amp; over</Label>\n    </Rating>\n";
+        assert!(xml.contains(first));
+        assert!(xml.contains(second));
+        assert!(xml.find(first).unwrap() < xml.find(second).unwrap());
+        assert!(xml.find("<RatingList>").unwrap() < xml.find(first).unwrap());
+        assert!(xml.find(second).unwrap() < xml.find("</RatingList>").unwrap());
+        assert!(xml.find("</RatingList>").unwrap() < xml.find("<ReelList>").unwrap());
+    }
+
+    #[test]
+    fn dcp_cpl_content_version_label_overrides_title() {
+        let cpl = DcpCpl {
+            uuid: "cpl".into(),
+            namespace: ns::CPL_SMPTE.into(),
+            title: "Feature Title".into(),
+            content_version_label: Some("Feature Title Version 2".into()),
+            reels: vec![DcpCplReel {
+                reel_id: "reel".into(),
+                picture_id: "pic".into(),
+                picture_edit_rate_num: 24,
+                picture_edit_rate_den: 1,
+                picture_width: 1998,
+                picture_height: 1080,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        assert!(xml.contains("<LabelText>Feature Title Version 2</LabelText>"));
+        assert!(xml.contains("<ContentTitleText>Feature Title</ContentTitleText>"));
     }
 
     #[test]
