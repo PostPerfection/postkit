@@ -48,6 +48,7 @@ Audio DSP (pure PCM, no ffmpeg):
 - mid_side: M/S to L/R decode in place (L=M+S, R=M-S with DoM's /2 normalization), leaving every other channel byte-identical
 - upmix: stereo to 5.1, mirroring DoM's two upmixers (A splits by band through blackman-windowed sinc FIR filters, B is passthrough L/R with a summed centre, lowpassed LFE, and a 20 ms-delayed L-R to both surrounds). Interleaved f32 or stereo-WAV in, 6-channel DCP order L,R,C,LFE,Ls,Rs out
 - crossfade: equal-power (cos/sin) join of two PCM sources by frame or by WAV file, failing loud on sample-rate/bit-depth/format/channel mismatch or an overlap longer than either source
+- audio_mix_matrix: any input channel to any output channel with a per-cell gain (DoM's audio mapping), the numeric half of the wizards' `--audio-map` flag and matrix widget, channel naming left to the caller. `MixMatrix::parse`/`to_spec` define the shared `IN:OUT@GAIN` grammar once (1-based channel numbers, decibels, several inputs summing into one output), and `mix_wav_files` streams any number of WAVs frame by frame into one output, concatenating their channels, padding a short input with silence, mixing in f64 with rounding and clamping for integer output and counting clipped samples, so a pure routing (one input per output at 0 dB) reproduces its source samples bit for bit at every depth including 32-bit int and float
 
 Workflow and infra:
 - dashboard, version_tracker: sqlite version/delivery DBs

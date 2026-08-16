@@ -98,7 +98,7 @@ impl MixMatrix {
     }
 
     /// True when every output takes at most one input and every routed cell is
-    /// at unity, so `apply` moves samples without touching their values.
+    /// at unity, so `mix_wav_files` moves samples without touching their values.
     pub fn is_pure_routing(&self) -> bool {
         (0..self.output_channels).all(|output| {
             let mut routed = 0;
@@ -240,7 +240,7 @@ fn format_decibels(decibels: f64) -> String {
         .to_string()
 }
 
-/// What `apply` wrote.
+/// What `mix_wav_files` wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixReport {
     pub input_channels: usize,
@@ -289,7 +289,11 @@ fn read_frame(
 /// depth; a shorter one is padded with silence to the longest. Mixing is done in
 /// f64 on the file's own sample values, rounded and clamped for integer output,
 /// so a pure routing reproduces its source samples bit for bit at any depth.
-pub fn apply(matrix: &MixMatrix, inputs: &[PathBuf], output: &Path) -> Result<MixReport, String> {
+pub fn mix_wav_files(
+    matrix: &MixMatrix,
+    inputs: &[PathBuf],
+    output: &Path,
+) -> Result<MixReport, String> {
     if inputs.is_empty() {
         return Err("no input files to mix".to_string());
     }
