@@ -59,3 +59,7 @@ tempfile = "3"
 [[bin]]
 name = "bench_j2k"
 required-features = ["grok-ffi"]
+
+[[test]]
+name = "video_encode_e2e"
+required-features = ["grok-ffi"]
