@@ -159,11 +159,14 @@ pub fn run_encode_with_options(
     };
     // an image sequence only reaches ffmpeg when something has to happen to each
     // frame, and the branch it takes decides which colour paths are open. jpeg
-    // frames always go that way, because grk_compress reads them only if grok was
-    // built with a jpeg loader and ffmpeg always does
+    // and png frames always go that way, because grk_compress reads them only if
+    // grok was built with those loaders and ffmpeg always does
     let sequence_needs_ffmpeg = options.subtitle_burn.is_some()
         || !options.picture.is_identity()
-        || sequence_frame_format == Some(ImageFormat::Jpeg);
+        || matches!(
+            sequence_frame_format,
+            Some(ImageFormat::Jpeg | ImageFormat::Png)
+        );
     let decodes_through_ffmpeg = match input_type {
         InputType::Video => true,
         InputType::ImageSequence => sequence_needs_ffmpeg,

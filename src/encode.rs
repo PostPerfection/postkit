@@ -99,7 +99,7 @@ pub fn detect_input_type(path: &Path) -> InputType {
                     .unwrap_or_default();
                 match ext.as_str() {
                     "j2c" | "j2k" => return InputType::J2kSequence,
-                    "tif" | "tiff" | "dpx" | "exr" | "bmp" | "jpg" | "jpeg" => {
+                    "tif" | "tiff" | "dpx" | "exr" | "bmp" | "jpg" | "jpeg" | "png" => {
                         return InputType::ImageSequence;
                     }
                     _ => {}
@@ -115,7 +115,9 @@ pub fn detect_input_type(path: &Path) -> InputType {
             .unwrap_or_default();
         match ext.as_str() {
             "mp4" | "mkv" | "mov" | "avi" | "mxf" | "webm" | "ts" | "m2ts" => InputType::Video,
-            "tif" | "tiff" | "dpx" | "exr" | "bmp" | "jpg" | "jpeg" => InputType::ImageSequence,
+            "tif" | "tiff" | "dpx" | "exr" | "bmp" | "jpg" | "jpeg" | "png" => {
+                InputType::ImageSequence
+            }
             "j2c" | "j2k" => InputType::J2kSequence,
             _ => InputType::Unknown,
         }
@@ -1223,6 +1225,10 @@ mod tests {
     fn jpeg_stills_are_an_image_sequence() {
         assert_eq!(
             detect_input_type(Path::new("/frames/shot_0001.jpg")),
+            InputType::ImageSequence
+        );
+        assert_eq!(
+            detect_input_type(Path::new("/frames/shot_0001.png")),
             InputType::ImageSequence
         );
         assert_eq!(
