@@ -1,5 +1,6 @@
 pub mod accessibility;
 pub mod assetmap;
+pub mod audio_mix_matrix;
 pub mod burnin;
 pub mod certificate;
 pub mod colour;
