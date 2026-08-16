@@ -11,6 +11,7 @@ use crate::encode::{
     InputType, ParallelProgress, SourceColour, StreamEncodeOptions, StreamProgress,
     check_codestream_size, encode_parallel, stream_encode_inprocess,
 };
+use crate::picture_processing::PictureProcessing;
 
 /// Progress information emitted during encode.
 #[derive(Clone, Debug)]
@@ -110,6 +111,10 @@ pub struct EncodeRunOptions {
     /// ffmpeg, image sequences included: [`reject_unsupported_burn`] names the
     /// inputs that cannot.
     pub subtitle_burn: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
+    /// Crop, deinterlace, rotate, flip, denoise and raster fit applied while the
+    /// source decodes. Anything but the identity takes an image sequence through
+    /// ffmpeg, the way a burn does.
+    pub picture: PictureProcessing,
 }
 
 impl Default for EncodeRunOptions {
@@ -120,6 +125,7 @@ impl Default for EncodeRunOptions {
             source_colour: SourceColour::DisplayRgb,
             codestream_byte_cap: None,
             subtitle_burn: None,
+            picture: PictureProcessing::default(),
         }
     }
 }
@@ -147,9 +153,20 @@ pub fn run_encode_with_options(
     let start_time = std::time::Instant::now();
     let input_type = crate::encode::detect_input_type(video);
     on_log(&format!("Input type: {:?}", input_type));
-    reject_unsupported_colour_path(input_type, &options.source_colour)?;
+    // an image sequence only reaches ffmpeg when something has to happen to each
+    // frame, and the branch it takes decides which colour paths are open
+    let sequence_needs_ffmpeg = options.subtitle_burn.is_some() || !options.picture.is_identity();
+    let decodes_through_ffmpeg = match input_type {
+        InputType::Video => true,
+        InputType::ImageSequence => sequence_needs_ffmpeg,
+        InputType::J2kSequence | InputType::Unknown => false,
+    };
+    reject_unsupported_colour_path(input_type, &options.source_colour, decodes_through_ffmpeg)?;
     if options.subtitle_burn.is_some() {
         reject_unsupported_burn(input_type, &options.source_colour)?;
+    }
+    if !options.picture.is_identity() {
+        reject_unsupported_picture(input_type)?;
     }
 
     let j2k_dir = output_dir.join("j2k");
@@ -206,6 +223,7 @@ pub fn run_encode_with_options(
                 fps,
                 source_colour: options.source_colour.clone(),
                 subtitle_burn: options.subtitle_burn.clone(),
+                picture: options.picture.clone(),
                 ..StreamEncodeOptions::default()
             })?;
             on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
@@ -217,11 +235,12 @@ pub fn run_encode_with_options(
                 video.parent().unwrap_or(video).to_path_buf()
             };
 
-            if options.subtitle_burn.is_some() {
+            if sequence_needs_ffmpeg {
                 // grk_compress reads the stills itself and never shows postkit a
-                // frame buffer, so a burn takes the sequence through ffmpeg
-                // instead: a concat list holding each still for one frame period
-                // decodes to the same rgb48be stream a video does.
+                // frame buffer, so a burn or a picture change takes the sequence
+                // through ffmpeg instead: a concat list holding each still for
+                // one frame period decodes to the same rgb48be stream a video
+                // does.
                 let frames = crate::encode::find_source_frames(&input_dir)
                     .map_err(|e| format!("cannot list {}: {e}", input_dir.display()))?;
                 if frames.is_empty() {
@@ -230,7 +249,7 @@ pub fn run_encode_with_options(
                 let list = output_dir.join("frames.ffconcat");
                 crate::encode::write_image_concat_list(&frames, fps, &list)?;
                 on_log(&format!(
-                    "[ENCODE] Burning subtitles onto {} images through ffmpeg",
+                    "[ENCODE] Taking {} images through ffmpeg",
                     frames.len()
                 ));
                 frames_encoded = run_stream(&StreamEncodeOptions {
@@ -243,6 +262,7 @@ pub fn run_encode_with_options(
                     fps,
                     source_colour: options.source_colour.clone(),
                     subtitle_burn: options.subtitle_burn.clone(),
+                    picture: options.picture.clone(),
                     decode_source: crate::encode::DecodeSource::ImageList,
                     ..StreamEncodeOptions::default()
                 })?;
@@ -322,19 +342,32 @@ pub fn run_encode_with_options(
 /// Refuse a source colour the chosen input branch cannot honour: the image
 /// sequence encoder hands each file to grk_compress, which only converts
 /// Rec.709, and nothing can be converted once the frames are compressed.
+///
+/// `decodes_through_ffmpeg` is what the sequence limits hang on rather than the
+/// input type: a sequence that a burn or a picture change routes through ffmpeg
+/// reaches the same per-frame hooks a video does, so those limits fall away.
 fn reject_unsupported_colour_path(
     input_type: InputType,
     source_colour: &SourceColour,
+    decodes_through_ffmpeg: bool,
 ) -> Result<(), String> {
     match (input_type, source_colour) {
-        (InputType::ImageSequence, SourceColour::DisplayRgbIn(space)) => Err(format!(
-            "image sequences are compressed straight from file by grk_compress, which only \
-             converts Rec.709: convert a {space:?} sequence to X'Y'Z' first, or encode from \
-             a video"
-        )),
-        (InputType::ImageSequence, colour) if !colour.applies_xyz_transform() => Err(format!(
-            "image sequences are always encoded through the DCDM X'Y'Z' transform, so {colour:?} would be mislabelled"
-        )),
+        (InputType::ImageSequence, SourceColour::DisplayRgbIn(space))
+            if !decodes_through_ffmpeg =>
+        {
+            Err(format!(
+                "image sequences are compressed straight from file by grk_compress, which only \
+                 converts Rec.709: convert a {space:?} sequence to X'Y'Z' first, or encode from \
+                 a video"
+            ))
+        }
+        (InputType::ImageSequence, colour)
+            if !decodes_through_ffmpeg && !colour.applies_xyz_transform() =>
+        {
+            Err(format!(
+                "image sequences are always encoded through the DCDM X'Y'Z' transform, so {colour:?} would be mislabelled"
+            ))
+        }
         (InputType::J2kSequence, SourceColour::DciLut(lut)) => Err(format!(
             "J2K input is already compressed, so the HDR-to-DCI LUT {} cannot be applied",
             lut.display()
@@ -367,6 +400,19 @@ fn reject_unsupported_burn(
         (_, SourceColour::AlreadyPq) => Err(
             "an X'Y'Z' PQ source is already in the projector's colour space, so burnt-in text \
              would be drawn in the wrong one"
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse picture processing the encode cannot honour: cropping, scaling and
+/// the rest happen while ffmpeg decodes, so an input that never decodes has no
+/// picture to process.
+fn reject_unsupported_picture(input_type: InputType) -> Result<(), String> {
+    match input_type {
+        InputType::J2kSequence => Err(
+            "J2K input is already compressed, so there are no frames to crop, rotate or fit"
                 .to_string(),
         ),
         _ => Ok(()),
@@ -424,32 +470,67 @@ mod tests {
         }
     }
 
+    /// The branch an input takes, as `reject_unsupported_colour_path` sees it.
+    const THROUGH_FFMPEG: bool = true;
+    const STRAIGHT_FROM_FILE: bool = false;
+
     #[test]
     fn image_sequences_refuse_an_untransformed_source() {
         assert!(
-            reject_unsupported_colour_path(InputType::ImageSequence, &SourceColour::DisplayRgb)
-                .is_ok()
+            reject_unsupported_colour_path(
+                InputType::ImageSequence,
+                &SourceColour::DisplayRgb,
+                STRAIGHT_FROM_FILE
+            )
+            .is_ok()
         );
         assert!(
-            reject_unsupported_colour_path(InputType::ImageSequence, &SourceColour::AlreadyPq)
-                .is_err()
+            reject_unsupported_colour_path(
+                InputType::ImageSequence,
+                &SourceColour::AlreadyPq,
+                STRAIGHT_FROM_FILE
+            )
+            .is_err()
         );
         assert!(
             reject_unsupported_colour_path(
                 InputType::ImageSequence,
                 &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+                STRAIGHT_FROM_FILE
             )
             .is_err()
         );
     }
 
     #[test]
+    fn a_streamed_image_sequence_takes_the_colours_a_video_does() {
+        let p3 = SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3);
+        assert!(
+            reject_unsupported_colour_path(InputType::ImageSequence, &p3, THROUGH_FFMPEG).is_ok(),
+            "a burn or a picture change decodes the sequence through ffmpeg, where the frame \
+             transform runs"
+        );
+        assert!(
+            reject_unsupported_colour_path(
+                InputType::ImageSequence,
+                &SourceColour::AlreadyPq,
+                THROUGH_FFMPEG
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn a_wide_gamut_source_encodes_from_video_only() {
         let p3 = SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3);
-        assert!(reject_unsupported_colour_path(InputType::Video, &p3).is_ok());
-        let images = reject_unsupported_colour_path(InputType::ImageSequence, &p3).unwrap_err();
+        assert!(reject_unsupported_colour_path(InputType::Video, &p3, THROUGH_FFMPEG).is_ok());
+        let images =
+            reject_unsupported_colour_path(InputType::ImageSequence, &p3, STRAIGHT_FROM_FILE)
+                .unwrap_err();
         assert!(images.contains("P3"), "{images}");
-        let compressed = reject_unsupported_colour_path(InputType::J2kSequence, &p3).unwrap_err();
+        let compressed =
+            reject_unsupported_colour_path(InputType::J2kSequence, &p3, STRAIGHT_FROM_FILE)
+                .unwrap_err();
         assert!(compressed.contains("already compressed"), "{compressed}");
     }
 
@@ -459,20 +540,34 @@ mod tests {
             reject_unsupported_colour_path(
                 InputType::J2kSequence,
                 &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+                STRAIGHT_FROM_FILE
             )
             .is_err()
         );
         assert!(
-            reject_unsupported_colour_path(InputType::J2kSequence, &SourceColour::AlreadyPq)
-                .is_ok()
+            reject_unsupported_colour_path(
+                InputType::J2kSequence,
+                &SourceColour::AlreadyPq,
+                STRAIGHT_FROM_FILE
+            )
+            .is_ok()
         );
         assert!(
             reject_unsupported_colour_path(
                 InputType::Video,
                 &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+                THROUGH_FFMPEG
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn compressed_input_refuses_picture_processing() {
+        assert!(reject_unsupported_picture(InputType::Video).is_ok());
+        assert!(reject_unsupported_picture(InputType::ImageSequence).is_ok());
+        let compressed = reject_unsupported_picture(InputType::J2kSequence).unwrap_err();
+        assert!(compressed.contains("no frames to crop"), "{compressed}");
     }
 
     #[test]

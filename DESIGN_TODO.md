@@ -69,6 +69,16 @@
   which is stricter than the document defining the label. Applying either would
   mean reading the essence coding UL, which nothing here does. Settle which
   number is right before adding that.
+- Picture processing flags in the apps. postkit does the work in
+  `picture_processing`, and the callers still have to expose it: dcpwizard's
+  `create --crop-*/--auto-crop/--fill-crop/--deinterlace/--rotate/--flip/--denoise`,
+  a GUI crop indicator over `PicturePlan::describe`, and dcpwizard-core's
+  `check_encode_raster`, which refuses a source raster that is not the encode
+  raster rather than building a `Fit` for it. Deliberately out of postkit:
+  arbitrary rotation angles, anamorphic desqueeze, field-rate deinterlacing
+  (yadif emits one frame per frame here), and border detection during the
+  encode, which stays a separate pass a caller runs first because it seeks and
+  decodes frames of its own.
 
 # Done
 

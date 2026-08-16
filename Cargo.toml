@@ -69,3 +69,7 @@ required-features = ["grok-ffi"]
 [[test]]
 name = "subtitle_burn_e2e"
 required-features = ["grok-ffi"]
+
+[[test]]
+name = "picture_processing_e2e"
+required-features = ["grok-ffi"]

@@ -31,6 +31,7 @@ pub mod mpv_render;
 pub mod mxf_wrap;
 pub mod otioz_import;
 pub mod packaging;
+pub mod picture_processing;
 pub mod pipeline;
 pub mod plugin;
 pub mod preferences;

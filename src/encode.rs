@@ -316,13 +316,20 @@ impl SourceColour {
     }
 }
 
-/// The ffmpeg filter chain for a stream decode: the output frame rate, plus the
-/// HDR-to-DCI LUT when the source needs one.
-pub(crate) fn decode_filters(fps: u32, source_colour: &SourceColour) -> String {
-    match source_colour {
-        SourceColour::DciLut(lut) => format!("fps={fps},lut3d={}", lut.display()),
-        _ => format!("fps={fps}"),
+/// The ffmpeg filter chain for a stream decode: the picture plan, the output
+/// frame rate at the position the plan names, plus the HDR-to-DCI LUT last when
+/// the source needs one, so the LUT sees the finished picture.
+pub(crate) fn decode_filters(
+    fps: u32,
+    source_colour: &SourceColour,
+    plan: &crate::picture_processing::PicturePlan,
+) -> String {
+    let mut filters = plan.filters.clone();
+    filters.insert(plan.fps_position, format!("fps={fps}"));
+    if let SourceColour::DciLut(lut) = source_colour {
+        filters.push(format!("lut3d={}", lut.display()));
     }
+    filters.join(",")
 }
 
 /// Reject a written codestream that exceeds the per-frame byte cap (DCI caps
@@ -354,7 +361,7 @@ pub enum DecodeSource {
 
 impl DecodeSource {
     /// Demuxer arguments that go before `-i`.
-    fn demuxer_args(&self) -> &'static [&'static str] {
+    pub(crate) fn demuxer_args(&self) -> &'static [&'static str] {
         match self {
             DecodeSource::Video => &[],
             DecodeSource::ImageList => &["-f", "concat", "-safe", "0"],
@@ -412,6 +419,10 @@ pub struct StreamEncodeOptions {
     /// Whether `input` is a container or a concat list of stills.
     #[serde(default)]
     pub decode_source: DecodeSource,
+    /// Crop, deinterlace, rotate, flip, denoise and raster fit applied during
+    /// the decode, which decides the size of the frames the encoder receives.
+    #[serde(default)]
+    pub picture: crate::picture_processing::PictureProcessing,
     /// Subtitles burnt into each decoded frame before it is compressed. Not
     /// serialised: it carries a live font database, so a stored job names the
     /// subtitle file and rebuilds it.
@@ -433,6 +444,7 @@ impl Default for StreamEncodeOptions {
             lib_dir: None,
             source_colour: SourceColour::DisplayRgb,
             decode_source: DecodeSource::Video,
+            picture: crate::picture_processing::PictureProcessing::default(),
             subtitle_burn: None,
         }
     }
@@ -584,14 +596,27 @@ where
         };
     }
 
-    let (width, height, total_frames) = probe_decode_source(&opts.input, opts.decode_source);
-    if width == 0 || height == 0 {
+    let (source_width, source_height, total_frames) =
+        probe_decode_source(&opts.input, opts.decode_source);
+    if source_width == 0 || source_height == 0 {
         return EncodeResult {
             success: false,
             error: "Could not determine video dimensions".to_string(),
             ..Default::default()
         };
     }
+    let plan = match opts.picture.plan(source_width, source_height) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return EncodeResult {
+                success: false,
+                error: e,
+                ..Default::default()
+            };
+        }
+    };
+    tracing::info!("picture: {}", plan.describe());
+    let (width, height) = (plan.output_width, plan.output_height);
 
     if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
         return EncodeResult {
@@ -604,7 +629,7 @@ where
     let frame_size = (width as usize) * (height as usize) * 3 * 2; // 16-bit RGB
 
     // Start ffmpeg: decode to raw 16-bit big-endian RGB
-    let filters = decode_filters(opts.fps, &opts.source_colour);
+    let filters = decode_filters(opts.fps, &opts.source_colour, &plan);
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .arg("-y")
         .args(opts.decode_source.demuxer_args())
@@ -759,14 +784,27 @@ where
         };
     }
 
-    let (width, height, total_frames) = probe_decode_source(&opts.input, opts.decode_source);
-    if width == 0 || height == 0 {
+    let (source_width, source_height, total_frames) =
+        probe_decode_source(&opts.input, opts.decode_source);
+    if source_width == 0 || source_height == 0 {
         return EncodeResult {
             success: false,
             error: "Could not determine video dimensions".to_string(),
             ..Default::default()
         };
     }
+    let plan = match opts.picture.plan(source_width, source_height) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return EncodeResult {
+                success: false,
+                error: e,
+                ..Default::default()
+            };
+        }
+    };
+    tracing::info!("picture: {}", plan.describe());
+    let (width, height) = (plan.output_width, plan.output_height);
 
     if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
         return EncodeResult {
@@ -779,7 +817,7 @@ where
     let frame_size = (width as usize) * (height as usize) * 3 * 2;
 
     // Start ffmpeg
-    let filters = decode_filters(opts.fps, &opts.source_colour);
+    let filters = decode_filters(opts.fps, &opts.source_colour, &plan);
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .arg("-y")
         .args(opts.decode_source.demuxer_args())
@@ -1131,14 +1169,49 @@ mod tests {
 
     #[test]
     fn the_lut_source_decodes_through_lut3d() {
-        assert_eq!(decode_filters(24, &SourceColour::DisplayRgb), "fps=24");
-        assert_eq!(decode_filters(25, &SourceColour::AlreadyPq), "fps=25");
+        let plain = crate::picture_processing::PictureProcessing::default()
+            .plan(1920, 1080)
+            .unwrap();
+        assert_eq!(
+            decode_filters(24, &SourceColour::DisplayRgb, &plain),
+            "fps=24"
+        );
+        assert_eq!(
+            decode_filters(25, &SourceColour::AlreadyPq, &plain),
+            "fps=25"
+        );
         assert_eq!(
             decode_filters(
                 48,
-                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube"))
+                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+                &plain
             ),
             "fps=48,lut3d=/luts/hdr_to_dci.cube"
+        );
+    }
+
+    #[test]
+    fn the_picture_plan_wraps_the_frame_rate_and_keeps_the_lut_last() {
+        let plan = crate::picture_processing::PictureProcessing {
+            deinterlace: true,
+            denoise: true,
+            crop: crate::picture_processing::Crop {
+                left: 0,
+                right: 0,
+                top: 138,
+                bottom: 138,
+            },
+            ..crate::picture_processing::PictureProcessing::default()
+        }
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!(
+            decode_filters(
+                24,
+                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+                &plan
+            ),
+            "yadif,fps=24,hqdn3d,format=gbrp16le,crop=1920:804:0:138,lut3d=/luts/hdr_to_dci.cube"
         );
     }
 
