@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::encode::{
-    InputType, ParallelProgress, SourceColour, StreamEncodeOptions, StreamProgress,
+    ImageFormat, InputType, ParallelProgress, SourceColour, StreamEncodeOptions, StreamProgress,
     check_codestream_size, encode_parallel, stream_encode_inprocess,
 };
 use crate::picture_processing::PictureProcessing;
@@ -153,9 +153,17 @@ pub fn run_encode_with_options(
     let start_time = std::time::Instant::now();
     let input_type = crate::encode::detect_input_type(video);
     on_log(&format!("Input type: {:?}", input_type));
+    let sequence_frame_format = match input_type {
+        InputType::ImageSequence => Some(first_frame_format(video)?),
+        _ => None,
+    };
     // an image sequence only reaches ffmpeg when something has to happen to each
-    // frame, and the branch it takes decides which colour paths are open
-    let sequence_needs_ffmpeg = options.subtitle_burn.is_some() || !options.picture.is_identity();
+    // frame, and the branch it takes decides which colour paths are open. jpeg
+    // frames always go that way, because grk_compress reads them only if grok was
+    // built with a jpeg loader and ffmpeg always does
+    let sequence_needs_ffmpeg = options.subtitle_burn.is_some()
+        || !options.picture.is_identity()
+        || sequence_frame_format == Some(ImageFormat::Jpeg);
     let decodes_through_ffmpeg = match input_type {
         InputType::Video => true,
         InputType::ImageSequence => sequence_needs_ffmpeg,
@@ -229,11 +237,7 @@ pub fn run_encode_with_options(
             on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
         }
         InputType::ImageSequence => {
-            let input_dir = if video.is_dir() {
-                video.to_path_buf()
-            } else {
-                video.parent().unwrap_or(video).to_path_buf()
-            };
+            let input_dir = sequence_directory(video);
 
             if sequence_needs_ffmpeg {
                 // grk_compress reads the stills itself and never shows postkit a
@@ -337,6 +341,28 @@ pub fn run_encode_with_options(
         frames_encoded,
         elapsed_secs,
     })
+}
+
+/// The directory holding an image sequence, whether the input names the
+/// directory itself or one frame in it.
+fn sequence_directory(input: &Path) -> PathBuf {
+    if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        input.parent().unwrap_or(input).to_path_buf()
+    }
+}
+
+/// Format of the first frame of an image sequence, which decides whether the
+/// frames can be handed to grk_compress as they are.
+fn first_frame_format(input: &Path) -> Result<ImageFormat, String> {
+    let directory = sequence_directory(input);
+    let frames = crate::encode::find_source_frames(&directory)
+        .map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
+    let first = frames
+        .first()
+        .ok_or_else(|| format!("no images in {}", directory.display()))?;
+    Ok(crate::encode::detect_image_format(first))
 }
 
 /// Refuse a source colour the chosen input branch cannot honour: the image
@@ -568,6 +594,30 @@ mod tests {
         assert!(reject_unsupported_picture(InputType::ImageSequence).is_ok());
         let compressed = reject_unsupported_picture(InputType::J2kSequence).unwrap_err();
         assert!(compressed.contains("no frames to crop"), "{compressed}");
+    }
+
+    #[test]
+    fn the_routing_reads_the_format_of_the_first_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("shot_0001.jpg");
+        std::fs::write(&frame, b"not really a jpeg").unwrap();
+
+        assert_eq!(first_frame_format(dir.path()).unwrap(), ImageFormat::Jpeg);
+        assert_eq!(
+            first_frame_format(&frame).unwrap(),
+            ImageFormat::Jpeg,
+            "naming one frame has to find the sequence it belongs to"
+        );
+
+        std::fs::write(dir.path().join("shot_0000.tiff"), b"not really a tiff").unwrap();
+        assert_eq!(
+            first_frame_format(dir.path()).unwrap(),
+            ImageFormat::Tiff,
+            "the first frame by name decides"
+        );
+
+        let empty = tempfile::tempdir().unwrap();
+        assert!(first_frame_format(empty.path()).is_err());
     }
 
     #[test]

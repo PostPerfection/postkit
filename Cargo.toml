@@ -73,3 +73,7 @@ required-features = ["grok-ffi"]
 [[test]]
 name = "picture_processing_e2e"
 required-features = ["grok-ffi"]
+
+[[test]]
+name = "jpeg_sequence_e2e"
+required-features = ["grok-ffi"]

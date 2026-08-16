@@ -73,6 +73,7 @@ pub enum ImageFormat {
     Exr,
     Png,
     Bmp,
+    Jpeg,
     Unknown,
 }
 
@@ -98,7 +99,9 @@ pub fn detect_input_type(path: &Path) -> InputType {
                     .unwrap_or_default();
                 match ext.as_str() {
                     "j2c" | "j2k" => return InputType::J2kSequence,
-                    "tif" | "tiff" | "dpx" | "exr" | "bmp" => return InputType::ImageSequence,
+                    "tif" | "tiff" | "dpx" | "exr" | "bmp" | "jpg" | "jpeg" => {
+                        return InputType::ImageSequence;
+                    }
                     _ => {}
                 }
             }
@@ -112,7 +115,7 @@ pub fn detect_input_type(path: &Path) -> InputType {
             .unwrap_or_default();
         match ext.as_str() {
             "mp4" | "mkv" | "mov" | "avi" | "mxf" | "webm" | "ts" | "m2ts" => InputType::Video,
-            "tif" | "tiff" | "dpx" | "exr" | "bmp" => InputType::ImageSequence,
+            "tif" | "tiff" | "dpx" | "exr" | "bmp" | "jpg" | "jpeg" => InputType::ImageSequence,
             "j2c" | "j2k" => InputType::J2kSequence,
             _ => InputType::Unknown,
         }
@@ -132,6 +135,7 @@ pub fn detect_image_format(path: &Path) -> ImageFormat {
         Some("exr") => ImageFormat::Exr,
         Some("png") => ImageFormat::Png,
         Some("bmp") => ImageFormat::Bmp,
+        Some("jpg" | "jpeg") => ImageFormat::Jpeg,
         _ => ImageFormat::Unknown,
     }
 }
@@ -1213,6 +1217,31 @@ mod tests {
             ),
             "yadif,fps=24,hqdn3d,format=gbrp16le,crop=1920:804:0:138,lut3d=/luts/hdr_to_dci.cube"
         );
+    }
+
+    #[test]
+    fn jpeg_stills_are_an_image_sequence() {
+        assert_eq!(
+            detect_input_type(Path::new("/frames/shot_0001.jpg")),
+            InputType::ImageSequence
+        );
+        assert_eq!(
+            detect_input_type(Path::new("/frames/shot_0001.JPEG")),
+            InputType::ImageSequence
+        );
+        assert_eq!(
+            detect_image_format(Path::new("/frames/shot_0001.jpg")),
+            ImageFormat::Jpeg
+        );
+        assert_eq!(
+            detect_image_format(Path::new("/frames/shot_0001.Jpeg")),
+            ImageFormat::Jpeg
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shot_0001.jpeg"), b"not really a jpeg").unwrap();
+        assert_eq!(detect_input_type(dir.path()), InputType::ImageSequence);
+        assert_eq!(find_source_frames(dir.path()).unwrap().len(), 1);
     }
 
     #[test]
