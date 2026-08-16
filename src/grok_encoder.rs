@@ -91,13 +91,82 @@ pub struct CompressParams {
     pub mct: bool,
     /// Apply XYZ colour transform (Rec.709 RGB → DCI X'Y'Z')
     pub apply_xyz_transform: bool,
-    /// Colour transform postkit runs over each frame before compression, for a
-    /// source space the compressor's own transform does not model (P3,
-    /// Rec.2020). Setting it together with `apply_xyz_transform` converts the
-    /// frame twice and is refused.
-    pub source_transform: Option<Arc<crate::colour::DcdmTransform>>,
+    /// What the encoder threads do to each frame before compressing it.
+    pub source_preparation: SourcePreparation,
     /// Threads per codec instance (set internally by pipeline)
     pub threads_per_codec: u32,
+}
+
+/// The work each decoded frame gets on the encoder threads before it reaches
+/// the compressor.
+///
+/// Both steps go through [`SourcePreparation::apply`], which fixes their order:
+/// subtitles are authored in display RGB, so the burn lands before any colour
+/// conversion, this struct's own or the compressor's later one. There is no
+/// knob for the other order.
+#[derive(Debug, Clone, Default)]
+pub struct SourcePreparation {
+    /// Subtitles composited into the picture, in display RGB. Needs a packed
+    /// 16-bit frame. The caller keeps it off for a source that is already
+    /// X'Y'Z', where display-RGB text would land in the wrong space.
+    pub subtitle_burn: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
+    /// Colour transform postkit runs over each frame, for a source space the
+    /// compressor's own transform does not model (P3, Rec.2020). Setting it
+    /// together with `apply_xyz_transform` converts the frame twice and is
+    /// refused.
+    pub colour_transform: Option<Arc<crate::colour::DcdmTransform>>,
+}
+
+impl SourcePreparation {
+    pub fn is_empty(&self) -> bool {
+        self.subtitle_burn.is_none() && self.colour_transform.is_none()
+    }
+
+    /// Burn subtitles in, then convert the colour. Both steps need a packed
+    /// 16-bit rgb48be frame.
+    fn apply(&self, frame: &mut RawFrame, compressor_transform: bool) -> Result<(), String> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        if compressor_transform && self.colour_transform.is_some() {
+            return Err(
+                "the compressor's X'Y'Z' transform and a source transform are both set: \
+                 the frame would be converted twice"
+                    .to_string(),
+            );
+        }
+        let index = frame.index();
+        let (data, width, height) = match frame {
+            RawFrame::Packed {
+                data,
+                width,
+                height,
+                precision: 16,
+                ..
+            } => (data, *width, *height),
+            _ => {
+                return Err(
+                    "a subtitle burn or a source colour transform needs a packed 16-bit \
+                     rgb48be frame"
+                        .to_string(),
+                );
+            }
+        };
+        if let Some(burn) = &self.subtitle_burn {
+            burn.burn_rgb48(
+                data,
+                width,
+                height,
+                crate::subtitle_raster::SampleOrder::Big,
+                index,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        if let Some(transform) = &self.colour_transform {
+            transform.frame_rgb48be_inplace(data);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,7 +192,7 @@ impl Default for CompressParams {
             irreversible: true,
             mct: true,
             apply_xyz_transform: false,
-            source_transform: None,
+            source_preparation: SourcePreparation::default(),
             threads_per_codec: 1,
         }
     }
@@ -420,8 +489,9 @@ fn encoder_thread_fn(
             break;
         };
 
-        if let Some(transform) = &params.source_transform
-            && let Err(e) = transform_frame(&mut frame, transform, params.apply_xyz_transform)
+        if let Err(e) = params
+            .source_preparation
+            .apply(&mut frame, params.apply_xyz_transform)
         {
             error_flag.store(true, Ordering::Relaxed);
             let mut err = first_error.lock().unwrap();
@@ -450,33 +520,6 @@ fn encoder_thread_fn(
                 break;
             }
         }
-    }
-}
-
-/// Convert one frame into X'Y'Z' before it reaches the compressor. Runs on the
-/// encoder threads, so a whole-frame matrix costs no pipeline throughput.
-fn transform_frame(
-    frame: &mut RawFrame,
-    transform: &crate::colour::DcdmTransform,
-    compressor_transform: bool,
-) -> Result<(), String> {
-    if compressor_transform {
-        return Err(
-            "the compressor's X'Y'Z' transform and a source transform are both set: \
-             the frame would be converted twice"
-                .to_string(),
-        );
-    }
-    match frame {
-        RawFrame::Packed {
-            data,
-            precision: 16,
-            ..
-        } => {
-            transform.frame_rgb48be_inplace(data);
-            Ok(())
-        }
-        _ => Err("a source colour transform needs a packed 16-bit rgb48be frame".to_string()),
     }
 }
 
@@ -882,11 +925,12 @@ where
 {
     use std::process::{Command, Stdio};
 
-    if params.source_transform.is_some() {
+    if !params.source_preparation.is_empty() {
         return PipelineResult {
             success: false,
             error: "the subprocess encoder writes raw frames straight to grk_compress and \
-                    cannot run a source colour transform: use the in-process pipeline"
+                    cannot burn subtitles or run a source colour transform: use the \
+                    in-process pipeline"
                 .to_string(),
             frames_encoded: 0,
             output_dir: output_dir.to_path_buf(),
@@ -1175,11 +1219,8 @@ mod tests {
         assert!(!result); // push should return false after close
     }
 
-    #[test]
-    fn a_frame_transform_converts_packed_frames_and_refuses_the_rest() {
-        let transform = crate::colour::DcdmTransform::to_xyz(crate::colour::ColourSpace::P3)
-            .expect("P3 transform");
-        let mut packed = RawFrame::Packed {
+    fn one_red_packed_frame() -> RawFrame {
+        RawFrame::Packed {
             data: [65535u16, 0, 0]
                 .iter()
                 .flat_map(|c| c.to_be_bytes())
@@ -1188,8 +1229,20 @@ mod tests {
             height: 1,
             precision: 16,
             index: 0,
+        }
+    }
+
+    #[test]
+    fn a_frame_transform_converts_packed_frames_and_refuses_the_rest() {
+        let transform = crate::colour::DcdmTransform::to_xyz(crate::colour::ColourSpace::P3)
+            .expect("P3 transform");
+        let transform = Arc::new(transform);
+        let prep = SourcePreparation {
+            subtitle_burn: None,
+            colour_transform: Some(Arc::clone(&transform)),
         };
-        transform_frame(&mut packed, &transform, false).unwrap();
+        let mut packed = one_red_packed_frame();
+        prep.apply(&mut packed, false).unwrap();
         let RawFrame::Packed { data, .. } = &packed else {
             panic!("frame changed shape");
         };
@@ -1197,7 +1250,7 @@ mod tests {
         assert_eq!(u16::from_be_bytes([data[0], data[1]]), want[0]);
 
         // converting twice would be silently wrong colour, so it fails instead
-        assert!(transform_frame(&mut packed, &transform, true).is_err());
+        assert!(prep.apply(&mut packed, true).is_err());
 
         let mut planar = RawFrame::Planar {
             components: [vec![0i32], vec![0], vec![0]],
@@ -1206,7 +1259,97 @@ mod tests {
             precision: 16,
             index: 0,
         };
-        assert!(transform_frame(&mut planar, &transform, false).is_err());
+        assert!(prep.apply(&mut planar, false).is_err());
+    }
+
+    #[test]
+    fn empty_source_preparation_leaves_the_frame_alone() {
+        let prep = SourcePreparation::default();
+        let mut packed = one_red_packed_frame();
+        prep.apply(&mut packed, true).unwrap();
+        let RawFrame::Packed { data, .. } = &packed else {
+            panic!("frame changed shape");
+        };
+        assert_eq!(u16::from_be_bytes([data[0], data[1]]), 65535);
+    }
+
+    #[test]
+    fn a_burn_lands_before_the_colour_transform() {
+        use crate::subtitle_formats::{StyledCue, StyledRun, VAlign};
+        use crate::subtitle_raster::{BurnStyle, SubtitleBurn};
+
+        // A bitmap cue covering the whole 1x1 frame with opaque red, so the
+        // burn result is known without a font.
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("cue.png");
+        write_red_png(&png);
+        let mut cue = StyledCue::text(0, 1000, vec![StyledRun::plain("")]);
+        cue.runs.clear();
+        cue.image = Some(png);
+        cue.valign = Some(VAlign::Top);
+        cue.vposition = Some(0.0);
+        let burn = SubtitleBurn::new(vec![cue], None, BurnStyle::default(), 24.0).unwrap();
+
+        let transform = crate::colour::DcdmTransform::to_xyz(crate::colour::ColourSpace::P3)
+            .expect("P3 transform");
+        let transform = Arc::new(transform);
+        let prep = SourcePreparation {
+            subtitle_burn: Some(Arc::new(burn)),
+            colour_transform: Some(Arc::clone(&transform)),
+        };
+        let mut frame = RawFrame::Packed {
+            data: vec![0u8; 6],
+            width: 1,
+            height: 1,
+            precision: 16,
+            index: 0,
+        };
+        prep.apply(&mut frame, false).unwrap();
+        let RawFrame::Packed { data, .. } = &frame else {
+            panic!("frame changed shape");
+        };
+        // Burnt red, then converted: the reverse order would give the red
+        // straight through, unconverted.
+        let want = transform.pixel([65535, 0, 0], u16::MAX);
+        assert_eq!(u16::from_be_bytes([data[0], data[1]]), want[0]);
+        assert_eq!(u16::from_be_bytes([data[2], data[3]]), want[1]);
+        assert_eq!(u16::from_be_bytes([data[4], data[5]]), want[2]);
+        assert_ne!(
+            want,
+            [65535, 0, 0],
+            "P3 red must move, or the test proves nothing"
+        );
+
+        // A burn alone is fine alongside the compressor's own transform: the
+        // text is composited in display RGB and grok converts it with the rest.
+        let burn_only = SourcePreparation {
+            subtitle_burn: prep.subtitle_burn.clone(),
+            colour_transform: None,
+        };
+        let mut frame = RawFrame::Packed {
+            data: vec![0u8; 6],
+            width: 1,
+            height: 1,
+            precision: 16,
+            index: 0,
+        };
+        burn_only.apply(&mut frame, true).unwrap();
+        let RawFrame::Packed { data, .. } = &frame else {
+            panic!("frame changed shape");
+        };
+        assert_eq!(u16::from_be_bytes([data[0], data[1]]), 65535);
+    }
+
+    fn write_red_png(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 1, 1);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&[255, 0, 0, 255])
+            .unwrap();
     }
 
     #[test]

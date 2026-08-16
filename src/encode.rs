@@ -340,10 +340,55 @@ pub(crate) fn check_codestream_size(frame: &Path, cap: u64) -> Result<(), String
     Ok(())
 }
 
+/// What ffmpeg opens for a stream encode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DecodeSource {
+    /// A container ffmpeg opens directly.
+    #[default]
+    Video,
+    /// A concat list naming the stills of an image sequence, one frame each.
+    /// This is how a sequence reaches the same per-frame path a video does,
+    /// which is what a subtitle burn needs.
+    ImageList,
+}
+
+impl DecodeSource {
+    /// Demuxer arguments that go before `-i`.
+    fn demuxer_args(&self) -> &'static [&'static str] {
+        match self {
+            DecodeSource::Video => &[],
+            DecodeSource::ImageList => &["-f", "concat", "-safe", "0"],
+        }
+    }
+}
+
+/// Write an ffmpeg concat list holding every frame of an image sequence for one
+/// frame period, in the order [`find_source_frames`] returns them.
+///
+/// Absolute paths, so the list can live anywhere; single quotes inside a path
+/// are escaped the way the concat demuxer reads them.
+pub fn write_image_concat_list(
+    frames: &[PathBuf],
+    fps: u32,
+    list_path: &Path,
+) -> Result<(), String> {
+    let fps = if fps == 0 { 24 } else { fps };
+    let mut list = String::from("ffconcat version 1.0\n");
+    for frame in frames {
+        let absolute = frame
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {}: {e}", frame.display()))?;
+        let quoted = absolute.to_string_lossy().replace('\'', r"'\''");
+        list.push_str(&format!("file '{quoted}'\nduration {}\n", 1.0 / fps as f64));
+    }
+    std::fs::write(list_path, list)
+        .map_err(|e| format!("cannot write {}: {e}", list_path.display()))
+}
+
 /// Options for streaming encode (video → J2K without intermediate files).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamEncodeOptions {
-    /// Input video file
+    /// Input video file, or the concat list when `decode_source` names one.
     pub input: PathBuf,
     /// Output J2K directory
     pub output_dir: PathBuf,
@@ -364,6 +409,14 @@ pub struct StreamEncodeOptions {
     /// Colour the decoded frames carry, which decides the encoder transform.
     #[serde(default)]
     pub source_colour: SourceColour,
+    /// Whether `input` is a container or a concat list of stills.
+    #[serde(default)]
+    pub decode_source: DecodeSource,
+    /// Subtitles burnt into each decoded frame before it is compressed. Not
+    /// serialised: it carries a live font database, so a stored job names the
+    /// subtitle file and rebuilds it.
+    #[serde(skip)]
+    pub subtitle_burn: Option<std::sync::Arc<crate::subtitle_raster::SubtitleBurn>>,
 }
 
 impl Default for StreamEncodeOptions {
@@ -379,6 +432,8 @@ impl Default for StreamEncodeOptions {
             compressor_path: PathBuf::new(),
             lib_dir: None,
             source_colour: SourceColour::DisplayRgb,
+            decode_source: DecodeSource::Video,
+            subtitle_burn: None,
         }
     }
 }
@@ -410,10 +465,16 @@ pub fn find_compressor() -> Option<(PathBuf, Option<PathBuf>)> {
 
 /// Probe a video file for dimensions and frame count.
 pub fn probe_video(input: &Path) -> (u32, u32, u64) {
+    probe_decode_source(input, DecodeSource::Video)
+}
+
+/// Probe whatever ffmpeg will decode for dimensions and frame count.
+pub fn probe_decode_source(input: &Path, source: DecodeSource) -> (u32, u32, u64) {
+    let demuxer = source.demuxer_args();
     let dim_output = std::process::Command::new("ffprobe")
+        .args(["-v", "error"])
+        .args(demuxer)
         .args([
-            "-v",
-            "error",
             "-select_streams",
             "v:0",
             "-show_entries",
@@ -438,9 +499,9 @@ pub fn probe_video(input: &Path) -> (u32, u32, u64) {
     };
 
     let count_output = std::process::Command::new("ffprobe")
+        .args(["-v", "error"])
+        .args(demuxer)
         .args([
-            "-v",
-            "error",
             "-select_streams",
             "v:0",
             "-count_packets",
@@ -523,7 +584,7 @@ where
         };
     }
 
-    let (width, height, total_frames) = probe_video(&opts.input);
+    let (width, height, total_frames) = probe_decode_source(&opts.input, opts.decode_source);
     if width == 0 || height == 0 {
         return EncodeResult {
             success: false,
@@ -545,7 +606,9 @@ where
     // Start ffmpeg: decode to raw 16-bit big-endian RGB
     let filters = decode_filters(opts.fps, &opts.source_colour);
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
-        .args(["-y", "-i"])
+        .arg("-y")
+        .args(opts.decode_source.demuxer_args())
+        .arg("-i")
         .arg(&opts.input)
         .args([
             "-vf", &filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1",
@@ -575,7 +638,7 @@ where
         }
     };
 
-    let source_transform = match opts.source_colour.frame_transform() {
+    let colour_transform = match opts.source_colour.frame_transform() {
         Ok(t) => t,
         Err(e) => {
             kill_child(&mut ffmpeg);
@@ -593,7 +656,10 @@ where
         codeblock_size: opts.codeblock_size,
         frame_rate: opts.fps as u16,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
-        source_transform,
+        source_preparation: grok_encoder::SourcePreparation {
+            subtitle_burn: opts.subtitle_burn.clone(),
+            colour_transform,
+        },
         ..CompressParams::default()
     };
 
@@ -693,7 +759,7 @@ where
         };
     }
 
-    let (width, height, total_frames) = probe_video(&opts.input);
+    let (width, height, total_frames) = probe_decode_source(&opts.input, opts.decode_source);
     if width == 0 || height == 0 {
         return EncodeResult {
             success: false,
@@ -715,7 +781,9 @@ where
     // Start ffmpeg
     let filters = decode_filters(opts.fps, &opts.source_colour);
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
-        .args(["-y", "-i"])
+        .arg("-y")
+        .args(opts.decode_source.demuxer_args())
+        .arg("-i")
         .arg(&opts.input)
         .args([
             "-vf", &filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1",

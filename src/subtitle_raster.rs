@@ -1,0 +1,1124 @@
+//! Rasterise [`StyledCue`]s to positioned RGBA bitmaps and alpha-blend them
+//! onto a decoded picture frame.
+//!
+//! This is the burn-in path: instead of asking a decoder's subtitle filter to
+//! draw text (which only reaches ffmpeg-decoded input and takes its styling
+//! from the subtitle file rather than from our flags), cues are shaped and
+//! rasterised here and composited onto the frame buffer, so every input shape
+//! that decodes to pixels can carry burnt-in subtitles.
+//!
+//! Text is shaped by cosmic-text (harfrust shaping, unicode-bidi reordering,
+//! per-codepoint fallback across the faces fontdb discovers) and rasterised by
+//! swash. Bitmap cues (Interop PNG subs) skip shaping and are scaled to the
+//! frame instead.
+//!
+//! Nothing here knows about the encoder, so a preview or an export can reuse
+//! the same two steps.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use cosmic_text::{
+    Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent,
+    Weight, Wrap,
+};
+
+use crate::subtitle_formats::{HAlign, Rgba, StyledCue, StyledRun, SubtitleError, VAlign};
+
+/// Text height as a fraction of frame height when the caller names none. 1/22nd
+/// of the picture is about the DCI house style for a 2K subtitle.
+const DEFAULT_FONT_SIZE_RATIO: f32 = 1.0 / 22.0;
+
+/// Distance from the anchored edge as a fraction of frame height, used when the
+/// cue carries no vposition.
+const DEFAULT_MARGIN_RATIO: f32 = 0.08;
+
+/// Line box height as a multiple of the text height.
+const DEFAULT_LINE_HEIGHT_RATIO: f32 = 1.25;
+
+/// Underline thickness as a fraction of the text height.
+const UNDERLINE_THICKNESS_RATIO: f32 = 0.06;
+
+/// How far below the baseline the underline sits, as a fraction of text height.
+const UNDERLINE_OFFSET_RATIO: f32 = 0.13;
+
+/// How a cue is drawn when it does not say for itself.
+#[derive(Debug, Clone)]
+pub struct BurnStyle {
+    /// Text height as a fraction of the frame height.
+    pub font_size_ratio: f32,
+    /// Line box height as a multiple of the text height.
+    pub line_height_ratio: f32,
+    /// Distance from the anchored edge as a fraction of the frame height, for
+    /// cues with no vposition of their own.
+    pub margin_ratio: f32,
+    /// Colour for runs that carry none.
+    pub default_colour: Rgba,
+}
+
+impl Default for BurnStyle {
+    fn default() -> Self {
+        BurnStyle {
+            font_size_ratio: DEFAULT_FONT_SIZE_RATIO,
+            line_height_ratio: DEFAULT_LINE_HEIGHT_RATIO,
+            margin_ratio: DEFAULT_MARGIN_RATIO,
+            default_colour: Rgba {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: 255,
+            },
+        }
+    }
+}
+
+/// A rasterised cue: un-premultiplied RGBA8 pixels and the frame-space
+/// top-left corner they belong at. `x`/`y` may be negative or run past the
+/// frame; [`composite_rgb48`] clips.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionedBitmap {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    /// RGBA8, four bytes per pixel, `width * height * 4` long.
+    pub pixels: Vec<u8>,
+}
+
+impl PositionedBitmap {
+    fn blank(x: i32, y: i32, width: u32, height: u32) -> Self {
+        PositionedBitmap {
+            x,
+            y,
+            width,
+            height,
+            pixels: vec![0u8; (width as usize) * (height as usize) * 4],
+        }
+    }
+
+    /// Source-over one un-premultiplied RGBA pixel, no bounds check.
+    fn blend(&mut self, px: u32, py: u32, colour: [u8; 4]) {
+        let at = ((py as usize) * (self.width as usize) + px as usize) * 4;
+        let source_alpha = colour[3] as u32;
+        if source_alpha == 0 {
+            return;
+        }
+        let keep = self.pixels[at + 3] as u32 * (255 - source_alpha) / 255;
+        let out_alpha = source_alpha + keep;
+        if out_alpha == 0 {
+            self.pixels[at..at + 4].copy_from_slice(&[0; 4]);
+            return;
+        }
+        for (channel, &source) in colour.iter().take(3).enumerate() {
+            let mixed = source as u32 * source_alpha
+                + self.pixels[at + channel] as u32 * keep
+                + out_alpha / 2;
+            self.pixels[at + channel] = (mixed / out_alpha) as u8;
+        }
+        self.pixels[at + 3] = out_alpha as u8;
+    }
+}
+
+/// Byte order of the 16-bit samples in a packed rgb48 frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleOrder {
+    Big,
+    Little,
+}
+
+/// Alpha-blend `bitmaps` onto a packed rgb48 frame, in order, clipping each to
+/// the frame. `frame` is `width * height * 6` bytes of interleaved RGB with
+/// 16-bit samples in `order`.
+///
+/// The source is 8-bit un-premultiplied RGBA, so a channel is lifted to 16 bits
+/// by `* 257` before mixing and the whole blend stays in integer math.
+pub fn composite_rgb48(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    order: SampleOrder,
+    bitmaps: &[PositionedBitmap],
+) {
+    let stride = width as usize * 6;
+    for bitmap in bitmaps {
+        for row in 0..bitmap.height as i32 {
+            let frame_y = bitmap.y + row;
+            if frame_y < 0 || frame_y >= height as i32 {
+                continue;
+            }
+            for column in 0..bitmap.width as i32 {
+                let frame_x = bitmap.x + column;
+                if frame_x < 0 || frame_x >= width as i32 {
+                    continue;
+                }
+                let source = ((row as usize) * (bitmap.width as usize) + column as usize) * 4;
+                let alpha = bitmap.pixels[source + 3] as u32;
+                if alpha == 0 {
+                    continue;
+                }
+                let at = frame_y as usize * stride + frame_x as usize * 6;
+                for channel in 0..3 {
+                    let sample = at + channel * 2;
+                    let destination = match order {
+                        SampleOrder::Big => u16::from_be_bytes([frame[sample], frame[sample + 1]]),
+                        SampleOrder::Little => {
+                            u16::from_le_bytes([frame[sample], frame[sample + 1]])
+                        }
+                    } as u32;
+                    let source_sample = bitmap.pixels[source + channel] as u32 * 257;
+                    let mixed = (source_sample * alpha + destination * (255 - alpha) + 127) / 255;
+                    let bytes = (mixed.min(u16::MAX as u32) as u16).to_be_bytes();
+                    match order {
+                        SampleOrder::Big => {
+                            frame[sample] = bytes[0];
+                            frame[sample + 1] = bytes[1];
+                        }
+                        SampleOrder::Little => {
+                            frame[sample] = bytes[1];
+                            frame[sample + 1] = bytes[0];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A cue list ready to be burnt onto frames, addressed by frame number.
+///
+/// Holds the rasterizer behind a lock because the encoder threads share one
+/// instance, and caches the last render: the active cue set changes a few times
+/// a second at most, so nearly every frame reuses the bitmaps of the one before
+/// it and the lock is held only long enough to clone an `Arc`.
+pub struct SubtitleBurn {
+    cues: Vec<StyledCue>,
+    style: BurnStyle,
+    /// Frames per second the cue timings are read against.
+    fps: f64,
+    state: std::sync::Mutex<BurnState>,
+}
+
+struct BurnState {
+    rasterizer: SubtitleRasterizer,
+    /// Cue indices, frame width and height the cached bitmaps were made for.
+    rendered_for: Option<(Vec<usize>, u32, u32)>,
+    rendered: Arc<Vec<PositionedBitmap>>,
+}
+
+impl std::fmt::Debug for SubtitleBurn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubtitleBurn")
+            .field("cues", &self.cues.len())
+            .field("fps", &self.fps)
+            .field("style", &self.style)
+            .finish()
+    }
+}
+
+impl SubtitleBurn {
+    /// Prepare `cues` for burning at `fps`, drawing text with `font` (or the
+    /// system faces when `None`).
+    ///
+    /// Refused when a text cue is present and no face is available at all,
+    /// since that would silently encode a subtitle-free picture.
+    pub fn new(
+        cues: Vec<StyledCue>,
+        font: Option<&Path>,
+        style: BurnStyle,
+        fps: f64,
+    ) -> Result<Self, SubtitleError> {
+        if fps <= 0.0 || !fps.is_finite() {
+            return Err(SubtitleError::Parse(format!(
+                "a burn needs a positive frame rate, got {fps}"
+            )));
+        }
+        let rasterizer = SubtitleRasterizer::new(font)?;
+        let has_text = cues.iter().any(|cue| cue.image.is_none());
+        if has_text && !rasterizer.has_font() {
+            return Err(SubtitleError::Parse(
+                "no font found to burn subtitles with: install a system font or pass one".into(),
+            ));
+        }
+        Ok(SubtitleBurn {
+            cues,
+            style,
+            fps,
+            state: std::sync::Mutex::new(BurnState {
+                rasterizer,
+                rendered_for: None,
+                rendered: Arc::new(Vec::new()),
+            }),
+        })
+    }
+
+    /// Indices of the cues covering `frame_index`. Two frames with the same
+    /// list burn to the same picture, which is what lets a held still encode
+    /// once per cue change instead of once per frame.
+    pub fn active_cues(&self, frame_index: u64) -> Vec<usize> {
+        let time_ms = self.time_ms(frame_index);
+        self.cues
+            .iter()
+            .enumerate()
+            .filter(|(_, cue)| time_ms >= cue.start_ms && time_ms < cue.end_ms)
+            .map(|(at, _)| at)
+            .collect()
+    }
+
+    /// Burn the cues covering `frame_index` into a packed rgb48 frame.
+    pub fn burn_rgb48(
+        &self,
+        frame: &mut [u8],
+        width: u32,
+        height: u32,
+        order: SampleOrder,
+        frame_index: u64,
+    ) -> Result<(), SubtitleError> {
+        let want = (width as usize) * (height as usize) * 6;
+        if frame.len() != want {
+            return Err(SubtitleError::Parse(format!(
+                "a {width}x{height} rgb48 frame is {want} bytes, got {}",
+                frame.len()
+            )));
+        }
+        let active = self.active_cues(frame_index);
+        let bitmaps = {
+            let mut state = self.state.lock().expect("subtitle burn state");
+            if state.rendered_for.as_ref() != Some(&(active.clone(), width, height)) {
+                let due: Vec<StyledCue> = active.iter().map(|at| self.cues[*at].clone()).collect();
+                let rendered = state.rasterizer.render(
+                    &due,
+                    self.time_ms(frame_index),
+                    width,
+                    height,
+                    &self.style,
+                )?;
+                state.rendered = Arc::new(rendered);
+                state.rendered_for = Some((active, width, height));
+            }
+            Arc::clone(&state.rendered)
+        };
+        composite_rgb48(frame, width, height, order, &bitmaps);
+        Ok(())
+    }
+
+    fn time_ms(&self, frame_index: u64) -> u64 {
+        (frame_index as f64 * 1000.0 / self.fps).round() as u64
+    }
+}
+
+/// Shaping and rasterisation state: the discovered font database and the glyph
+/// raster cache, both reused across cues and frames.
+///
+/// [`FontSystem::new`] scans every system font directory, which costs tens to
+/// hundreds of milliseconds, so build one and keep it.
+pub struct SubtitleRasterizer {
+    fonts: FontSystem,
+    cache: SwashCache,
+    /// Family name of the caller's font file, asked for as the primary family
+    /// so the system faces only fill in codepoints it lacks. `None` asks for
+    /// the generic sans-serif.
+    primary_family: Option<String>,
+}
+
+impl std::fmt::Debug for SubtitleRasterizer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubtitleRasterizer")
+            .field("primary_family", &self.primary_family)
+            .field("face_count", &self.fonts.db().len())
+            .finish()
+    }
+}
+
+impl SubtitleRasterizer {
+    /// Discover the system fonts, and register `font` (a .ttf / .otf / .ttc)
+    /// alongside them as the primary family when one is given.
+    pub fn new(font: Option<&Path>) -> Result<Self, SubtitleError> {
+        let mut fonts = FontSystem::new();
+        let mut primary_family = None;
+        if let Some(path) = font {
+            let bytes = std::fs::read(path)?;
+            let ids = fonts
+                .db_mut()
+                .load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
+            primary_family = ids
+                .first()
+                .and_then(|id| fonts.db().face(*id))
+                .and_then(|face| face.families.first())
+                .map(|(name, _)| name.clone());
+            if primary_family.is_none() {
+                return Err(SubtitleError::Parse(format!(
+                    "no usable font face in {}",
+                    path.display()
+                )));
+            }
+        }
+        Ok(SubtitleRasterizer {
+            fonts,
+            cache: SwashCache::new(),
+            primary_family,
+        })
+    }
+
+    /// Whether any face at all is available. False means fontdb found no system
+    /// font and the caller supplied none, so text cues would render empty.
+    pub fn has_font(&self) -> bool {
+        !self.fonts.db().is_empty()
+    }
+
+    /// Rasterise every cue covering `time_ms` for a `width` x `height` frame.
+    ///
+    /// Cues are returned in input order, so a later cue paints over an earlier
+    /// one. A cue that shapes to nothing yields no bitmap.
+    pub fn render(
+        &mut self,
+        cues: &[StyledCue],
+        time_ms: u64,
+        width: u32,
+        height: u32,
+        style: &BurnStyle,
+    ) -> Result<Vec<PositionedBitmap>, SubtitleError> {
+        let mut bitmaps = Vec::new();
+        for cue in cues {
+            if time_ms < cue.start_ms || time_ms >= cue.end_ms {
+                continue;
+            }
+            let bitmap = match &cue.image {
+                Some(path) => Some(render_bitmap_cue(path, cue, width, height, style)?),
+                None => self.render_text_cue(cue, width, height, style),
+            };
+            bitmaps.extend(bitmap);
+        }
+        Ok(bitmaps)
+    }
+
+    fn render_text_cue(
+        &mut self,
+        cue: &StyledCue,
+        width: u32,
+        height: u32,
+        style: &BurnStyle,
+    ) -> Option<PositionedBitmap> {
+        let text = cue.plain_text();
+        if text.trim().is_empty() {
+            return None;
+        }
+        let font_size = (height as f32 * style.font_size_ratio).max(1.0);
+        let line_height = font_size * style.line_height_ratio;
+
+        let family = self.primary_family.clone();
+        let base = base_attrs(family.as_deref(), style);
+        let spans: Vec<(&str, Attrs)> = cue
+            .runs
+            .iter()
+            .filter(|run| !run.text.is_empty())
+            .map(|run| (run.text.as_str(), run_attrs(&base, run, style)))
+            .collect();
+        if spans.is_empty() {
+            return None;
+        }
+
+        let mut buffer = Buffer::new(&mut self.fonts, Metrics::new(font_size, line_height));
+        // Cue lines are pre-broken by the subtitle format, so no wrapping: an
+        // over-wide line is clipped at composite time rather than reflowed.
+        buffer.set_wrap(&mut self.fonts, Wrap::None);
+        buffer.set_size(&mut self.fonts, None, None);
+        buffer.set_rich_text(&mut self.fonts, spans, &base, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.fonts, false);
+
+        let underlines = underlined_byte_ranges(&cue.runs);
+        let lines: Vec<LaidOutLine> = buffer
+            .layout_runs()
+            .map(|run| LaidOutLine {
+                width: run.line_w,
+                top: run.line_top,
+                height: run.line_height,
+                baseline: run.line_y - run.line_top,
+                glyphs: run
+                    .glyphs
+                    .iter()
+                    .map(|glyph| {
+                        let physical = glyph.physical((0.0, 0.0), 1.0);
+                        LaidOutGlyph {
+                            key: physical.cache_key,
+                            x: physical.x,
+                            y: physical.y,
+                            start: glyph.start,
+                            left: glyph.x,
+                            advance: glyph.w,
+                            colour: glyph.color_opt,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+
+        let block_width = lines.iter().fold(0.0_f32, |widest, l| widest.max(l.width));
+        let block_height = lines
+            .iter()
+            .fold(0.0_f32, |tallest, l| tallest.max(l.top + l.height));
+        // Glyphs overhang their line box (descenders, accents), so pad by one
+        // line height all round rather than clipping at the block edge.
+        let pad = line_height.ceil() as i32;
+        let bitmap_width = (block_width.ceil() as i32 + pad * 2).max(1) as u32;
+        let bitmap_height = (block_height.ceil() as i32 + pad * 2).max(1) as u32;
+        let (origin_x, origin_y) = anchor(cue, style, width, height, block_width, block_height);
+        let mut bitmap =
+            PositionedBitmap::blank(origin_x - pad, origin_y - pad, bitmap_width, bitmap_height);
+
+        let default = style.default_colour;
+        for line in &lines {
+            let line_x = match cue.align.unwrap_or(HAlign::Center) {
+                HAlign::Left => 0.0,
+                HAlign::Center => (block_width - line.width) / 2.0,
+                HAlign::Right => block_width - line.width,
+            };
+            let line_origin_x = pad as f32 + line_x;
+            let line_origin_y = pad as f32 + line.top + line.baseline;
+            for glyph in &line.glyphs {
+                let colour = glyph
+                    .colour
+                    .map(|c| [c.r(), c.g(), c.b(), c.a()])
+                    .unwrap_or([default.r, default.g, default.b, default.a]);
+                self.blit_glyph(
+                    &mut bitmap,
+                    glyph,
+                    line_origin_x + glyph.x as f32,
+                    line_origin_y + glyph.y as f32,
+                    colour,
+                );
+            }
+            draw_underlines(
+                &mut bitmap,
+                line,
+                line_origin_x,
+                line_origin_y,
+                font_size,
+                &underlines,
+                default,
+            );
+        }
+        Some(bitmap)
+    }
+
+    fn blit_glyph(
+        &mut self,
+        bitmap: &mut PositionedBitmap,
+        glyph: &LaidOutGlyph,
+        origin_x: f32,
+        origin_y: f32,
+        colour: [u8; 4],
+    ) {
+        let Some(image) = self.cache.get_image(&mut self.fonts, glyph.key).as_ref() else {
+            return;
+        };
+        let colour_bitmap = match image.content {
+            SwashContent::Mask => false,
+            SwashContent::Color => true,
+            // Never asked for: the cache key carries no subpixel bin here.
+            SwashContent::SubpixelMask => return,
+        };
+        let left = origin_x.round() as i32 + image.placement.left;
+        let top = origin_y.round() as i32 - image.placement.top;
+        let (glyph_width, glyph_height) = (image.placement.width, image.placement.height);
+        for row in 0..glyph_height as i32 {
+            let py = top + row;
+            if py < 0 || py >= bitmap.height as i32 {
+                continue;
+            }
+            for column in 0..glyph_width as i32 {
+                let px = left + column;
+                if px < 0 || px >= bitmap.width as i32 {
+                    continue;
+                }
+                let at = (row as usize) * (glyph_width as usize) + column as usize;
+                let source = if colour_bitmap {
+                    let rgba = &image.data[at * 4..at * 4 + 4];
+                    [rgba[0], rgba[1], rgba[2], rgba[3]]
+                } else {
+                    let coverage = image.data[at] as u32;
+                    [
+                        colour[0],
+                        colour[1],
+                        colour[2],
+                        ((coverage * colour[3] as u32 + 127) / 255) as u8,
+                    ]
+                };
+                bitmap.blend(px as u32, py as u32, source);
+            }
+        }
+    }
+}
+
+fn base_attrs<'a>(family: Option<&'a str>, style: &BurnStyle) -> Attrs<'a> {
+    let colour = style.default_colour;
+    let mut attrs = Attrs::new().color(Color::rgba(colour.r, colour.g, colour.b, colour.a));
+    if let Some(name) = family {
+        attrs = attrs.family(Family::Name(name));
+    }
+    attrs
+}
+
+fn run_attrs<'a>(base: &Attrs<'a>, run: &StyledRun, style: &BurnStyle) -> Attrs<'a> {
+    let mut attrs = base.clone();
+    if run.bold {
+        attrs = attrs.weight(Weight::BOLD);
+    }
+    if run.italic {
+        attrs = attrs.style(Style::Italic);
+    }
+    let colour = run.color.unwrap_or(style.default_colour);
+    attrs.color(Color::rgba(colour.r, colour.g, colour.b, colour.a))
+}
+
+/// One visual line of a shaped cue, in visual (post-bidi) order.
+struct LaidOutLine {
+    width: f32,
+    top: f32,
+    height: f32,
+    /// Baseline offset from the top of the line box.
+    baseline: f32,
+    glyphs: Vec<LaidOutGlyph>,
+}
+
+struct LaidOutGlyph {
+    key: cosmic_text::CacheKey,
+    x: i32,
+    y: i32,
+    /// Byte offset of this glyph's cluster in the cue text, which is what ties
+    /// a glyph back to the run that styled it.
+    start: usize,
+    /// Left edge of the glyph's cluster in the line, before bidi-independent
+    /// rounding, used to place an underline.
+    left: f32,
+    advance: f32,
+    colour: Option<Color>,
+}
+
+/// Byte ranges of `runs` whose text is underlined, as offsets into the
+/// concatenated cue text.
+fn underlined_byte_ranges(runs: &[StyledRun]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut at = 0usize;
+    for run in runs {
+        let end = at + run.text.len();
+        if run.underline && end > at {
+            ranges.push((at, end));
+        }
+        at = end;
+    }
+    ranges
+}
+
+/// Paint the underline bar under every glyph whose cluster falls in an
+/// underlined run. cosmic-text carries no underline decoration, so the bar is
+/// drawn per glyph and adjacent glyphs join into a continuous rule.
+fn draw_underlines(
+    bitmap: &mut PositionedBitmap,
+    line: &LaidOutLine,
+    line_origin_x: f32,
+    baseline_y: f32,
+    font_size: f32,
+    ranges: &[(usize, usize)],
+    default: Rgba,
+) {
+    if ranges.is_empty() {
+        return;
+    }
+    let thickness = (font_size * UNDERLINE_THICKNESS_RATIO).round().max(1.0) as i32;
+    let top = (baseline_y + font_size * UNDERLINE_OFFSET_RATIO).round() as i32;
+    for glyph in &line.glyphs {
+        if !ranges
+            .iter()
+            .any(|(s, e)| glyph.start >= *s && glyph.start < *e)
+        {
+            continue;
+        }
+        let colour = glyph
+            .colour
+            .map(|c| [c.r(), c.g(), c.b(), c.a()])
+            .unwrap_or([default.r, default.g, default.b, default.a]);
+        let start_x = (line_origin_x + glyph.left).round() as i32;
+        let end_x = (line_origin_x + glyph.left + glyph.advance).round() as i32;
+        for row in top..top + thickness {
+            if row < 0 || row >= bitmap.height as i32 {
+                continue;
+            }
+            for column in start_x..end_x {
+                if column < 0 || column >= bitmap.width as i32 {
+                    continue;
+                }
+                bitmap.blend(column as u32, row as u32, colour);
+            }
+        }
+    }
+}
+
+/// Decode a bitmap cue's PNG and place it. The image is scaled down to fit the
+/// frame if it is larger, and otherwise used at its own size, matching how an
+/// Interop bitmap sub is authored against a known picture size.
+fn render_bitmap_cue(
+    path: &Path,
+    cue: &StyledCue,
+    width: u32,
+    height: u32,
+    style: &BurnStyle,
+) -> Result<PositionedBitmap, SubtitleError> {
+    let (image_width, image_height, pixels) = decode_png_rgba(path)?;
+    let scale = (width as f32 / image_width as f32)
+        .min(height as f32 / image_height as f32)
+        .min(1.0);
+    let (scaled_width, scaled_height, scaled) = if scale >= 1.0 {
+        (image_width, image_height, pixels)
+    } else {
+        let target_width = ((image_width as f32 * scale).round() as u32).max(1);
+        let target_height = ((image_height as f32 * scale).round() as u32).max(1);
+        (
+            target_width,
+            target_height,
+            nearest_neighbour(
+                &pixels,
+                image_width,
+                image_height,
+                target_width,
+                target_height,
+            ),
+        )
+    };
+    let (x, y) = anchor(
+        cue,
+        style,
+        width,
+        height,
+        scaled_width as f32,
+        scaled_height as f32,
+    );
+    Ok(PositionedBitmap {
+        x,
+        y,
+        width: scaled_width,
+        height: scaled_height,
+        pixels: scaled,
+    })
+}
+
+/// Decode a PNG to un-premultiplied RGBA8.
+fn decode_png_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), SubtitleError> {
+    let file = std::fs::File::open(path)?;
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::EXPAND);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| SubtitleError::Parse(format!("{}: {e}", path.display())))?;
+    let mut buffer = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+    let info = reader
+        .next_frame(&mut buffer)
+        .map_err(|e| SubtitleError::Parse(format!("{}: {e}", path.display())))?;
+    buffer.truncate(info.buffer_size());
+    let rgba = match (info.color_type, info.bit_depth) {
+        (png::ColorType::Rgba, png::BitDepth::Eight) => buffer,
+        (png::ColorType::Rgba, png::BitDepth::Sixteen) => {
+            buffer.chunks_exact(2).map(|s| s[0]).collect()
+        }
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => buffer
+            .chunks_exact(2)
+            .flat_map(|s| [s[0], s[0], s[0], s[1]])
+            .collect(),
+        (png::ColorType::GrayscaleAlpha, png::BitDepth::Sixteen) => buffer
+            .chunks_exact(4)
+            .flat_map(|s| [s[0], s[0], s[0], s[2]])
+            .collect(),
+        (colour, depth) => {
+            return Err(SubtitleError::Parse(format!(
+                "{}: unsupported PNG {colour:?} at {depth:?} bits",
+                path.display()
+            )));
+        }
+    };
+    Ok((info.width, info.height, rgba))
+}
+
+fn nearest_neighbour(
+    pixels: &[u8],
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> Vec<u8> {
+    let mut out = vec![0u8; (target_width as usize) * (target_height as usize) * 4];
+    for row in 0..target_height {
+        let source_row = (row as u64 * source_height as u64 / target_height as u64)
+            .min(source_height as u64 - 1) as usize;
+        for column in 0..target_width {
+            let source_column = (column as u64 * source_width as u64 / target_width as u64)
+                .min(source_width as u64 - 1) as usize;
+            let from = (source_row * source_width as usize + source_column) * 4;
+            let to = ((row as usize) * (target_width as usize) + column as usize) * 4;
+            out[to..to + 4].copy_from_slice(&pixels[from..from + 4]);
+        }
+    }
+    out
+}
+
+/// Frame-space top-left corner of a `block_width` x `block_height` block, from
+/// the cue's alignment and vertical position.
+///
+/// vposition is a percent of frame height measured from the anchored edge, the
+/// way Interop DCSubtitle and PAC give it: from the top for a top anchor, from
+/// the bottom for a bottom anchor, and as a centre offset for a middle anchor.
+fn anchor(
+    cue: &StyledCue,
+    style: &BurnStyle,
+    width: u32,
+    height: u32,
+    block_width: f32,
+    block_height: f32,
+) -> (i32, i32) {
+    let frame_width = width as f32;
+    let frame_height = height as f32;
+    let margin = frame_height * style.margin_ratio;
+    let inset = cue
+        .vposition
+        .map(|percent| frame_height * percent / 100.0)
+        .unwrap_or(margin);
+    let x = match cue.align.unwrap_or(HAlign::Center) {
+        HAlign::Left => margin,
+        HAlign::Center => (frame_width - block_width) / 2.0,
+        HAlign::Right => frame_width - block_width - margin,
+    };
+    let y = match cue.valign.unwrap_or(VAlign::Bottom) {
+        VAlign::Top => inset,
+        VAlign::Middle => (frame_height - block_height) / 2.0 + inset - margin,
+        VAlign::Bottom => frame_height - block_height - inset,
+    };
+    (x.round() as i32, y.round() as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::subtitle_formats::StyledRun;
+
+    /// A rasterizer with a font, or `None` when this machine has none and the
+    /// test should be skipped rather than failing on the environment.
+    fn rasterizer() -> Option<SubtitleRasterizer> {
+        let raster = SubtitleRasterizer::new(None).expect("font discovery");
+        if raster.has_font() {
+            Some(raster)
+        } else {
+            eprintln!("skipping: fontdb found no system font on this machine");
+            None
+        }
+    }
+
+    fn cue(text: &str) -> StyledCue {
+        StyledCue::text(0, 1000, vec![StyledRun::plain(text)])
+    }
+
+    /// Total alpha in a bitmap, which is nonzero exactly when something drew.
+    fn coverage(bitmap: &PositionedBitmap) -> u64 {
+        bitmap.pixels.chunks_exact(4).map(|p| p[3] as u64).sum()
+    }
+
+    const WIDTH: u32 = 512;
+    const HEIGHT: u32 = 256;
+
+    #[test]
+    fn a_text_cue_draws_pixels_only_while_it_is_on_screen() {
+        let Some(mut raster) = rasterizer() else {
+            return;
+        };
+        let cues = [cue("Hello")];
+        let style = BurnStyle::default();
+        let before = raster.render(&cues, 0, WIDTH, HEIGHT, &style).unwrap();
+        assert_eq!(before.len(), 1, "the cue starts at 0 and must render");
+        assert!(coverage(&before[0]) > 0, "shaped text drew nothing");
+        let after = raster.render(&cues, 1000, WIDTH, HEIGHT, &style).unwrap();
+        assert!(after.is_empty(), "the cue's end is exclusive");
+    }
+
+    #[test]
+    fn alignment_moves_the_block_to_the_named_corner() {
+        let Some(mut raster) = rasterizer() else {
+            return;
+        };
+        let style = BurnStyle::default();
+        let mut placed = Vec::new();
+        for (halign, valign) in [
+            (HAlign::Left, VAlign::Top),
+            (HAlign::Center, VAlign::Middle),
+            (HAlign::Right, VAlign::Bottom),
+        ] {
+            let mut c = cue("Hello");
+            c.align = Some(halign);
+            c.valign = Some(valign);
+            let out = raster.render(&[c], 0, WIDTH, HEIGHT, &style).unwrap();
+            assert_eq!(out.len(), 1);
+            assert!(coverage(&out[0]) > 0, "{halign:?}/{valign:?} drew nothing");
+            placed.push((out[0].x, out[0].y, out[0].width, out[0].height));
+        }
+        let (left_x, top_y, _, _) = placed[0];
+        let (centre_x, middle_y, centre_w, centre_h) = placed[1];
+        let (right_x, bottom_y, right_w, _) = placed[2];
+
+        assert!(left_x < centre_x, "left must sit left of centre");
+        assert!(centre_x < right_x, "right must sit right of centre");
+        assert!(top_y < middle_y, "top must sit above middle");
+        assert!(middle_y < bottom_y, "bottom must sit below middle");
+        // The centred block's centre is the frame's centre, within a pixel of
+        // rounding.
+        let centre = centre_x + centre_w as i32 / 2;
+        assert!(
+            (centre - WIDTH as i32 / 2).abs() <= 2,
+            "centred block centred at {centre}, frame centre {}",
+            WIDTH / 2
+        );
+        assert!(
+            (middle_y + centre_h as i32 / 2 - HEIGHT as i32 / 2).abs() <= 2,
+            "middle block is not vertically centred"
+        );
+        assert!(
+            right_x + right_w as i32 <= WIDTH as i32 + centre_w as i32,
+            "right-aligned block ran off the frame"
+        );
+    }
+
+    #[test]
+    fn vposition_measures_from_the_anchored_edge() {
+        let Some(mut raster) = rasterizer() else {
+            return;
+        };
+        let style = BurnStyle::default();
+        let mut top = cue("Hello");
+        top.valign = Some(VAlign::Top);
+        top.vposition = Some(10.0);
+        let mut bottom = cue("Hello");
+        bottom.valign = Some(VAlign::Bottom);
+        bottom.vposition = Some(10.0);
+        let top_out = raster.render(&[top], 0, WIDTH, HEIGHT, &style).unwrap();
+        let bottom_out = raster.render(&[bottom], 0, WIDTH, HEIGHT, &style).unwrap();
+        // 10% of 256 is 25.6 rows below the top edge.
+        let expected_top = (HEIGHT as f32 * 0.1).round() as i32;
+        let block_height = top_out[0].height as i32;
+        assert!(
+            (top_out[0].y + block_height - expected_top).abs() < block_height,
+            "top-anchored block at y={} for a 10% inset",
+            top_out[0].y
+        );
+        assert!(
+            bottom_out[0].y > top_out[0].y,
+            "a bottom anchor must sit lower than a top anchor at the same inset"
+        );
+    }
+
+    #[test]
+    fn bold_and_italic_change_what_is_drawn() {
+        let Some(mut raster) = rasterizer() else {
+            return;
+        };
+        let style = BurnStyle::default();
+        let plain = raster
+            .render(&[cue("Hamburgefonstiv")], 0, WIDTH, HEIGHT, &style)
+            .unwrap();
+        let bold_run = StyledRun {
+            text: "Hamburgefonstiv".into(),
+            bold: true,
+            ..StyledRun::plain("")
+        };
+        let bold = raster
+            .render(
+                &[StyledCue::text(0, 1000, vec![bold_run])],
+                0,
+                WIDTH,
+                HEIGHT,
+                &style,
+            )
+            .unwrap();
+        assert_ne!(
+            plain[0].pixels, bold[0].pixels,
+            "bold rendered the same pixels as plain"
+        );
+    }
+
+    #[test]
+    fn a_run_colour_overrides_the_default_colour() {
+        let Some(mut raster) = rasterizer() else {
+            return;
+        };
+        let red = StyledRun {
+            text: "Hello".into(),
+            color: Some(Rgba {
+                r: 255,
+                g: 0,
+                b: 0,
+                a: 255,
+            }),
+            ..StyledRun::plain("")
+        };
+        let out = raster
+            .render(
+                &[StyledCue::text(0, 1000, vec![red])],
+                0,
+                WIDTH,
+                HEIGHT,
+                &BurnStyle::default(),
+            )
+            .unwrap();
+        let opaque: Vec<[u8; 4]> = out[0]
+            .pixels
+            .chunks_exact(4)
+            .filter(|p| p[3] > 200)
+            .map(|p| [p[0], p[1], p[2], p[3]])
+            .collect();
+        assert!(!opaque.is_empty(), "no solid text pixels to check");
+        assert!(
+            opaque.iter().all(|p| p[0] > 200 && p[1] < 60 && p[2] < 60),
+            "solid pixels are not red: {:?}",
+            &opaque[..opaque.len().min(4)]
+        );
+    }
+
+    #[test]
+    fn underline_adds_coverage_below_the_text() {
+        let Some(mut raster) = rasterizer() else {
+            return;
+        };
+        let style = BurnStyle::default();
+        let plain = raster
+            .render(&[cue("Hello")], 0, WIDTH, HEIGHT, &style)
+            .unwrap();
+        let underlined_run = StyledRun {
+            text: "Hello".into(),
+            underline: true,
+            ..StyledRun::plain("")
+        };
+        let underlined = raster
+            .render(
+                &[StyledCue::text(0, 1000, vec![underlined_run])],
+                0,
+                WIDTH,
+                HEIGHT,
+                &style,
+            )
+            .unwrap();
+        assert!(
+            coverage(&underlined[0]) > coverage(&plain[0]),
+            "the underline bar added no coverage"
+        );
+    }
+
+    #[test]
+    fn a_bitmap_cue_composites_its_png() {
+        let dir = tempfile::tempdir().unwrap();
+        let png_path = dir.path().join("cue.png");
+        write_solid_png(&png_path, 64, 32, [0, 255, 0, 255]);
+        let mut cue = StyledCue::text(0, 1000, Vec::new());
+        cue.image = Some(png_path);
+        cue.valign = Some(VAlign::Bottom);
+        let mut raster = SubtitleRasterizer::new(None).unwrap();
+        let out = raster
+            .render(&[cue], 500, WIDTH, HEIGHT, &BurnStyle::default())
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!((out[0].width, out[0].height), (64, 32));
+        assert_eq!(&out[0].pixels[..4], &[0, 255, 0, 255]);
+        assert!(
+            out[0].y + 32 <= HEIGHT as i32,
+            "bottom-anchored bitmap ran off the frame"
+        );
+    }
+
+    fn write_solid_png(path: &Path, width: u32, height: u32, rgba: [u8; 4]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        let data: Vec<u8> = rgba
+            .iter()
+            .copied()
+            .cycle()
+            .take((width * height * 4) as usize)
+            .collect();
+        writer.write_image_data(&data).unwrap();
+    }
+
+    #[test]
+    fn compositing_half_alpha_white_mixes_the_frame_by_hand_computed_amounts() {
+        // One 2x1 rgb48be frame at mid grey (0x4000), half-alpha white on the
+        // left pixel only.
+        let mut frame = vec![
+            0x40, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40, 0x00, 0x40, 0x00,
+        ];
+        let bitmap = PositionedBitmap {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            pixels: vec![255, 255, 255, 128],
+        };
+        composite_rgb48(&mut frame, 2, 1, SampleOrder::Big, &[bitmap]);
+        // white lifted to 16 bits is 255*257 = 65535, so the mix is
+        // (65535*128 + 16384*127 + 127) / 255 = 10469375 / 255 = 41056.
+        assert_eq!(u16::from_be_bytes([frame[0], frame[1]]), 41056);
+        assert_eq!(u16::from_be_bytes([frame[2], frame[3]]), 41056);
+        assert_eq!(u16::from_be_bytes([frame[4], frame[5]]), 41056);
+        // The right pixel is untouched.
+        assert_eq!(&frame[6..], &[0x40, 0x00, 0x40, 0x00, 0x40, 0x00]);
+    }
+
+    #[test]
+    fn compositing_respects_sample_order_and_clips_to_the_frame() {
+        let mut big = vec![0u8; 6];
+        let mut little = vec![0u8; 6];
+        let bitmap = PositionedBitmap {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            pixels: vec![255, 0, 0, 255],
+        };
+        composite_rgb48(
+            &mut big,
+            1,
+            1,
+            SampleOrder::Big,
+            std::slice::from_ref(&bitmap),
+        );
+        composite_rgb48(&mut little, 1, 1, SampleOrder::Little, &[bitmap]);
+        assert_eq!(u16::from_be_bytes([big[0], big[1]]), 65535);
+        assert_eq!(u16::from_le_bytes([little[0], little[1]]), 65535);
+        assert_eq!(big[0..2], [0xff, 0xff]);
+
+        // A bitmap straddling the top-left corner paints only its visible part.
+        let mut frame = vec![0u8; 2 * 2 * 6];
+        let straddle = PositionedBitmap {
+            x: -1,
+            y: -1,
+            width: 2,
+            height: 2,
+            pixels: vec![255u8; 16],
+        };
+        composite_rgb48(&mut frame, 2, 2, SampleOrder::Big, &[straddle]);
+        assert_eq!(u16::from_be_bytes([frame[0], frame[1]]), 65535);
+        // Only pixel (0,0) is covered; the rest of the 2x2 frame stays black.
+        assert!(
+            frame[6..].iter().all(|&b| b == 0),
+            "clipping painted outside"
+        );
+    }
+
+    #[test]
+    fn a_font_file_with_no_face_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("not-a-font.ttf");
+        std::fs::write(&path, b"this is not a font").unwrap();
+        let err = SubtitleRasterizer::new(Some(&path)).unwrap_err();
+        assert!(
+            err.to_string().contains("no usable font face"),
+            "got: {err}"
+        );
+    }
+}

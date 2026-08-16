@@ -41,6 +41,7 @@ pub mod report;
 pub mod rest_api;
 pub mod shell_completion;
 pub mod subtitle_formats;
+pub mod subtitle_raster;
 pub mod subtitle_retime;
 pub mod timecode;
 pub mod trailer;

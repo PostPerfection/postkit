@@ -10,7 +10,26 @@
   refuses ACES, ACEScg and LogC, which need a LUT rather than a matrix.
   `create_dcdm` and `rgb_to_xyz_inplace` both run through it, so the file
   pipeline and the in-memory path are one transform.
-- `SourceColour::DisplayRgbIn(space)` and `CompressParams.source_transform`: a
+- `subtitle_raster`: a text rasteriser and frame compositor for burnt-in
+  subtitles. `SubtitleRasterizer` shapes `StyledCue`s with cosmic-text (system
+  fonts through fontdb, or a supplied .ttf/.otf) and rasterises them to
+  positioned RGBA bitmaps, honouring per-run bold/italic/underline/colour and
+  per-cue align/valign/vposition; bitmap cues composite their PNG directly.
+  `composite_rgb48` alpha-blends those onto a packed rgb48 frame. Neither knows
+  about the encoder, so a preview can reuse both.
+- `SubtitleBurn` and `CompressParams.source_preparation`: subtitles composited
+  into every decoded frame during the encode, so burning costs no second
+  generation. The burn always lands before any colour conversion, this crate's
+  own or the compressor's, because text is authored in display RGB.
+  `SourcePreparation` replaces `CompressParams.source_transform` and carries
+  both per-frame steps, so the order cannot be asked for the other way round.
+  `SubtitleBurn::active_cues` names the cues on a frame, which is how a held
+  still encodes once per cue change instead of once per frame.
+- An image sequence reaches the per-frame encode path through ffmpeg's concat
+  demuxer when a burn is set (`DecodeSource::ImageList`,
+  `write_image_concat_list`), so TIFF, DPX, EXR and PNG sequences burn the same
+  way a video does. Without a burn they still go straight to `grk_compress`.
+- `SourceColour::DisplayRgbIn(space)` and `CompressParams.source_preparation`: a
   P3 or Rec.2020 video source is converted to X'Y'Z' on the encoder threads,
   with grok's own transform off, so those sources encode correctly instead of
   being refused. Image sequences, J2K input and the subprocess encoder refuse

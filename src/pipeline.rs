@@ -106,6 +106,9 @@ pub struct EncodeRunOptions {
     /// Per-codestream byte cap, e.g. the DCI HDR Addendum's raised cap. A frame
     /// over it fails the run.
     pub codestream_byte_cap: Option<u64>,
+    /// Subtitles burnt into every decoded frame. Only the video path can carry
+    /// one: see [`reject_unsupported_burn`].
+    pub subtitle_burn: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
 }
 
 impl Default for EncodeRunOptions {
@@ -115,6 +118,7 @@ impl Default for EncodeRunOptions {
             fps: 24,
             source_colour: SourceColour::DisplayRgb,
             codestream_byte_cap: None,
+            subtitle_burn: None,
         }
     }
 }
@@ -143,13 +147,55 @@ pub fn run_encode_with_options(
     let input_type = crate::encode::detect_input_type(video);
     on_log(&format!("Input type: {:?}", input_type));
     reject_unsupported_colour_path(input_type, &options.source_colour)?;
+    if options.subtitle_burn.is_some() {
+        reject_unsupported_burn(input_type, &options.source_colour)?;
+    }
 
     let j2k_dir = output_dir.join("j2k");
     let mut frames_encoded = 0u64;
 
+    // Everything ffmpeg decodes goes through one code path, so a subtitle burn
+    // has a single place to hook into. `run_stream` is that path; the arms below
+    // only decide what ffmpeg opens.
+    let run_stream = |opts: &StreamEncodeOptions| -> Result<u64, String> {
+        on_progress(&PipelineProgress {
+            stage: "encode".to_string(),
+            message: "Starting...".to_string(),
+            frame: 0,
+            total_frames: 0,
+            fps: 0.0,
+            elapsed_secs: 0.0,
+            percent: 0.0,
+        });
+        let result = stream_encode_inprocess(opts, cancel, pause, |p: StreamProgress| {
+            let percent = if p.total_frames > 0 {
+                (p.frame as f64 / p.total_frames as f64) * 100.0
+            } else {
+                0.0
+            };
+            on_progress(&PipelineProgress {
+                stage: "encode".to_string(),
+                message: format!("Frame {}/{}", p.frame, p.total_frames),
+                frame: p.frame,
+                total_frames: p.total_frames,
+                fps: p.fps,
+                elapsed_secs: p.elapsed_secs,
+                percent: percent.min(99.0),
+            });
+            on_log(&format!(
+                "[ENCODE] frame={}/{} fps={:.1}",
+                p.frame, p.total_frames, p.fps
+            ));
+        });
+        if !result.success {
+            return Err(result.error);
+        }
+        Ok(result.frames_encoded)
+    };
+
     match input_type {
         InputType::Video => {
-            let opts = StreamEncodeOptions {
+            frames_encoded = run_stream(&StreamEncodeOptions {
                 input: video.to_path_buf(),
                 output_dir: j2k_dir.clone(),
                 compression_ratio,
@@ -158,44 +204,9 @@ pub fn run_encode_with_options(
                 progression: "CPRL".to_string(),
                 fps,
                 source_colour: options.source_colour.clone(),
+                subtitle_burn: options.subtitle_burn.clone(),
                 ..StreamEncodeOptions::default()
-            };
-
-            on_progress(&PipelineProgress {
-                stage: "encode".to_string(),
-                message: "Starting...".to_string(),
-                frame: 0,
-                total_frames: 0,
-                fps: 0.0,
-                elapsed_secs: 0.0,
-                percent: 0.0,
-            });
-
-            let result = stream_encode_inprocess(&opts, cancel, pause, |p: StreamProgress| {
-                let percent = if p.total_frames > 0 {
-                    (p.frame as f64 / p.total_frames as f64) * 100.0
-                } else {
-                    0.0
-                };
-                on_progress(&PipelineProgress {
-                    stage: "encode".to_string(),
-                    message: format!("Frame {}/{}", p.frame, p.total_frames),
-                    frame: p.frame,
-                    total_frames: p.total_frames,
-                    fps: p.fps,
-                    elapsed_secs: p.elapsed_secs,
-                    percent: percent.min(99.0),
-                });
-                on_log(&format!(
-                    "[ENCODE] frame={}/{} fps={:.1}",
-                    p.frame, p.total_frames, p.fps
-                ));
-            });
-
-            if !result.success {
-                return Err(result.error);
-            }
-            frames_encoded = result.frames_encoded;
+            })?;
             on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
         }
         InputType::ImageSequence => {
@@ -205,44 +216,76 @@ pub fn run_encode_with_options(
                 video.parent().unwrap_or(video).to_path_buf()
             };
 
-            on_progress(&PipelineProgress {
-                stage: "encode".to_string(),
-                message: "Encoding images...".to_string(),
-                frame: 0,
-                total_frames: 0,
-                fps: 0.0,
-                elapsed_secs: 0.0,
-                percent: 0.0,
-            });
+            if options.subtitle_burn.is_some() {
+                // grk_compress reads the stills itself and never shows postkit a
+                // frame buffer, so a burn takes the sequence through ffmpeg
+                // instead: a concat list holding each still for one frame period
+                // decodes to the same rgb48be stream a video does.
+                let frames = crate::encode::find_source_frames(&input_dir)
+                    .map_err(|e| format!("cannot list {}: {e}", input_dir.display()))?;
+                if frames.is_empty() {
+                    return Err(format!("no images in {}", input_dir.display()));
+                }
+                let list = output_dir.join("frames.ffconcat");
+                crate::encode::write_image_concat_list(&frames, fps, &list)?;
+                on_log(&format!(
+                    "[ENCODE] Burning subtitles onto {} images through ffmpeg",
+                    frames.len()
+                ));
+                frames_encoded = run_stream(&StreamEncodeOptions {
+                    input: list,
+                    output_dir: j2k_dir.clone(),
+                    compression_ratio,
+                    num_resolutions: 6,
+                    codeblock_size: 32,
+                    progression: "CPRL".to_string(),
+                    fps,
+                    source_colour: options.source_colour.clone(),
+                    subtitle_burn: options.subtitle_burn.clone(),
+                    decode_source: crate::encode::DecodeSource::ImageList,
+                    ..StreamEncodeOptions::default()
+                })?;
+                on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
+            } else {
+                on_progress(&PipelineProgress {
+                    stage: "encode".to_string(),
+                    message: "Encoding images...".to_string(),
+                    frame: 0,
+                    total_frames: 0,
+                    fps: 0.0,
+                    elapsed_secs: 0.0,
+                    percent: 0.0,
+                });
 
-            let result = encode_parallel(
-                &input_dir,
-                &j2k_dir,
-                cancel,
-                pause,
-                |p: ParallelProgress| {
-                    let percent = if p.total > 0 {
-                        (p.done as f64 / p.total as f64) * 100.0
-                    } else {
-                        0.0
-                    };
-                    on_progress(&PipelineProgress {
-                        stage: "encode".to_string(),
-                        message: format!("Frame {}/{}", p.done, p.total),
-                        frame: p.done,
-                        total_frames: p.total,
-                        fps: p.fps,
-                        elapsed_secs: p.elapsed_secs,
-                        percent: percent.min(99.0),
-                    });
-                },
-            );
+                let result = encode_parallel(
+                    &input_dir,
+                    &j2k_dir,
+                    cancel,
+                    pause,
+                    |p: ParallelProgress| {
+                        let percent = if p.total > 0 {
+                            (p.done as f64 / p.total as f64) * 100.0
+                        } else {
+                            0.0
+                        };
+                        on_progress(&PipelineProgress {
+                            stage: "encode".to_string(),
+                            message: format!("Frame {}/{}", p.done, p.total),
+                            frame: p.done,
+                            total_frames: p.total,
+                            fps: p.fps,
+                            elapsed_secs: p.elapsed_secs,
+                            percent: percent.min(99.0),
+                        });
+                    },
+                );
 
-            if !result.success {
-                return Err(result.error);
+                if !result.success {
+                    return Err(result.error);
+                }
+                frames_encoded = result.frames_encoded;
+                on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
             }
-            frames_encoded = result.frames_encoded;
-            on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
         }
         InputType::J2kSequence => {
             on_log("Input is already J2K, skipping encode");
@@ -303,6 +346,32 @@ fn reject_unsupported_colour_path(
     }
 }
 
+/// Refuse a burn the encode cannot honour: subtitle bitmaps are display RGB, so
+/// they only make sense on frames that have not been converted yet, and only
+/// the video path decodes frames postkit can composite onto at all.
+fn reject_unsupported_burn(
+    input_type: InputType,
+    source_colour: &SourceColour,
+) -> Result<(), String> {
+    match (input_type, source_colour) {
+        (InputType::J2kSequence, _) => Err(
+            "J2K input is already compressed, so there are no frames to burn subtitles onto"
+                .to_string(),
+        ),
+        (_, SourceColour::DciLut(lut)) => Err(format!(
+            "the HDR-to-DCI LUT {} converts frames to X'Y'Z' during decode, so burnt-in text \
+             would be drawn in the wrong colour space",
+            lut.display()
+        )),
+        (_, SourceColour::AlreadyPq) => Err(
+            "an X'Y'Z' PQ source is already in the projector's colour space, so burnt-in text \
+             would be drawn in the wrong one"
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Hold every codestream in a directory under the per-frame byte cap.
 fn check_codestream_dir(dir: &Path, cap: u64) -> Result<(), String> {
     let entries =
@@ -319,6 +388,40 @@ fn check_codestream_dir(dir: &Path, cap: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_burn_is_refused_wherever_the_frames_are_not_display_rgb() {
+        assert!(reject_unsupported_burn(InputType::Video, &SourceColour::DisplayRgb).is_ok());
+        assert!(
+            reject_unsupported_burn(
+                InputType::Video,
+                &SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3),
+            )
+            .is_ok(),
+            "P3 burns in display RGB and is converted afterwards"
+        );
+        assert!(
+            reject_unsupported_burn(InputType::ImageSequence, &SourceColour::DisplayRgb).is_ok(),
+            "an image sequence burns through the concat demuxer"
+        );
+        for (input, colour, expected) in [
+            (
+                InputType::J2kSequence,
+                SourceColour::DisplayRgb,
+                "already compressed",
+            ),
+            (
+                InputType::Video,
+                SourceColour::DciLut(PathBuf::from("hdr.cube")),
+                "wrong colour space",
+            ),
+            (InputType::Video, SourceColour::AlreadyPq, "wrong one"),
+        ] {
+            let err = reject_unsupported_burn(input, &colour)
+                .expect_err("this combination has to refuse a burn");
+            assert!(err.contains(expected), "got: {err}");
+        }
+    }
 
     #[test]
     fn image_sequences_refuse_an_untransformed_source() {

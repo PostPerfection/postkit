@@ -11,6 +11,7 @@ ar-reshaper = "1.5"
 asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "4f137a0" }
 base64 = "0.22"
 chrono = "0.4"
+cosmic-text = { version = "0.17", default-features = false, features = ["std", "swash"] }
 dirs = "6"
 dolby_vision = { version = "3.3.2", features = ["xml"] }
 ebur128 = "0.1.10"
@@ -20,6 +21,7 @@ hound = "3.5.1"
 lcms2 = { version = "6", optional = true }
 libc = { version = "0.2", optional = true }
 notify = "8"
+png = "0.18"
 quick-xml = "0.37"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 regex = "1"
@@ -62,4 +64,8 @@ required-features = ["grok-ffi"]
 
 [[test]]
 name = "video_encode_e2e"
+required-features = ["grok-ffi"]
+
+[[test]]
+name = "subtitle_burn_e2e"
 required-features = ["grok-ffi"]
