@@ -60,6 +60,16 @@ impl std::fmt::Debug for MxfEncryption {
     }
 }
 
+/// The MCA labels a PCM wrap carries: the asdcp-wrap style label string, e.g.
+/// `"51(L,R,C,LFE,Ls,Rs),HI,VIN"` (build one from a soundfield with
+/// [`crate::mca::soundfield_to_mca_config`]), and the RFC 5646 spoken language
+/// written on every label. asdcplib writes en-US when the language is None.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McaConfig {
+    pub labels: String,
+    pub spoken_language: Option<String>,
+}
+
 /// Options for MXF wrapping.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MxfWrapOptions {
@@ -82,11 +92,9 @@ pub struct MxfWrapOptions {
     /// claims. Never serialized: it carries secret key material.
     #[serde(skip)]
     pub encryption: Option<MxfEncryption>,
-    /// SMPTE 377-4 MCA label config for PCM, asdcp-wrap style, e.g.
-    /// `"51(L,R,C,LFE,Ls,Rs),HI,VIN"`. AS-DCP (DCP) only. Build one from a
-    /// soundfield with [`crate::mca::soundfield_to_mca_config`].
+    /// SMPTE 377-4 MCA labels for PCM. AS-DCP (DCP) only.
     #[serde(default)]
-    pub mca_config: Option<String>,
+    pub mca_config: Option<McaConfig>,
     /// TimedText only: explicit asset ids for the ancillary resources (the
     /// `input_files` after the first). Entry `i` is the id for `input_files[i+1]`.
     /// A DCST that references a font/image by `urn:uuid:<id>` must embed that
@@ -202,12 +210,19 @@ impl PcmWriter {
         filename: &str,
         info: &asdcplib::WriterInfo,
         desc: &asdcplib::pcm::AudioDescriptor,
-        mca_config: Option<&str>,
+        mca_config: Option<&McaConfig>,
         header_size: u32,
     ) -> asdcplib::Result<()> {
         match self {
             Self::AsDcp(w) => match mca_config {
-                Some(m) => w.open_write_mca(filename, info, desc, m, header_size),
+                Some(m) => w.open_write_mca(
+                    filename,
+                    info,
+                    desc,
+                    &m.labels,
+                    m.spoken_language.as_deref(),
+                    header_size,
+                ),
                 None => w.open_write(filename, info, desc, header_size),
             },
             Self::As02(w) => w.open_write(filename, info, desc, header_size),
@@ -679,8 +694,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
 
     let mut writer = PcmWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
-    if let Err(e) = writer.open_write(&output_str, &info, &desc, opts.mca_config.as_deref(), 16384)
-    {
+    if let Err(e) = writer.open_write(&output_str, &info, &desc, opts.mca_config.as_ref(), 16384) {
         return MxfTrackFile {
             error: format!("PCM open_write failed: {e}"),
             ..Default::default()
@@ -1523,7 +1537,10 @@ mod tests {
             fps_den: 1,
             partition_size: 0,
             encryption: None,
-            mca_config: mca,
+            mca_config: Some(McaConfig {
+                labels: mca.unwrap(),
+                spoken_language: Some("fr-CA".to_string()),
+            }),
             resource_ids: vec![],
             hdr: None,
             asset_uuid: None,
@@ -1540,6 +1557,17 @@ mod tests {
             labels.has_mca_channel_assignment,
             "MCA ChannelAssignment UL must be set"
         );
+        let subdescriptors = reader
+            .mca_label_subdescriptors()
+            .expect("read mca subdescriptors");
+        assert_eq!(
+            subdescriptors.len(),
+            7,
+            "six channels plus the soundfield group"
+        );
+        for label in &subdescriptors {
+            assert_eq!(label.spoken_language.as_deref(), Some("fr-CA"));
+        }
     }
 
     #[test]
@@ -1556,7 +1584,10 @@ mod tests {
             fps_den: 1,
             partition_size: 0,
             encryption: None,
-            mca_config: Some("51(L,R,C,LFE,Ls,Rs)".to_string()),
+            mca_config: Some(McaConfig {
+                labels: "51(L,R,C,LFE,Ls,Rs)".to_string(),
+                spoken_language: None,
+            }),
             resource_ids: vec![],
             hdr: None,
             asset_uuid: None,

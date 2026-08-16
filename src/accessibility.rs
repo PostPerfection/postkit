@@ -1021,7 +1021,10 @@ mod tests {
             fps_den: 1,
             partition_size: 0,
             encryption: None,
-            mca_config: Some(mca_config.to_string()),
+            mca_config: Some(crate::mxf_wrap::McaConfig {
+                labels: mca_config.to_string(),
+                spoken_language: None,
+            }),
             resource_ids: vec![],
             hdr: None,
             asset_uuid: Some(asset_uuid),
