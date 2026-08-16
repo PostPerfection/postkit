@@ -59,6 +59,7 @@ fn base_params(res: &Res) -> CompressParams {
         irreversible: true,
         mct: true,
         apply_xyz_transform: false,
+        source_transform: None,
         threads_per_codec: 1,
     }
 }
