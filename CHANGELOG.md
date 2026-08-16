@@ -18,7 +18,9 @@
   pipeline and the in-memory path are one transform.
 - `subtitle_raster::find_system_sans_font`: a sans-serif font file off the same
   fontdb scan the burn path shapes with, preferring Liberation Sans, then DejaVu
-  Sans, then whatever the generic sans-serif resolves to. Only a whole font file
+  Sans, Arial, Helvetica Neue, Helvetica, Segoe UI, Noto Sans, then whatever the
+  generic sans-serif resolves to, then any regular face calling itself sans, then
+  any face at all. Only a whole font file
   on disk qualifies, because the subsetter reads the first face of the bytes it
   is handed. A packager uses it to embed a font when the caller named none.
 - `subtitle_raster`: a text rasteriser and frame compositor for burnt-in

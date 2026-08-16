@@ -142,10 +142,17 @@ pub fn parse_burn_effect(text: &str) -> Result<BurnEffect, String> {
 }
 
 /// Families a packaged subtitle track falls back to when the caller names no
-/// font, most preferred first. Both are open-licence sans faces wide enough for
-/// Latin, Greek and Cyrillic, and a machine that has either is very likely to
-/// have it under this exact name.
-const FALLBACK_SANS_FAMILIES: [&str; 2] = ["Liberation Sans", "DejaVu Sans"];
+/// font, most preferred first: the open-licence sans faces Linux ships, then the
+/// sans faces macOS and Windows ship under these exact names.
+const FALLBACK_SANS_FAMILIES: [&str; 7] = [
+    "Liberation Sans",
+    "DejaVu Sans",
+    "Arial",
+    "Helvetica Neue",
+    "Helvetica",
+    "Segoe UI",
+    "Noto Sans",
+];
 
 /// A system sans-serif font file to embed in a timed-text track when the caller
 /// names none, found through the same fontdb scan the burn path shapes with.
@@ -155,10 +162,19 @@ const FALLBACK_SANS_FAMILIES: [&str; 2] = ["Liberation Sans", "DejaVu Sans"];
 /// first face of whatever bytes it is handed, so one face out of a collection
 /// would come back as a different typeface than the one asked for.
 pub fn find_system_sans_font() -> Option<std::path::PathBuf> {
-    use cosmic_text::fontdb::{Family as DbFamily, Query, Source};
+    use cosmic_text::fontdb::{FaceInfo, Family as DbFamily, Query, Source};
 
     let fonts = FontSystem::new();
     let database = fonts.db();
+    let whole_file = |face: &FaceInfo| -> Option<std::path::PathBuf> {
+        if face.index != 0 {
+            return None;
+        }
+        match &face.source {
+            Source::File(path) => Some(path.clone()),
+            _ => None,
+        }
+    };
     let families = FALLBACK_SANS_FAMILIES
         .iter()
         .map(|name| DbFamily::Name(name))
@@ -168,20 +184,31 @@ pub fn find_system_sans_font() -> Option<std::path::PathBuf> {
             families: &[family],
             ..Query::default()
         };
-        let Some(id) = database.query(&query) else {
-            continue;
-        };
-        let Some(face) = database.face(id) else {
-            continue;
-        };
-        if face.index != 0 {
-            continue;
-        }
-        if let Source::File(path) = &face.source {
-            return Some(path.clone());
+        if let Some(path) = database
+            .query(&query)
+            .and_then(|id| database.face(id))
+            .and_then(whole_file)
+        {
+            return Some(path);
         }
     }
-    None
+    // no known name matched: any regular face calling itself sans, then any face
+    let mut faces: Vec<&FaceInfo> = database
+        .faces()
+        .filter(|face| face.style == cosmic_text::fontdb::Style::Normal)
+        .collect();
+    faces.sort_by(|a, b| a.post_script_name.cmp(&b.post_script_name));
+    let calls_itself_sans = |face: &FaceInfo| {
+        face.families
+            .iter()
+            .any(|(name, _)| name.to_ascii_lowercase().contains("sans"))
+    };
+    faces
+        .iter()
+        .copied()
+        .filter(|face| calls_itself_sans(face))
+        .chain(faces.iter().copied())
+        .find_map(whole_file)
 }
 
 /// Percent of a whole, as the appearance flags take their sizes.
