@@ -60,34 +60,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --features async -- -D warnings
 
-      # build grok (jpeg 2000 codec) from source once per tag, cached.
-      # provides libgrokj2k on the pkg-config + loader paths and grk_compress on PATH.
-      - name: Cache grok
-        if: runner.os != 'Windows'
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/grok-install
-          key: grok-${{ runner.os }}-v20.3.10
-
       - name: Setup grok
         if: runner.os != 'Windows'
-        env:
-          GROK_TAG: v20.3.10
-        run: |
-          prefix="$GITHUB_WORKSPACE/grok-install"
-          if [ ! -x "$prefix/bin/grk_compress" ]; then
-            git clone --depth 1 --recurse-submodules --shallow-submodules --branch "$GROK_TAG" \
-              https://github.com/GrokImageCompression/grok.git "$RUNNER_TEMP/grok-src"
-            cmake -S "$RUNNER_TEMP/grok-src" -B "$RUNNER_TEMP/grok-build" \
-              -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$prefix" \
-              -DGRK_BUILD_CORE_SWIG_BINDINGS=OFF
-            cmake --build "$RUNNER_TEMP/grok-build" --parallel "$(getconf _NPROCESSORS_ONLN)"
-            cmake --install "$RUNNER_TEMP/grok-build"
-          fi
-          echo "PKG_CONFIG_PATH=$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig:$PKG_CONFIG_PATH" >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$prefix/lib:$prefix/lib64:$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
-          echo "DYLD_LIBRARY_PATH=$prefix/lib:$prefix/lib64:$DYLD_LIBRARY_PATH" >> "$GITHUB_ENV"
-          echo "$prefix/bin" >> "$GITHUB_PATH"
+        uses: PostPerfection/setup-grok@v1
+        with:
+          grok-ref: v20.3.10
 
       # grok-ffi links libgrokj2k (built above); skipped on windows where the
       # source build is not wired up.
