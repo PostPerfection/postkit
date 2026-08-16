@@ -849,11 +849,11 @@ mod tests_xyz {
         for (i, px) in pixels.iter().enumerate() {
             let want = transform.pixel(*px, 65535);
             assert_eq!(&out[i * 3..i * 3 + 3], &want, "rgb48le pixel {i}");
-            for c in 0..3 {
+            for (c, want_channel) in want.iter().enumerate() {
                 let off = i * 6 + c * 2;
                 assert_eq!(
                     u16::from_be_bytes([be[off], be[off + 1]]),
-                    want[c],
+                    *want_channel,
                     "rgb48be pixel {i} channel {c}"
                 );
             }
