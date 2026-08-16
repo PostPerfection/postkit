@@ -32,6 +32,12 @@
   which renders a marking pair to the ST 430-1 Annex C URIs a KDM carries; and
   the `ContentAuthenticator`, `CertificateThumbprint`, `ForensicMarkFlagList`
   and `ForensicMarkFlag` element names.
+- `wav_io::read_interleaved_exact` and `write_interleaved_exact`, which carry
+  interleaved samples in the file's own type through the new `Samples` enum, so a
+  read and write back is byte-identical at every depth. The normalised f32 pair
+  cannot be: 32 significant bits do not fit an f32 mantissa, so 32-bit int PCM
+  loses its low bits through any read-modify-write. Anything that only moves
+  samples around, an audio delay or a trim, wants the exact pair.
 
 ### Changed
 
@@ -40,6 +46,17 @@
   Blue moves by up to 5 code values at 16 bits, under one at 12.
 - `rgb_to_xyz_inplace` gamma-encodes each value directly instead of through a
   16-bit quantised output table, which was coarse near black.
+- Burn-in applies `font_size`, `font_colour` and `position` to subtitles, as ASS
+  style overrides on the `subtitles` filter. The three options reached the text
+  watermark path only, so `--font-size` did nothing on the path the command is
+  named after. Each one is left to the subtitle file when it is zero or empty,
+  and `font_colour` must be RRGGBB hex there.
+- Burn-in escapes what it puts in an ffmpeg filtergraph, so a subtitle path or a
+  watermark text holding `:`, `,`, `'`, `[`, `]` or `\` no longer breaks ffmpeg's
+  filter parser or silently truncates.
+- Burn-in refuses a subtitle XML input before it runs ffmpeg, naming SRT as the
+  remedy. ffmpeg has no reader for SMPTE ST 428-7 (DCST) or Interop subtitle XML,
+  so it died inside ffmpeg with a message about the filter chain.
 - Timed text and Atmos wraps honour `MxfWrapOptions.encryption`, so a DCP built
   with encryption no longer ships cleartext subtitles and Atmos beside encrypted
   picture and sound. Both carry the caller's KeyId and an HMAC, as picture and
