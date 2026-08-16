@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::encode::{
-    ImageFormat, InputType, ParallelProgress, SourceColour, StreamEncodeOptions, StreamProgress,
-    check_codestream_size, encode_parallel, stream_encode_inprocess,
+    FrameRate, ImageFormat, InputType, ParallelProgress, SourceColour, StreamEncodeOptions,
+    StreamProgress, check_codestream_size, encode_parallel, stream_encode_inprocess,
 };
 use crate::picture_processing::PictureProcessing;
 
@@ -47,7 +47,7 @@ pub struct EncodeResult {
 pub fn run_encode(
     video: &Path,
     output_dir: &Path,
-    fps: u32,
+    fps: FrameRate,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     on_progress: impl Fn(&PipelineProgress),
@@ -67,14 +67,13 @@ pub fn run_encode(
 
 /// Same as `run_encode` but with a caller-chosen J2K compression ratio. Only the
 /// video branch honours it; image/J2K sequences ignore it. Callers that expose a
-/// target bitrate convert it to a ratio first. `fps` sets the J2K edit rate
-/// (0 falls back to 24).
+/// target bitrate convert it to a ratio first. `fps` sets the J2K edit rate.
 #[allow(clippy::too_many_arguments)]
 pub fn run_encode_with_ratio(
     video: &Path,
     output_dir: &Path,
     compression_ratio: f64,
-    fps: u32,
+    fps: FrameRate,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     on_progress: impl Fn(&PipelineProgress),
@@ -99,8 +98,8 @@ pub fn run_encode_with_ratio(
 pub struct EncodeRunOptions {
     /// J2K compression ratio (video input only).
     pub compression_ratio: f64,
-    /// J2K edit rate (0 falls back to 24).
-    pub fps: u32,
+    /// J2K edit rate.
+    pub fps: FrameRate,
     /// Colour the source frames carry, which decides whether the encoder runs
     /// the DCDM X'Y'Z' transform or leaves DCI PQ essence alone.
     pub source_colour: SourceColour,
@@ -121,7 +120,7 @@ impl Default for EncodeRunOptions {
     fn default() -> Self {
         Self {
             compression_ratio: 10.0,
-            fps: 24,
+            fps: FrameRate::default(),
             source_colour: SourceColour::DisplayRgb,
             codestream_byte_cap: None,
             subtitle_burn: None,
@@ -142,7 +141,7 @@ pub fn run_encode_with_options(
     on_log: impl Fn(&str),
 ) -> Result<EncodeResult, String> {
     let compression_ratio = options.compression_ratio;
-    let fps = if options.fps == 0 { 24 } else { options.fps };
+    let fps = options.fps;
     if !video.exists() {
         return Err(format!("Input not found: {}", video.display()));
     }

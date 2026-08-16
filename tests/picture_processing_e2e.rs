@@ -5,7 +5,7 @@
 //! processed frame size rather than the source's, and that black border
 //! detection reads back the bars a clip really has.
 
-use postkit::encode::DecodeSource;
+use postkit::encode::{DecodeSource, FrameRate};
 use postkit::picture_processing::{Crop, Fit, PictureProcessing};
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_with_options};
 use std::path::{Path, PathBuf};
@@ -93,7 +93,7 @@ fn encode(input: &Path, output: &Path, picture: PictureProcessing) -> PathBuf {
         input,
         output,
         &EncodeRunOptions {
-            fps: FRAME_COUNT as u32,
+            fps: FrameRate::whole(FRAME_COUNT as u32),
             picture,
             ..Default::default()
         },

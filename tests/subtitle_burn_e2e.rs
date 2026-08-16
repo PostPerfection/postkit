@@ -12,6 +12,7 @@
 //!
 //! A bitmap cue rather than text, so the test does not depend on a system font.
 
+use postkit::encode::FrameRate;
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_with_options};
 use postkit::subtitle_formats::{Rgba, StyledCue, StyledRun, VAlign};
 use postkit::subtitle_raster::{BurnEffect, BurnStyle, SampleOrder, SubtitleBurn};
@@ -109,7 +110,7 @@ fn encode(video: &Path, output: &Path, burn: Option<Arc<SubtitleBurn>>) -> PathB
         video,
         output,
         &EncodeRunOptions {
-            fps: FRAME_COUNT as u32,
+            fps: FrameRate::whole(FRAME_COUNT as u32),
             subtitle_burn: burn,
             ..Default::default()
         },

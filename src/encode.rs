@@ -1,6 +1,61 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// A frame rate as an exact fraction, so 24000/1001 reaches ffmpeg as itself
+/// rather than as 24.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameRate {
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+impl FrameRate {
+    /// Panics on a zero numerator or denominator: no source carries one, so a
+    /// caller passing one has a bug rather than an unusual rate.
+    pub fn new(numerator: u32, denominator: u32) -> Self {
+        assert!(
+            numerator > 0 && denominator > 0,
+            "frame rate {numerator}/{denominator} needs a non-zero numerator and denominator"
+        );
+        Self {
+            numerator,
+            denominator,
+        }
+    }
+
+    /// A whole-number rate such as 24 or 25.
+    pub fn whole(fps: u32) -> Self {
+        Self::new(fps, 1)
+    }
+
+    pub fn as_f64(&self) -> f64 {
+        f64::from(self.numerator) / f64::from(self.denominator)
+    }
+
+    /// The rate as ffmpeg's `fps` filter takes it, `24000/1001` or `24`.
+    pub fn ffmpeg_filter_value(&self) -> String {
+        if self.denominator == 1 {
+            return self.numerator.to_string();
+        }
+        format!("{}/{}", self.numerator, self.denominator)
+    }
+
+    /// One frame period in seconds, as an ffmpeg concat list writes it. The
+    /// concat demuxer rejects a fraction, so this is decimal seconds.
+    pub fn frame_duration_seconds(&self) -> String {
+        format!(
+            "{:.9}",
+            f64::from(self.denominator) / f64::from(self.numerator)
+        )
+    }
+}
+
+impl Default for FrameRate {
+    fn default() -> Self {
+        Self::whole(24)
+    }
+}
+
 /// JPEG 2000 encoding options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncodeOptions {
@@ -326,12 +381,15 @@ impl SourceColour {
 /// frame rate at the position the plan names, plus the HDR-to-DCI LUT last when
 /// the source needs one, so the LUT sees the finished picture.
 pub(crate) fn decode_filters(
-    fps: u32,
+    fps: FrameRate,
     source_colour: &SourceColour,
     plan: &crate::picture_processing::PicturePlan,
 ) -> String {
     let mut filters = plan.filters.clone();
-    filters.insert(plan.fps_position, format!("fps={fps}"));
+    filters.insert(
+        plan.fps_position,
+        format!("fps={}", fps.ffmpeg_filter_value()),
+    );
     if let SourceColour::DciLut(lut) = source_colour {
         filters.push(format!("lut3d={}", lut.display()));
     }
@@ -382,17 +440,17 @@ impl DecodeSource {
 /// are escaped the way the concat demuxer reads them.
 pub fn write_image_concat_list(
     frames: &[PathBuf],
-    fps: u32,
+    fps: FrameRate,
     list_path: &Path,
 ) -> Result<(), String> {
-    let fps = if fps == 0 { 24 } else { fps };
+    let duration = fps.frame_duration_seconds();
     let mut list = String::from("ffconcat version 1.0\n");
     for frame in frames {
         let absolute = frame
             .canonicalize()
             .map_err(|e| format!("cannot resolve {}: {e}", frame.display()))?;
         let quoted = absolute.to_string_lossy().replace('\'', r"'\''");
-        list.push_str(&format!("file '{quoted}'\nduration {}\n", 1.0 / fps as f64));
+        list.push_str(&format!("file '{quoted}'\nduration {duration}\n"));
     }
     std::fs::write(list_path, list)
         .map_err(|e| format!("cannot write {}: {e}", list_path.display()))
@@ -414,7 +472,7 @@ pub struct StreamEncodeOptions {
     /// Progression order
     pub progression: String,
     /// Target frame rate for output (ffmpeg fps filter)
-    pub fps: u32,
+    pub fps: FrameRate,
     /// Path to compressor binary (auto-detected if empty)
     pub compressor_path: PathBuf,
     /// Library directory for LD_LIBRARY_PATH (if needed)
@@ -445,7 +503,7 @@ impl Default for StreamEncodeOptions {
             num_resolutions: 6,
             codeblock_size: 32,
             progression: "CPRL".to_string(),
-            fps: 24,
+            fps: FrameRate::default(),
             compressor_path: PathBuf::new(),
             lib_dir: None,
             source_colour: SourceColour::DisplayRgb,
@@ -685,7 +743,8 @@ where
         compression_ratio: opts.compression_ratio,
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
-        frame_rate: opts.fps as u16,
+        // grok only sizes the per-frame byte budget from this, so the whole rate is enough
+        frame_rate: opts.fps.as_f64().round() as u16,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         source_preparation: grok_encoder::SourcePreparation {
             subtitle_burn: opts.subtitle_burn.clone(),
@@ -861,7 +920,8 @@ where
         compression_ratio: opts.compression_ratio,
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
-        frame_rate: opts.fps as u16,
+        // grok only sizes the per-frame byte budget from this, so the whole rate is enough
+        frame_rate: opts.fps.as_f64().round() as u16,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         ..grok_encoder::CompressParams::default()
     };
@@ -1133,6 +1193,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_fractional_rate_keeps_its_fraction_and_a_whole_one_prints_bare() {
+        assert_eq!(FrameRate::whole(24).ffmpeg_filter_value(), "24");
+        assert_eq!(
+            FrameRate::new(24000, 1001).ffmpeg_filter_value(),
+            "24000/1001"
+        );
+        assert_eq!(FrameRate::default(), FrameRate::whole(24));
+        assert_eq!(FrameRate::whole(25).as_f64(), 25.0);
+        assert!((FrameRate::new(24000, 1001).as_f64() - 23.976_023_976).abs() < 1e-9);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-zero numerator and denominator")]
+    fn a_zero_rate_is_refused() {
+        FrameRate::new(0, 1);
+    }
+
+    #[test]
+    fn a_concat_list_holds_each_still_for_the_exact_frame_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let frames: Vec<PathBuf> = (0..2)
+            .map(|index| {
+                let frame = dir.path().join(format!("frame_{index}.png"));
+                std::fs::write(&frame, b"not a real png").unwrap();
+                frame
+            })
+            .collect();
+        let list_path = dir.path().join("frames.ffconcat");
+        write_image_concat_list(&frames, FrameRate::new(24000, 1001), &list_path).unwrap();
+        let list = std::fs::read_to_string(&list_path).unwrap();
+        assert_eq!(list.matches("duration 0.041708333").count(), 2, "{list}");
+
+        write_image_concat_list(&frames, FrameRate::whole(24), &list_path).unwrap();
+        let list = std::fs::read_to_string(&list_path).unwrap();
+        assert_eq!(list.matches("duration 0.041666667").count(), 2, "{list}");
+    }
+
+    #[test]
     fn only_display_rgb_gets_the_xyz_transform() {
         assert!(SourceColour::DisplayRgb.applies_xyz_transform());
         assert!(!SourceColour::AlreadyPq.applies_xyz_transform());
@@ -1179,16 +1277,16 @@ mod tests {
             .plan(1920, 1080)
             .unwrap();
         assert_eq!(
-            decode_filters(24, &SourceColour::DisplayRgb, &plain),
+            decode_filters(FrameRate::whole(24), &SourceColour::DisplayRgb, &plain),
             "fps=24"
         );
         assert_eq!(
-            decode_filters(25, &SourceColour::AlreadyPq, &plain),
+            decode_filters(FrameRate::whole(25), &SourceColour::AlreadyPq, &plain),
             "fps=25"
         );
         assert_eq!(
             decode_filters(
-                48,
+                FrameRate::whole(48),
                 &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
                 &plain
             ),
@@ -1213,7 +1311,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             decode_filters(
-                24,
+                FrameRate::whole(24),
                 &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
                 &plan
             ),

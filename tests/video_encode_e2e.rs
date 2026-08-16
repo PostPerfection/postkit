@@ -5,6 +5,7 @@
 //! consumer that forgets the `grok-ffi` feature gets an error instead of an
 //! encode, and nothing else catches it.
 
+use postkit::encode::FrameRate;
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_with_options};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -58,7 +59,7 @@ fn a_video_source_encodes_to_one_codestream_per_frame() {
         &video,
         &output,
         &EncodeRunOptions {
-            fps: FRAME_COUNT as u32,
+            fps: FrameRate::whole(FRAME_COUNT as u32),
             ..Default::default()
         },
         &cancel,
@@ -87,4 +88,62 @@ fn a_video_source_encodes_to_one_codestream_per_frame() {
         .unwrap_or_else(|| panic!("{} is not a J2K codestream", first.display()));
     assert_eq!((header.width, header.height), (WIDTH, HEIGHT));
     assert_eq!(header.num_components, 3);
+}
+
+/// 500 is the shortest clip where the two rates disagree: 500 frames at
+/// 24000/1001 run 20.854 s, which an `fps=24` filter resamples to 501 frames,
+/// so a wrong-by-a-frame composition shows up as a codestream count.
+#[test]
+fn a_23_976_clip_encodes_500_codestreams_where_an_integer_24_would_make_501() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    const NTSC_FRAME_COUNT: u64 = 500;
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("ntsc.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=s={WIDTH}x{HEIGHT}:r=24000/1001"),
+            "-frames:v",
+            &NTSC_FRAME_COUNT.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&video)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let output = dir.path().join("out");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    let result = run_encode_with_options(
+        &video,
+        &output,
+        &EncodeRunOptions {
+            fps: FrameRate::new(24000, 1001),
+            ..Default::default()
+        },
+        &cancel,
+        &pause,
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    )
+    .expect("video encode");
+
+    assert_eq!(
+        postkit::grok_encoder::contiguous_encoded_frames(&result.j2k_dir),
+        NTSC_FRAME_COUNT,
+        "the fractional rate should neither add nor drop a frame"
+    );
 }
