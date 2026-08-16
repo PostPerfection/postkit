@@ -147,6 +147,16 @@ const PERCENT_DIVISOR: f32 = 100.0;
 /// Text taller than the frame itself, which no caller can mean.
 const MAX_FONT_SIZE_PERCENT: f32 = 100.0;
 
+/// Refuse a text height, as a percent of the frame height, that nothing can draw.
+pub fn check_font_size_percent(percent: f32) -> Result<(), String> {
+    if !percent.is_finite() || percent <= 0.0 || percent > MAX_FONT_SIZE_PERCENT {
+        return Err(format!(
+            "a font size is a percent of the frame height above 0 and up to {MAX_FONT_SIZE_PERCENT}, got {percent}"
+        ));
+    }
+    Ok(())
+}
+
 /// The appearance settings a caller named on the command line, each left
 /// `None` when the flag was not given so the base style keeps its own value.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -169,11 +179,7 @@ impl BurnStyleOverrides {
     pub fn apply(&self, base: BurnStyle) -> Result<BurnStyle, String> {
         let mut style = base;
         if let Some(percent) = self.font_size_percent {
-            if !percent.is_finite() || percent <= 0.0 || percent > MAX_FONT_SIZE_PERCENT {
-                return Err(format!(
-                    "a font size is a percent of the frame height above 0 and up to {MAX_FONT_SIZE_PERCENT}, got {percent}"
-                ));
-            }
+            check_font_size_percent(percent)?;
             style.font_size_ratio = percent / PERCENT_DIVISOR;
         }
         if let Some(percent) = self.outline_width_percent {
