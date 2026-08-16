@@ -4,6 +4,9 @@
 
 ### Added
 
+- `DcpCpl::annotation_text` and per-reel `picture_hash` / `sound_hash`, so a
+  generated CPL can carry the `AnnotationText` Bv2.1 requires and the `<Hash>`
+  some servers check instead of the PKL's. Both are schema-validated in place.
 - Forensic marking flags: `KdmConfig` and `RewrapConfig` can disable picture
   marking, audio marking, or audio marking above a given channel, writing the
   ST 430-1 `ForensicMarkFlagList`. Marking stays on by default, and the element

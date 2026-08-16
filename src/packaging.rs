@@ -225,6 +225,10 @@ pub struct DcpCplReel {
     pub sound_entry_point: u64,
     /// KeyId (bare UUID) when the sound essence is encrypted.
     pub sound_key_id: Option<String>,
+    /// Base64 SHA-1 of each track file. Some servers check the CPL's hash rather
+    /// than the PKL's, so a CPL without them is trusted less than one with them.
+    pub picture_hash: Option<String>,
+    pub sound_hash: Option<String>,
 }
 
 /// A DCP Composition Playlist (ST 429-7 SMPTE or Interop, by `namespace`).
@@ -238,6 +242,8 @@ pub struct DcpCpl {
     pub issuer: String,
     pub creator: String,
     pub issue_date: String,
+    /// Bv2.1 8.1 requires this and requires it to equal the title.
+    pub annotation_text: Option<String>,
     pub reels: Vec<DcpCplReel>,
 }
 
@@ -254,9 +260,16 @@ impl DcpCpl {
         let mut xml = String::new();
         xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(xml, "<CompositionPlaylist xmlns=\"{}\">", self.namespace);
-        // ST 429-7 element order: Id, IssueDate, Issuer, Creator,
-        // ContentTitleText, ContentKind, ContentVersion, RatingList.
+        // ST 429-7 element order: Id, AnnotationText, IssueDate, Issuer,
+        // Creator, ContentTitleText, ContentKind, ContentVersion, RatingList.
         let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
+        if let Some(ref annotation) = self.annotation_text {
+            let _ = writeln!(
+                xml,
+                "  <AnnotationText>{}</AnnotationText>",
+                escape_xml(annotation)
+            );
+        }
         let _ = writeln!(xml, "  <IssueDate>{}</IssueDate>", self.issue_date);
         let _ = writeln!(xml, "  <Issuer>{}</Issuer>", escape_xml(&self.issuer));
         let _ = writeln!(xml, "  <Creator>{}</Creator>", escape_xml(&self.creator));
@@ -318,6 +331,9 @@ impl DcpCpl {
             if let Some(ref key_id) = reel.picture_key_id {
                 let _ = writeln!(xml, "          <KeyId>urn:uuid:{key_id}</KeyId>");
             }
+            if let Some(ref hash) = reel.picture_hash {
+                let _ = writeln!(xml, "          <Hash>{}</Hash>", escape_xml(hash));
+            }
             let _ = writeln!(
                 xml,
                 "          <FrameRate>{} {}</FrameRate>",
@@ -364,6 +380,9 @@ impl DcpCpl {
                 );
                 if let Some(ref key_id) = reel.sound_key_id {
                     let _ = writeln!(xml, "          <KeyId>urn:uuid:{key_id}</KeyId>");
+                }
+                if let Some(ref hash) = reel.sound_hash {
+                    let _ = writeln!(xml, "          <Hash>{}</Hash>", escape_xml(hash));
                 }
                 xml.push_str("        </MainSound>\n");
             }
@@ -693,6 +712,7 @@ mod tests {
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation_text: Some("Test".into()),
             reels: vec![DcpCplReel {
                 reel_id: "66666666-7777-8888-9999-aaaaaaaaaaaa".into(),
                 picture_id: "77777777-7777-8888-9999-aaaaaaaaaaaa".into(),
@@ -705,6 +725,9 @@ mod tests {
                 sound_edit_rate_num: 24,
                 sound_edit_rate_den: 1,
                 sound_duration: 240,
+                // base64 SHA-1, so the schema's base64Binary type is exercised
+                picture_hash: Some("kO0m3F3qX3qg3n3qg3n3qg3n3q0=".into()),
+                sound_hash: Some("kO0m3F3qX3qg3n3qg3n3qg3n3q0=".into()),
                 ..Default::default()
             }],
         };
@@ -718,6 +741,7 @@ mod tests {
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation_text: Some("Test".into()),
             reels: vec![DcpCplReel {
                 reel_id: "66666666-7777-8888-9999-aaaaaaaaaaaa".into(),
                 picture_id: "77777777-7777-8888-9999-aaaaaaaaaaaa".into(),
@@ -1007,6 +1031,7 @@ mod tests {
             issuer: "DCP Wizard".into(),
             creator: "DCP Wizard".into(),
             issue_date: "2024-01-01T00:00:00+00:00".into(),
+            annotation_text: Some("Test".into()),
             reels: vec![DcpCplReel {
                 reel_id: "reel".into(),
                 picture_id: "pic".into(),
@@ -1023,6 +1048,8 @@ mod tests {
                 sound_duration: 240,
                 sound_entry_point: 0,
                 sound_key_id: None,
+                picture_hash: Some("cGljdHVyZS1oYXNo".into()),
+                sound_hash: Some("c291bmQtaGFzaA==".into()),
             }],
         };
         let xml = cpl.to_xml();
@@ -1043,6 +1070,14 @@ mod tests {
         // encrypted picture carries its KeyId; unencrypted sound does not
         assert!(xml.contains("<KeyId>urn:uuid:pic-key</KeyId>"));
         assert_eq!(xml.matches("<KeyId>").count(), 1);
+        // Bv2.1 8.1 wants the annotation, and it sits between Id and IssueDate
+        assert!(xml.contains("<AnnotationText>Test</AnnotationText>"));
+        assert!(xml.find("<Id>urn:uuid:cpl</Id>").unwrap() < xml.find("<AnnotationText>").unwrap());
+        assert!(xml.find("<AnnotationText>").unwrap() < xml.find("<IssueDate>").unwrap());
+        // both track files carry a Hash, which follows KeyId in the asset
+        assert!(xml.contains("<Hash>cGljdHVyZS1oYXNo</Hash>"));
+        assert!(xml.contains("<Hash>c291bmQtaGFzaA==</Hash>"));
+        assert!(xml.find("<KeyId>").unwrap() < xml.find("<Hash>").unwrap());
     }
 
     #[test]
