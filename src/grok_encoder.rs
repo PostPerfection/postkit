@@ -645,6 +645,7 @@ where
         height,
         cancel,
         false,
+        None,
         on_progress,
     )
 }
@@ -675,6 +676,10 @@ pub fn encode_video_pipeline_resumable<P>(
     height: u32,
     cancel: &Arc<AtomicBool>,
     resume: bool,
+    // ffmpeg -vf chain applied while decoding, for fades and the like. It must
+    // not change the frame size or count: the reader slices stdout into fixed
+    // width*height frames and the CPL already declares the count.
+    video_filter: Option<&str>,
     mut on_progress: P,
 ) -> PipelineResult
 where
@@ -710,10 +715,12 @@ where
     }
 
     // Launch ffmpeg to decode video → raw rgb48be frames on stdout
-    let mut child = match Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-i")
-        .arg(input_video)
+    let mut command = Command::new("ffmpeg");
+    command.arg("-y").arg("-i").arg(input_video);
+    if let Some(filter) = video_filter {
+        command.arg("-vf").arg(filter);
+    }
+    let mut child = match command
         .arg("-pix_fmt")
         .arg("rgb48be")
         .arg("-f")

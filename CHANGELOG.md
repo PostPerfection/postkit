@@ -4,6 +4,8 @@
 
 ### Added
 
+- `encode_video_pipeline_resumable` takes an optional ffmpeg `-vf` chain, so a
+  caller can fade the picture while it decodes rather than in a second pass.
 - `DcpCpl::annotation_text` and per-reel `picture_hash` / `sound_hash`, so a
   generated CPL can carry the `AnnotationText` Bv2.1 requires and the `<Hash>`
   some servers check instead of the PKL's. Both are schema-validated in place.
