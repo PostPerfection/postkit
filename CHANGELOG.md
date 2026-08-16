@@ -4,6 +4,17 @@
 
 ### Added
 
+- `colour::DcdmTransform`: the DCDM encode transform for one source colour
+  space, built once and applied per frame (`pixel`, `frame_rgb48le`,
+  `frame_rgb48be_inplace`). It covers Rec.709, P3, Rec.2020 and X'Y'Z', and
+  refuses ACES, ACEScg and LogC, which need a LUT rather than a matrix.
+  `create_dcdm` and `rgb_to_xyz_inplace` both run through it, so the file
+  pipeline and the in-memory path are one transform.
+- `SourceColour::DisplayRgbIn(space)` and `CompressParams.source_transform`: a
+  P3 or Rec.2020 video source is converted to X'Y'Z' on the encoder threads,
+  with grok's own transform off, so those sources encode correctly instead of
+  being refused. Image sequences, J2K input and the subprocess encoder refuse
+  the variant, naming why.
 - `encode_video_pipeline_resumable` takes an optional ffmpeg `-vf` chain, so a
   caller can fade the picture while it decodes rather than in a second pass.
 - `DcpCpl::annotation_text` and per-reel `picture_hash` / `sound_hash`, so a
@@ -24,6 +35,11 @@
 
 ### Changed
 
+- The DCDM Rec.709 matrix is the sRGB/D65 one grok and libdcp use, where
+  `create_dcdm` had a BT.709-derived variant differing in the fourth decimal.
+  Blue moves by up to 5 code values at 16 bits, under one at 12.
+- `rgb_to_xyz_inplace` gamma-encodes each value directly instead of through a
+  16-bit quantised output table, which was coarse near black.
 - Timed text and Atmos wraps honour `MxfWrapOptions.encryption`, so a DCP built
   with encryption no longer ships cleartext subtitles and Atmos beside encrypted
   picture and sound. Both carry the caller's KeyId and an HMAC, as picture and

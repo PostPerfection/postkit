@@ -278,14 +278,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What colour the source frames carry when they reach the J2K compressor.
 ///
-/// The DCDM X'Y'Z' transform is applied if and only if this is `DisplayRgb`, so
-/// essence that a caller later labels ST 2084 PQ can never hold frames the
-/// encoder transformed itself.
+/// The compressor's own DCDM X'Y'Z' transform is applied if and only if this is
+/// `DisplayRgb`, so essence that a caller later labels ST 2084 PQ can never hold
+/// frames the encoder transformed itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SourceColour {
     /// Display RGB. The compressor runs the DCDM X'Y'Z' transform.
     #[default]
     DisplayRgb,
+    /// Display RGB in a space the compressor's own transform does not model
+    /// (P3, Rec.2020): postkit converts every frame with that space's matrix
+    /// before compression, and the compressor transform stays off.
+    DisplayRgbIn(crate::colour::ColourSpace),
     /// HDR source converted to DCI X'Y'Z' by this 3D LUT during decode, so the
     /// compressor applies no further transform.
     DciLut(PathBuf),
@@ -298,6 +302,17 @@ impl SourceColour {
     /// Whether the compressor has to run the DCDM X'Y'Z' transform.
     pub fn applies_xyz_transform(&self) -> bool {
         matches!(self, SourceColour::DisplayRgb)
+    }
+
+    /// The transform postkit runs over each frame before compression, built once
+    /// for the whole run. Errs for a space no 3x3 matrix reaches X'Y'Z' from.
+    pub fn frame_transform(&self) -> Result<Option<Arc<crate::colour::DcdmTransform>>, String> {
+        match self {
+            SourceColour::DisplayRgbIn(space) => Ok(Some(Arc::new(
+                crate::colour::DcdmTransform::to_xyz(*space)?,
+            ))),
+            _ => Ok(None),
+        }
     }
 }
 
@@ -560,12 +575,25 @@ where
         }
     };
 
+    let source_transform = match opts.source_colour.frame_transform() {
+        Ok(t) => t,
+        Err(e) => {
+            kill_child(&mut ffmpeg);
+            return EncodeResult {
+                success: false,
+                error: e,
+                ..Default::default()
+            };
+        }
+    };
+
     let params = CompressParams {
         compression_ratio: opts.compression_ratio,
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
         frame_rate: opts.fps as u16,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
+        source_transform,
         ..CompressParams::default()
     };
 
@@ -651,6 +679,16 @@ where
         return EncodeResult {
             success: false,
             error: format!("HDR-to-DCI LUT not found: {}", lut.display()),
+            ..Default::default()
+        };
+    }
+    if let SourceColour::DisplayRgbIn(space) = &opts.source_colour {
+        return EncodeResult {
+            success: false,
+            error: format!(
+                "a {space:?} source needs the in-process encoder: the subprocess pool hands \
+                 raw frames to grk_compress, which only converts Rec.709"
+            ),
             ..Default::default()
         };
     }
@@ -988,6 +1026,38 @@ mod tests {
         assert!(!SourceColour::AlreadyPq.applies_xyz_transform());
         assert!(
             !SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")).applies_xyz_transform()
+        );
+        assert!(
+            !SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3).applies_xyz_transform(),
+            "postkit converts a P3 source itself, so the compressor must not"
+        );
+    }
+
+    #[test]
+    fn a_wide_gamut_source_carries_its_own_frame_transform() {
+        for space in [
+            crate::colour::ColourSpace::P3,
+            crate::colour::ColourSpace::Rec2020,
+        ] {
+            assert!(
+                SourceColour::DisplayRgbIn(space)
+                    .frame_transform()
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(
+            SourceColour::DisplayRgb
+                .frame_transform()
+                .unwrap()
+                .is_none()
+        );
+        assert!(SourceColour::AlreadyPq.frame_transform().unwrap().is_none());
+        assert!(
+            SourceColour::DisplayRgbIn(crate::colour::ColourSpace::Aces)
+                .frame_transform()
+                .is_err(),
+            "a scene-referred source has no matrix"
         );
     }
 

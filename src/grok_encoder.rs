@@ -91,6 +91,11 @@ pub struct CompressParams {
     pub mct: bool,
     /// Apply XYZ colour transform (Rec.709 RGB → DCI X'Y'Z')
     pub apply_xyz_transform: bool,
+    /// Colour transform postkit runs over each frame before compression, for a
+    /// source space the compressor's own transform does not model (P3,
+    /// Rec.2020). Setting it together with `apply_xyz_transform` converts the
+    /// frame twice and is refused.
+    pub source_transform: Option<Arc<crate::colour::DcdmTransform>>,
     /// Threads per codec instance (set internally by pipeline)
     pub threads_per_codec: u32,
 }
@@ -118,6 +123,7 @@ impl Default for CompressParams {
             irreversible: true,
             mct: true,
             apply_xyz_transform: false,
+            source_transform: None,
             threads_per_codec: 1,
         }
     }
@@ -410,9 +416,20 @@ fn encoder_thread_fn(
     let mut output_buf = vec![0u8; buf_size];
 
     while !cancel.load(Ordering::Relaxed) && !error_flag.load(Ordering::Relaxed) {
-        let Some(frame) = input_queue.pop() else {
+        let Some(mut frame) = input_queue.pop() else {
             break;
         };
+
+        if let Some(transform) = &params.source_transform
+            && let Err(e) = transform_frame(&mut frame, transform, params.apply_xyz_transform)
+        {
+            error_flag.store(true, Ordering::Relaxed);
+            let mut err = first_error.lock().unwrap();
+            if err.is_empty() {
+                *err = format!("Encode failed frame {}: {e}", frame.index());
+            }
+            break;
+        }
 
         match compress_frame_grok(&frame, params, &mut output_buf) {
             Ok(data) => {
@@ -433,6 +450,33 @@ fn encoder_thread_fn(
                 break;
             }
         }
+    }
+}
+
+/// Convert one frame into X'Y'Z' before it reaches the compressor. Runs on the
+/// encoder threads, so a whole-frame matrix costs no pipeline throughput.
+fn transform_frame(
+    frame: &mut RawFrame,
+    transform: &crate::colour::DcdmTransform,
+    compressor_transform: bool,
+) -> Result<(), String> {
+    if compressor_transform {
+        return Err(
+            "the compressor's X'Y'Z' transform and a source transform are both set: \
+             the frame would be converted twice"
+                .to_string(),
+        );
+    }
+    match frame {
+        RawFrame::Packed {
+            data,
+            precision: 16,
+            ..
+        } => {
+            transform.frame_rgb48be_inplace(data);
+            Ok(())
+        }
+        _ => Err("a source colour transform needs a packed 16-bit rgb48be frame".to_string()),
     }
 }
 
@@ -838,6 +882,17 @@ where
 {
     use std::process::{Command, Stdio};
 
+    if params.source_transform.is_some() {
+        return PipelineResult {
+            success: false,
+            error: "the subprocess encoder writes raw frames straight to grk_compress and \
+                    cannot run a source colour transform: use the in-process pipeline"
+                .to_string(),
+            frames_encoded: 0,
+            output_dir: output_dir.to_path_buf(),
+        };
+    }
+
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         return PipelineResult {
             success: false,
@@ -1118,6 +1173,40 @@ mod tests {
         queue.close();
         let result = handle.join().unwrap();
         assert!(!result); // push should return false after close
+    }
+
+    #[test]
+    fn a_frame_transform_converts_packed_frames_and_refuses_the_rest() {
+        let transform = crate::colour::DcdmTransform::to_xyz(crate::colour::ColourSpace::P3)
+            .expect("P3 transform");
+        let mut packed = RawFrame::Packed {
+            data: [65535u16, 0, 0]
+                .iter()
+                .flat_map(|c| c.to_be_bytes())
+                .collect(),
+            width: 1,
+            height: 1,
+            precision: 16,
+            index: 0,
+        };
+        transform_frame(&mut packed, &transform, false).unwrap();
+        let RawFrame::Packed { data, .. } = &packed else {
+            panic!("frame changed shape");
+        };
+        let want = transform.pixel([65535, 0, 0], u16::MAX);
+        assert_eq!(u16::from_be_bytes([data[0], data[1]]), want[0]);
+
+        // converting twice would be silently wrong colour, so it fails instead
+        assert!(transform_frame(&mut packed, &transform, true).is_err());
+
+        let mut planar = RawFrame::Planar {
+            components: [vec![0i32], vec![0], vec![0]],
+            width: 1,
+            height: 1,
+            precision: 16,
+            index: 0,
+        };
+        assert!(transform_frame(&mut planar, &transform, false).is_err());
     }
 
     #[test]

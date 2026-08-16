@@ -130,96 +130,179 @@ mod tests {
 
 // ─── In-memory RGB → X'Y'Z' transform for DCI ─────────────────────────────
 
-// DCI companding (SMPTE 428-1 / RP 431-2): 48 cd/m² reference white over the
-// 52.37 encoding peak. libdcp/DoM (rgb_xyz.cc) and grok fold this into the
-// matrix so diffuse white lands below full code, not at 4095.
-const DCI_COEFFICIENT: f64 = 48.0 / 52.37;
-
-// Display-referred Rec.709 linearization: pure gamma 2.2. This matches libdcp's
-// rec709_to_xyz and grok's applyXYZTransform (the DoM-parity reference), not the
-// camera OETF inverse. The OETF inverse is for scene-referred capture; DCP
-// content is display-referred, so gamma 2.2 is the mastering convention here.
-fn rec709_to_linear(v: f64) -> f64 {
-    if v <= 0.0 { 0.0 } else { v.powf(2.2) }
+/// Source colour space description for the DCDM transform: the linear RGB to
+/// CIE XYZ matrix, the gamma that linearises its code values, and the scale that
+/// lands source white on the DCI reference white.
+pub(crate) struct SourceSpace {
+    pub to_xyz: [[f32; 3]; 3],
+    pub gamma: f32,
+    pub scale: f32,
 }
 
-// DCI 2.6 gamma: linear → X'Y'Z' (gamma-encoded)
-fn linear_to_dci_gamma(v: f64) -> f64 {
-    if v <= 0.0 { 0.0 } else { v.powf(1.0 / 2.6) }
+/// Resolve a source colour space to its matrix, gamma and DCI scale.
+///
+/// The scene-referred and log spaces are refused: no 3x3 matrix reaches X'Y'Z'
+/// from them, and approximating one silently would be wrong colour.
+pub(crate) fn source_space(space: ColourSpace) -> Result<SourceSpace, String> {
+    let dci_scale = DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
+    let resolved = match space {
+        ColourSpace::Rec709 => SourceSpace {
+            // the sRGB/D65 matrix grok, libdcp and DoM all use, so their X'Y'Z'
+            // and ours agree code for code
+            to_xyz: [
+                [0.412_456_4, 0.357_576_1, 0.180_437_5],
+                [0.212_672_9, 0.715_152_2, 0.072_175],
+                [0.019_333_9, 0.119_192, 0.950_304_1],
+            ],
+            // gamma 2.2 for display-referred Rec.709, matching libdcp rec709_to_xyz,
+            // DoM and grok. Was 2.4 (Rec.1886); harmonized 2026-07-23.
+            gamma: 2.2,
+            scale: dci_scale,
+        },
+        ColourSpace::P3 => SourceSpace {
+            to_xyz: [
+                [0.445_169_8, 0.277_134_4, 0.172_282_7],
+                [0.209_491_7, 0.721_595_2, 0.068_913_1],
+                [0.0, 0.047_060_6, 0.907_378_4],
+            ],
+            gamma: DCDM_GAMMA,
+            scale: dci_scale,
+        },
+        ColourSpace::Rec2020 => SourceSpace {
+            to_xyz: [
+                [0.636_958, 0.144_616_9, 0.168_881],
+                [0.262_700_2, 0.677_998_1, 0.059_301_7],
+                [0.0, 0.028_072_7, 1.060_985_1],
+            ],
+            gamma: 2.4,
+            scale: dci_scale,
+        },
+        // already X'Y'Z': decode and requantise, the luminance scaling is baked in
+        ColourSpace::Xyz => SourceSpace {
+            to_xyz: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            gamma: DCDM_GAMMA,
+            scale: 1.0,
+        },
+        ColourSpace::Aces | ColourSpace::AcesCg | ColourSpace::LogC => {
+            return Err(format!(
+                "{space:?} is scene-referred or log: no 3x3 matrix reaches X'Y'Z' from it, \
+                 so it needs a 3D LUT that lands on one of rec709, p3, rec2020 or xyz"
+            ));
+        }
+    };
+    Ok(resolved)
 }
 
-// Rec.709/D65 RGB → CIE XYZ, pre-multiplied by the DCI companding coefficient.
-const C: f32 = DCI_COEFFICIENT as f32;
-const M00: f32 = 0.4124564 * C;
-const M01: f32 = 0.3575761 * C;
-const M02: f32 = 0.1804375 * C;
-const M10: f32 = 0.2126729 * C;
-const M11: f32 = 0.7151522 * C;
-const M12: f32 = 0.0721750 * C;
-const M20: f32 = 0.0193339 * C;
-const M21: f32 = 0.119192 * C;
-const M22: f32 = 0.9503041 * C;
+/// The DCDM encode transform for one source colour space, built once and applied
+/// to every frame of a run.
+///
+/// Per pixel: linearise the source's code values with its gamma, matrix them
+/// into the output space, scale to the DCI reference white, then re-encode with
+/// the 2.6 gamma SMPTE 428-1 stores. For Rec.709 this is the transform grok
+/// applies itself and libdcp/DoM's `rgb_xyz.cc` agrees with.
+pub struct DcdmTransform {
+    space: ColourSpace,
+    /// linear source RGB to the output space (X'Y'Z' or P3-D65 linear RGB)
+    matrix: [[f32; 3]; 3],
+    /// linear scale applied to the matrix output
+    scale: f32,
+    /// 16-bit source code value to linear light
+    linear: Vec<f32>,
+}
 
-/// Transform a 16-bit big-endian RGB frame buffer to X'Y'Z' (DCI) in-place.
+impl std::fmt::Debug for DcdmTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DcdmTransform")
+            .field("space", &self.space)
+            .finish()
+    }
+}
+
+impl DcdmTransform {
+    /// Transform from `space` to DCI X'Y'Z'.
+    pub fn to_xyz(space: ColourSpace) -> Result<Self, String> {
+        let resolved = source_space(space)?;
+        Ok(Self::new(
+            space,
+            resolved.to_xyz,
+            resolved.gamma,
+            resolved.scale,
+        ))
+    }
+
+    pub(crate) fn new(space: ColourSpace, matrix: [[f32; 3]; 3], gamma: f32, scale: f32) -> Self {
+        Self {
+            space,
+            matrix,
+            scale,
+            linear: (0..=u16::MAX)
+                .map(|v| (v as f32 / 65535.0).powf(gamma))
+                .collect(),
+        }
+    }
+
+    /// One pixel of 16-bit source code values to output code values, quantised
+    /// to `max_code` (4095 for 12-bit DCDM, 65535 for 16-bit).
+    pub fn pixel(&self, rgb: [u16; 3], max_code: u16) -> [u16; 3] {
+        let r = self.linear[rgb[0] as usize];
+        let g = self.linear[rgb[1] as usize];
+        let b = self.linear[rgb[2] as usize];
+        let inv_gamma = 1.0 / DCDM_GAMMA;
+        let max = max_code as f32;
+        let mut out = [0u16; 3];
+        for (row, slot) in self.matrix.iter().zip(out.iter_mut()) {
+            let v = (row[0] * r + row[1] * g + row[2] * b) * self.scale;
+            *slot = (v.clamp(0.0, 1.0).powf(inv_gamma) * max).round() as u16;
+        }
+        out
+    }
+
+    /// Convert one rgb48le frame into `out`, three code values per pixel.
+    pub fn frame_rgb48le(&self, rgb: &[u8], max_code: u16, out: &mut [u16]) {
+        for (px, xyz) in rgb.chunks_exact(6).zip(out.chunks_exact_mut(3)) {
+            let codes = self.pixel(
+                [
+                    u16::from_le_bytes([px[0], px[1]]),
+                    u16::from_le_bytes([px[2], px[3]]),
+                    u16::from_le_bytes([px[4], px[5]]),
+                ],
+                max_code,
+            );
+            xyz.copy_from_slice(&codes);
+        }
+    }
+
+    /// Convert one rgb48be frame in place, to 16-bit code values in the same
+    /// layout. This is ffmpeg's rawvideo format and what the J2K encoder reads.
+    pub fn frame_rgb48be_inplace(&self, buf: &mut [u8]) {
+        for px in buf.chunks_exact_mut(6) {
+            let codes = self.pixel(
+                [
+                    u16::from_be_bytes([px[0], px[1]]),
+                    u16::from_be_bytes([px[2], px[3]]),
+                    u16::from_be_bytes([px[4], px[5]]),
+                ],
+                u16::MAX,
+            );
+            for (i, code) in codes.iter().enumerate() {
+                px[i * 2] = (code >> 8) as u8;
+                px[i * 2 + 1] = *code as u8;
+            }
+        }
+    }
+}
+
+/// Transform a 16-bit big-endian Rec.709 RGB frame buffer to X'Y'Z' (DCI) in place.
 ///
 /// Assumes `buf` contains pixels as [R_hi, R_lo, G_hi, G_lo, B_hi, B_lo, ...]
 /// (rgb48be format from ffmpeg). Each sample is 16-bit unsigned big-endian.
 ///
-/// The transform pipeline (libdcp/DoM and grok parity):
-/// 1. Rec.709 gamma 2.2 (display-referred → linear)
-/// 2. 3×3 matrix (linear Rec.709/D65 RGB → linear CIE XYZ), pre-multiplied by
-///    the DCI companding coefficient (48/52.37)
-/// 3. DCI 2.6 gamma (linear → X'Y'Z')
-///
-/// Output overwrites `buf` in the same rgb48be layout.
+/// Builds the transform per call, so a caller converting more than one frame
+/// should hold a [`DcdmTransform`] instead.
 pub fn rgb_to_xyz_inplace(buf: &mut [u8]) {
-    // Pre-compute LUTs to avoid per-pixel powf calls
-    // Linearization LUT: u16 Rec.709 → f32 linear (256 KB)
-    let lin_lut: Vec<f32> = (0..=65535u32)
-        .map(|v| rec709_to_linear(v as f64 / 65535.0) as f32)
-        .collect();
-
-    // DCI gamma LUT: u16 linear → u16 gamma-encoded (128 KB)
-    let gamma_lut: Vec<u16> = (0..=65535u32)
-        .map(|v| {
-            let g = linear_to_dci_gamma(v as f64 / 65535.0);
-            (g.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
-        })
-        .collect();
-
-    let pixel_count = buf.len() / 6;
-
-    for i in 0..pixel_count {
-        let off = i * 6;
-
-        // Read 16-bit big-endian samples
-        let r_raw = ((buf[off] as u16) << 8) | (buf[off + 1] as u16);
-        let g_raw = ((buf[off + 2] as u16) << 8) | (buf[off + 3] as u16);
-        let b_raw = ((buf[off + 4] as u16) << 8) | (buf[off + 5] as u16);
-
-        // Step 1: Linearize via LUT (no powf)
-        let r_lin = lin_lut[r_raw as usize];
-        let g_lin = lin_lut[g_raw as usize];
-        let b_lin = lin_lut[b_raw as usize];
-
-        // Step 2: 3×3 matrix multiply (linear RGB → linear XYZ), with DCI companding folded in
-        let x_lin = M00 * r_lin + M01 * g_lin + M02 * b_lin;
-        let y_lin = M10 * r_lin + M11 * g_lin + M12 * b_lin;
-        let z_lin = M20 * r_lin + M21 * g_lin + M22 * b_lin;
-
-        // Step 3: Quantize and apply DCI 2.6 gamma via LUT (no powf)
-        let x16 = gamma_lut[(x_lin.clamp(0.0, 1.0) * 65535.0 + 0.5) as usize];
-        let y16 = gamma_lut[(y_lin.clamp(0.0, 1.0) * 65535.0 + 0.5) as usize];
-        let z16 = gamma_lut[(z_lin.clamp(0.0, 1.0) * 65535.0 + 0.5) as usize];
-
-        // Write back as big-endian
-        buf[off] = (x16 >> 8) as u8;
-        buf[off + 1] = x16 as u8;
-        buf[off + 2] = (y16 >> 8) as u8;
-        buf[off + 3] = y16 as u8;
-        buf[off + 4] = (z16 >> 8) as u8;
-        buf[off + 5] = z16 as u8;
-    }
+    DcdmTransform::to_xyz(ColourSpace::Rec709)
+        .expect("Rec.709 has a matrix")
+        .frame_rgb48be_inplace(buf);
 }
 
 // ─── Display transform: DCI X'Y'Z' code values → sRGB ─────────────────────
@@ -244,7 +327,8 @@ pub enum RenderingIntent {
     Saturation,
 }
 
-const DCDM_DECODE_GAMMA: f32 = 2.6;
+/// DCDM encoding gamma (SMPTE 428-1), used in both directions.
+const DCDM_GAMMA: f32 = 2.6;
 const MAX_CODE_12BIT: f32 = 4095.0;
 /// SMPTE 428-1 peak luminance the encoding normalises against (cd/m²).
 const DCI_PEAK_LUMINANCE: f32 = 52.37;
@@ -343,7 +427,7 @@ impl XyzToSrgb {
             }
         }
         let expand = (0..=4095u32)
-            .map(|c| (c as f32 / MAX_CODE_12BIT).powf(DCDM_DECODE_GAMMA))
+            .map(|c| (c as f32 / MAX_CODE_12BIT).powf(DCDM_GAMMA))
             .collect();
         let oetf = (0..=4095u32)
             .map(|i| (srgb_oetf(i as f32 / 4095.0) * 255.0 + 0.5) as u8)
@@ -384,7 +468,7 @@ impl XyzToSrgb {
 
 #[cfg(feature = "icc")]
 mod icc {
-    use super::{DCDM_DECODE_GAMMA, RenderingIntent, bradford, mat_vec};
+    use super::{DCDM_GAMMA, RenderingIntent, bradford, mat_vec};
     use super::{DCI_PEAK_LUMINANCE, DCI_REFERENCE_WHITE, DCI_WHITE_XYZ, MAX_CODE_12BIT};
     use lcms2::{Intent, PixelFormat, Profile, Transform};
 
@@ -432,7 +516,7 @@ mod icc {
                 }
             }
             let expand = (0..=4095u32)
-                .map(|c| (c as f32 / MAX_CODE_12BIT).powf(DCDM_DECODE_GAMMA))
+                .map(|c| (c as f32 / MAX_CODE_12BIT).powf(DCDM_GAMMA))
                 .collect();
             Ok(Self {
                 expand,
@@ -477,7 +561,7 @@ mod tests_display {
         let mut c = [0u16; 3];
         for i in 0..3 {
             let peak = DCI_WHITE_XYZ[i] * DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
-            c[i] = (peak.powf(1.0 / DCDM_DECODE_GAMMA) * MAX_CODE_12BIT).round() as u16;
+            c[i] = (peak.powf(1.0 / DCDM_GAMMA) * MAX_CODE_12BIT).round() as u16;
         }
         c
     }
@@ -506,7 +590,7 @@ mod tests_display {
         let mut codes = [0u16; 3];
         for i in 0..3 {
             let peak = DCI_WHITE_XYZ[i] * 0.18 * DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
-            codes[i] = (peak.powf(1.0 / DCDM_DECODE_GAMMA) * MAX_CODE_12BIT).round() as u16;
+            codes[i] = (peak.powf(1.0 / DCDM_GAMMA) * MAX_CODE_12BIT).round() as u16;
         }
         let rgb = t.pixel(codes[0], codes[1], codes[2]);
         let max = *rgb.iter().max().unwrap();
@@ -619,7 +703,8 @@ mod tests_xyz {
         ]
     }
 
-    // two-stage LUT quantization vs the f64 reference costs a few codes at most
+    // f32 arithmetic and the linearization table cost a few codes against the
+    // f64 reference
     fn assert_close(got: [u16; 3], want: [u16; 3]) {
         for i in 0..3 {
             let d = (got[i] as i32 - want[i] as i32).abs();
@@ -659,5 +744,119 @@ mod tests_xyz {
     fn mid_grey_matches_reference() {
         let rgb = [32768, 32768, 32768];
         assert_close(run(rgb), expected_xyz16(rgb));
+    }
+
+    // Independent 12-bit reference for a source that is not Rec.709: linearise
+    // with the space's own gamma, apply its published RGB->XYZ matrix, compand
+    // to the DCI reference white, encode with 2.6.
+    fn expected_xyz12(rgb: [u16; 3], matrix: [[f64; 3]; 3], gamma: f64) -> [u16; 3] {
+        let coeff = 48.0f64 / 52.37;
+        let lin: Vec<f64> = rgb
+            .iter()
+            .map(|&v| (v as f64 / 65535.0).powf(gamma))
+            .collect();
+        let mut out = [0u16; 3];
+        for (i, row) in matrix.iter().enumerate() {
+            let xyz = (row[0] * lin[0] + row[1] * lin[1] + row[2] * lin[2]) * coeff;
+            out[i] = (xyz.clamp(0.0, 1.0).powf(1.0 / 2.6) * 4095.0 + 0.5) as u16;
+        }
+        out
+    }
+
+    // SMPTE RP 431-2 P3-DCI primaries with the DCI white point, gamma 2.6.
+    const P3_DCI_TO_XYZ: [[f64; 3]; 3] = [
+        [0.4451698, 0.2771344, 0.1722827],
+        [0.2094917, 0.7215952, 0.0689131],
+        [0.0, 0.0470606, 0.9073747],
+    ];
+    // ITU-R BT.2020 primaries with D65, gamma 2.4.
+    const REC2020_TO_XYZ: [[f64; 3]; 3] = [
+        [0.6369580, 0.1446169, 0.1688810],
+        [0.2627002, 0.6779981, 0.0593017],
+        [0.0, 0.0280727, 1.0609851],
+    ];
+
+    #[test]
+    fn p3_source_matches_a_published_matrix() {
+        let transform = DcdmTransform::to_xyz(ColourSpace::P3).unwrap();
+        for rgb in [[65535u16, 0, 0], [0, 65535, 0], [65535; 3], [32768; 3]] {
+            let got = transform.pixel(rgb, 4095);
+            let want = expected_xyz12(rgb, P3_DCI_TO_XYZ, 2.6);
+            for i in 0..3 {
+                let d = (got[i] as i32 - want[i] as i32).abs();
+                assert!(d <= 2, "{rgb:?} channel {i}: got {got:?} want {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn rec2020_source_matches_a_published_matrix() {
+        let transform = DcdmTransform::to_xyz(ColourSpace::Rec2020).unwrap();
+        for rgb in [[65535u16, 0, 0], [0, 0, 65535], [65535; 3], [32768; 3]] {
+            let got = transform.pixel(rgb, 4095);
+            let want = expected_xyz12(rgb, REC2020_TO_XYZ, 2.4);
+            for i in 0..3 {
+                let d = (got[i] as i32 - want[i] as i32).abs();
+                assert!(d <= 2, "{rgb:?} channel {i}: got {got:?} want {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_gamut_source_is_not_silently_read_as_rec709() {
+        let red = [65535u16, 0, 0];
+        let rec709 = DcdmTransform::to_xyz(ColourSpace::Rec709)
+            .unwrap()
+            .pixel(red, 4095);
+        for space in [ColourSpace::P3, ColourSpace::Rec2020] {
+            let got = DcdmTransform::to_xyz(space).unwrap().pixel(red, 4095);
+            assert!(
+                got[0] > rec709[0],
+                "{space:?} red must reach further than Rec.709 red: {got:?} vs {rec709:?}"
+            );
+        }
+        for (i, grok) in [2817i32, 2183, 870].iter().enumerate() {
+            let d = (rec709[i] as i32 - grok).abs();
+            assert!(d <= 2, "Rec.709 red {rec709:?} vs grok's published values");
+        }
+    }
+
+    #[test]
+    fn the_scene_referred_and_log_spaces_are_refused() {
+        for space in [ColourSpace::Aces, ColourSpace::AcesCg, ColourSpace::LogC] {
+            let err = DcdmTransform::to_xyz(space).unwrap_err();
+            assert!(err.contains("3D LUT"), "{space:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_frame_forms_agree_with_the_pixel_form() {
+        let transform = DcdmTransform::to_xyz(ColourSpace::P3).unwrap();
+        let pixels = [[65535u16, 0, 0], [0, 32768, 12345]];
+
+        let mut le = Vec::new();
+        let mut be = Vec::new();
+        for px in pixels {
+            for c in px {
+                le.extend_from_slice(&c.to_le_bytes());
+                be.extend_from_slice(&c.to_be_bytes());
+            }
+        }
+        let mut out = vec![0u16; 6];
+        transform.frame_rgb48le(&le, 65535, &mut out);
+        transform.frame_rgb48be_inplace(&mut be);
+
+        for (i, px) in pixels.iter().enumerate() {
+            let want = transform.pixel(*px, 65535);
+            assert_eq!(&out[i * 3..i * 3 + 3], &want, "rgb48le pixel {i}");
+            for c in 0..3 {
+                let off = i * 6 + c * 2;
+                assert_eq!(
+                    u16::from_be_bytes([be[off], be[off + 1]]),
+                    want[c],
+                    "rgb48be pixel {i} channel {c}"
+                );
+            }
+        }
     }
 }

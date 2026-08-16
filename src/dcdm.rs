@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::colour::{ColourSpace, DcdmTransform};
+
 /// DCDM colour encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DcdmColourEncoding {
@@ -99,8 +101,8 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
         };
     }
 
-    let space = match source_space(&opts.colour_space) {
-        Ok(s) => s,
+    let transform = match source_transform(&opts.colour_space, opts.target) {
+        Ok(t) => t,
         Err(e) => {
             return DcdmResult {
                 success: false,
@@ -179,9 +181,7 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
         };
     };
 
-    let xf = space.to_target(opts.target);
     let max_code = opts.encoding.max_code_value();
-    let lin = build_linear_lut(xf.gamma);
     let pixels = width as usize * height as usize;
     let mut frame_buf = vec![0u8; pixels * 3 * 2];
     let mut xyz_buf = vec![0u16; pixels * 3];
@@ -203,7 +203,7 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
             }
         }
 
-        convert_frame(&frame_buf, &xf, &lin, max_code, &mut xyz_buf);
+        transform.frame_rgb48le(&frame_buf, max_code, &mut xyz_buf);
 
         let path = opts
             .output_dir
@@ -257,60 +257,12 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
     }
 }
 
-/// DCI reference white luminance in cd/m^2 (SMPTE 431-2).
-const DCI_REFERENCE_WHITE: f32 = 48.0;
-/// Peak luminance the DCDM encoding normalises against (SMPTE 428-1).
-const DCI_PEAK_LUMINANCE: f32 = 52.37;
-/// DCDM encoding gamma (SMPTE 428-1).
-const DCDM_GAMMA: f32 = 2.6;
-
 impl DcdmColourEncoding {
     /// Largest code value the encoding quantises to.
     fn max_code_value(self) -> u16 {
         match self {
             DcdmColourEncoding::Xyz12Bit => 4095,
             DcdmColourEncoding::Xyz16Bit => 65535,
-        }
-    }
-}
-
-/// Source colour space description for the X'Y'Z' transform.
-struct SourceSpace {
-    /// linear RGB to CIE XYZ, row major
-    to_xyz: [[f32; 3]; 3],
-    /// gamma used to linearise the incoming code values
-    gamma: f32,
-    /// linear scale mapping source white onto the DCI reference white
-    scale: f32,
-}
-
-/// The resolved linear transform for one (source, target) pair: linear source
-/// RGB -> output space, plus the luminance scale applied before the 2.6 gamma.
-struct Transform {
-    /// linear source RGB to the output space (X'Y'Z' or P3-D65 linear RGB)
-    matrix: [[f32; 3]; 3],
-    /// gamma used to linearise the incoming code values
-    gamma: f32,
-    /// linear scale applied to the matrix output
-    scale: f32,
-}
-
-impl SourceSpace {
-    /// Compose the source->XYZ matrix with the chosen output target.
-    fn to_target(&self, target: DcdmTarget) -> Transform {
-        match target {
-            DcdmTarget::Xyz => Transform {
-                matrix: self.to_xyz,
-                gamma: self.gamma,
-                scale: self.scale,
-            },
-            DcdmTarget::P3D65 => Transform {
-                // linear source RGB -> XYZ -> P3-D65 linear RGB
-                matrix: mat_mul(&xyz_to_p3d65(), &self.to_xyz),
-                gamma: self.gamma,
-                // rgb mastering target: source white -> full-scale, no dci companding
-                scale: 1.0,
-            },
         }
     }
 }
@@ -391,79 +343,37 @@ fn invert3(m: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     r
 }
 
-/// Resolve a source colour space name to its transform.
+/// Resolve a source colour space name to the [`ColourSpace`] it names.
 ///
 /// An empty name is treated as Rec.709, matching the wizard CLIs' own default.
-fn source_space(name: &str) -> Result<SourceSpace, String> {
-    let dci_scale = DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
-    let space = match name.trim().to_lowercase().as_str() {
-        "" | "rec709" | "bt709" | "srgb" => SourceSpace {
-            to_xyz: [
-                [0.412_390_8, 0.357_584_3, 0.180_480_8],
-                [0.212_639, 0.715_168_7, 0.072_192_3],
-                [0.019_330_8, 0.119_194_8, 0.950_532_2],
-            ],
-            // gamma 2.2 for display-referred Rec.709, matching libdcp rec709_to_xyz,
-            // DoM and grok. Was 2.4 (Rec.1886); harmonized 2026-07-23.
-            gamma: 2.2,
-            scale: dci_scale,
-        },
-        "p3" | "dcip3" | "dci-p3" | "p3dci" | "smpte431" => SourceSpace {
-            to_xyz: [
-                [0.445_169_8, 0.277_134_4, 0.172_282_7],
-                [0.209_491_7, 0.721_595_2, 0.068_913_1],
-                [0.0, 0.047_060_6, 0.907_378_4],
-            ],
-            gamma: DCDM_GAMMA,
-            scale: dci_scale,
-        },
-        "rec2020" | "bt2020" => SourceSpace {
-            to_xyz: [
-                [0.636_958, 0.144_616_9, 0.168_881],
-                [0.262_700_2, 0.677_998_1, 0.059_301_7],
-                [0.0, 0.028_072_7, 1.060_985_1],
-            ],
-            gamma: 2.4,
-            scale: dci_scale,
-        },
-        // already X'Y'Z': decode and requantise, the luminance scaling is baked in
-        "xyz" | "ciexyz" => SourceSpace {
-            to_xyz: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            gamma: DCDM_GAMMA,
-            scale: 1.0,
-        },
-        other => {
-            return Err(format!(
-                "Unsupported source colour space '{other}' for DCDM conversion. \
-                 Use rec709, p3, rec2020 or xyz, or supply a 3D LUT that lands in one of those."
-            ));
-        }
-    };
-    Ok(space)
-}
-
-/// Table mapping every 16-bit code value to its linear light value.
-fn build_linear_lut(gamma: f32) -> Vec<f32> {
-    (0..=u16::MAX)
-        .map(|v| (v as f32 / 65535.0).powf(gamma))
-        .collect()
-}
-
-/// Convert one rgb48le frame into the target's code values (X'Y'Z' or P3-D65).
-fn convert_frame(rgb: &[u8], xf: &Transform, lin: &[f32], max_code: u16, out: &mut [u16]) {
-    let inv_gamma = 1.0 / DCDM_GAMMA;
-    let max = max_code as f32;
-
-    for (px, xyz) in rgb.chunks_exact(6).zip(out.chunks_exact_mut(3)) {
-        let r = lin[u16::from_le_bytes([px[0], px[1]]) as usize];
-        let g = lin[u16::from_le_bytes([px[2], px[3]]) as usize];
-        let b = lin[u16::from_le_bytes([px[4], px[5]]) as usize];
-
-        for (row, slot) in xf.matrix.iter().zip(xyz.iter_mut()) {
-            let v = (row[0] * r + row[1] * g + row[2] * b) * xf.scale;
-            *slot = (v.clamp(0.0, 1.0).powf(inv_gamma) * max).round() as u16;
-        }
+fn source_space(name: &str) -> Result<ColourSpace, String> {
+    match name.trim().to_lowercase().as_str() {
+        "" | "rec709" | "bt709" | "srgb" => Ok(ColourSpace::Rec709),
+        "p3" | "dcip3" | "dci-p3" | "p3dci" | "smpte431" => Ok(ColourSpace::P3),
+        "rec2020" | "bt2020" => Ok(ColourSpace::Rec2020),
+        "xyz" | "ciexyz" => Ok(ColourSpace::Xyz),
+        other => Err(format!(
+            "Unsupported source colour space '{other}' for DCDM conversion. \
+             Use rec709, p3, rec2020 or xyz, or supply a 3D LUT that lands in one of those."
+        )),
     }
+}
+
+/// The per-frame transform from a named source colour space into `target`.
+fn source_transform(name: &str, target: DcdmTarget) -> Result<DcdmTransform, String> {
+    let space = source_space(name)?;
+    let source = crate::colour::source_space(space)?;
+    Ok(match target {
+        DcdmTarget::Xyz => DcdmTransform::new(space, source.to_xyz, source.gamma, source.scale),
+        DcdmTarget::P3D65 => DcdmTransform::new(
+            space,
+            // linear source RGB -> XYZ -> P3-D65 linear RGB
+            mat_mul(&xyz_to_p3d65(), &source.to_xyz),
+            source.gamma,
+            // rgb mastering target: source white -> full-scale, no dci companding
+            1.0,
+        ),
+    })
 }
 
 /// Write X'Y'Z' code values as a 16-bit three-channel TIFF.
@@ -551,14 +461,13 @@ mod tests {
         target: DcdmTarget,
         encoding: DcdmColourEncoding,
     ) -> [u16; 3] {
-        let xf = source_space(colour_space).unwrap().to_target(target);
-        let lin = build_linear_lut(xf.gamma);
+        let transform = source_transform(colour_space, target).unwrap();
         let mut bytes = Vec::new();
         for c in rgb {
             bytes.extend_from_slice(&c.to_le_bytes());
         }
         let mut out = [0u16; 3];
-        convert_frame(&bytes, &xf, &lin, encoding.max_code_value(), &mut out);
+        transform.frame_rgb48le(&bytes, encoding.max_code_value(), &mut out);
         out
     }
 
@@ -634,8 +543,7 @@ mod tests {
 
     #[test]
     fn converts_every_pixel_in_a_frame() {
-        let xf = source_space("rec709").unwrap().to_target(DcdmTarget::Xyz);
-        let lin = build_linear_lut(xf.gamma);
+        let transform = source_transform("rec709", DcdmTarget::Xyz).unwrap();
         let mut bytes = Vec::new();
         for px in [[65535u16; 3], [0; 3], [65535; 3]] {
             for c in px {
@@ -643,7 +551,7 @@ mod tests {
             }
         }
         let mut out = vec![0u16; 9];
-        convert_frame(&bytes, &xf, &lin, 4095, &mut out);
+        transform.frame_rgb48le(&bytes, 4095, &mut out);
         assert_eq!(out[1], 3960);
         assert_eq!(&out[3..6], &[0, 0, 0]);
         assert_eq!(out[7], 3960);
@@ -734,5 +642,22 @@ mod tests {
         assert!(source_space("rec709").is_ok());
         assert!(source_space("P3").is_ok(), "names are case insensitive");
         assert!(source_space("").is_ok(), "empty defaults to rec709");
+    }
+
+    #[test]
+    fn the_public_transform_matches_the_file_pipeline() {
+        // create_dcdm and DcdmTransform::to_xyz must be one transform, not two
+        // implementations of it
+        for space in [ColourSpace::Rec709, ColourSpace::P3, ColourSpace::Rec2020] {
+            let name = format!("{space:?}").to_lowercase();
+            let public = DcdmTransform::to_xyz(space).unwrap();
+            for rgb in [[65535u16, 0, 0], [0, 32768, 12345], [65535; 3], [0; 3]] {
+                assert_eq!(
+                    public.pixel(rgb, 4095),
+                    convert_pixel(rgb, &name, DcdmColourEncoding::Xyz12Bit),
+                    "{space:?} {rgb:?}"
+                );
+            }
+        }
     }
 }

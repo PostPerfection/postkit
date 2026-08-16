@@ -72,6 +72,32 @@
 
 # Done
 
+## 2026-08-16
+
+Per-frame source colour transform (colour.rs, grok_encoder.rs, encode.rs): the
+DCDM maths that lived privately in dcdm.rs is now `colour::DcdmTransform`, built
+once from a `ColourSpace` and applied per frame as `pixel`, `frame_rgb48le` or
+`frame_rgb48be_inplace`. `create_dcdm` composes it with the P3-D65 target and
+keeps its name parsing; `rgb_to_xyz_inplace` is its Rec.709 one-shot form. A
+dcdm_smoke test compares a written DCDM frame against the public transform for
+rec709, p3 and rec2020 and requires equality, so the file pipeline and the
+encoder cannot drift. Harmonizing the two dropped dcdm's BT.709-derived matrix
+for the sRGB/D65 one grok and libdcp use.
+
+The encoder reaches it through `SourceColour::DisplayRgbIn(space)`, which sets
+`CompressParams.source_transform` and leaves grok's `apply_xyz_transform` off.
+The transform runs in `encoder_thread_fn`, not in the frame producer: a 2K frame
+costs ~120 ms of `powf` single-threaded, which would have capped the pipeline at
+about 8 fps, and the encoder threads absorb it in parallel instead. Setting both
+transforms fails the frame loudly rather than converting twice. The variant only
+works where postkit owns the frames: the image-sequence encoder hands each file
+to grk_compress, which converts Rec.709 only, and J2K input is already
+compressed, so `reject_unsupported_colour_path` refuses both, and the subprocess
+encoder refuses it too. Verified end to end in dcpwizard: a solid P3 frame
+encoded through the route and decoded with grk_decompress lands within one code
+value of an independent f64 computation over the RP 431-2 P3 matrix
+([65535,0,0] -> [2901, 2171, 0], where Rec.709 red is [2817, 2183, 870]).
+
 ## 2026-08-15
 
 One thumbprint (src/certificate.rs): the whole-certificate hex SHA-1 is gone.

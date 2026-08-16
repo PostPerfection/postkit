@@ -276,19 +276,28 @@ pub fn run_encode_with_options(
 }
 
 /// Refuse a source colour the chosen input branch cannot honour: the image
-/// sequence encoder always applies the DCDM X'Y'Z' transform, and a LUT cannot
-/// be run over frames that are already compressed.
+/// sequence encoder hands each file to grk_compress, which only converts
+/// Rec.709, and nothing can be converted once the frames are compressed.
 fn reject_unsupported_colour_path(
     input_type: InputType,
     source_colour: &SourceColour,
 ) -> Result<(), String> {
     match (input_type, source_colour) {
+        (InputType::ImageSequence, SourceColour::DisplayRgbIn(space)) => Err(format!(
+            "image sequences are compressed straight from file by grk_compress, which only \
+             converts Rec.709: convert a {space:?} sequence to X'Y'Z' first, or encode from \
+             a video"
+        )),
         (InputType::ImageSequence, colour) if !colour.applies_xyz_transform() => Err(format!(
             "image sequences are always encoded through the DCDM X'Y'Z' transform, so {colour:?} would be mislabelled"
         )),
         (InputType::J2kSequence, SourceColour::DciLut(lut)) => Err(format!(
             "J2K input is already compressed, so the HDR-to-DCI LUT {} cannot be applied",
             lut.display()
+        )),
+        (InputType::J2kSequence, SourceColour::DisplayRgbIn(space)) => Err(format!(
+            "J2K input is already compressed, so a {space:?} source cannot be converted to \
+             X'Y'Z' any more"
         )),
         _ => Ok(()),
     }
@@ -328,6 +337,16 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn a_wide_gamut_source_encodes_from_video_only() {
+        let p3 = SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3);
+        assert!(reject_unsupported_colour_path(InputType::Video, &p3).is_ok());
+        let images = reject_unsupported_colour_path(InputType::ImageSequence, &p3).unwrap_err();
+        assert!(images.contains("P3"), "{images}");
+        let compressed = reject_unsupported_colour_path(InputType::J2kSequence, &p3).unwrap_err();
+        assert!(compressed.contains("already compressed"), "{compressed}");
     }
 
     #[test]

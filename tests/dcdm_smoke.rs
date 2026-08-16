@@ -1,3 +1,4 @@
+use postkit::colour::{ColourSpace, DcdmTransform};
 use postkit::dcdm::*;
 
 fn have_ffmpeg() -> bool {
@@ -67,4 +68,78 @@ fn dcdm_end_to_end_writes_xyz_tiffs() {
         &px[..3]
     );
     assert!(px.iter().all(|v| *v <= 4095), "12-bit code values");
+}
+
+/// The public per-frame transform must produce exactly what the file pipeline
+/// writes, so the encoder and `create_dcdm` cannot drift apart.
+#[test]
+fn the_public_transform_reproduces_a_written_dcdm_frame() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    const SIZE: u32 = 32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let frame = src.join("f_001.png");
+    let st = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=s={SIZE}x{SIZE}"),
+            "-frames:v",
+            "1",
+        ])
+        .arg(&frame)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    for (name, space) in [
+        ("p3", ColourSpace::P3),
+        ("rec2020", ColourSpace::Rec2020),
+        ("rec709", ColourSpace::Rec709),
+    ] {
+        let out = dir.path().join(format!("out_{name}"));
+        let result = create_dcdm(&DcdmOptions {
+            input_dir: src.clone(),
+            output_dir: out.clone(),
+            encoding: DcdmColourEncoding::Xyz12Bit,
+            width: SIZE,
+            height: SIZE,
+            colour_space: name.into(),
+            ..Default::default()
+        });
+        assert!(result.success, "{}", result.error);
+
+        let f = std::fs::File::open(out.join("dcdm_000000.tif")).unwrap();
+        let mut dec = tiff::decoder::Decoder::new(f).unwrap();
+        let tiff::decoder::DecodingResult::U16(written) = dec.read_image().unwrap() else {
+            panic!("expected 16-bit samples");
+        };
+
+        // the same source frame as rgb48le, the layout the transform takes
+        let raw = std::process::Command::new("ffmpeg")
+            .args(["-y", "-i"])
+            .arg(&frame)
+            .args(["-pix_fmt", "rgb48le", "-f", "rawvideo", "pipe:1"])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .expect("ffmpeg");
+        assert!(raw.status.success());
+
+        let mut expected = vec![0u16; written.len()];
+        DcdmTransform::to_xyz(space)
+            .unwrap()
+            .frame_rgb48le(&raw.stdout, 4095, &mut expected);
+        assert_eq!(expected, written, "{name} frame differs from create_dcdm");
+    }
 }
