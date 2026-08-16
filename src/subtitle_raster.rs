@@ -27,7 +27,7 @@ use crate::subtitle_formats::{HAlign, Rgba, StyledCue, StyledRun, SubtitleError,
 
 /// Text height as a fraction of frame height when the caller names none. 1/22nd
 /// of the picture is about the DCI house style for a 2K subtitle.
-const DEFAULT_FONT_SIZE_RATIO: f32 = 1.0 / 22.0;
+pub const DEFAULT_FONT_SIZE_RATIO: f32 = 1.0 / 22.0;
 
 /// Distance from the anchored edge as a fraction of frame height, used when the
 /// cue carries no vposition.
@@ -44,7 +44,7 @@ const UNDERLINE_OFFSET_RATIO: f32 = 0.13;
 
 /// Outline thickness as a fraction of the text height. About 2px at the default
 /// text height on a 2K frame.
-const DEFAULT_OUTLINE_WIDTH_RATIO: f32 = 0.05;
+pub const DEFAULT_OUTLINE_WIDTH_RATIO: f32 = 0.05;
 
 /// How far down and right the shadow sits, as a fraction of the text height.
 /// About 3px at the default text height on a 2K frame.
@@ -119,15 +119,94 @@ impl Default for BurnStyle {
 }
 
 impl BurnStyle {
-    fn validate(&self) -> Result<(), SubtitleError> {
+    fn validate(&self) -> Result<(), String> {
         for (name, scale) in [("x_scale", self.x_scale), ("y_scale", self.y_scale)] {
             if scale <= 0.0 || !scale.is_finite() {
-                return Err(SubtitleError::Parse(format!(
-                    "a burn needs a positive {name}, got {scale}"
-                )));
+                return Err(format!("a burn needs a positive {name}, got {scale}"));
             }
         }
         Ok(())
+    }
+}
+
+/// Read an effect name, as the SMPTE `Effect` attribute spells it.
+pub fn parse_burn_effect(text: &str) -> Result<BurnEffect, String> {
+    match text.to_ascii_lowercase().as_str() {
+        "none" => Ok(BurnEffect::None),
+        "outline" => Ok(BurnEffect::Outline),
+        "shadow" => Ok(BurnEffect::Shadow),
+        _ => Err(format!(
+            "{text} is not an effect: pick none, outline, or shadow"
+        )),
+    }
+}
+
+/// Percent of a whole, as the appearance flags take their sizes.
+const PERCENT_DIVISOR: f32 = 100.0;
+
+/// Text taller than the frame itself, which no caller can mean.
+const MAX_FONT_SIZE_PERCENT: f32 = 100.0;
+
+/// The appearance settings a caller named on the command line, each left
+/// `None` when the flag was not given so the base style keeps its own value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BurnStyleOverrides {
+    /// Text height as a percent of the frame height, so 4.5 means 0.045.
+    pub font_size_percent: Option<f32>,
+    pub colour: Option<Rgba>,
+    pub effect: Option<BurnEffect>,
+    pub effect_colour: Option<Rgba>,
+    /// Outline thickness as a percent of the text height.
+    pub outline_width_percent: Option<f32>,
+    pub x_scale: Option<f32>,
+    pub y_scale: Option<f32>,
+    pub fade_up_ms: Option<u64>,
+    pub fade_down_ms: Option<u64>,
+}
+
+impl BurnStyleOverrides {
+    /// Lay every named value over `base` and check the result is drawable.
+    pub fn apply(&self, base: BurnStyle) -> Result<BurnStyle, String> {
+        let mut style = base;
+        if let Some(percent) = self.font_size_percent {
+            if !percent.is_finite() || percent <= 0.0 || percent > MAX_FONT_SIZE_PERCENT {
+                return Err(format!(
+                    "a font size is a percent of the frame height above 0 and up to {MAX_FONT_SIZE_PERCENT}, got {percent}"
+                ));
+            }
+            style.font_size_ratio = percent / PERCENT_DIVISOR;
+        }
+        if let Some(percent) = self.outline_width_percent {
+            if !percent.is_finite() || percent < 0.0 {
+                return Err(format!(
+                    "an outline width is a percent of the text height of 0 or more, got {percent}"
+                ));
+            }
+            style.outline_width_ratio = percent / PERCENT_DIVISOR;
+        }
+        if let Some(colour) = self.colour {
+            style.default_colour = colour;
+        }
+        if let Some(effect) = self.effect {
+            style.effect = effect;
+        }
+        if let Some(colour) = self.effect_colour {
+            style.effect_colour = colour;
+        }
+        if let Some(scale) = self.x_scale {
+            style.x_scale = scale;
+        }
+        if let Some(scale) = self.y_scale {
+            style.y_scale = scale;
+        }
+        if let Some(span) = self.fade_up_ms {
+            style.fade_up_ms = span;
+        }
+        if let Some(span) = self.fade_down_ms {
+            style.fade_down_ms = span;
+        }
+        style.validate()?;
+        Ok(style)
     }
 }
 
@@ -298,7 +377,7 @@ impl SubtitleBurn {
                 "a burn needs a positive frame rate, got {fps}"
             )));
         }
-        style.validate()?;
+        style.validate().map_err(SubtitleError::Parse)?;
         let rasterizer = SubtitleRasterizer::new(font)?;
         let has_text = cues.iter().any(|cue| cue.image.is_none());
         if has_text && !rasterizer.has_font() {
@@ -1586,6 +1665,112 @@ mod tests {
             assert!(
                 coverage(&out[0]) > coverage(&plain[0]),
                 "{effect:?} added no coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn effect_names_parse_in_any_case_and_an_unknown_one_is_refused() {
+        assert_eq!(parse_burn_effect("none").unwrap(), BurnEffect::None);
+        assert_eq!(parse_burn_effect("Outline").unwrap(), BurnEffect::Outline);
+        assert_eq!(parse_burn_effect("SHADOW").unwrap(), BurnEffect::Shadow);
+        let err = parse_burn_effect("glow").unwrap_err();
+        assert!(
+            err.contains("none") && err.contains("outline") && err.contains("shadow"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_full_set_of_overrides_changes_every_field() {
+        let red = Rgba {
+            r: 255,
+            g: 0,
+            b: 0,
+            a: 128,
+        };
+        let blue = Rgba {
+            r: 0,
+            g: 0,
+            b: 255,
+            a: 255,
+        };
+        let overrides = BurnStyleOverrides {
+            font_size_percent: Some(9.0),
+            colour: Some(red),
+            effect: Some(BurnEffect::Outline),
+            effect_colour: Some(blue),
+            outline_width_percent: Some(12.5),
+            x_scale: Some(1.5),
+            y_scale: Some(0.5),
+            fade_up_ms: Some(200),
+            fade_down_ms: Some(300),
+        };
+        let style = overrides.apply(BurnStyle::default()).unwrap();
+        assert_eq!(style.font_size_ratio, 0.09);
+        assert_eq!(style.default_colour, red);
+        assert_eq!(style.effect, BurnEffect::Outline);
+        assert_eq!(style.effect_colour, blue);
+        assert_eq!(style.outline_width_ratio, 0.125);
+        assert_eq!(style.x_scale, 1.5);
+        assert_eq!(style.y_scale, 0.5);
+        assert_eq!(style.fade_up_ms, 200);
+        assert_eq!(style.fade_down_ms, 300);
+    }
+
+    #[test]
+    fn no_overrides_leaves_the_base_style_alone() {
+        let base = BurnStyle::default();
+        let style = BurnStyleOverrides::default().apply(base.clone()).unwrap();
+        assert_eq!(style.font_size_ratio, base.font_size_ratio);
+        assert_eq!(style.line_height_ratio, base.line_height_ratio);
+        assert_eq!(style.margin_ratio, base.margin_ratio);
+        assert_eq!(style.default_colour, base.default_colour);
+        assert_eq!(style.effect, base.effect);
+        assert_eq!(style.effect_colour, base.effect_colour);
+        assert_eq!(style.outline_width_ratio, base.outline_width_ratio);
+        assert_eq!(style.x_scale, base.x_scale);
+        assert_eq!(style.y_scale, base.y_scale);
+        assert_eq!(style.fade_up_ms, base.fade_up_ms);
+        assert_eq!(style.fade_down_ms, base.fade_down_ms);
+    }
+
+    #[test]
+    fn an_override_outside_its_range_is_refused() {
+        for (wanted, overrides) in [
+            (
+                "font size",
+                BurnStyleOverrides {
+                    font_size_percent: Some(0.0),
+                    ..BurnStyleOverrides::default()
+                },
+            ),
+            (
+                "font size",
+                BurnStyleOverrides {
+                    font_size_percent: Some(150.0),
+                    ..BurnStyleOverrides::default()
+                },
+            ),
+            (
+                "x_scale",
+                BurnStyleOverrides {
+                    x_scale: Some(0.0),
+                    ..BurnStyleOverrides::default()
+                },
+            ),
+            (
+                "outline width",
+                BurnStyleOverrides {
+                    outline_width_percent: Some(-1.0),
+                    ..BurnStyleOverrides::default()
+                },
+            ),
+        ] {
+            let err = overrides.apply(BurnStyle::default()).unwrap_err();
+            assert!(
+                err.contains(wanted),
+                "{overrides:?} was accepted, or reported as something else: {err}"
             );
         }
     }

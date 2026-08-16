@@ -63,6 +63,36 @@ pub struct Rgba {
     pub a: u8,
 }
 
+impl Rgba {
+    /// Read a colour written as `RRGGBB` or `RRGGBBAA`, with an optional
+    /// leading `#` and either case. Alpha is opaque when it is left off.
+    pub fn parse_hex(text: &str) -> Result<Rgba, String> {
+        let digits = text.strip_prefix('#').unwrap_or(text);
+        let bad = || format!("{text} is not a colour: write it as RRGGBB or RRGGBBAA");
+        if !digits.is_ascii() {
+            return Err(bad());
+        }
+        let channel = |at: usize| u8::from_str_radix(&digits[at..at + 2], 16).map_err(|_| bad());
+        let alpha = match digits.len() {
+            RGB_HEX_DIGITS => u8::MAX,
+            RGBA_HEX_DIGITS => channel(6)?,
+            _ => return Err(bad()),
+        };
+        Ok(Rgba {
+            r: channel(0)?,
+            g: channel(2)?,
+            b: channel(4)?,
+            a: alpha,
+        })
+    }
+}
+
+/// Hex digits in a colour without an alpha channel.
+const RGB_HEX_DIGITS: usize = 6;
+
+/// Hex digits in a colour with an alpha channel.
+const RGBA_HEX_DIGITS: usize = 8;
+
 /// One run of text sharing a single style.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StyledRun {
@@ -169,6 +199,48 @@ mod tests {
         assert_eq!(srt.start_ms, 1000);
         assert_eq!(srt.end_ms, 4000);
         assert_eq!(srt.text, "hello world");
+    }
+
+    #[test]
+    fn parse_hex_reads_six_and_eight_digit_colours_in_either_case() {
+        assert_eq!(
+            Rgba::parse_hex("ff8000").unwrap(),
+            Rgba {
+                r: 255,
+                g: 128,
+                b: 0,
+                a: 255
+            }
+        );
+        assert_eq!(
+            Rgba::parse_hex("#FF800040").unwrap(),
+            Rgba {
+                r: 255,
+                g: 128,
+                b: 0,
+                a: 64
+            }
+        );
+        assert_eq!(
+            Rgba::parse_hex("#aAbBcC").unwrap(),
+            Rgba {
+                r: 170,
+                g: 187,
+                b: 204,
+                a: 255
+            }
+        );
+    }
+
+    #[test]
+    fn parse_hex_refuses_a_bad_length_or_a_bad_digit() {
+        for text in ["fff", "ff80001", "", "#", "ff80zz", "ffgg0011"] {
+            let err = Rgba::parse_hex(text).unwrap_err();
+            assert!(
+                err.contains("RRGGBB") && err.contains("RRGGBBAA"),
+                "{text} reported as: {err}"
+            );
+        }
     }
 
     #[test]
