@@ -141,6 +141,49 @@ pub fn parse_burn_effect(text: &str) -> Result<BurnEffect, String> {
     }
 }
 
+/// Families a packaged subtitle track falls back to when the caller names no
+/// font, most preferred first. Both are open-licence sans faces wide enough for
+/// Latin, Greek and Cyrillic, and a machine that has either is very likely to
+/// have it under this exact name.
+const FALLBACK_SANS_FAMILIES: [&str; 2] = ["Liberation Sans", "DejaVu Sans"];
+
+/// A system sans-serif font file to embed in a timed-text track when the caller
+/// names none, found through the same fontdb scan the burn path shapes with.
+/// `None` when this machine carries no usable face.
+///
+/// Only a face that is a whole file on disk qualifies: the subsetter reads the
+/// first face of whatever bytes it is handed, so one face out of a collection
+/// would come back as a different typeface than the one asked for.
+pub fn find_system_sans_font() -> Option<std::path::PathBuf> {
+    use cosmic_text::fontdb::{Family as DbFamily, Query, Source};
+
+    let fonts = FontSystem::new();
+    let database = fonts.db();
+    let families = FALLBACK_SANS_FAMILIES
+        .iter()
+        .map(|name| DbFamily::Name(name))
+        .chain(std::iter::once(DbFamily::SansSerif));
+    for family in families {
+        let query = Query {
+            families: &[family],
+            ..Query::default()
+        };
+        let Some(id) = database.query(&query) else {
+            continue;
+        };
+        let Some(face) = database.face(id) else {
+            continue;
+        };
+        if face.index != 0 {
+            continue;
+        }
+        if let Source::File(path) = &face.source {
+            return Some(path.clone());
+        }
+    }
+    None
+}
+
 /// Percent of a whole, as the appearance flags take their sizes.
 const PERCENT_DIVISOR: f32 = 100.0;
 
@@ -1225,6 +1268,23 @@ mod tests {
 
     fn cue(text: &str) -> StyledCue {
         StyledCue::text(0, 1000, vec![StyledRun::plain(text)])
+    }
+
+    /// A packaged subtitle track embeds this font, so it has to be a readable
+    /// single font file the subsetter can take, not a collection member or a
+    /// face fontdb only holds in memory.
+    #[test]
+    fn the_fallback_sans_font_is_a_readable_font_file() {
+        let Some(path) = find_system_sans_font() else {
+            eprintln!("skipping: fontdb found no sans-serif font on this machine");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("the discovered font file is readable");
+        assert!(
+            crate::font_subset::subset_font(&bytes, "Hi".chars()).is_ok(),
+            "the discovered font subsets, so it can be embedded: {}",
+            path.display()
+        );
     }
 
     /// The default style with nothing drawn under the text.

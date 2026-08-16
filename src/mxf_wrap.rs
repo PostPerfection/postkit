@@ -805,6 +805,50 @@ fn read_ancillary_resources(opts: &MxfWrapOptions) -> Result<Vec<AncillaryResour
     Ok(resources)
 }
 
+/// The id a timed-text document declares: the DCST `<Id>`, or the Interop
+/// `SubtitleID` written either as an element or as an attribute on the
+/// `DCSubtitle` root. ST 429-5 makes this the MXF ResourceID, which is what
+/// tells a player the document apart from the track file carrying it.
+fn timed_text_document_id(xml: &str) -> Option<[u8; 16]> {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut in_id_element = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                let qname = e.name();
+                let local = qname.local_name();
+                let name = String::from_utf8_lossy(local.as_ref()).into_owned();
+                if name == "DCSubtitle"
+                    && let Some(id) = e
+                        .attributes()
+                        .flatten()
+                        .find(|a| a.key.local_name().as_ref() == b"SubtitleID")
+                        .and_then(|a| String::from_utf8(a.value.into_owned()).ok())
+                        .and_then(|value| parse_document_uuid(&value))
+                {
+                    return Some(id);
+                }
+                in_id_element = name == "Id" || name == "SubtitleID";
+            }
+            Ok(Event::Text(e)) if in_id_element => {
+                return parse_document_uuid(&e.unescape().ok()?);
+            }
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// A document id written either as a `urn:uuid:` or as the bare uuid Interop
+/// uses.
+fn parse_document_uuid(text: &str) -> Option<[u8; 16]> {
+    let trimmed = text.trim();
+    let hex = trimmed.strip_prefix("urn:uuid:").unwrap_or(trimmed);
+    uuid::Uuid::parse_str(hex).ok().map(|id| *id.as_bytes())
+}
+
 fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
     if opts.input_files.is_empty() {
         return MxfTrackFile {
@@ -830,6 +874,16 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
                 ..Default::default()
             };
         }
+    };
+
+    let Some(document_id) = timed_text_document_id(&xml_data) else {
+        return MxfTrackFile {
+            error: format!(
+                "timed text {} declares no document id: ST 429-5 makes the DCST <Id> (Interop SubtitleID) the MXF ResourceID",
+                opts.input_files[0].display()
+            ),
+            ..Default::default()
+        };
     };
 
     let fps = opts.fps_num as f64 / opts.fps_den.max(1) as f64;
@@ -864,10 +918,12 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
             };
         }
     };
+    // asdcplib writes the descriptor's AssetID as the ResourceID of the
+    // timed-text resource, which ST 429-5 requires to be the document's own id
     let desc = asdcplib::timed_text::TimedTextDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         container_duration: duration_frames,
-        asset_id: info.asset_uuid,
+        asset_id: document_id,
     };
 
     let declared: Vec<_> = resources
@@ -1712,6 +1768,89 @@ mod tests {
             *uuid::Uuid::parse_str(DCST_IMAGE_ID).unwrap().as_bytes(),
         ];
         opts
+    }
+
+    /// The `<Id>` the `DCST` fixture declares, which ST 429-5 makes the MXF
+    /// ResourceID.
+    const DCST_DOCUMENT_ID: &str = "11111111-1111-1111-1111-111111111111";
+
+    /// ST 429-5 wants three distinct ids on a timed-text asset: the track file's
+    /// own, the document's, and the ResourceID naming the document inside the
+    /// MXF, which repeats the document's. libdcp and dcpdoctor both reject a wrap
+    /// that reuses the file id as the ResourceID.
+    #[test]
+    fn timed_text_resource_id_is_the_document_id_not_the_file_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("sub.mxf");
+        let mut opts = timed_text_with_resources(dir.path(), out.clone(), None);
+        let asset_uuid = *uuid::Uuid::parse_str("33333333-3333-3333-3333-333333333333")
+            .unwrap()
+            .as_bytes();
+        opts.asset_uuid = Some(asset_uuid);
+
+        let result = mxf_wrap(&opts);
+        assert!(result.success, "timed text wrap failed: {}", result.error);
+
+        let mut reader = asdcplib::timed_text::MxfReader::new();
+        reader.open_read(&out.to_string_lossy()).unwrap();
+        let descriptor = reader.descriptor().unwrap();
+        let info = reader.writer_info().unwrap();
+
+        let document_id = *uuid::Uuid::parse_str(DCST_DOCUMENT_ID).unwrap().as_bytes();
+        assert_eq!(
+            descriptor.asset_id, document_id,
+            "the ResourceID repeats the document's Id"
+        );
+        assert_eq!(
+            info.asset_uuid, asset_uuid,
+            "the track file keeps the caller's asset id"
+        );
+        assert_ne!(
+            descriptor.asset_id, info.asset_uuid,
+            "the ResourceID and the asset id are different things"
+        );
+    }
+
+    /// Without a document id there is nothing to write as the ResourceID, and a
+    /// wrap that invented one would name a document that does not exist.
+    #[test]
+    fn timed_text_without_a_document_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("sub.xml");
+        std::fs::write(&xml, DCST.replace(DCST_DOCUMENT_ID, "not-a-uuid")).unwrap();
+        let out = dir.path().join("sub.mxf");
+        let result = mxf_wrap(&wrap_opts(
+            EssenceType::TimedText,
+            vec![xml],
+            out.clone(),
+            None,
+        ));
+        assert!(!result.success, "a document with no id must not wrap");
+        assert!(
+            result.error.contains("declares no document id"),
+            "the error names the missing id, got: {}",
+            result.error
+        );
+        assert!(!out.exists(), "no MXF is left behind");
+    }
+
+    /// Interop spells the document id `SubtitleID`, both as an element and as a
+    /// root attribute, and a wrap of either has to find it.
+    #[test]
+    fn interop_subtitle_id_is_read_as_the_document_id() {
+        let expected = *uuid::Uuid::parse_str(DCST_DOCUMENT_ID).unwrap().as_bytes();
+        let element = format!(
+            "<DCSubtitle Version=\"1.0\"><SubtitleID>{DCST_DOCUMENT_ID}</SubtitleID></DCSubtitle>"
+        );
+        assert_eq!(timed_text_document_id(&element), Some(expected));
+
+        let attribute = format!("<DCSubtitle SubtitleID=\"{DCST_DOCUMENT_ID}\"/>");
+        assert_eq!(timed_text_document_id(&attribute), Some(expected));
+
+        assert_eq!(
+            timed_text_document_id("<DCSubtitle Version=\"1.0\"/>"),
+            None
+        );
     }
 
     /// A font a player cannot find is a font that is not there: the subtitle MXF

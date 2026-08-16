@@ -10,6 +10,11 @@
   refuses ACES, ACEScg and LogC, which need a LUT rather than a matrix.
   `create_dcdm` and `rgb_to_xyz_inplace` both run through it, so the file
   pipeline and the in-memory path are one transform.
+- `subtitle_raster::find_system_sans_font`: a sans-serif font file off the same
+  fontdb scan the burn path shapes with, preferring Liberation Sans, then DejaVu
+  Sans, then whatever the generic sans-serif resolves to. Only a whole font file
+  on disk qualifies, because the subsetter reads the first face of the bytes it
+  is handed. A packager uses it to embed a font when the caller named none.
 - `subtitle_raster`: a text rasteriser and frame compositor for burnt-in
   subtitles. `SubtitleRasterizer` shapes `StyledCue`s with cosmic-text (system
   fonts through fontdb, or a supplied .ttf/.otf) and rasterises them to
@@ -105,6 +110,17 @@
 - `X509SubjectName` and `X509IssuerName` are written in RFC 4514 order, most
   specific RDN first, which is what libdcp writes and what a projector matches a
   KDM recipient against. Reissue any KDM postkit produced earlier.
+
+### Subtitle MXFs written before this release reused the file id as the ResourceID
+
+Rebuild any package carrying a subtitle or closed-caption track. The timed-text
+wrap wrote the track file's own asset id as the descriptor AssetID, which
+asdcplib writes as the ResourceID of the timed-text resource. ST 429-5 wants
+that to be the id the document declares, and wants the track file, the document
+and the resource to be three different things, so libdcp and dcpdoctor both
+report the file id as reused. The wrap now reads the id out of the XML (DCST
+`<Id>`, Interop `SubtitleID` as an element or a root attribute) and refuses a
+document that declares none.
 
 ### Subtitle MXFs written before this release hid their fonts and images
 
