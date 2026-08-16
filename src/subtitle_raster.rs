@@ -42,6 +42,26 @@ const UNDERLINE_THICKNESS_RATIO: f32 = 0.06;
 /// How far below the baseline the underline sits, as a fraction of text height.
 const UNDERLINE_OFFSET_RATIO: f32 = 0.13;
 
+/// Outline thickness as a fraction of the text height. About 2px at the default
+/// text height on a 2K frame.
+const DEFAULT_OUTLINE_WIDTH_RATIO: f32 = 0.05;
+
+/// How far down and right the shadow sits, as a fraction of the text height.
+/// About 3px at the default text height on a 2K frame.
+const SHADOW_OFFSET_RATIO: f32 = 0.06;
+
+/// What is drawn under the text to lift it off the picture.
+///
+/// The names match the SMPTE subtitle `Effect` attribute, so a burnt track and
+/// a packaged track can be asked for the same way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BurnEffect {
+    None,
+    Outline,
+    #[default]
+    Shadow,
+}
+
 /// How a cue is drawn when it does not say for itself.
 #[derive(Debug, Clone)]
 pub struct BurnStyle {
@@ -54,6 +74,20 @@ pub struct BurnStyle {
     pub margin_ratio: f32,
     /// Colour for runs that carry none.
     pub default_colour: Rgba,
+    /// What is drawn under the text: nothing, an outline, or a drop shadow.
+    pub effect: BurnEffect,
+    /// Colour of that outline or shadow.
+    pub effect_colour: Rgba,
+    /// Outline thickness as a fraction of the text height.
+    pub outline_width_ratio: f32,
+    /// Horizontal stretch of the rasterised text. 1.0 leaves it alone.
+    pub x_scale: f32,
+    /// Vertical stretch of the text, applied to the text height itself.
+    pub y_scale: f32,
+    /// How long a cue takes to ramp up from transparent at its start.
+    pub fade_up_ms: u64,
+    /// How long a cue takes to ramp down to transparent at its end.
+    pub fade_down_ms: u64,
 }
 
 impl Default for BurnStyle {
@@ -68,7 +102,32 @@ impl Default for BurnStyle {
                 b: 255,
                 a: 255,
             },
+            effect: BurnEffect::default(),
+            effect_colour: Rgba {
+                r: 0,
+                g: 0,
+                b: 0,
+                a: 255,
+            },
+            outline_width_ratio: DEFAULT_OUTLINE_WIDTH_RATIO,
+            x_scale: 1.0,
+            y_scale: 1.0,
+            fade_up_ms: 0,
+            fade_down_ms: 0,
         }
+    }
+}
+
+impl BurnStyle {
+    fn validate(&self) -> Result<(), SubtitleError> {
+        for (name, scale) in [("x_scale", self.x_scale), ("y_scale", self.y_scale)] {
+            if scale <= 0.0 || !scale.is_finite() {
+                return Err(SubtitleError::Parse(format!(
+                    "a burn needs a positive {name}, got {scale}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -198,10 +257,17 @@ pub struct SubtitleBurn {
     state: std::sync::Mutex<BurnState>,
 }
 
+/// What a cached render belongs to: every active cue with the fade alpha it was
+/// drawn at, plus the frame width and height.
+///
+/// The alpha is part of the key because it is baked into the rendered pixels, so
+/// a cue mid-fade re-renders every frame while one at full strength keeps
+/// hitting the cache.
+type RenderKey = (Vec<(usize, u8)>, u32, u32);
+
 struct BurnState {
     rasterizer: SubtitleRasterizer,
-    /// Cue indices, frame width and height the cached bitmaps were made for.
-    rendered_for: Option<(Vec<usize>, u32, u32)>,
+    rendered_for: Option<RenderKey>,
     rendered: Arc<Vec<PositionedBitmap>>,
 }
 
@@ -232,6 +298,7 @@ impl SubtitleBurn {
                 "a burn needs a positive frame rate, got {fps}"
             )));
         }
+        style.validate()?;
         let rasterizer = SubtitleRasterizer::new(font)?;
         let has_text = cues.iter().any(|cue| cue.image.is_none());
         if has_text && !rasterizer.has_font() {
@@ -280,20 +347,23 @@ impl SubtitleBurn {
                 frame.len()
             )));
         }
-        let active = self.active_cues(frame_index);
+        let time_ms = self.time_ms(frame_index);
+        let key: Vec<(usize, u8)> = self
+            .active_cues(frame_index)
+            .into_iter()
+            .map(|at| (at, fade_alpha(&self.cues[at], time_ms, &self.style)))
+            .collect();
         let bitmaps = {
             let mut state = self.state.lock().expect("subtitle burn state");
-            if state.rendered_for.as_ref() != Some(&(active.clone(), width, height)) {
-                let due: Vec<StyledCue> = active.iter().map(|at| self.cues[*at].clone()).collect();
-                let rendered = state.rasterizer.render(
-                    &due,
-                    self.time_ms(frame_index),
-                    width,
-                    height,
-                    &self.style,
-                )?;
+            if state.rendered_for.as_ref() != Some(&(key.clone(), width, height)) {
+                let due: Vec<StyledCue> =
+                    key.iter().map(|(at, _)| self.cues[*at].clone()).collect();
+                let rendered =
+                    state
+                        .rasterizer
+                        .render(&due, time_ms, width, height, &self.style)?;
                 state.rendered = Arc::new(rendered);
-                state.rendered_for = Some((active, width, height));
+                state.rendered_for = Some((key, width, height));
             }
             Arc::clone(&state.rendered)
         };
@@ -382,11 +452,19 @@ impl SubtitleRasterizer {
             if time_ms < cue.start_ms || time_ms >= cue.end_ms {
                 continue;
             }
-            let bitmap = match &cue.image {
+            let alpha = fade_alpha(cue, time_ms, style);
+            if alpha == 0 {
+                continue;
+            }
+            let drawn = match &cue.image {
                 Some(path) => Some(render_bitmap_cue(path, cue, width, height, style)?),
                 None => self.render_text_cue(cue, width, height, style),
             };
-            bitmaps.extend(bitmap);
+            let Some(mut bitmap) = drawn else {
+                continue;
+            };
+            scale_alpha(&mut bitmap, alpha);
+            bitmaps.push(bitmap);
         }
         Ok(bitmaps)
     }
@@ -402,7 +480,7 @@ impl SubtitleRasterizer {
         if text.trim().is_empty() {
             return None;
         }
-        let font_size = (height as f32 * style.font_size_ratio).max(1.0);
+        let font_size = (height as f32 * style.font_size_ratio * style.y_scale).max(1.0);
         let line_height = font_size * style.line_height_ratio;
 
         let family = self.primary_family.clone();
@@ -464,43 +542,109 @@ impl SubtitleRasterizer {
         let pad = line_height.ceil() as i32;
         let bitmap_width = (block_width.ceil() as i32 + pad * 2).max(1) as u32;
         let bitmap_height = (block_height.ceil() as i32 + pad * 2).max(1) as u32;
-        let (origin_x, origin_y) = anchor(cue, style, width, height, block_width, block_height);
-        let mut bitmap =
-            PositionedBitmap::blank(origin_x - pad, origin_y - pad, bitmap_width, bitmap_height);
+        let (origin_x, origin_y) = anchor(
+            cue,
+            style,
+            width,
+            height,
+            block_width * style.x_scale,
+            block_height,
+        );
+        let mut bitmap = PositionedBitmap::blank(
+            origin_x - (pad as f32 * style.x_scale).round() as i32,
+            origin_y - pad,
+            bitmap_width,
+            bitmap_height,
+        );
 
-        let default = style.default_colour;
-        for line in &lines {
-            let line_x = match cue.align.unwrap_or(HAlign::Center) {
+        let layout = TextLayout {
+            lines,
+            underlines,
+            align: cue.align.unwrap_or(HAlign::Center),
+            block_width,
+            pad: pad as f32,
+            font_size,
+            default_colour: style.default_colour,
+        };
+        self.draw_effect(&mut bitmap, &layout, style);
+        self.draw_text(&mut bitmap, &layout, None);
+        Some(stretch_horizontally(bitmap, style.x_scale))
+    }
+
+    /// Draw the outline or shadow that sits under the text.
+    ///
+    /// The same glyphs are laid down again in the effect colour, then dilated or
+    /// offset, so bidi order, font fallback and italics carry through without
+    /// this pass knowing about any of them.
+    fn draw_effect(
+        &mut self,
+        bitmap: &mut PositionedBitmap,
+        layout: &TextLayout,
+        style: &BurnStyle,
+    ) {
+        let colour = [
+            style.effect_colour.r,
+            style.effect_colour.g,
+            style.effect_colour.b,
+            style.effect_colour.a,
+        ];
+        let (dilation, offset) = match style.effect {
+            BurnEffect::None => return,
+            BurnEffect::Outline => (
+                (layout.font_size * style.outline_width_ratio)
+                    .round()
+                    .max(1.0) as i32,
+                0,
+            ),
+            BurnEffect::Shadow => (
+                0,
+                (layout.font_size * SHADOW_OFFSET_RATIO).round().max(1.0) as i32,
+            ),
+        };
+        let mut layer = PositionedBitmap::blank(bitmap.x, bitmap.y, bitmap.width, bitmap.height);
+        self.draw_text(&mut layer, layout, Some(colour));
+        if dilation > 0 {
+            layer = dilate(&layer, dilation, colour);
+        }
+        blend_layer(bitmap, &layer, offset);
+    }
+
+    /// Blit every glyph and underline bar of `layout` onto `bitmap`, in
+    /// `force_colour` when the caller wants one flat colour.
+    fn draw_text(
+        &mut self,
+        bitmap: &mut PositionedBitmap,
+        layout: &TextLayout,
+        force_colour: Option<[u8; 4]>,
+    ) {
+        for line in &layout.lines {
+            let line_x = match layout.align {
                 HAlign::Left => 0.0,
-                HAlign::Center => (block_width - line.width) / 2.0,
-                HAlign::Right => block_width - line.width,
+                HAlign::Center => (layout.block_width - line.width) / 2.0,
+                HAlign::Right => layout.block_width - line.width,
             };
-            let line_origin_x = pad as f32 + line_x;
-            let line_origin_y = pad as f32 + line.top + line.baseline;
+            let line_origin_x = layout.pad + line_x;
+            let line_origin_y = layout.pad + line.top + line.baseline;
             for glyph in &line.glyphs {
-                let colour = glyph
-                    .colour
-                    .map(|c| [c.r(), c.g(), c.b(), c.a()])
-                    .unwrap_or([default.r, default.g, default.b, default.a]);
+                let colour = resolve_colour(glyph.colour, layout.default_colour, force_colour);
                 self.blit_glyph(
-                    &mut bitmap,
+                    bitmap,
                     glyph,
                     line_origin_x + glyph.x as f32,
                     line_origin_y + glyph.y as f32,
                     colour,
+                    force_colour.is_some(),
                 );
             }
             draw_underlines(
-                &mut bitmap,
+                bitmap,
                 line,
                 line_origin_x,
                 line_origin_y,
-                font_size,
-                &underlines,
-                default,
+                layout,
+                force_colour,
             );
         }
-        Some(bitmap)
     }
 
     fn blit_glyph(
@@ -510,6 +654,7 @@ impl SubtitleRasterizer {
         origin_x: f32,
         origin_y: f32,
         colour: [u8; 4],
+        ignore_glyph_colour: bool,
     ) {
         let Some(image) = self.cache.get_image(&mut self.fonts, glyph.key).as_ref() else {
             return;
@@ -523,6 +668,7 @@ impl SubtitleRasterizer {
         let left = origin_x.round() as i32 + image.placement.left;
         let top = origin_y.round() as i32 - image.placement.top;
         let (glyph_width, glyph_height) = (image.placement.width, image.placement.height);
+        let flat_colour = !colour_bitmap || ignore_glyph_colour;
         for row in 0..glyph_height as i32 {
             let py = top + row;
             if py < 0 || py >= bitmap.height as i32 {
@@ -534,17 +680,21 @@ impl SubtitleRasterizer {
                     continue;
                 }
                 let at = (row as usize) * (glyph_width as usize) + column as usize;
-                let source = if colour_bitmap {
-                    let rgba = &image.data[at * 4..at * 4 + 4];
-                    [rgba[0], rgba[1], rgba[2], rgba[3]]
-                } else {
-                    let coverage = image.data[at] as u32;
+                let source = if flat_colour {
+                    let coverage = if colour_bitmap {
+                        image.data[at * 4 + 3]
+                    } else {
+                        image.data[at]
+                    } as u32;
                     [
                         colour[0],
                         colour[1],
                         colour[2],
                         ((coverage * colour[3] as u32 + 127) / 255) as u8,
                     ]
+                } else {
+                    let rgba = &image.data[at * 4..at * 4 + 4];
+                    [rgba[0], rgba[1], rgba[2], rgba[3]]
                 };
                 bitmap.blend(px as u32, py as u32, source);
             }
@@ -571,6 +721,31 @@ fn run_attrs<'a>(base: &Attrs<'a>, run: &StyledRun, style: &BurnStyle) -> Attrs<
     }
     let colour = run.color.unwrap_or(style.default_colour);
     attrs.color(Color::rgba(colour.r, colour.g, colour.b, colour.a))
+}
+
+/// A shaped cue and everything the glyph pass needs to place it, so the text
+/// and the effect under it are drawn from one description.
+struct TextLayout {
+    lines: Vec<LaidOutLine>,
+    /// Byte ranges of the cue text that are underlined.
+    underlines: Vec<(usize, usize)>,
+    align: HAlign,
+    /// Width of the widest line, which the shorter lines are aligned against.
+    block_width: f32,
+    /// Blank border around the text block, in pixels.
+    pad: f32,
+    font_size: f32,
+    default_colour: Rgba,
+}
+
+/// The colour a glyph is drawn in: the caller's flat colour when it names one,
+/// otherwise the run's own colour, otherwise the style default.
+fn resolve_colour(run_colour: Option<Color>, default: Rgba, force: Option<[u8; 4]>) -> [u8; 4] {
+    force.unwrap_or_else(|| {
+        run_colour
+            .map(|c| [c.r(), c.g(), c.b(), c.a()])
+            .unwrap_or([default.r, default.g, default.b, default.a])
+    })
 }
 
 /// One visual line of a shaped cue, in visual (post-bidi) order.
@@ -620,26 +795,24 @@ fn draw_underlines(
     line: &LaidOutLine,
     line_origin_x: f32,
     baseline_y: f32,
-    font_size: f32,
-    ranges: &[(usize, usize)],
-    default: Rgba,
+    layout: &TextLayout,
+    force_colour: Option<[u8; 4]>,
 ) {
-    if ranges.is_empty() {
+    if layout.underlines.is_empty() {
         return;
     }
+    let font_size = layout.font_size;
     let thickness = (font_size * UNDERLINE_THICKNESS_RATIO).round().max(1.0) as i32;
     let top = (baseline_y + font_size * UNDERLINE_OFFSET_RATIO).round() as i32;
     for glyph in &line.glyphs {
-        if !ranges
+        if !layout
+            .underlines
             .iter()
             .any(|(s, e)| glyph.start >= *s && glyph.start < *e)
         {
             continue;
         }
-        let colour = glyph
-            .colour
-            .map(|c| [c.r(), c.g(), c.b(), c.a()])
-            .unwrap_or([default.r, default.g, default.b, default.a]);
+        let colour = resolve_colour(glyph.colour, layout.default_colour, force_colour);
         let start_x = (line_origin_x + glyph.left).round() as i32;
         let end_x = (line_origin_x + glyph.left + glyph.advance).round() as i32;
         for row in top..top + thickness {
@@ -654,6 +827,132 @@ fn draw_underlines(
             }
         }
     }
+}
+
+/// Grow a flat-coloured layer's alpha by `radius` pixels in every direction, so
+/// the text coverage becomes a band the text itself then sits inside.
+fn dilate(layer: &PositionedBitmap, radius: i32, colour: [u8; 4]) -> PositionedBitmap {
+    let mut grown = PositionedBitmap::blank(layer.x, layer.y, layer.width, layer.height);
+    let spread: Vec<(i32, i32)> = (-radius..=radius)
+        .flat_map(|row| (-radius..=radius).map(move |column| (column, row)))
+        .filter(|(column, row)| column * column + row * row <= radius * radius)
+        .collect();
+    for row in 0..layer.height as i32 {
+        for column in 0..layer.width as i32 {
+            let from = ((row as usize) * (layer.width as usize) + column as usize) * 4;
+            let alpha = layer.pixels[from + 3];
+            if alpha == 0 {
+                continue;
+            }
+            for (column_step, row_step) in &spread {
+                let px = column + column_step;
+                let py = row + row_step;
+                if px < 0 || py < 0 || px >= layer.width as i32 || py >= layer.height as i32 {
+                    continue;
+                }
+                let to = ((py as usize) * (layer.width as usize) + px as usize) * 4;
+                if grown.pixels[to + 3] < alpha {
+                    grown.pixels[to..to + 4]
+                        .copy_from_slice(&[colour[0], colour[1], colour[2], alpha]);
+                }
+            }
+        }
+    }
+    grown
+}
+
+/// Source-over `layer` onto `target` shifted `offset` pixels down and right,
+/// clipping to the target.
+fn blend_layer(target: &mut PositionedBitmap, layer: &PositionedBitmap, offset: i32) {
+    for row in 0..layer.height as i32 {
+        let py = row + offset;
+        if py < 0 || py >= target.height as i32 {
+            continue;
+        }
+        for column in 0..layer.width as i32 {
+            let px = column + offset;
+            if px < 0 || px >= target.width as i32 {
+                continue;
+            }
+            let from = ((row as usize) * (layer.width as usize) + column as usize) * 4;
+            let source = [
+                layer.pixels[from],
+                layer.pixels[from + 1],
+                layer.pixels[from + 2],
+                layer.pixels[from + 3],
+            ];
+            target.blend(px as u32, py as u32, source);
+        }
+    }
+}
+
+/// Resample a bitmap to `scale` times its width with a bilinear filter, keeping
+/// its rows and its placement.
+///
+/// cosmic-text shapes at one size in both axes, so an anisotropic stretch has to
+/// happen on the finished raster rather than in the shaper.
+fn stretch_horizontally(bitmap: PositionedBitmap, scale: f32) -> PositionedBitmap {
+    let target_width = ((bitmap.width as f32 * scale).round() as u32).max(1);
+    if target_width == bitmap.width {
+        return bitmap;
+    }
+    let mut stretched = PositionedBitmap::blank(bitmap.x, bitmap.y, target_width, bitmap.height);
+    let step = bitmap.width as f32 / target_width as f32;
+    for row in 0..bitmap.height as usize {
+        let source_row = row * bitmap.width as usize;
+        let target_row = row * target_width as usize;
+        for column in 0..target_width as usize {
+            let source = (column as f32 + 0.5) * step - 0.5;
+            let fraction = source - source.floor();
+            let left = (source.floor() as i32).clamp(0, bitmap.width as i32 - 1) as usize;
+            let right = (left + 1).min(bitmap.width as usize - 1);
+            let from_left = (source_row + left) * 4;
+            let from_right = (source_row + right) * 4;
+            // Mixed premultiplied, so the transparent side of an edge cannot
+            // drag its colour into the visible pixel.
+            let left_alpha = bitmap.pixels[from_left + 3] as f32 * (1.0 - fraction);
+            let right_alpha = bitmap.pixels[from_right + 3] as f32 * fraction;
+            let alpha = left_alpha + right_alpha;
+            let to = (target_row + column) * 4;
+            stretched.pixels[to + 3] = alpha.round().min(255.0) as u8;
+            if alpha <= 0.0 {
+                continue;
+            }
+            for channel in 0..3 {
+                let mixed = bitmap.pixels[from_left + channel] as f32 * left_alpha
+                    + bitmap.pixels[from_right + channel] as f32 * right_alpha;
+                stretched.pixels[to + channel] = (mixed / alpha).round().clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    stretched
+}
+
+/// Multiply every pixel's alpha by `alpha / 255`.
+fn scale_alpha(bitmap: &mut PositionedBitmap, alpha: u8) {
+    if alpha == u8::MAX {
+        return;
+    }
+    for pixel in bitmap.pixels.chunks_exact_mut(4) {
+        pixel[3] = ((pixel[3] as u32 * alpha as u32 + 127) / 255) as u8;
+    }
+}
+
+/// How much of `cue` is visible at `time_ms`, as an 8-bit multiplier: it ramps
+/// up over `fade_up_ms` from the cue's start and down over `fade_down_ms` to its
+/// end. A cue shorter than the two ramps together takes whichever is lower, so
+/// it never reaches full strength.
+fn fade_alpha(cue: &StyledCue, time_ms: u64, style: &BurnStyle) -> u8 {
+    let full = u8::MAX as u64;
+    let up = match style.fade_up_ms {
+        0 => full,
+        span => time_ms.saturating_sub(cue.start_ms).min(span) * full / span,
+    };
+    let down = match style.fade_down_ms {
+        0 => full,
+        span => cue.end_ms.saturating_sub(time_ms).min(span) * full / span,
+    };
+    up.min(down) as u8
 }
 
 /// Decode a bitmap cue's PNG and place it. The image is scaled down to fit the
@@ -817,6 +1116,14 @@ mod tests {
         StyledCue::text(0, 1000, vec![StyledRun::plain(text)])
     }
 
+    /// The default style with nothing drawn under the text.
+    fn plain_style() -> BurnStyle {
+        BurnStyle {
+            effect: BurnEffect::None,
+            ..BurnStyle::default()
+        }
+    }
+
     /// Total alpha in a bitmap, which is nonzero exactly when something drew.
     fn coverage(bitmap: &PositionedBitmap) -> u64 {
         bitmap.pixels.chunks_exact(4).map(|p| p[3] as u64).sum()
@@ -957,13 +1264,15 @@ mod tests {
             }),
             ..StyledRun::plain("")
         };
+        // No effect, so every solid pixel is text rather than the shadow the
+        // default style draws under it.
         let out = raster
             .render(
                 &[StyledCue::text(0, 1000, vec![red])],
                 0,
                 WIDTH,
                 HEIGHT,
-                &BurnStyle::default(),
+                &plain_style(),
             )
             .unwrap();
         let opaque: Vec<[u8; 4]> = out[0]
@@ -1108,6 +1417,177 @@ mod tests {
             frame[6..].iter().all(|&b| b == 0),
             "clipping painted outside"
         );
+    }
+
+    #[test]
+    fn a_fade_ramps_alpha_over_the_span_it_is_given() {
+        let cue = cue("Hello");
+        let style = BurnStyle {
+            fade_up_ms: 200,
+            fade_down_ms: 400,
+            ..BurnStyle::default()
+        };
+        assert_eq!(fade_alpha(&cue, 0, &style), 0, "a cue starts transparent");
+        assert_eq!(fade_alpha(&cue, 100, &style), 127, "half way up the ramp");
+        assert_eq!(fade_alpha(&cue, 200, &style), 255, "full at the ramp's end");
+        assert_eq!(fade_alpha(&cue, 500, &style), 255, "full between the ramps");
+        assert_eq!(fade_alpha(&cue, 600, &style), 255, "the down ramp starts");
+        assert_eq!(fade_alpha(&cue, 800, &style), 127, "half way down the ramp");
+        assert_eq!(fade_alpha(&cue, 999, &style), 0, "transparent at the end");
+        assert_eq!(
+            fade_alpha(&cue, 0, &BurnStyle::default()),
+            255,
+            "no ramps means full strength throughout"
+        );
+    }
+
+    #[test]
+    fn overlapping_ramps_on_a_short_cue_take_the_lower_one() {
+        let short = StyledCue::text(0, 100, vec![StyledRun::plain("Hi")]);
+        let style = BurnStyle {
+            fade_up_ms: 100,
+            fade_down_ms: 100,
+            ..BurnStyle::default()
+        };
+        assert_eq!(fade_alpha(&short, 50, &style), 127);
+        for time_ms in 0..100 {
+            let alpha = fade_alpha(&short, time_ms, &style);
+            assert!(
+                alpha <= 127,
+                "a cue as short as both ramps reached {alpha} at {time_ms}ms"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scale_that_is_not_positive_and_finite_is_refused() {
+        for (field, style) in [
+            (
+                "x_scale",
+                BurnStyle {
+                    x_scale: 0.0,
+                    ..BurnStyle::default()
+                },
+            ),
+            (
+                "x_scale",
+                BurnStyle {
+                    x_scale: f32::NAN,
+                    ..BurnStyle::default()
+                },
+            ),
+            (
+                "y_scale",
+                BurnStyle {
+                    y_scale: -1.0,
+                    ..BurnStyle::default()
+                },
+            ),
+            (
+                "y_scale",
+                BurnStyle {
+                    y_scale: f32::INFINITY,
+                    ..BurnStyle::default()
+                },
+            ),
+        ] {
+            let err = SubtitleBurn::new(Vec::new(), None, style, 24.0).unwrap_err();
+            assert!(
+                err.to_string().contains(field),
+                "{field} was accepted, or reported as something else: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scales_stretch_the_text_in_one_axis_each() {
+        let Some(mut raster) = rasterizer() else {
+            return;
+        };
+        let base = raster
+            .render(&[cue("Hello")], 0, WIDTH, HEIGHT, &plain_style())
+            .unwrap();
+        let taller = raster
+            .render(
+                &[cue("Hello")],
+                0,
+                WIDTH,
+                HEIGHT,
+                &BurnStyle {
+                    y_scale: 2.0,
+                    ..plain_style()
+                },
+            )
+            .unwrap();
+        assert!(
+            taller[0].height > base[0].height * 3 / 2,
+            "y_scale 2.0 left a {}px block against {}px",
+            taller[0].height,
+            base[0].height
+        );
+        let wider = raster
+            .render(
+                &[cue("Hello")],
+                0,
+                WIDTH,
+                HEIGHT,
+                &BurnStyle {
+                    x_scale: 2.0,
+                    ..plain_style()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            wider[0].height, base[0].height,
+            "x_scale must not touch the height"
+        );
+        assert!(
+            wider[0].width.abs_diff(base[0].width * 2) <= 1,
+            "x_scale 2.0 left a {}px wide bitmap against {}px",
+            wider[0].width,
+            base[0].width
+        );
+    }
+
+    #[test]
+    fn an_effect_draws_effect_colour_pixels_the_plain_style_does_not() {
+        let Some(mut raster) = rasterizer() else {
+            return;
+        };
+        let green = Rgba {
+            r: 0,
+            g: 255,
+            b: 0,
+            a: 255,
+        };
+        let plain = raster
+            .render(&[cue("Hello")], 0, WIDTH, HEIGHT, &plain_style())
+            .unwrap();
+        for effect in [BurnEffect::Outline, BurnEffect::Shadow] {
+            let style = BurnStyle {
+                effect,
+                effect_colour: green,
+                ..BurnStyle::default()
+            };
+            let out = raster
+                .render(&[cue("Hello")], 0, WIDTH, HEIGHT, &style)
+                .unwrap();
+            assert_eq!(
+                (out[0].width, out[0].height),
+                (plain[0].width, plain[0].height),
+                "{effect:?} changed the block size"
+            );
+            let solid_green = out[0]
+                .pixels
+                .chunks_exact(4)
+                .filter(|p| p[3] > 200 && p[1] > 200 && p[0] < 60 && p[2] < 60)
+                .count();
+            assert!(solid_green > 0, "{effect:?} drew no effect-colour pixels");
+            assert!(
+                coverage(&out[0]) > coverage(&plain[0]),
+                "{effect:?} added no coverage"
+            );
+        }
     }
 
     #[test]
