@@ -271,7 +271,8 @@ pub fn encode(opts: &EncodeOptions) -> EncodeResult {
             .arg("-o")
             .arg(&output)
             .arg("-r")
-            .arg(format!("{}", opts.bitrate_mbps));
+            .arg(format!("{}", opts.bitrate_mbps))
+            .arg("-X");
 
         if opts.gpu_device >= 0 {
             cmd.arg("-G").arg(format!("{}", opts.gpu_device));
@@ -1096,6 +1097,7 @@ where
                                 "CPRL",
                                 "-H",
                                 "1",
+                                "-X",
                             ])
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())

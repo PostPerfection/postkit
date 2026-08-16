@@ -644,6 +644,9 @@ fn compress_frame_grok(
         cparams.framerate = params.frame_rate;
         cparams.num_threads = params.threads_per_codec;
         cparams.apply_xyz_transform = params.apply_xyz_transform;
+        // Bv2.1 requires a TLM marker in every codestream (libdcp's
+        // MISSING_JPEG2000_TLM_MARKER), and grok writes none unless asked
+        cparams.write_tlm = true;
 
         cparams.prog_order = match params.progression {
             ProgressionOrder::Lrcp => _GRK_PROG_ORDER_GRK_LRCP,

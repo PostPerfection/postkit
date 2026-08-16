@@ -88,6 +88,10 @@ fn a_video_source_encodes_to_one_codestream_per_frame() {
         .unwrap_or_else(|| panic!("{} is not a J2K codestream", first.display()));
     assert_eq!((header.width, header.height), (WIDTH, HEIGHT));
     assert_eq!(header.num_components, 3);
+    assert!(
+        header.tlm_present,
+        "Bv2.1 needs a TLM marker in every codestream"
+    );
 }
 
 /// 500 is the shortest clip where the two rates disagree: 500 frames at
