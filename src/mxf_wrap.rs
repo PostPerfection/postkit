@@ -114,6 +114,13 @@ pub struct MxfWrapOptions {
     /// mints a fresh id.
     #[serde(default)]
     pub asset_uuid: Option<[u8; 16]>,
+    /// TimedText only: the essence duration to write, in frames at the wrap edit
+    /// rate. A reel's subtitle asset has to span the whole reel even where the
+    /// cues do not, so the caller that knows the reel length sets it here. The
+    /// wrap is refused when a cue ends past it. None derives the duration from
+    /// the last cue, which also means a document with no cue timing is refused.
+    #[serde(default)]
+    pub timed_text_duration_frames: Option<u32>,
 }
 
 /// Result of MXF wrapping.
@@ -887,16 +894,36 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
     };
 
     let fps = opts.fps_num as f64 / opts.fps_den.max(1) as f64;
-    let Some(end_secs) = crate::subtitle_retime::subtitle_end_time_seconds(&xml_data, fps) else {
-        return MxfTrackFile {
-            error: format!(
-                "cannot determine subtitle duration: no parsable end/TimeOut timing in {}",
-                opts.input_files[0].display()
-            ),
-            ..Default::default()
-        };
+    let last_cue_frames = crate::subtitle_retime::subtitle_end_time_seconds(&xml_data, fps)
+        .map(|end_secs| (end_secs * fps).ceil() as u32);
+    let duration_frames = match opts.timed_text_duration_frames {
+        Some(declared) => {
+            if let Some(cue_end) = last_cue_frames
+                && cue_end > declared
+            {
+                return MxfTrackFile {
+                    error: format!(
+                        "timed text {} has a cue ending at frame {cue_end}, past the declared duration of {declared} frames",
+                        opts.input_files[0].display()
+                    ),
+                    ..Default::default()
+                };
+            }
+            declared
+        }
+        None => {
+            let Some(frames) = last_cue_frames else {
+                return MxfTrackFile {
+                    error: format!(
+                        "cannot determine subtitle duration: no parsable end/TimeOut timing in {}",
+                        opts.input_files[0].display()
+                    ),
+                    ..Default::default()
+                };
+            };
+            frames
+        }
     };
-    let duration_frames = (end_secs * fps).ceil() as u32;
 
     let resources = match read_ancillary_resources(opts) {
         Ok(r) => r,
@@ -1336,6 +1363,7 @@ mod tests {
             resource_ids: vec![],
             hdr: None,
             asset_uuid: None,
+            timed_text_duration_frames: None,
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -1369,6 +1397,7 @@ mod tests {
             resource_ids: vec![],
             hdr: None,
             asset_uuid: None,
+            timed_text_duration_frames: None,
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "must not wrap a non-WAV file");
@@ -1438,6 +1467,7 @@ mod tests {
             resource_ids: vec![],
             hdr: None,
             asset_uuid: None,
+            timed_text_duration_frames: None,
         }
     }
 
@@ -1600,6 +1630,7 @@ mod tests {
             resource_ids: vec![],
             hdr: None,
             asset_uuid: None,
+            timed_text_duration_frames: None,
         };
         let result = wrap_pcm(&opts);
         assert!(result.success, "wrap failed: {}", result.error);
@@ -1647,6 +1678,7 @@ mod tests {
             resource_ids: vec![],
             hdr: None,
             asset_uuid: None,
+            timed_text_duration_frames: None,
         };
         let result = wrap_pcm(&opts);
         assert!(!result.success, "MCA on AS-02 must be rejected");
@@ -1684,6 +1716,7 @@ mod tests {
             resource_ids: vec![],
             hdr: None,
             asset_uuid: None,
+            timed_text_duration_frames: None,
         };
         let result = mxf_wrap(&opts);
         assert!(result.success, "atmos wrap failed: {}", result.error);
@@ -1829,6 +1862,81 @@ mod tests {
         assert!(
             result.error.contains("declares no document id"),
             "the error names the missing id, got: {}",
+            result.error
+        );
+        assert!(!out.exists(), "no MXF is left behind");
+    }
+
+    /// A DCST with no cues at all, which is what a reel of a subtitled
+    /// composition carries when none of the cues fall inside it.
+    const EMPTY_DCST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<dcst:SubtitleReel xmlns:dcst=\"http://www.smpte-ra.org/schemas/428-7/2010/DCST\">\n\
+  <dcst:Id>urn:uuid:11111111-1111-1111-1111-111111111111</dcst:Id>\n\
+  <dcst:ContentTitleText>t</dcst:ContentTitleText>\n\
+  <dcst:IssueDate>2020-01-01T00:00:00+00:00</dcst:IssueDate>\n\
+  <dcst:EditRate>24 1</dcst:EditRate>\n\
+  <dcst:TimeCodeRate>24</dcst:TimeCodeRate>\n\
+  <dcst:SubtitleList/>\n\
+</dcst:SubtitleReel>\n";
+
+    /// A reel length in frames, longer than the `DCST` fixture's last cue.
+    const DECLARED_DURATION_FRAMES: u32 = 240;
+
+    /// A reel with no cues still needs a subtitle asset spanning it, so the
+    /// caller's duration is what gets written and the missing cue timing is no
+    /// longer a reason to refuse.
+    #[test]
+    fn timed_text_with_no_cues_wraps_at_the_declared_duration() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("sub.xml");
+        std::fs::write(&xml, EMPTY_DCST).unwrap();
+        let out = dir.path().join("sub.mxf");
+        let mut opts = wrap_opts(EssenceType::TimedText, vec![xml], out.clone(), None);
+        opts.timed_text_duration_frames = Some(DECLARED_DURATION_FRAMES);
+
+        let result = mxf_wrap(&opts);
+        assert!(
+            result.success,
+            "empty subtitle wrap failed: {}",
+            result.error
+        );
+        assert_eq!(result.duration, DECLARED_DURATION_FRAMES as u64);
+
+        let mut reader = asdcplib::timed_text::MxfReader::new();
+        reader.open_read(&out.to_string_lossy()).unwrap();
+        assert_eq!(
+            reader.descriptor().unwrap().container_duration,
+            DECLARED_DURATION_FRAMES,
+            "the essence spans the reel the caller declared"
+        );
+
+        let mut buf = vec![0u8; RESOURCE_READ_BUFFER_LEN];
+        let n = reader
+            .read_timed_text_resource(&mut buf, None, None)
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("<dcst:SubtitleList/>"),
+            "the empty document round-trips"
+        );
+    }
+
+    /// An asset shorter than its own cues would drop them at playback, so the
+    /// caller's duration and the document have to agree.
+    #[test]
+    fn timed_text_cue_past_the_declared_duration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = dir.path().join("sub.xml");
+        std::fs::write(&xml, DCST).unwrap();
+        let out = dir.path().join("sub.mxf");
+        let mut opts = wrap_opts(EssenceType::TimedText, vec![xml], out.clone(), None);
+        // DCST's only cue ends at 00:00:04:00, frame 96 at 24 fps
+        opts.timed_text_duration_frames = Some(48);
+
+        let result = mxf_wrap(&opts);
+        assert!(!result.success, "a cue past the reel must not wrap");
+        assert!(
+            result.error.contains("96") && result.error.contains("48"),
+            "the error names both frame counts, got: {}",
             result.error
         );
         assert!(!out.exists(), "no MXF is left behind");

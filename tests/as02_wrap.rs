@@ -110,6 +110,7 @@ fn as02_j2k_roundtrip() {
         resource_ids: vec![],
         hdr: None,
         asset_uuid: None,
+        timed_text_duration_frames: None,
     });
     assert!(result.success, "wrap failed: {}", result.error);
 
@@ -157,6 +158,7 @@ fn as02_pcm_roundtrip() {
         resource_ids: vec![],
         hdr: None,
         asset_uuid: None,
+        timed_text_duration_frames: None,
     });
     assert!(result.success, "wrap failed: {}", result.error);
     assert_eq!(result.duration, 2);
@@ -210,6 +212,7 @@ fn as02_timed_text_encrypts_the_subtitle_xml() {
         resource_ids: vec![],
         hdr: None,
         asset_uuid: None,
+        timed_text_duration_frames: None,
     });
     assert!(result.success, "wrap failed: {}", result.error);
 
@@ -265,6 +268,7 @@ fn as02_timed_text_refuses_ancillary_resources() {
         resource_ids: vec![],
         hdr: None,
         asset_uuid: None,
+        timed_text_duration_frames: None,
     });
     assert!(!result.success);
     assert!(
@@ -299,6 +303,7 @@ fn as02_atmos_errors() {
         resource_ids: vec![],
         hdr: None,
         asset_uuid: None,
+        timed_text_duration_frames: None,
     });
     assert!(!result.success);
     assert!(

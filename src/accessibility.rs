@@ -1028,6 +1028,7 @@ mod tests {
             resource_ids: vec![],
             hdr: None,
             asset_uuid: Some(asset_uuid),
+            timed_text_duration_frames: None,
         });
         assert!(result.success, "sound wrap failed: {}", result.error);
 

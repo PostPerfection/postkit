@@ -4,6 +4,12 @@
 
 ### Added
 
+- `MxfWrapOptions.timed_text_duration_frames`: the essence duration a timed-text
+  wrap writes, in frames, for a caller that knows how long the asset has to be.
+  A reel of a subtitled composition needs a subtitle asset spanning the whole
+  reel even where no cue falls inside it, so a document with no cue timing now
+  wraps when the duration is given. A cue ending past it is refused, with both
+  frame counts in the message. Unset keeps the cue-derived duration.
 - `colour::DcdmTransform`: the DCDM encode transform for one source colour
   space, built once and applied per frame (`pixel`, `frame_rgb48le`,
   `frame_rgb48be_inplace`). It covers Rec.709, P3, Rec.2020 and X'Y'Z', and
