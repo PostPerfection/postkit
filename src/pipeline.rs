@@ -106,8 +106,9 @@ pub struct EncodeRunOptions {
     /// Per-codestream byte cap, e.g. the DCI HDR Addendum's raised cap. A frame
     /// over it fails the run.
     pub codestream_byte_cap: Option<u64>,
-    /// Subtitles burnt into every decoded frame. Only the video path can carry
-    /// one: see [`reject_unsupported_burn`].
+    /// Subtitles burnt into every decoded frame. Every burn decodes through
+    /// ffmpeg, image sequences included: [`reject_unsupported_burn`] names the
+    /// inputs that cannot.
     pub subtitle_burn: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
 }
 
