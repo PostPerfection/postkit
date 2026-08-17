@@ -434,6 +434,33 @@ impl DecodeSource {
     }
 }
 
+/// Every ffmpeg argument that goes before `-i` for a stream decode: what the
+/// demuxer needs, plus the input rate when the caller reads the source at a rate
+/// other than its own.
+pub(crate) fn decode_input_args(
+    decode_source: DecodeSource,
+    read_source_at: Option<FrameRate>,
+) -> Result<Vec<String>, String> {
+    let mut args: Vec<String> = decode_source
+        .demuxer_args()
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect();
+    let Some(rate) = read_source_at else {
+        return Ok(args);
+    };
+    if decode_source == DecodeSource::ImageList {
+        return Err(format!(
+            "a concat list of stills already holds each frame for one period, so it cannot also \
+             be read at {} fps",
+            rate.ffmpeg_filter_value()
+        ));
+    }
+    args.push("-r".to_string());
+    args.push(rate.ffmpeg_filter_value());
+    Ok(args)
+}
+
 /// Write an ffmpeg concat list holding every frame of an image sequence for one
 /// frame period, in the order [`find_source_frames`] returns them.
 ///
@@ -474,6 +501,12 @@ pub struct StreamEncodeOptions {
     pub progression: String,
     /// Target frame rate for output (ffmpeg fps filter)
     pub fps: FrameRate,
+    /// Read the source as if it ran at this rate, ignoring its own timestamps.
+    /// This is how a 23.976 source becomes 24 fps by playing 0.1% faster: every
+    /// frame reaches the encoder once, none is duplicated or dropped. Video
+    /// only, and the sound needs the matching pull-up.
+    #[serde(default)]
+    pub read_source_at: Option<FrameRate>,
     /// Path to compressor binary (auto-detected if empty)
     pub compressor_path: PathBuf,
     /// Library directory for LD_LIBRARY_PATH (if needed)
@@ -505,6 +538,7 @@ impl Default for StreamEncodeOptions {
             codeblock_size: 32,
             progression: "CPRL".to_string(),
             fps: FrameRate::default(),
+            read_source_at: None,
             compressor_path: PathBuf::new(),
             lib_dir: None,
             source_colour: SourceColour::DisplayRgb,
@@ -695,9 +729,24 @@ where
 
     // Start ffmpeg: decode to raw 16-bit big-endian RGB
     let filters = decode_filters(opts.fps, &opts.source_colour, &plan);
+    let input_args = match decode_input_args(opts.decode_source, opts.read_source_at) {
+        Ok(args) => args,
+        Err(e) => {
+            return EncodeResult {
+                success: false,
+                error: e,
+                ..Default::default()
+            };
+        }
+    };
+    tracing::debug!(
+        "ffmpeg -y {} -i {} -vf {filters}",
+        input_args.join(" "),
+        opts.input.display()
+    );
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .arg("-y")
-        .args(opts.decode_source.demuxer_args())
+        .args(&input_args)
         .arg("-i")
         .arg(&opts.input)
         .args([
@@ -884,9 +933,24 @@ where
 
     // Start ffmpeg
     let filters = decode_filters(opts.fps, &opts.source_colour, &plan);
+    let input_args = match decode_input_args(opts.decode_source, opts.read_source_at) {
+        Ok(args) => args,
+        Err(e) => {
+            return EncodeResult {
+                success: false,
+                error: e,
+                ..Default::default()
+            };
+        }
+    };
+    tracing::debug!(
+        "ffmpeg -y {} -i {} -vf {filters}",
+        input_args.join(" "),
+        opts.input.display()
+    );
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .arg("-y")
-        .args(opts.decode_source.demuxer_args())
+        .args(&input_args)
         .arg("-i")
         .arg(&opts.input)
         .args([
@@ -1230,6 +1294,25 @@ mod tests {
         write_image_concat_list(&frames, FrameRate::whole(24), &list_path).unwrap();
         let list = std::fs::read_to_string(&list_path).unwrap();
         assert_eq!(list.matches("duration 0.041666667").count(), 2, "{list}");
+    }
+
+    #[test]
+    fn a_source_read_rate_reaches_ffmpeg_as_an_input_rate() {
+        assert_eq!(
+            decode_input_args(DecodeSource::Video, None).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24))).unwrap(),
+            vec!["-r", "24"]
+        );
+        assert_eq!(
+            decode_input_args(DecodeSource::ImageList, None).unwrap(),
+            vec!["-f", "concat", "-safe", "0"]
+        );
+        let refused =
+            decode_input_args(DecodeSource::ImageList, Some(FrameRate::whole(24))).unwrap_err();
+        assert!(refused.contains("concat list"), "{refused}");
     }
 
     #[test]

@@ -100,6 +100,11 @@ pub struct EncodeRunOptions {
     pub compression_ratio: f64,
     /// J2K edit rate.
     pub fps: FrameRate,
+    /// Read the source as if it ran at this rate, ignoring its own timestamps.
+    /// This is how a 23.976 source becomes 24 fps by playing 0.1% faster: every
+    /// frame reaches the encoder once, none is duplicated or dropped. Video
+    /// only, and the sound needs the matching pull-up.
+    pub read_source_at: Option<FrameRate>,
     /// Colour the source frames carry, which decides whether the encoder runs
     /// the DCDM X'Y'Z' transform or leaves DCI PQ essence alone.
     pub source_colour: SourceColour,
@@ -121,6 +126,7 @@ impl Default for EncodeRunOptions {
         Self {
             compression_ratio: 10.0,
             fps: FrameRate::default(),
+            read_source_at: None,
             source_colour: SourceColour::DisplayRgb,
             codestream_byte_cap: None,
             subtitle_burn: None,
@@ -171,6 +177,12 @@ pub fn run_encode_with_options(
         InputType::ImageSequence => sequence_needs_ffmpeg,
         InputType::J2kSequence | InputType::Unknown => false,
     };
+    if options.read_source_at.is_some() && input_type != InputType::Video {
+        return Err(format!(
+            "a {input_type:?} input carries no timestamps to override, so it cannot be read at \
+             another rate"
+        ));
+    }
     reject_unsupported_colour_path(input_type, &options.source_colour, decodes_through_ffmpeg)?;
     if options.subtitle_burn.is_some() {
         reject_unsupported_burn(input_type, &options.source_colour)?;
@@ -231,6 +243,7 @@ pub fn run_encode_with_options(
                 codeblock_size: 32,
                 progression: "CPRL".to_string(),
                 fps,
+                read_source_at: options.read_source_at,
                 source_colour: options.source_colour.clone(),
                 subtitle_burn: options.subtitle_burn.clone(),
                 picture: options.picture.clone(),

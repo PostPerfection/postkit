@@ -4,6 +4,14 @@
 
 ### Added
 
+- `StreamEncodeOptions.read_source_at` and `EncodeRunOptions.read_source_at`:
+  read the source as if it ran at this rate, ignoring its own timestamps. It
+  reaches ffmpeg as an input `-r` before `-i`, which regenerates constant-rate
+  timestamps, so the `fps` filter of the same rate passes every frame through
+  untouched. This is how a 23.976 source becomes a 24 fps DCP by playing 0.1%
+  faster instead of having one frame in 1001 duplicated, and the sound needs the
+  matching 1000/1001 pull-up. Video only: an image sequence carries its rate in
+  the concat list and is refused.
 - `MxfWrapOptions.timed_text_duration_frames`: the essence duration a timed-text
   wrap writes, in frames, for a caller that knows how long the asset has to be.
   A reel of a subtitled composition needs a subtitle asset spanning the whole
