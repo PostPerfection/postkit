@@ -287,8 +287,12 @@ pub struct PipelineResult {
 }
 
 /// Bounded work queue with condition-variable backpressure (mirrors dcpomatic's design).
+///
+/// FIFO. A full queue refilled as fast as it is drained would never hand out its
+/// oldest item under LIFO, and the overlapped wrap holds every later frame while
+/// it waits for that one.
 pub struct BoundedQueue<T> {
-    items: Mutex<Vec<T>>,
+    items: Mutex<std::collections::VecDeque<T>>,
     not_full: Condvar,
     not_empty: Condvar,
     capacity: usize,
@@ -298,7 +302,7 @@ pub struct BoundedQueue<T> {
 impl<T> BoundedQueue<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
-            items: Mutex::new(Vec::with_capacity(capacity)),
+            items: Mutex::new(std::collections::VecDeque::with_capacity(capacity)),
             not_full: Condvar::new(),
             not_empty: Condvar::new(),
             capacity,
@@ -317,7 +321,7 @@ impl<T> BoundedQueue<T> {
         if self.closed.load(Ordering::Relaxed) {
             return false;
         }
-        queue.push(item);
+        queue.push_back(item);
         self.not_empty.notify_one();
         true
     }
@@ -325,7 +329,7 @@ impl<T> BoundedQueue<T> {
     pub fn pop(&self) -> Option<T> {
         let mut queue = self.items.lock().unwrap();
         loop {
-            if let Some(item) = queue.pop() {
+            if let Some(item) = queue.pop_front() {
                 self.not_full.notify_one();
                 return Some(item);
             }
@@ -1338,7 +1342,7 @@ mod tests {
         assert!(queue.push(1));
         assert!(queue.push(2));
         assert!(queue.push(3));
-        assert_eq!(queue.pop(), Some(3)); // Vec::pop returns last
+        assert_eq!(queue.pop(), Some(1)); // fifo, oldest first
         assert!(queue.push(4));
         queue.close();
     }

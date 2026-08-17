@@ -668,9 +668,9 @@ impl Drop for IncrementalJ2kWrap {
 
 /// Frames arriving out of order, released as the contiguous run they form.
 ///
-/// The in-process encoder hands frames to its writer in completion order and
-/// hands work to its encoder threads off a LIFO queue, so arrival order runs
-/// ahead of index order by roughly the queue depth plus the thread count.
+/// The in-process encoder hands frames to its writer in completion order off a
+/// FIFO work queue, so arrival order runs ahead of index order by roughly the
+/// queue depth plus the thread count.
 /// `capacity` caps how far ahead: past that the wrap fails rather than holding an
 /// unbounded number of frames, which is also what a frame that is never coming
 /// looks like.

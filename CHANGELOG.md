@@ -178,6 +178,12 @@
 
 ### Fixed
 
+- The in-process encoder's work queue is FIFO. It was a stack, so while the
+  decoder kept it full the frame at the bottom was never picked up until the
+  decode ended. The sequential wrap never noticed, codestream files are named by
+  index, but an overlapped wrap holds every frame after the stuck one in its
+  reorder buffer and fails once that passes the buffer's capacity.
+
 - `metadata_edit::write_metadata` writes an IMF composition's annotation into
   `Annotation`, the element ST 2067-3 declares, instead of the ST 429-7
   `AnnotationText` it wrote for both formats. On an IMF CPL the old element is
