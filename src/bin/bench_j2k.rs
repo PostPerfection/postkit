@@ -156,11 +156,13 @@ fn run(
         })
     };
     let start = Instant::now();
+    let phase_clocks = Arc::new(grok_encoder::PhaseClocks::default());
     encode_pipeline(
         dir,
         params,
         n,
         &cancel,
+        &phase_clocks,
         &mut producer,
         |_p: EncodeProgress| {},
     );

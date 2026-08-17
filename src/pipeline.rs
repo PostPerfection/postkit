@@ -14,6 +14,10 @@ use crate::encode::{
 use crate::picture_processing::PictureProcessing;
 
 /// Progress information emitted during encode.
+///
+/// The four phase clocks carry [`StreamProgress`]'s breakdown of the time
+/// inside the encode. They are zero for a stage that measures nothing, such as
+/// an image sequence handed straight to grk_compress.
 #[derive(Clone, Debug)]
 pub struct PipelineProgress {
     pub stage: String,
@@ -23,6 +27,43 @@ pub struct PipelineProgress {
     pub fps: f64,
     pub elapsed_secs: f64,
     pub percent: f64,
+    /// Time the frame reader spent blocked on ffmpeg's pipe.
+    pub decode_wait_secs: f64,
+    /// Time spent burning subtitles and converting colour, summed over the
+    /// encoder threads, so it can exceed `elapsed_secs`.
+    pub prepare_secs: f64,
+    /// Time spent compressing, summed over the encoder threads, so it can
+    /// exceed `elapsed_secs`.
+    pub encode_secs: f64,
+    /// Time spent writing codestreams to disk.
+    pub write_secs: f64,
+}
+
+impl PipelineProgress {
+    /// One line naming where the encode time went, in the `4m10s` shape the
+    /// wizards print their timings in.
+    pub fn phase_breakdown(&self) -> String {
+        format!(
+            "decoder wait {}, frame prep {}, j2k {}, write {}",
+            format_minutes_seconds(self.decode_wait_secs),
+            format_minutes_seconds(self.prepare_secs),
+            format_minutes_seconds(self.encode_secs),
+            format_minutes_seconds(self.write_secs),
+        )
+    }
+}
+
+const SECONDS_PER_MINUTE: u64 = 60;
+
+fn format_minutes_seconds(seconds: f64) -> String {
+    let whole_seconds = seconds.max(0.0).round() as u64;
+    let minutes = whole_seconds / SECONDS_PER_MINUTE;
+    let remainder = whole_seconds % SECONDS_PER_MINUTE;
+    if minutes == 0 {
+        format!("{remainder}s")
+    } else {
+        format!("{minutes}m{remainder}s")
+    }
 }
 
 /// Result of a successful encode run.
@@ -206,6 +247,10 @@ pub fn run_encode_with_options(
             fps: 0.0,
             elapsed_secs: 0.0,
             percent: 0.0,
+            decode_wait_secs: 0.0,
+            prepare_secs: 0.0,
+            encode_secs: 0.0,
+            write_secs: 0.0,
         });
         let result = stream_encode_inprocess(opts, cancel, pause, |p: StreamProgress| {
             let percent = if p.total_frames > 0 {
@@ -221,6 +266,10 @@ pub fn run_encode_with_options(
                 fps: p.fps,
                 elapsed_secs: p.elapsed_secs,
                 percent: percent.min(99.0),
+                decode_wait_secs: p.decode_wait_secs,
+                prepare_secs: p.prepare_secs,
+                encode_secs: p.encode_secs,
+                write_secs: p.write_secs,
             });
             on_log(&format!(
                 "[ENCODE] frame={}/{} fps={:.1}",
@@ -295,6 +344,10 @@ pub fn run_encode_with_options(
                     fps: 0.0,
                     elapsed_secs: 0.0,
                     percent: 0.0,
+                    decode_wait_secs: 0.0,
+                    prepare_secs: 0.0,
+                    encode_secs: 0.0,
+                    write_secs: 0.0,
                 });
 
                 let result = encode_parallel(
@@ -316,6 +369,10 @@ pub fn run_encode_with_options(
                             fps: p.fps,
                             elapsed_secs: p.elapsed_secs,
                             percent: percent.min(99.0),
+                            decode_wait_secs: 0.0,
+                            prepare_secs: 0.0,
+                            encode_secs: 0.0,
+                            write_secs: 0.0,
                         });
                     },
                 );
@@ -476,6 +533,31 @@ fn check_codestream_dir(dir: &Path, cap: u64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phase_breakdown_reads_as_one_line_of_minutes_and_seconds() {
+        let progress = PipelineProgress {
+            stage: "encode".to_string(),
+            message: "Frame 6000/6000".to_string(),
+            frame: 6000,
+            total_frames: 6000,
+            fps: 24.0,
+            elapsed_secs: 300.0,
+            percent: 100.0,
+            decode_wait_secs: 12.0,
+            prepare_secs: 30.4,
+            encode_secs: 250.0,
+            write_secs: 7.6,
+        };
+        assert_eq!(
+            progress.phase_breakdown(),
+            "decoder wait 12s, frame prep 30s, j2k 4m10s, write 8s"
+        );
+
+        assert_eq!(format_minutes_seconds(0.0), "0s");
+        assert_eq!(format_minutes_seconds(59.6), "1m0s");
+        assert_eq!(format_minutes_seconds(3600.0), "60m0s");
+    }
 
     #[test]
     fn a_burn_is_refused_wherever_the_frames_are_not_display_rgb() {

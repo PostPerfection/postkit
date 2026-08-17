@@ -4,6 +4,18 @@
 
 ### Added
 
+- Encode progress carries where the time inside an encode went:
+  `StreamProgress`, `PipelineProgress` and `grok_encoder::EncodeProgress` gain
+  `decode_wait_secs`, `prepare_secs`, `encode_secs` and `write_secs`, all
+  cumulative over the run. Preparation and compression are summed over the
+  encoder threads, so those two can each exceed `elapsed_secs`.
+  `PipelineProgress::phase_breakdown()` renders them as one line, `decoder wait
+  12s, frame prep 30s, j2k 4m10s, write 8s`, in the shape the wizards print
+  their `[TIMING]` lines in. The in-process encoder fills in all four;
+  the subprocess encoder fills in the decoder wait and the whole grk_compress
+  run, and leaves preparation and write at zero, since it prepares nothing and
+  the child writes the codestream itself. `grok_encoder::encode_pipeline` takes
+  the `PhaseClocks` its producer adds the decoder wait to.
 - `StreamEncodeOptions.read_source_at` and `EncodeRunOptions.read_source_at`:
   read the source as if it ran at this rate, ignoring its own timestamps. It
   reaches ffmpeg as an input `-r` before `-i`, which regenerates constant-rate

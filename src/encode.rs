@@ -550,11 +550,28 @@ impl Default for StreamEncodeOptions {
 }
 
 /// Progress callback for streaming encode.
+///
+/// The four phase clocks say where the time inside the encode went. Each is
+/// cumulative over the whole run so far, and a phase nothing measures on the
+/// chosen path stays at zero.
 pub struct StreamProgress {
     pub frame: u64,
     pub total_frames: u64,
     pub fps: f64,
     pub elapsed_secs: f64,
+    /// Time the frame reader spent blocked on ffmpeg's pipe.
+    pub decode_wait_secs: f64,
+    /// Time spent burning subtitles and converting colour, summed over the
+    /// encoder threads, so it can exceed `elapsed_secs`. Zero on the subprocess
+    /// path, which refuses both.
+    pub prepare_secs: f64,
+    /// Time spent compressing, summed over the encoder threads, so it can
+    /// exceed `elapsed_secs`. On the subprocess path this is the whole
+    /// grk_compress run, which also covers the child's own read and write.
+    pub encode_secs: f64,
+    /// Time spent writing codestreams to disk. Zero on the subprocess path,
+    /// where grk_compress writes them inside the child.
+    pub write_secs: f64,
 }
 
 /// Find the grk_compress binary, checking common locations.
@@ -808,12 +825,14 @@ where
     let mut frame_buf = vec![0u8; frame_size];
     let mut frame_index: u64 = 0;
     let encode_start = std::time::Instant::now();
+    let phase_clocks = Arc::new(grok_encoder::PhaseClocks::default());
 
     let result = grok_encoder::encode_pipeline(
         &opts.output_dir,
         &params,
         total_frames,
         cancel,
+        &phase_clocks,
         || {
             while pause.load(Ordering::Relaxed) {
                 if cancel.load(Ordering::Relaxed) {
@@ -824,7 +843,10 @@ where
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            match read_exact_or_eof(&mut ffmpeg_stdout, &mut frame_buf) {
+            let read_start = std::time::Instant::now();
+            let read = read_exact_or_eof(&mut ffmpeg_stdout, &mut frame_buf);
+            phase_clocks.add(grok_encoder::EncodePhase::DecoderWait, read_start.elapsed());
+            match read {
                 ReadResult::Ok => {}
                 ReadResult::Eof => return None,
                 ReadResult::Err(_) => return None,
@@ -850,6 +872,10 @@ where
                 total_frames: progress.total_frames,
                 fps: progress.fps,
                 elapsed_secs: elapsed,
+                decode_wait_secs: progress.decode_wait_secs,
+                prepare_secs: progress.prepare_secs,
+                encode_secs: progress.encode_secs,
+                write_secs: progress.write_secs,
             });
         },
     );
@@ -1016,6 +1042,10 @@ where
                 total_frames: progress.total_frames,
                 fps: progress.fps,
                 elapsed_secs: elapsed,
+                decode_wait_secs: progress.decode_wait_secs,
+                prepare_secs: progress.prepare_secs,
+                encode_secs: progress.encode_secs,
+                write_secs: progress.write_secs,
             });
         },
     );

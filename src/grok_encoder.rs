@@ -198,6 +198,42 @@ impl Default for CompressParams {
     }
 }
 
+/// The stretches of work an encode splits into, timed apart so a slow encode
+/// can be blamed on the right one.
+#[derive(Debug, Clone, Copy)]
+pub enum EncodePhase {
+    /// Blocked reading the next decoded frame from ffmpeg.
+    DecoderWait,
+    /// Subtitle burn and source colour transform on the encoder threads.
+    Preparation,
+    /// The grok compression call.
+    Jpeg2000,
+    /// Writing the codestream to disk.
+    CodestreamWrite,
+}
+
+const PHASE_COUNT: usize = 4;
+const NANOS_PER_SECOND: f64 = 1_000_000_000.0;
+
+/// Cumulative time spent in each phase, in nanoseconds.
+///
+/// Preparation and JPEG 2000 run on every encoder thread at once and are summed
+/// over them, so they can add up to more than the wall clock.
+#[derive(Debug, Default)]
+pub struct PhaseClocks {
+    nanos: [AtomicU64; PHASE_COUNT],
+}
+
+impl PhaseClocks {
+    pub fn add(&self, phase: EncodePhase, elapsed: std::time::Duration) {
+        self.nanos[phase as usize].fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    pub fn seconds(&self, phase: EncodePhase) -> f64 {
+        self.nanos[phase as usize].load(Ordering::Relaxed) as f64 / NANOS_PER_SECOND
+    }
+}
+
 /// Progress information from the encoder pipeline.
 #[derive(Debug, Clone)]
 pub struct EncodeProgress {
@@ -205,6 +241,40 @@ pub struct EncodeProgress {
     pub total_frames: u64,
     pub fps: f64,
     pub elapsed_secs: f64,
+    /// Time blocked on the decoder's pipe.
+    pub decode_wait_secs: f64,
+    /// Time burning subtitles and converting colour, summed over the encoder
+    /// threads, so it can exceed `elapsed_secs`.
+    pub prepare_secs: f64,
+    /// Time inside grok, summed over the encoder threads, so it can exceed
+    /// `elapsed_secs`.
+    pub encode_secs: f64,
+    /// Time writing codestreams to disk.
+    pub write_secs: f64,
+}
+
+impl EncodeProgress {
+    fn new(
+        frames_encoded: u64,
+        total_frames: u64,
+        elapsed_secs: f64,
+        phase_clocks: &PhaseClocks,
+    ) -> Self {
+        Self {
+            frames_encoded,
+            total_frames,
+            fps: if elapsed_secs > 0.0 {
+                frames_encoded as f64 / elapsed_secs
+            } else {
+                0.0
+            },
+            elapsed_secs,
+            decode_wait_secs: phase_clocks.seconds(EncodePhase::DecoderWait),
+            prepare_secs: phase_clocks.seconds(EncodePhase::Preparation),
+            encode_secs: phase_clocks.seconds(EncodePhase::Jpeg2000),
+            write_secs: phase_clocks.seconds(EncodePhase::CodestreamWrite),
+        }
+    }
 }
 
 /// Result from the encoding pipeline.
@@ -280,11 +350,16 @@ impl<T> BoundedQueue<T> {
 /// frames are written to disk by a dedicated writer thread.
 ///
 /// `frame_producer` is called repeatedly to produce frames. Return `None` when done.
+///
+/// `phase_clocks` collects the preparation, compression and write time; the
+/// producer is the only one that can time its own wait on the decoder, so it
+/// adds [`EncodePhase::DecoderWait`] itself.
 pub fn encode_pipeline<F, P>(
     output_dir: &Path,
     params: &CompressParams,
     total_frames: u64,
     cancel: &Arc<AtomicBool>,
+    phase_clocks: &Arc<PhaseClocks>,
     mut frame_producer: F,
     mut on_progress: P,
 ) -> PipelineResult
@@ -330,10 +405,14 @@ where
     let writer_encoded_count = frames_encoded.clone();
     let writer_error_flag = error_flag.clone();
     let writer_first_error = first_error.clone();
+    let writer_phase_clocks = phase_clocks.clone();
     let writer_handle = std::thread::spawn(move || {
         for frame in writer_rx {
             let path = writer_output_dir.join(format!("frame_{:08}.j2c", frame.index));
-            if let Err(e) = std::fs::write(&path, &frame.data) {
+            let write_start = std::time::Instant::now();
+            let written = std::fs::write(&path, &frame.data);
+            writer_phase_clocks.add(EncodePhase::CodestreamWrite, write_start.elapsed());
+            if let Err(e) = written {
                 writer_error_flag.store(true, Ordering::Relaxed);
                 let mut err = writer_first_error.lock().unwrap();
                 if err.is_empty() {
@@ -357,6 +436,7 @@ where
                 let first_error = first_error.clone();
                 let cancel = cancel.clone();
                 let params = params.clone();
+                let phase_clocks = phase_clocks.clone();
 
                 s.spawn(move || {
                     encoder_thread_fn(
@@ -366,6 +446,7 @@ where
                         &first_error,
                         &cancel,
                         &params,
+                        &phase_clocks,
                     );
                 })
             })
@@ -396,16 +477,12 @@ where
                 last_progress = std::time::Instant::now();
                 let done = frames_encoded.load(Ordering::Relaxed);
                 let elapsed = encode_start.elapsed().as_secs_f64();
-                on_progress(EncodeProgress {
-                    frames_encoded: done,
+                on_progress(EncodeProgress::new(
+                    done,
                     total_frames,
-                    fps: if elapsed > 0.0 {
-                        done as f64 / elapsed
-                    } else {
-                        0.0
-                    },
-                    elapsed_secs: elapsed,
-                });
+                    elapsed,
+                    phase_clocks,
+                ));
             }
         }
 
@@ -416,16 +493,12 @@ where
         loop {
             let done = frames_encoded.load(Ordering::Relaxed);
             let elapsed = encode_start.elapsed().as_secs_f64();
-            on_progress(EncodeProgress {
-                frames_encoded: done,
+            on_progress(EncodeProgress::new(
+                done,
                 total_frames,
-                fps: if elapsed > 0.0 {
-                    done as f64 / elapsed
-                } else {
-                    0.0
-                },
-                elapsed_secs: elapsed,
-            });
+                elapsed,
+                phase_clocks,
+            ));
 
             if done >= total_frames
                 || error_flag.load(Ordering::Relaxed)
@@ -479,6 +552,7 @@ fn encoder_thread_fn(
     first_error: &Mutex<String>,
     cancel: &AtomicBool,
     params: &CompressParams,
+    phase_clocks: &PhaseClocks,
 ) {
     // Pre-allocate output buffer once per thread and reuse across frames
     let buf_size = 2048 * 1080 * 3 * 2; // max 2K frame uncompressed size
@@ -489,10 +563,13 @@ fn encoder_thread_fn(
             break;
         };
 
-        if let Err(e) = params
+        let prepare_start = std::time::Instant::now();
+        let prepared = params
             .source_preparation
-            .apply(&mut frame, params.apply_xyz_transform)
-        {
+            .apply(&mut frame, params.apply_xyz_transform);
+        phase_clocks.add(EncodePhase::Preparation, prepare_start.elapsed());
+
+        if let Err(e) = prepared {
             error_flag.store(true, Ordering::Relaxed);
             let mut err = first_error.lock().unwrap();
             if err.is_empty() {
@@ -501,7 +578,11 @@ fn encoder_thread_fn(
             break;
         }
 
-        match compress_frame_grok(&frame, params, &mut output_buf) {
+        let encode_start = std::time::Instant::now();
+        let compressed = compress_frame_grok(&frame, params, &mut output_buf);
+        phase_clocks.add(EncodePhase::Jpeg2000, encode_start.elapsed());
+
+        match compressed {
             Ok(data) => {
                 let encoded = EncodedFrame {
                     data,
@@ -863,17 +944,22 @@ where
     // progress total is the remaining frames so the pipeline's completion check
     // (done >= total) is reachable after a resume.
     let remaining_total = total_frames.saturating_sub(start_frame);
+    let phase_clocks = Arc::new(PhaseClocks::default());
     let result = encode_pipeline(
         output_dir,
         params,
         remaining_total,
         cancel,
+        &phase_clocks,
         || {
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
             let mut buf = vec![0u8; frame_size];
-            match stdout.read_exact(&mut buf) {
+            let read_start = std::time::Instant::now();
+            let read = stdout.read_exact(&mut buf);
+            phase_clocks.add(EncodePhase::DecoderWait, read_start.elapsed());
+            match read {
                 Ok(()) => {
                     let idx = frame_index;
                     frame_index += 1;
@@ -910,6 +996,12 @@ where
 /// `input` provides raw frames (rgb48be) as a contiguous byte stream. Each frame
 /// is `frame_size` bytes. The producer reads directly from the stream to /dev/shm,
 /// avoiding intermediate buffer clones.
+///
+/// Of the phase clocks, only the decoder wait and the JPEG 2000 time are filled
+/// in: this path prepares nothing, and grk_compress writes the codestream inside
+/// the child, where nothing here can time it. The JPEG 2000 clock is the whole
+/// grk_compress run, summed over the workers, so it also covers the child's own
+/// read and write.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_pipeline_subprocess<P>(
     output_dir: &Path,
@@ -972,6 +1064,7 @@ where
     let error_flag = Arc::new(AtomicBool::new(false));
     let first_error = Arc::new(Mutex::new(String::new()));
     let encode_start = std::time::Instant::now();
+    let phase_clocks = Arc::new(PhaseClocks::default());
 
     // Bounded queue for work items: (frame_index, input_path)
     let work_queue: Arc<BoundedQueue<(u64, PathBuf, u32, u32)>> =
@@ -1020,6 +1113,7 @@ where
                 let output_dir = output_dir_owned.clone();
                 let grk_bin = grk_bin.clone();
                 let cinema_flag = cinema_flag.clone();
+                let phase_clocks = phase_clocks.clone();
 
                 s.spawn(move || {
                     while !cancel.load(Ordering::Relaxed) && !error_flag.load(Ordering::Relaxed) {
@@ -1030,6 +1124,7 @@ where
                         let output_path = output_dir.join(format!("frame_{:08}.j2c", frame_idx));
                         let raw_spec = format!("{w},{h},3,16,u");
 
+                        let compress_start = std::time::Instant::now();
                         let status = Command::new(&grk_bin)
                             .arg("-i")
                             .arg(&input_path)
@@ -1041,6 +1136,7 @@ where
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
                             .status();
+                        phase_clocks.add(EncodePhase::Jpeg2000, compress_start.elapsed());
 
                         match status {
                             Ok(s) if s.success() => {
@@ -1094,7 +1190,10 @@ where
             let mut hit_eof = false;
             while remaining > 0 {
                 let chunk = remaining.min(buf.len());
-                match input.read_exact(&mut buf[..chunk]) {
+                let read_start = std::time::Instant::now();
+                let read = input.read_exact(&mut buf[..chunk]);
+                phase_clocks.add(EncodePhase::DecoderWait, read_start.elapsed());
+                match read {
                     Ok(()) => {
                         use std::io::Write;
                         if let Err(e) = file.write_all(&buf[..chunk]) {
@@ -1137,17 +1236,12 @@ where
             // Progress reporting
             let encoded = frames_encoded.load(Ordering::Relaxed);
             let elapsed = encode_start.elapsed().as_secs_f64();
-            let fps = if elapsed > 0.0 {
-                encoded as f64 / elapsed
-            } else {
-                0.0
-            };
-            on_progress(EncodeProgress {
-                frames_encoded: encoded,
+            on_progress(EncodeProgress::new(
+                encoded,
                 total_frames,
-                fps,
-                elapsed_secs: elapsed,
-            });
+                elapsed,
+                &phase_clocks,
+            ));
         }
 
         work_queue.close();
@@ -1158,17 +1252,12 @@ where
 
     let elapsed = encode_start.elapsed().as_secs_f64();
     let final_count = frames_encoded.load(Ordering::Relaxed);
-    let fps = if elapsed > 0.0 {
-        final_count as f64 / elapsed
-    } else {
-        0.0
-    };
-    on_progress(EncodeProgress {
-        frames_encoded: final_count,
+    on_progress(EncodeProgress::new(
+        final_count,
         total_frames,
-        fps,
-        elapsed_secs: elapsed,
-    });
+        elapsed,
+        &phase_clocks,
+    ));
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
@@ -1484,11 +1573,13 @@ mod tests {
                     let (w, h) = (128u32, 128u32);
                     let cancel = Arc::new(AtomicBool::new(false));
                     let mut left = 3u64;
+                    let phase_clocks = Arc::new(PhaseClocks::default());
                     let result = encode_pipeline(
                         &out,
                         &CompressParams::default(),
                         3,
                         &cancel,
+                        &phase_clocks,
                         || {
                             if left == 0 {
                                 return None;

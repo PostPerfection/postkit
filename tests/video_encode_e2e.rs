@@ -220,6 +220,81 @@ fn reading_a_23_976_clip_at_24_encodes_every_frame_once_and_not_reading_it_dupli
     );
 }
 
+/// A `[TIMING]` line is only worth printing if the clocks behind it come from a
+/// real encode, so this runs one and reads the last progress update.
+#[test]
+fn a_video_encode_reports_where_the_time_went() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=s={WIDTH}x{HEIGHT}:d=1:r={FRAME_COUNT}"),
+            "-frames:v",
+            &FRAME_COUNT.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&video)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let last_progress = std::sync::Mutex::new(None::<PipelineProgress>);
+    let result = run_encode_with_options(
+        &video,
+        &dir.path().join("out"),
+        &EncodeRunOptions {
+            fps: FrameRate::whole(FRAME_COUNT as u32),
+            ..Default::default()
+        },
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(AtomicBool::new(false)),
+        |progress: &PipelineProgress| {
+            *last_progress.lock().unwrap() = Some(progress.clone());
+        },
+        |_: &str| {},
+    )
+    .expect("video encode");
+    assert_eq!(result.frames_encoded, FRAME_COUNT);
+
+    let progress = last_progress
+        .into_inner()
+        .unwrap()
+        .expect("the encode should report progress at least once");
+    assert!(
+        progress.encode_secs > 0.0,
+        "four frames went through grok, so the j2k clock cannot be zero: {progress:?}"
+    );
+    for (phase, seconds) in [
+        ("decoder wait", progress.decode_wait_secs),
+        ("frame prep", progress.prepare_secs),
+        ("j2k", progress.encode_secs),
+        ("write", progress.write_secs),
+    ] {
+        assert!(seconds >= 0.0, "{phase} clock ran backwards: {seconds}");
+    }
+    let breakdown = progress.phase_breakdown();
+    for phase in ["decoder wait", "frame prep", "j2k", "write"] {
+        assert!(
+            breakdown.contains(phase),
+            "{phase} missing from {breakdown}"
+        );
+    }
+}
+
 /// An image sequence carries its rate in the concat list it decodes from, so
 /// there is no source timing to override.
 #[test]
