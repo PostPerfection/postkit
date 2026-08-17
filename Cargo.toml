@@ -37,6 +37,7 @@ sha2 = { version = "0.10", features = ["oid"] }
 # the CVE-2026-55200 fix, so do not float below it.
 ssh2 = { version = "0.9.6", optional = true }
 suppaftp = { version = "10", optional = true }
+tempfile = "3"
 thiserror = "2"
 tiff = "0.9"
 time = "0.3"
@@ -61,7 +62,6 @@ tms = ["dep:ssh2", "dep:suppaftp"]
 [dev-dependencies]
 asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "ff29a31" }
 skrifa = "0.45"
-tempfile = "3"
 # the tms config file is the app's to read; these tests stand in for one
 toml = "1"
 
