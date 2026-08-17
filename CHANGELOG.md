@@ -22,6 +22,25 @@
   named in `unsigned_documents`. Documents are found by root element rather than
   by file name, so an Interop `ASSETMAP` with no extension resolves. Setting a
   field the CPL does not carry is an error rather than a silent no-op.
+- `tms` (feature `tms`, off by default): push a written package to a theatre
+  management system over ftp or sftp, moved out of dcpwizard so imfwizard can
+  deliver an IMP the same way. `TmsConfig` carries DCP-o-matic's
+  `tms_protocol`/`tms_ip`/`tms_path`/`tms_user`/`tms_password` keys, deserializes
+  from the app's config file, redacts the password in Debug, and `validate`
+  refuses one naming no server or no login; `upload_package` puts every file under
+  the package directory into `<path>/<package dir name>/`, creating each remote
+  directory before the files that go in it and stopping at the first failure
+  naming the file and the remote path it was going to. One `TmsTransport` trait
+  (`ensure_dir`, `put_file`) covers both protocols, with an ssh2/libssh2
+  implementation, a suppaftp one, and a fake the layout tests drive, so no test
+  touches a network. sftp checks the host key against `~/.ssh/known_hosts` and
+  refuses an unknown or changed key, printing the SHA256 fingerprint and the
+  `ssh-keyscan` line that would record it; ftp warns that the login and the
+  package cross the network in the clear. The feature is off by default because
+  ssh2 links libssh2 and openssl, which dcpdoctor's wasm build cannot have.
+  Reading the config file stays with the app: the path carries the app's name,
+  and a `toml` dependency here would put winnow's `AsRef` impls in front of every
+  crate that links postkit, which stops dcpdoctor's schema reader compiling.
 - `xmldsig::strip_signature` drops a document's ds:Signature and the Signer
   beside it, whatever namespace prefix they carry, reporting whether the
   document was signed. Anything that rewrites a signed document needs it: a
@@ -131,6 +150,13 @@
 
 ### Fixed
 
+- `metadata_edit::write_metadata` writes an IMF composition's annotation into
+  `Annotation`, the element ST 2067-3 declares, instead of the ST 429-7
+  `AnnotationText` it wrote for both formats. On an IMF CPL the old element is
+  absent, so the annotation was silently dropped. Which element to write now
+  comes out of `package_edit`'s `CplVocabulary`, so the two modules cannot
+  disagree about it. DCP output is unchanged.
+
 - Previewing a package plays the whole composition. `MpvPlayer::load_package_dir`
   and `MpvRenderPlayer::load_package_dir` picked one picture MXF by filename
   ("pic") or by size, so a three-reel DCP played as whichever single reel the
@@ -190,6 +216,13 @@
 - `X509SubjectName` and `X509IssuerName` are written in RFC 4514 order, most
   specific RDN first, which is what libdcp writes and what a projector matches a
   KDM recipient against. Reissue any KDM postkit produced earlier.
+
+### Removed
+
+- `j2k::analyse_mxf_bitrate` and `j2k::analyse_as02_mxf_bitrate`. Their only
+  consumer, dcpdoctor's `analyze_picture_bitrate`, now measures the frames
+  through its own key-aware reader, which also opens the essence these two could
+  not. `MxfBitrateStats` stays: it is the shape dcpdoctor reports.
 
 ### Subtitle MXFs written before this release reused the file id as the ResourceID
 
