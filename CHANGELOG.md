@@ -233,6 +233,13 @@
 - `X509SubjectName` and `X509IssuerName` are written in RFC 4514 order, most
   specific RDN first, which is what libdcp writes and what a projector matches a
   KDM recipient against. Reissue any KDM postkit produced earlier.
+- `MpvRenderPlayer::init_opengl` sets `vd-lavc-dr=no`, turning libavcodec's direct
+  rendering off. With it on, the decoder's buffers are allocated on the thread
+  holding the render context, which mpv documents as deadlocking against
+  `MPV_RENDER_PARAM_ADVANCED_CONTROL` (DOCS/client-api-changes.rst): a caller that
+  waits on the core from its render thread never comes back, and the app is frozen
+  for good. The copy direct rendering saves is not worth that. The software render
+  context never had it.
 
 ### Removed
 

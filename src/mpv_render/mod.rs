@@ -39,8 +39,10 @@ const COMMON_OPTIONS: &[(&str, &str)] = &[
 ];
 
 /// Hardware decoding is negotiated by mpv; `auto-safe` falls back to software
-/// decode rather than failing when VAAPI is unusable.
-const OPENGL_OPTIONS: &[(&str, &str)] = &[("hwdec", "auto-safe")];
+/// decode rather than failing when VAAPI is unusable. Direct rendering is off
+/// because it freezes playback for good against advanced control: the decoder's
+/// buffers come from the render thread, which is waiting on the core.
+const OPENGL_OPTIONS: &[(&str, &str)] = &[("hwdec", "auto-safe"), ("vd-lavc-dr", "no")];
 
 /// The software renderer has no GPU to hand frames to, and a test machine may
 /// have no sound device at all.
