@@ -695,6 +695,22 @@ pub fn stream_encode_inprocess<F>(
     opts: &StreamEncodeOptions,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
+    on_progress: F,
+) -> EncodeResult
+where
+    F: FnMut(StreamProgress),
+{
+    stream_encode_inprocess_with_mxf_feed(opts, cancel, pause, None, on_progress)
+}
+
+/// Like [`stream_encode_inprocess`], but each codestream also goes to `mxf_feed`
+/// as it is written, so a picture MXF can be wrapped while the encode runs. See
+/// [`crate::grok_encoder::encode_pipeline_with_mxf_feed`].
+pub fn stream_encode_inprocess_with_mxf_feed<F>(
+    opts: &StreamEncodeOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
     mut on_progress: F,
 ) -> EncodeResult
 where
@@ -827,12 +843,13 @@ where
     let encode_start = std::time::Instant::now();
     let phase_clocks = Arc::new(grok_encoder::PhaseClocks::default());
 
-    let result = grok_encoder::encode_pipeline(
+    let result = grok_encoder::encode_pipeline_with_mxf_feed(
         &opts.output_dir,
         &params,
         total_frames,
         cancel,
         &phase_clocks,
+        mxf_feed,
         || {
             while pause.load(Ordering::Relaxed) {
                 if cancel.load(Ordering::Relaxed) {

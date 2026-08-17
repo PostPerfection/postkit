@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::encode::{
     FrameRate, ImageFormat, InputType, ParallelProgress, SourceColour, StreamEncodeOptions,
-    StreamProgress, check_codestream_size, encode_parallel, stream_encode_inprocess,
+    StreamProgress, check_codestream_size, encode_parallel, stream_encode_inprocess_with_mxf_feed,
 };
 use crate::picture_processing::PictureProcessing;
 
@@ -187,6 +187,69 @@ pub fn run_encode_with_options(
     on_progress: impl Fn(&PipelineProgress),
     on_log: impl Fn(&str),
 ) -> Result<EncodeResult, String> {
+    let (encode, _) = run_encode_and_maybe_wrap(
+        video,
+        output_dir,
+        options,
+        None,
+        cancel,
+        pause,
+        on_progress,
+        on_log,
+    )?;
+    Ok(encode)
+}
+
+/// Encode one picture track and wrap it into an MXF at the same time.
+///
+/// The wrap runs on its own thread and takes each codestream from the encoder as
+/// it is written, so it neither waits for the encode to finish nor reads the whole
+/// J2K directory back into memory. The J2K directory is still written and still
+/// left behind. A cancel or a failure of either side deletes the part-written MXF
+/// and leaves the codestreams that finished, as an encode on its own does.
+///
+/// Only a source that decodes through ffmpeg can overlap: that is the path where
+/// postkit holds each codestream in memory. A J2K sequence, or an image sequence
+/// grk_compress reads for itself, is refused here and wraps with
+/// [`crate::mxf_wrap::mxf_wrap`] once the encode is done. This is the 2D picture
+/// path only: a stereoscopic wrap interleaves two eyes per frame and stays with
+/// [`crate::mxf_wrap::wrap_stereoscopic`], and sound and Atmos never come through
+/// here at all.
+#[allow(clippy::too_many_arguments)]
+pub fn run_encode_and_wrap_picture(
+    video: &Path,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    wrap: crate::mxf_wrap::IncrementalWrapOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    on_progress: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<(EncodeResult, crate::mxf_wrap::MxfTrackFile), String> {
+    let (encode, track) = run_encode_and_maybe_wrap(
+        video,
+        output_dir,
+        options,
+        Some(wrap),
+        cancel,
+        pause,
+        on_progress,
+        on_log,
+    )?;
+    Ok((encode, track.expect("a wrap was asked for")))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_encode_and_maybe_wrap(
+    video: &Path,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    wrap: Option<crate::mxf_wrap::IncrementalWrapOptions>,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    on_progress: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<(EncodeResult, Option<crate::mxf_wrap::MxfTrackFile>), String> {
     let compression_ratio = options.compression_ratio;
     let fps = options.fps;
     if !video.exists() {
@@ -232,13 +295,25 @@ pub fn run_encode_with_options(
         reject_unsupported_picture(input_type)?;
     }
 
+    let mut overlapped_wrap = match wrap {
+        Some(wrap) if !decodes_through_ffmpeg => {
+            return Err(format!(
+                "a {input_type:?} input never hands postkit a codestream, so its MXF cannot be \
+                 wrapped while it encodes: wrap {} once the encode is done",
+                wrap.output.display()
+            ));
+        }
+        Some(wrap) => Some(crate::mxf_wrap::OverlappedJ2kWrap::start(wrap)?),
+        None => None,
+    };
+
     let j2k_dir = output_dir.join("j2k");
     let mut frames_encoded = 0u64;
 
     // Everything ffmpeg decodes goes through one code path, so a subtitle burn
     // has a single place to hook into. `run_stream` is that path; the arms below
     // only decide what ffmpeg opens.
-    let run_stream = |opts: &StreamEncodeOptions| -> Result<u64, String> {
+    let mut run_stream = |opts: &StreamEncodeOptions| -> Result<u64, String> {
         on_progress(&PipelineProgress {
             stage: "encode".to_string(),
             message: "Starting...".to_string(),
@@ -252,31 +327,45 @@ pub fn run_encode_with_options(
             encode_secs: 0.0,
             write_secs: 0.0,
         });
-        let result = stream_encode_inprocess(opts, cancel, pause, |p: StreamProgress| {
-            let percent = if p.total_frames > 0 {
-                (p.frame as f64 / p.total_frames as f64) * 100.0
-            } else {
-                0.0
-            };
-            on_progress(&PipelineProgress {
-                stage: "encode".to_string(),
-                message: format!("Frame {}/{}", p.frame, p.total_frames),
-                frame: p.frame,
-                total_frames: p.total_frames,
-                fps: p.fps,
-                elapsed_secs: p.elapsed_secs,
-                percent: percent.min(99.0),
-                decode_wait_secs: p.decode_wait_secs,
-                prepare_secs: p.prepare_secs,
-                encode_secs: p.encode_secs,
-                write_secs: p.write_secs,
-            });
-            on_log(&format!(
-                "[ENCODE] frame={}/{} fps={:.1}",
-                p.frame, p.total_frames, p.fps
-            ));
-        });
+        let mxf_feed = overlapped_wrap.as_ref().map(|wrap| wrap.sender());
+        let result = stream_encode_inprocess_with_mxf_feed(
+            opts,
+            cancel,
+            pause,
+            mxf_feed,
+            |p: StreamProgress| {
+                let percent = if p.total_frames > 0 {
+                    (p.frame as f64 / p.total_frames as f64) * 100.0
+                } else {
+                    0.0
+                };
+                on_progress(&PipelineProgress {
+                    stage: "encode".to_string(),
+                    message: format!("Frame {}/{}", p.frame, p.total_frames),
+                    frame: p.frame,
+                    total_frames: p.total_frames,
+                    fps: p.fps,
+                    elapsed_secs: p.elapsed_secs,
+                    percent: percent.min(99.0),
+                    decode_wait_secs: p.decode_wait_secs,
+                    prepare_secs: p.prepare_secs,
+                    encode_secs: p.encode_secs,
+                    write_secs: p.write_secs,
+                });
+                on_log(&format!(
+                    "[ENCODE] frame={}/{} fps={:.1}",
+                    p.frame, p.total_frames, p.fps
+                ));
+            },
+        );
         if !result.success {
+            // the encoder only sees that the wrap stopped taking frames, so the
+            // wrap's own error is the one worth reporting
+            if let Some(wrap) = overlapped_wrap.as_mut()
+                && let Some(error) = wrap.abandon()
+            {
+                return Err(error);
+            }
             return Err(result.error);
         }
         Ok(result.frames_encoded)
@@ -406,13 +495,30 @@ pub fn run_encode_with_options(
         check_codestream_dir(&final_j2k_dir, cap)?;
     }
 
+    // the wrap has every frame by now, so this only writes the footer and hashes
+    let track_file = match overlapped_wrap.take() {
+        Some(wrap) => {
+            let track = wrap.finish(frames_encoded)?;
+            on_log(&format!(
+                "[WRAP] {} frames into {}",
+                track.duration,
+                track.path.display()
+            ));
+            Some(track)
+        }
+        None => None,
+    };
+
     let elapsed_secs = start_time.elapsed().as_secs_f64();
 
-    Ok(EncodeResult {
-        j2k_dir: final_j2k_dir,
-        frames_encoded,
-        elapsed_secs,
-    })
+    Ok((
+        EncodeResult {
+            j2k_dir: final_j2k_dir,
+            frames_encoded,
+            elapsed_secs,
+        },
+        track_file,
+    ))
 }
 
 /// The directory holding an image sequence, whether the input names the

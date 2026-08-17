@@ -360,6 +360,40 @@ pub fn encode_pipeline<F, P>(
     total_frames: u64,
     cancel: &Arc<AtomicBool>,
     phase_clocks: &Arc<PhaseClocks>,
+    frame_producer: F,
+    on_progress: P,
+) -> PipelineResult
+where
+    F: FnMut() -> Option<RawFrame>,
+    P: FnMut(EncodeProgress),
+{
+    encode_pipeline_with_mxf_feed(
+        output_dir,
+        params,
+        total_frames,
+        cancel,
+        phase_clocks,
+        None,
+        frame_producer,
+        on_progress,
+    )
+}
+
+/// Like [`encode_pipeline`], but the writer thread also hands each codestream to
+/// `mxf_feed` once it is on disk, so an MXF picture wrap can be written while the
+/// encode runs instead of re-reading the whole J2K directory afterwards.
+///
+/// Frames reach the feed in the order they finish encoding, not in index order;
+/// the wrap end reorders them. A feed that has stopped fails the encode, which is
+/// how a wrap error gets out.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_pipeline_with_mxf_feed<F, P>(
+    output_dir: &Path,
+    params: &CompressParams,
+    total_frames: u64,
+    cancel: &Arc<AtomicBool>,
+    phase_clocks: &Arc<PhaseClocks>,
+    mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
     mut frame_producer: F,
     mut on_progress: P,
 ) -> PipelineResult
@@ -421,6 +455,16 @@ where
                 break;
             }
             writer_encoded_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(feed) = &mxf_feed
+                && let Err(e) = feed.send(frame.index, frame.data)
+            {
+                writer_error_flag.store(true, Ordering::Relaxed);
+                let mut err = writer_first_error.lock().unwrap();
+                if err.is_empty() {
+                    *err = e;
+                }
+                break;
+            }
         }
     });
 
