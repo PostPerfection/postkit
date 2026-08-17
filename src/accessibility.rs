@@ -458,7 +458,8 @@ fn record_element(
         "AssetList" if is_child_of(stack, "Reel") => {
             evidence.reel_asset_lists += 1;
         }
-        "MainClosedCaption" if is_in_reel_asset_list(stack) => {
+        // ST 429-12 names the element ClosedCaption, older writers used MainClosedCaption
+        "ClosedCaption" | "MainClosedCaption" if is_in_reel_asset_list(stack) => {
             evidence.closed_caption_assets += 1;
         }
         "SequenceList" if is_child_of(stack, "Segment") => {
@@ -1128,6 +1129,20 @@ mod tests {
     #[test]
     fn closed_captions_detected_from_the_asset_element() {
         let dir = package(&cpl("Feature", None, CLOSED_CAPTION_ASSET));
+        assert_eq!(
+            status(dir.path(), AccessibilityTrack::ClosedCaptions),
+            TrackStatus::Present
+        );
+    }
+
+    /// The element ST 429-12 declares, prefixed the way libdcp writes it.
+    #[test]
+    fn closed_captions_detected_from_the_st_429_12_element() {
+        const ST_429_12_ASSET: &str = r#"<tt:ClosedCaption xmlns:tt="http://www.smpte-ra.org/schemas/429-12/2008/TT">
+          <Id>urn:uuid:1e0f0b1a-0000-4000-8000-000000000005</Id>
+          <tt:Language>en</tt:Language>
+        </tt:ClosedCaption>"#;
+        let dir = package(&cpl("Feature", None, ST_429_12_ASSET));
         assert_eq!(
             status(dir.path(), AccessibilityTrack::ClosedCaptions),
             TrackStatus::Present

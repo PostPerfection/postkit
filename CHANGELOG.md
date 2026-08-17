@@ -91,6 +91,10 @@
   loses its low bits through any read-modify-write. Anything that only moves
   samples around, an audio delay or a trim, wants the exact pair.
 
+### Fixed
+
+- `accessibility`: the closed-caption probe recognises the ST 429-12 `ClosedCaption` reel element (the name the schema declares, which libdcp and dcpwizard write) as well as the older `MainClosedCaption`.
+
 ### Changed
 
 - The DCDM Rec.709 matrix is the sRGB/D65 one grok and libdcp use, where
