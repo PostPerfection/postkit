@@ -191,8 +191,7 @@ pub fn edit_package(edit: &PackageEdit) -> Result<EditedPackage, String> {
     if crate::xmldsig::strip_signature(&mut xml) {
         unsigned_documents.push(new_cpl_name.clone());
     }
-    write_atomic(&new_cpl_path, xml.as_bytes())
-        .map_err(|e| format!("cannot write {}: {e}", new_cpl_path.display()))?;
+    crate::fs::write_atomic(&new_cpl_path, xml.as_bytes())?;
     let old_cpl_name = file_name(&cpl_path);
     if old_cpl_name != new_cpl_name {
         std::fs::remove_file(&cpl_path)
@@ -218,8 +217,7 @@ pub fn edit_package(edit: &PackageEdit) -> Result<EditedPackage, String> {
         if crate::xmldsig::strip_signature(&mut updated) {
             unsigned_documents.push(file_name(&pkl));
         }
-        write_atomic(&pkl, updated.as_bytes())
-            .map_err(|e| format!("cannot update {}: {e}", pkl.display()))?;
+        crate::fs::write_atomic(&pkl, updated.as_bytes())?;
         patched_a_pkl = true;
     }
     if !patched_a_pkl {
@@ -245,8 +243,7 @@ pub fn edit_package(edit: &PackageEdit) -> Result<EditedPackage, String> {
     if crate::xmldsig::strip_signature(&mut updated) {
         unsigned_documents.push(file_name(&assetmap_path));
     }
-    write_atomic(&assetmap_path, updated.as_bytes())
-        .map_err(|e| format!("cannot update {}: {e}", assetmap_path.display()))?;
+    crate::fs::write_atomic(&assetmap_path, updated.as_bytes())?;
 
     Ok(EditedPackage {
         package_dir,
@@ -383,12 +380,6 @@ fn file_name(path: &Path) -> String {
 }
 
 /// Write `bytes` to `path` atomically: a temp file in the same dir, then rename.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension(format!("tmp_{}", uuid::Uuid::new_v4()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)
-}
-
 /// Copy `src` into `dst`, subdirectories and all.
 fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dst)?;

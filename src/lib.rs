@@ -16,6 +16,8 @@ pub mod edl_import;
 pub mod encode;
 pub mod font_subset;
 pub mod frame_compare;
+pub mod free_space;
+pub mod fs;
 pub mod grok;
 pub mod grok_encoder;
 pub mod hash;

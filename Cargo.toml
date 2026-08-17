@@ -19,7 +19,7 @@ grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", option
 hex = "0.4"
 hound = "3.5.1"
 lcms2 = { version = "6", optional = true }
-libc = { version = "0.2", optional = true }
+libc = "0.2"
 notify = "8"
 png = "0.18"
 quick-xml = "0.37"
@@ -56,7 +56,7 @@ default = []
 async = ["dep:tokio"]
 grok-ffi = ["dep:grokj2k-sys"]
 icc = ["dep:lcms2"]
-libmpv = ["dep:libc"]
+libmpv = []
 tms = ["dep:ssh2", "dep:suppaftp"]
 
 [dev-dependencies]

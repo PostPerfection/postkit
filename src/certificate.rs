@@ -2852,6 +2852,44 @@ fn rand_bytes<const N: usize>() -> Result<[u8; N], String> {
     Ok(buf)
 }
 
+/// Parse an X.509 cert from a file, treating it as untrusted input.
+/// [`read_certificate`] returns a default (empty thumbprint) on any parse
+/// failure, so an empty thumbprint means "not a valid certificate".
+pub fn cert_info_from_file(path: &Path) -> Result<CertInfo, String> {
+    let info = read_certificate(path);
+    if info.thumbprint.is_empty() {
+        return Err(format!(
+            "{} is not a parseable X.509 certificate",
+            path.display()
+        ));
+    }
+    Ok(info)
+}
+
+/// Parse an X.509 cert from an in-memory PEM string. Writes to a temp file so
+/// the existing file-based parser is reused; errors on non-cert input.
+pub fn cert_info_from_pem(pem: &str) -> Result<CertInfo, String> {
+    let mut tmp =
+        tempfile::NamedTempFile::new().map_err(|e| format!("cannot create temp file: {e}"))?;
+    use std::io::Write;
+    tmp.write_all(pem.as_bytes())
+        .map_err(|e| format!("cannot write temp cert: {e}"))?;
+    tmp.flush().ok();
+    cert_info_from_file(tmp.path())
+}
+
+/// Re-wrap base64 DER (as found in FLM ds:X509Certificate) into a PEM block.
+pub fn der_base64_to_pem(b64: &str) -> String {
+    let clean: String = b64.split_whitespace().collect();
+    let mut out = String::from("-----BEGIN CERTIFICATE-----\n");
+    for chunk in clean.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or(""));
+        out.push('\n');
+    }
+    out.push_str("-----END CERTIFICATE-----\n");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

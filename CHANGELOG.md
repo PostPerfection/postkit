@@ -4,6 +4,25 @@
 
 ### Added
 
+- `picture_processing` grew the crop resolution both wizards each carried:
+  `require_one_crop_decider`, `fill_crop` (with the quarter-turn aspect swap),
+  `detect_crop` (auto-crop through a video or an image-sequence concat list,
+  refusing an out-of-range threshold and an all-black source), and the
+  `parse_rotation`/`parse_flip` spellings, which now accept the union of what
+  the two wizards each accepted.
+
+- `free_space::available_bytes`/`volume_bytes`: what is free on the filesystem
+  holding a path, statvfs on unix and GetDiskFreeSpaceExW on windows. Moved up
+  from dcpwizard; imfwizard read the same numbers through the fs4 crate.
+
+- `fs::write_atomic`: temp file in the same directory, then rename, creating
+  parents as needed. `package_edit` used a private rename-based copy of this and
+  dcpwizard carried another.
+
+- `certificate::cert_info_from_file`/`cert_info_from_pem`/`der_base64_to_pem`:
+  parsing untrusted certificates into `CertInfo` with a real error instead of
+  the empty-thumbprint default, moved up from dcpwizard's kdm store.
+
 - `still`: a single image held for a duration, encoded once and hard-linked into
   a directory of J2K frames, with a burnt-in subtitle breaking the repeat only
   where the cues change. Moved up from the two wizards, which had drifted apart:
