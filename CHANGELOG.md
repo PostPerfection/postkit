@@ -176,9 +176,14 @@ and intermediate were always correct and only the signer was affected.
 
 ### KDMs written before this release were schema-invalid
 
-Regenerate any KDM postkit produced earlier. Three defects broke it against the
+Regenerate any KDM postkit produced earlier. Four defects broke it against the
 ST 430-1 schema, and each one on its own is enough for a conformant consumer to
 reject the message.
+
+- No `NonCriticalExtensions`. ST 430-3 requires the element after
+  `RequiredExtensions` even when empty, and dcpdoctor's schema pass flagged
+  every KDM for it. A whole-message schema test now covers the envelope, not
+  only the `KDMRequiredExtensions` fragment.
 
 - No `AuthorizedDeviceInfo` at all. ST 430-1 Annex B declares it with no
   `minOccurs`, so it is required, and postkit never wrote one.

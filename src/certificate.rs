@@ -1824,6 +1824,7 @@ fn build_kdm_xml(
 {typed_key_ids}        </KeyIdList>
 {forensic_mark_flag_list}      </KDMRequiredExtensions>
     </RequiredExtensions>
+    <NonCriticalExtensions/>
   "#,
         issue_date = now.format("%Y-%m-%dT%H:%M:%S+00:00"),
         not_before = not_valid_before,
@@ -5018,6 +5019,32 @@ mod tests {
             assert!(
                 out.status.success(),
                 "the {label} KDM must pass the ST 430-1 XSD:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// The whole message against the vendored ST 430-1 schema, which imports
+    /// ST 430-3, so the envelope around the extensions is checked too:
+    /// dcpdoctor validates a KDM this way.
+    #[test]
+    fn a_whole_kdm_passes_the_st_430_1_xsd() {
+        if !xmllint_available() {
+            eprintln!("skipping: xmllint not installed");
+            return;
+        }
+
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        for formulation in KdmFormulation::ALL {
+            let label = formulation.as_str();
+            let kdm = build_kdm(&formulation_config(f, formulation)).expect("build");
+            let path = dir.path().join(format!("{label}-whole.xml"));
+            std::fs::write(&path, &kdm.xml).unwrap();
+            let out = xmllint_kdm_schema(&path);
+            assert!(
+                out.status.success(),
+                "the whole {label} KDM must pass the ST 430-1 XSD:\n{}",
                 String::from_utf8_lossy(&out.stderr)
             );
         }
