@@ -48,6 +48,8 @@ pub mod subtitle_formats;
 pub mod subtitle_raster;
 pub mod subtitle_retime;
 pub mod timecode;
+#[cfg(feature = "tms")]
+pub mod tms;
 pub mod trailer;
 pub mod upmix;
 pub mod version_tracker;

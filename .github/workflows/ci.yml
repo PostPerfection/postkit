@@ -52,13 +52,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        run: cargo build --features async
+        run: cargo build --features "async tms"
 
       - name: Test
-        run: cargo test --features async
+        run: cargo test --features "async tms"
 
       - name: Clippy
-        run: cargo clippy --features async -- -D warnings
+        run: cargo clippy --all-targets --features "async tms" -- -D warnings
 
       - name: Setup grok
         if: runner.os != 'Windows'

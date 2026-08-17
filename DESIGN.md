@@ -2,7 +2,7 @@
 
 Shared library crate for the PostPerfection suite. dcpdoctor, dcpwizard, and imfwizard depend on it by path; anything needed by more than one app lives here. Depends on asdcplib-rs (git) for MXF I/O. dcpdoctor-wasm deliberately does not use postkit (no-std-io rewrites in dcpdoctor-parse/-imf).
 
-## Modules (50 in lib.rs)
+## Modules (51 in lib.rs)
 
 Packaging and formats:
 - certificate: X.509 chains, KDM creation/rewrap, trust management. KDM content keys are caller-supplied (from the DCP's keys file) so the KDM unlocks the actual encrypted essence, falling back to a fresh MDIK when none are given. One certificate thumbprint throughout, the base64 ST 430-2 value (SHA-1 over the DER TBSCertificate) that a KDM lists; the trusted-device store names its files by the hex spelling of that same digest and migrates older stores on access. `KdmFormulation` picks the ISDCF formulation: it emits ContentAuthenticator (the signer leaf's thumbprint) for `dci-any`/`dci-specific` and rejects a `device_cert_files` its formulation would silently discard
@@ -57,6 +57,7 @@ Workflow and infra:
 - job_queue: in-memory job store (caller drives execution)
 - rest_api: minimal blocking HTTP server
 - plugin, watch, webhook, preferences, profiles, report, accessibility, shell_completion
+- tms (feature `tms`, off by default): push a written package to a theatre management system over ftp or sftp, DCP-o-matic's `tms_protocol`/`tms_ip`/`tms_path`/`tms_user`/`tms_password` config keys. Every file under the package directory is put into `<path>/<package dir name>/`, remote directories created before the files that go in them, and the first failure stops the upload naming the file and the remote path it was going to. Protocol handling sits behind one `TmsTransport` trait (`ensure_dir`, `put_file`) with an ssh2/libssh2 implementation, a suppaftp one, and a fake the layout tests drive, so nothing in the test run touches a network. sftp checks the host key against `~/.ssh/known_hosts` and refuses an unknown or changed key, printing the SHA256 fingerprint and the `ssh-keyscan` line that would record it: libssh2 verifies nothing by itself, so without that the password goes to whatever answers on the address. ftp warns that the login and the package cross the network in the clear. `TmsConfig` deserializes the config and redacts the password in Debug, and `validate` refuses one naming no server or no login; reading the file is the app's job, both because the path carries the app's name and because a `toml` dependency here would put winnow's `AsRef` impls in front of every crate that links postkit, which stops dcpdoctor's schema reader compiling. The feature is off by default because ssh2 links libssh2 and openssl, which dcpdoctor's wasm build cannot have
 
 ## Testing
 
