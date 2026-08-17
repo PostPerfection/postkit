@@ -492,9 +492,188 @@ fn probe_duration_seconds(input: &Path, source: DecodeSource) -> Option<f64> {
         .filter(|seconds| *seconds > 0.0)
 }
 
+/// Fraction of full scale a pixel stays under to count as border. This is
+/// DCP-o-matic's default.
+pub const DEFAULT_AUTO_CROP_THRESHOLD: f32 = 0.1;
+
+/// Frames auto-crop measures before it unions their content rectangles. Enough
+/// that one dark shot cannot crop away picture the rest of the content has.
+const AUTO_CROP_SAMPLE_COUNT: u32 = 8;
+
+/// Edit rate the auto-crop concat list holds each still at. It only spreads the
+/// samples over the list, so any rate serves.
+const AUTO_CROP_LIST_FPS: u32 = 24;
+
+/// Refuse more than one way of deciding the crop, naming the flags that clash.
+pub fn require_one_crop_decider(manual: bool, auto: bool, fill: bool) -> Result<(), String> {
+    let deciders: Vec<&str> = [
+        (manual, "--crop-left/--crop-right/--crop-top/--crop-bottom"),
+        (auto, "--auto-crop"),
+        (fill, "--fill-crop"),
+    ]
+    .into_iter()
+    .filter(|(given, _)| *given)
+    .map(|(_, name)| name)
+    .collect();
+    if deciders.len() > 1 {
+        return Err(format!(
+            "{} each decide the crop, so give only one of them",
+            deciders.join(" and ")
+        ));
+    }
+    Ok(())
+}
+
+/// The centred crop that brings the source to the box's aspect. A quarter turn
+/// happens after the crop, so the box's aspect is wanted the other way round.
+pub fn fill_crop(
+    source_width: u32,
+    source_height: u32,
+    (box_width, box_height): (u32, u32),
+    rotation: Rotation,
+) -> Crop {
+    let (aspect_width, aspect_height) = match rotation {
+        Rotation::Clockwise90 | Rotation::CounterClockwise90 => (box_height, box_width),
+        Rotation::None | Rotation::Half => (box_width, box_height),
+    };
+    Crop::to_aspect(source_width, source_height, aspect_width, aspect_height)
+}
+
+/// Measure the black borders around the content. An image sequence has no
+/// container ffmpeg can seek, so it is measured through a concat list, the same
+/// way an encode decodes one. A source that is all border at `threshold` is
+/// refused rather than cropped to nothing.
+pub fn detect_crop(
+    source: &Path,
+    threshold: f32,
+    is_image_sequence: bool,
+    source_width: u32,
+    source_height: u32,
+) -> Result<Crop, String> {
+    if !(0.0..=1.0).contains(&threshold) {
+        return Err(format!(
+            "black threshold {threshold} is outside 0..1, where \
+             {DEFAULT_AUTO_CROP_THRESHOLD} is the usual value"
+        ));
+    }
+    let detected = if is_image_sequence {
+        let directory = if source.is_dir() {
+            source.to_path_buf()
+        } else {
+            source.parent().unwrap_or(source).to_path_buf()
+        };
+        let frames = crate::encode::find_source_frames(&directory)
+            .map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
+        if frames.is_empty() {
+            return Err(format!("no images in {}", directory.display()));
+        }
+        let list_dir = tempfile::tempdir()
+            .map_err(|e| format!("cannot create a working directory for auto-crop: {e}"))?;
+        let list = list_dir.path().join("frames.ffconcat");
+        crate::encode::write_image_concat_list(
+            &frames,
+            crate::encode::FrameRate::whole(AUTO_CROP_LIST_FPS),
+            &list,
+        )?;
+        detect_black_borders(
+            &list,
+            DecodeSource::ImageList,
+            threshold,
+            AUTO_CROP_SAMPLE_COUNT,
+        )?
+    } else {
+        detect_black_borders(
+            source,
+            DecodeSource::Video,
+            threshold,
+            AUTO_CROP_SAMPLE_COUNT,
+        )?
+    };
+    if detected.left + detected.right >= source_width
+        || detected.top + detected.bottom >= source_height
+    {
+        return Err(format!(
+            "black border detection found no picture in {}: it is black at a \
+             threshold of {threshold}",
+            source.display()
+        ));
+    }
+    Ok(detected)
+}
+
+/// Parse a clockwise rotation: `none`, `0`, `90`, `180` or `270`.
+pub fn parse_rotation(spec: &str) -> Result<Rotation, String> {
+    match spec.trim().to_lowercase().as_str() {
+        "" | "none" | "0" => Ok(Rotation::None),
+        "90" => Ok(Rotation::Clockwise90),
+        "180" => Ok(Rotation::Half),
+        "270" => Ok(Rotation::CounterClockwise90),
+        other => Err(format!(
+            "unknown rotation '{other}' (use 90, 180 or 270 degrees clockwise)"
+        )),
+    }
+}
+
+/// Parse a flip into (horizontal, vertical): `none`, `horizontal`, `vertical`
+/// or `both`.
+pub fn parse_flip(spec: &str) -> Result<(bool, bool), String> {
+    match spec.trim().to_lowercase().as_str() {
+        "" | "none" => Ok((false, false)),
+        "horizontal" => Ok((true, false)),
+        "vertical" => Ok((false, true)),
+        "both" => Ok((true, true)),
+        other => Err(format!(
+            "unknown flip '{other}' (use horizontal, vertical or both)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn more_than_one_crop_decider_is_refused_by_name() {
+        assert!(require_one_crop_decider(false, false, false).is_ok());
+        assert!(require_one_crop_decider(true, false, false).is_ok());
+        let error = require_one_crop_decider(true, false, true).unwrap_err();
+        assert!(error.contains("--crop-left"), "{error}");
+        assert!(error.contains("--fill-crop"), "{error}");
+        let error = require_one_crop_decider(false, true, true).unwrap_err();
+        assert!(error.contains("--auto-crop"), "{error}");
+    }
+
+    #[test]
+    fn a_quarter_turn_takes_the_fill_crop_aspect_the_other_way_round() {
+        let flat = fill_crop(1920, 1080, (2048, 858), Rotation::None);
+        assert_eq!(flat.left, 0);
+        assert!(flat.top > 0);
+        let turned = fill_crop(1920, 1080, (2048, 858), Rotation::Clockwise90);
+        assert_eq!(turned.top, 0);
+        assert!(turned.left > 0);
+    }
+
+    #[test]
+    fn an_out_of_range_threshold_is_refused_before_ffmpeg_runs() {
+        let error = detect_crop(Path::new("/never/read.mov"), 1.5, false, 1920, 1080).unwrap_err();
+        assert!(error.contains("outside 0..1"), "{error}");
+    }
+
+    #[test]
+    fn every_rotation_and_flip_has_a_spelling_and_a_typo_does_not() {
+        assert_eq!(parse_rotation("none").unwrap(), Rotation::None);
+        assert_eq!(parse_rotation("0").unwrap(), Rotation::None);
+        assert_eq!(parse_rotation("90").unwrap(), Rotation::Clockwise90);
+        assert_eq!(parse_rotation("180").unwrap(), Rotation::Half);
+        assert_eq!(parse_rotation("270").unwrap(), Rotation::CounterClockwise90);
+        assert!(parse_rotation("45").unwrap_err().contains("45"));
+
+        assert_eq!(parse_flip("none").unwrap(), (false, false));
+        assert_eq!(parse_flip("horizontal").unwrap(), (true, false));
+        assert_eq!(parse_flip("Vertical").unwrap(), (false, true));
+        assert_eq!(parse_flip("both").unwrap(), (true, true));
+        assert!(parse_flip("sideways").unwrap_err().contains("sideways"));
+    }
 
     #[test]
     fn an_identity_processing_emits_no_filters() {
