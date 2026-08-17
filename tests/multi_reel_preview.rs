@@ -24,6 +24,7 @@ const REELS: [(&str, &str, u32); 3] = [
     ("tail;rating.mxf", "33333333-3333-3333-3333-333333333333", 5),
 ];
 const FRAMES_PER_SECOND: u32 = 24;
+const COMPOSITION_TITLE: &str = "Three Reel Test";
 /// The reel the trimmed-composition test cuts down, and the seconds it keeps.
 const TRIMMED_REEL: usize = 1;
 const TRIMMED_REEL_SECONDS: u32 = 1;
@@ -101,7 +102,7 @@ fn write_package(dir: &Path, edit_cpl: impl Fn(String) -> String) {
     let cpl = DcpCpl {
         uuid: "cc10cc10-0000-0000-0000-000000000000".into(),
         namespace: ns::CPL_SMPTE.into(),
-        title: "Three Reel Test".into(),
+        title: COMPOSITION_TITLE.into(),
         reels,
         ..Default::default()
     };
@@ -206,5 +207,10 @@ fn a_trimmed_reel_plays_only_the_span_the_cpl_states() {
     assert!(
         (duration - f64::from(total)).abs() < DURATION_TOLERANCE_SECONDS,
         "played {duration}s of a {total}s composition"
+    );
+
+    assert_eq!(
+        player.get_property_string("media-title").unwrap(),
+        COMPOSITION_TITLE
     );
 }

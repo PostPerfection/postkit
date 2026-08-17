@@ -435,6 +435,7 @@ impl MpvRenderPlayer {
         if !file.exists() {
             return Err(format!("File not found: {path}"));
         }
+        self.force_media_title("")?;
         self.command(&["loadfile", &file.display().to_string()])
     }
 
@@ -446,11 +447,21 @@ impl MpvRenderPlayer {
         if !directory.is_dir() {
             return Err(format!("Not a directory: {dir_path}"));
         }
-        let source = match crate::composition_timeline::mpv_source(directory) {
-            Some(source) => source,
-            None => pick_picture_mxf(directory)?.display().to_string(),
+        let (source, title) = match crate::composition_timeline::mpv_source(directory) {
+            Some(composition) => (composition.uri, composition.title.unwrap_or_default()),
+            None => (
+                pick_picture_mxf(directory)?.display().to_string(),
+                String::new(),
+            ),
         };
+        self.force_media_title(&title)?;
         self.command(&["loadfile", &source])
+    }
+
+    /// Name what plays in the transport bar. An empty title clears the one an
+    /// earlier load forced, which leaves mpv back on the filename.
+    fn force_media_title(&self, title: &str) -> Result<(), String> {
+        self.set_property("force-media-title", title)
     }
 
     pub fn play_pause(&self) -> Result<(), String> {
@@ -486,7 +497,9 @@ impl MpvRenderPlayer {
             Ok(value) => value.to_string(),
             Err(_) => "null".to_string(),
         };
-        let filename = match self.get_property_string("filename") {
+        // media-title is the forced composition title when there is one and the
+        // filename when there is not
+        let filename = match self.get_property_string("media-title") {
             Ok(name) => format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\"")),
             Err(_) => "null".to_string(),
         };

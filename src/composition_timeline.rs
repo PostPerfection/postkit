@@ -2,12 +2,19 @@
 //!
 //! Picking a picture MXF by filename or size plays a single reel of a
 //! multi-reel composition. The CPL is the only document that says which track
-//! files belong to the composition, in what order and how much of each one
-//! plays, so resolution goes ASSETMAP → CPL → picture track files and mpv gets
-//! them as one EDL timeline.
+//! files belong to the composition, in what order, how much of each one plays
+//! and what the whole thing is called, so resolution goes ASSETMAP → CPL →
+//! picture track files and mpv gets them as one EDL timeline.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+/// The one mpv source that plays a composition, and the title to show for it.
+#[derive(Debug, PartialEq)]
+pub struct CompositionSource {
+    pub uri: String,
+    pub title: Option<String>,
+}
 
 /// A picture track file as the composition plays it: the whole file, or only
 /// the span the reel enters and leaves at.
@@ -35,31 +42,33 @@ struct PictureReference {
 ///
 /// None when the package has no ASSETMAP, no CPL, or a CPL naming no picture,
 /// which leaves the caller on its own single-file fallback.
-pub fn mpv_source(package_dir: &Path) -> Option<String> {
-    match picture_segments(package_dir).as_slice() {
-        [] => None,
+pub fn mpv_source(package_dir: &Path) -> Option<CompositionSource> {
+    let (segments, title) = read_composition(package_dir);
+    let uri = match segments.as_slice() {
+        [] => return None,
         // one untrimmed reel is the file it always was: an EDL wrapper would
         // change the demuxer and add a chapter for no gain
-        [only] if only.trim.is_none() => Some(only.path.to_string_lossy().into_owned()),
-        several => Some(edl_uri(several)),
-    }
+        [only] if only.trim.is_none() => only.path.to_string_lossy().into_owned(),
+        several => edl_uri(several),
+    };
+    Some(CompositionSource { uri, title })
 }
 
 /// Every picture track file the composition names, in composition order, with
-/// the span of each one the composition plays.
-fn picture_segments(package_dir: &Path) -> Vec<PictureSegment> {
+/// the composition title.
+fn read_composition(package_dir: &Path) -> (Vec<PictureSegment>, Option<String>) {
     let Some(assetmap) = crate::assetmap::find(package_dir) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let assets = crate::assetmap::parse_ordered(&assetmap);
     let Some(cpl) = first_cpl(package_dir, &assets) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let path_by_id: HashMap<&str, &str> = assets
         .iter()
         .map(|(id, relative)| (id.as_str(), relative.as_str()))
         .collect();
-    picture_references(&cpl)
+    let segments = picture_references(&cpl)
         .into_iter()
         .filter_map(|picture| {
             let relative = path_by_id.get(picture.asset_id.as_str())?;
@@ -68,7 +77,8 @@ fn picture_segments(package_dir: &Path) -> Vec<PictureSegment> {
                 trim: picture.trim,
             })
         })
-        .collect()
+        .collect();
+    (segments, composition_title(&cpl))
 }
 
 /// The text of the first CPL in ASSETMAP order. ASSETMAP order is the only
@@ -162,6 +172,18 @@ fn segment_trim(
     })
 }
 
+/// The title the CPL states: a DCP's ContentTitleText, else an IMF's
+/// ContentTitle.
+fn composition_title(cpl: &str) -> Option<String> {
+    let stated =
+        element_text(cpl, "ContentTitleText").or_else(|| element_text(cpl, "ContentTitle"))?;
+    let title = match quick_xml::escape::unescape(&stated) {
+        Ok(unescaped) => unescaped.into_owned(),
+        Err(_) => stated,
+    };
+    (!title.is_empty()).then_some(title)
+}
+
 /// Each `name` element of `xml`, bounded by its own close tag and never running
 /// past the next one that opens, so a reel missing a close tag still resolves
 /// instead of swallowing the reels after it.
@@ -246,10 +268,15 @@ mod tests {
     ];
 
     fn picture_files(package_dir: &Path) -> Vec<PathBuf> {
-        picture_segments(package_dir)
+        read_composition(package_dir)
+            .0
             .into_iter()
             .map(|segment| segment.path)
             .collect()
+    }
+
+    fn source_uri(package_dir: &Path) -> Option<String> {
+        mpv_source(package_dir).map(|source| source.uri)
     }
 
     fn whole_files(paths: &[&str]) -> Vec<PictureSegment> {
@@ -357,7 +384,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(
-            mpv_source(dir.path()),
+            source_uri(dir.path()),
             Some(format!(
                 "edl://%{}%{head};%{}%{feature}",
                 head.len(),
@@ -373,7 +400,7 @@ mod tests {
         std::fs::write(dir.path().join("CPL_a.xml"), dcp_cpl(&REEL_UUIDS[..1])).unwrap();
 
         assert_eq!(
-            mpv_source(dir.path()),
+            source_uri(dir.path()),
             Some(dir.path().join("only.mxf").to_string_lossy().into_owned())
         );
     }
@@ -473,14 +500,14 @@ mod tests {
     fn no_assetmap_falls_back() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("picture.mxf"), b"").unwrap();
-        assert_eq!(mpv_source(dir.path()), None);
+        assert_eq!(source_uri(dir.path()), None);
     }
 
     #[test]
     fn no_cpl_falls_back() {
         let dir = tempfile::tempdir().unwrap();
         write_assetmap(dir.path(), "missing.xml", &[(REEL_UUIDS[0], "head.mxf")]);
-        assert_eq!(mpv_source(dir.path()), None);
+        assert_eq!(source_uri(dir.path()), None);
     }
 
     #[test]
@@ -488,7 +515,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_assetmap(dir.path(), "CPL_a.xml", &[(REEL_UUIDS[0], "head.mxf")]);
         std::fs::write(dir.path().join("CPL_a.xml"), "<CompositionPlaylist").unwrap();
-        assert_eq!(mpv_source(dir.path()), None);
+        assert_eq!(source_uri(dir.path()), None);
     }
 
     #[test]
@@ -496,7 +523,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_assetmap(dir.path(), "CPL_a.xml", &[(REEL_UUIDS[0], "sound.mxf")]);
         std::fs::write(dir.path().join("CPL_a.xml"), dcp_cpl(&[])).unwrap();
-        assert_eq!(mpv_source(dir.path()), None);
+        assert_eq!(source_uri(dir.path()), None);
     }
 
     #[test]
@@ -504,7 +531,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_assetmap(dir.path(), "CPL_a.xml", &[("dead-beef", "head.mxf")]);
         std::fs::write(dir.path().join("CPL_a.xml"), dcp_cpl(&[REEL_UUIDS[0]])).unwrap();
-        assert_eq!(mpv_source(dir.path()), None);
+        assert_eq!(source_uri(dir.path()), None);
     }
 
     #[test]
@@ -540,7 +567,7 @@ mod tests {
 
         let only = dir.path().join("only.mxf").to_string_lossy().into_owned();
         assert_eq!(
-            mpv_source(dir.path()),
+            source_uri(dir.path()),
             Some(format!("edl://%{}%{only},1,2", only.len()))
         );
     }
@@ -602,6 +629,50 @@ mod tests {
                 start_seconds: 1.0,
                 length_seconds: Some(2.0),
             })
+        );
+    }
+
+    #[test]
+    fn a_dcp_composition_is_titled_by_its_content_title_text() {
+        let cpl = "<CompositionPlaylist xmlns=\"x\">\
+             <ContentTitleText>Cle&amp;o &lt;2 &quot;cut&quot;</ContentTitleText>\
+             </CompositionPlaylist>";
+        assert_eq!(composition_title(cpl), Some("Cle&o <2 \"cut\"".to_string()));
+    }
+
+    #[test]
+    fn an_imf_composition_is_titled_by_its_content_title() {
+        let cpl = "<CompositionPlaylist xmlns=\"y\">\
+             <ContentTitle>Feature OV</ContentTitle></CompositionPlaylist>";
+        assert_eq!(composition_title(cpl), Some("Feature OV".to_string()));
+    }
+
+    #[test]
+    fn a_cpl_stating_no_title_has_none() {
+        assert_eq!(composition_title(&dcp_cpl(&REEL_UUIDS[..1])), None);
+        let empty = "<CompositionPlaylist xmlns=\"x\">\
+             <ContentTitleText></ContentTitleText></CompositionPlaylist>";
+        assert_eq!(composition_title(empty), None);
+    }
+
+    #[test]
+    fn the_composition_source_carries_the_title() {
+        let dir = tempfile::tempdir().unwrap();
+        write_assetmap(dir.path(), "CPL_a.xml", &[(REEL_UUIDS[0], "only.mxf")]);
+        std::fs::write(
+            dir.path().join("CPL_a.xml"),
+            format!(
+                "<CompositionPlaylist xmlns=\"x\"><ContentTitleText>Feature</ContentTitleText>\
+                 <ReelList><Reel><AssetList><MainPicture><Id>urn:uuid:{}</Id>\
+                 </MainPicture></AssetList></Reel></ReelList></CompositionPlaylist>",
+                REEL_UUIDS[0]
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mpv_source(dir.path()).unwrap().title,
+            Some("Feature".to_string())
         );
     }
 }

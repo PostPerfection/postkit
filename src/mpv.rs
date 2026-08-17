@@ -238,6 +238,7 @@ impl MpvPlayer {
             return Err(format!("File not found: {path}"));
         }
         self.ensure_running()?;
+        self.force_media_title("")?;
         self.loadfile(&p.display().to_string())
     }
 
@@ -249,17 +250,29 @@ impl MpvPlayer {
         if !dir.is_dir() {
             return Err(format!("Not a directory: {dir_path}"));
         }
-        let source = match crate::composition_timeline::mpv_source(&dir) {
-            Some(source) => source,
-            None => pick_picture_mxf(&dir)?.display().to_string(),
+        let (source, title) = match crate::composition_timeline::mpv_source(&dir) {
+            Some(composition) => (composition.uri, composition.title.unwrap_or_default()),
+            None => (pick_picture_mxf(&dir)?.display().to_string(), String::new()),
         };
         self.ensure_running()?;
+        self.force_media_title(&title)?;
         self.loadfile(&source)
     }
 
     /// Hand mpv one source, which may be a path or an `edl://` timeline.
     fn loadfile(&self, source: &str) -> Result<(), String> {
         let cmd = format!(r#"{{"command": ["loadfile", "{}"]}}"#, json_escape(source));
+        self.send_command(&cmd)?;
+        Ok(())
+    }
+
+    /// Name what plays in the transport bar. An empty title clears the one an
+    /// earlier load forced, which leaves mpv back on the filename.
+    fn force_media_title(&self, title: &str) -> Result<(), String> {
+        let cmd = format!(
+            r#"{{"command": ["set_property", "force-media-title", "{}"]}}"#,
+            json_escape(title)
+        );
         self.send_command(&cmd)?;
         Ok(())
     }
@@ -315,8 +328,10 @@ impl MpvPlayer {
         let paused = self
             .send_command(r#"{"command": ["get_property", "pause"]}"#)
             .unwrap_or_default();
+        // media-title is the forced composition title when there is one and the
+        // filename when there is not
         let fname = self
-            .send_command(r#"{"command": ["get_property", "filename"]}"#)
+            .send_command(r#"{"command": ["get_property", "media-title"]}"#)
             .unwrap_or_default();
 
         Ok(format!(
