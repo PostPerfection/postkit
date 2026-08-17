@@ -165,6 +165,17 @@
   loses its low bits through any read-modify-write. Anything that only moves
   samples around, an audio delay or a trim, wants the exact pair.
 
+- `MpvRenderPlayer::set_osd_overlay(id, Option<OsdAssOverlay>)`: draw ASS over the
+  video through mpv's `osd-overlay` command, or take that overlay away with None.
+  `OsdAssOverlay` carries the events, one dialogue event per line, and the
+  PlayResX / PlayResY the coordinates are in. ASS drawing commands make this a
+  vector overlay, which is what QC guides (safe area, aspect masks, a crop
+  rectangle) want: it is composited by the OSD renderer rather than by a video
+  filter, so no frame passes through the CPU for it and a change is not a filter
+  reconfiguration. mpv stretches the PlayRes canvas over the whole rendered
+  surface, letterbox bars included, so a caller drawing onto the picture places it
+  there itself from `osd-dimensions`.
+
 ### Fixed
 
 - `metadata_edit::write_metadata` writes an IMF composition's annotation into

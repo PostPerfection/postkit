@@ -57,6 +57,23 @@ pub enum NativeDisplay {
     X11(*mut c_void),
 }
 
+/// mpv's OSD overlay command, and the two formats it takes: one that carries ASS
+/// dialogue events, one that takes the overlay away again.
+const OSD_OVERLAY_COMMAND: &str = "osd-overlay";
+const ASS_EVENTS_FORMAT: &str = "ass-events";
+const NO_OVERLAY_FORMAT: &str = "none";
+
+/// Text to draw over the video as ASS, which is how vector graphics reach the
+/// OSD. `events` becomes one dialogue event per line, drawn on a canvas
+/// `play_res_x` by `play_res_y`, ASS's PlayResX and PlayResY. mpv stretches that
+/// canvas over the whole rendered surface, black bars included, so a caller
+/// wanting to land on the picture has to place its drawing there itself.
+pub struct OsdAssOverlay<'a> {
+    pub events: &'a str,
+    pub play_res_x: u32,
+    pub play_res_y: u32,
+}
+
 pub struct MpvRenderPlayer {
     handle: *mut ffi::mpv_handle,
     render: Mutex<*mut ffi::mpv_render_context>,
@@ -428,6 +445,32 @@ impl MpvRenderPlayer {
             .into_owned();
         unsafe { ffi::mpv_free(value as *mut c_void) };
         Ok(owned)
+    }
+
+    // ─── OSD overlays ──────────────────────────────────────────────────────
+
+    /// Draw `overlay` over the video under `id`, replacing whatever that id held
+    /// before, or take it away by passing None. The ids are this client's own, so
+    /// nothing else on libmpv can collide with one, and mpv drops them all when
+    /// the player goes.
+    pub fn set_osd_overlay(
+        &self,
+        id: i64,
+        overlay: Option<OsdAssOverlay<'_>>,
+    ) -> Result<(), String> {
+        let id = id.to_string();
+        let Some(overlay) = overlay else {
+            // data is positional, so a removal still has to carry an empty one
+            return self.command(&[OSD_OVERLAY_COMMAND, &id, NO_OVERLAY_FORMAT, ""]);
+        };
+        self.command(&[
+            OSD_OVERLAY_COMMAND,
+            &id,
+            ASS_EVENTS_FORMAT,
+            overlay.events,
+            &overlay.play_res_x.to_string(),
+            &overlay.play_res_y.to_string(),
+        ])
     }
 
     // ─── High-level playback ───────────────────────────────────────────────
