@@ -264,6 +264,38 @@ fn a_cancelled_overlapped_wrap_leaves_the_codestreams_and_no_mxf() {
     );
 }
 
+/// A wrap that fails takes the encode down with it, and the encoder only knows
+/// that the wrap stopped taking frames. The error that comes back has to be the
+/// wrap's own, or nobody can tell what went wrong.
+#[test]
+fn a_wrap_that_cannot_open_its_mxf_reports_why_rather_than_that_it_stopped() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mp4");
+    make_clip(&video, FRAME_COUNT);
+
+    let unwritable = dir.path().join("no").join("such").join("dir");
+    let outcome = run_encode_and_wrap_picture(
+        &video,
+        &dir.path().join("out"),
+        &encode_options(FRAME_COUNT),
+        wrap_options(unwritable.join("picture.mxf"), FRAME_COUNT),
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(AtomicBool::new(false)),
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    );
+
+    let Err(error) = outcome else {
+        panic!("the MXF cannot be written into a directory that does not exist");
+    };
+    assert!(error.contains("open_write failed"), "{error}");
+}
+
 /// A J2K sequence is already codestreams: nothing hands postkit a frame to wrap
 /// as it goes, so asking for an overlapped wrap has to say so rather than
 /// silently wrap nothing.
