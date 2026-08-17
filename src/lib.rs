@@ -4,6 +4,7 @@ pub mod audio_mix_matrix;
 pub mod burnin;
 pub mod certificate;
 pub mod colour;
+pub mod composition_timeline;
 pub mod conform;
 pub mod cpl_annotation;
 pub mod cpl_xml;

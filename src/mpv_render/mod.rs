@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use ffi::mpv_get_proc_address_fn;
 
-use crate::mpv::find_mxf_files;
+use crate::mpv::pick_picture_mxf;
 
 /// Pixel format libmpv writes in software mode, and the one `render_software`
 /// promises its callers.
@@ -438,14 +438,19 @@ impl MpvRenderPlayer {
         self.command(&["loadfile", &file.display().to_string()])
     }
 
-    /// Load the picture track out of a DCP or IMP directory.
+    /// Load a DCP or IMP directory's whole composition: every reel's picture,
+    /// in reel order, as one timeline. Falls back to a single picture MXF when
+    /// the package names no composition this can resolve.
     pub fn load_package_dir(&self, dir_path: &str) -> Result<(), String> {
         let directory = Path::new(dir_path);
         if !directory.is_dir() {
             return Err(format!("Not a directory: {dir_path}"));
         }
-        let picture = pick_picture_mxf(directory)?;
-        self.command(&["loadfile", &picture.display().to_string()])
+        let source = match crate::composition_timeline::mpv_source(directory) {
+            Some(source) => source,
+            None => pick_picture_mxf(directory)?.display().to_string(),
+        };
+        self.command(&["loadfile", &source])
     }
 
     pub fn play_pause(&self) -> Result<(), String> {
@@ -535,22 +540,4 @@ fn json_number(value: Result<f64, String>) -> String {
         Ok(number) if number.is_finite() => number.to_string(),
         _ => "null".to_string(),
     }
-}
-
-/// The picture track, by the `pic` naming convention DCP and IMP writers follow,
-/// falling back to the largest MXF when nothing declares itself.
-fn pick_picture_mxf(directory: &Path) -> Result<PathBuf, String> {
-    let mut candidates = find_mxf_files(directory);
-    if candidates.is_empty() {
-        return Err("No MXF files found in directory".to_string());
-    }
-    if let Some(picture) = candidates.iter().find(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.contains("pic"))
-    }) {
-        return Ok(picture.clone());
-    }
-    candidates.sort_by_key(|path| std::cmp::Reverse(path.metadata().map(|m| m.len()).unwrap_or(0)));
-    Ok(candidates.remove(0))
 }

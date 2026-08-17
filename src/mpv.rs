@@ -238,55 +238,28 @@ impl MpvPlayer {
             return Err(format!("File not found: {path}"));
         }
         self.ensure_running()?;
-        let cmd = format!(
-            r#"{{"command": ["loadfile", "{}"]}}"#,
-            p.display()
-                .to_string()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-        );
-        self.send_command(&cmd)?;
-        Ok(())
+        self.loadfile(&p.display().to_string())
     }
 
-    /// Load the first video MXF from a DCP/IMP directory.
+    /// Load a DCP/IMP directory's whole composition: every reel's picture, in
+    /// reel order, as one timeline. Falls back to a single picture MXF when the
+    /// package names no composition this can resolve.
     pub fn load_package_dir(&self, dir_path: &str) -> Result<(), String> {
         let dir = PathBuf::from(dir_path);
         if !dir.is_dir() {
             return Err(format!("Not a directory: {dir_path}"));
         }
-
-        let mut mxf_files = find_mxf_files(&dir);
-        if mxf_files.is_empty() {
-            return Err("No MXF files found in directory".to_string());
-        }
-
-        let video_mxf = mxf_files
-            .iter()
-            .find(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.contains("pic"))
-            })
-            .cloned()
-            .unwrap_or_else(|| {
-                mxf_files.sort_by(|a, b| {
-                    let size_a = a.metadata().map(|m| m.len()).unwrap_or(0);
-                    let size_b = b.metadata().map(|m| m.len()).unwrap_or(0);
-                    size_b.cmp(&size_a)
-                });
-                mxf_files[0].clone()
-            });
-
+        let source = match crate::composition_timeline::mpv_source(&dir) {
+            Some(source) => source,
+            None => pick_picture_mxf(&dir)?.display().to_string(),
+        };
         self.ensure_running()?;
-        let cmd = format!(
-            r#"{{"command": ["loadfile", "{}"]}}"#,
-            video_mxf
-                .display()
-                .to_string()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\"")
-        );
+        self.loadfile(&source)
+    }
+
+    /// Hand mpv one source, which may be a path or an `edl://` timeline.
+    fn loadfile(&self, source: &str) -> Result<(), String> {
+        let cmd = format!(r#"{{"command": ["loadfile", "{}"]}}"#, json_escape(source));
         self.send_command(&cmd)?;
         Ok(())
     }
@@ -364,6 +337,11 @@ impl Drop for MpvPlayer {
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
+/// Escape a value for a JSON string body in an IPC command.
+fn json_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn parse_property_f64(resp: &str) -> Result<f64, String> {
     if let Some(start) = resp.find("\"data\":") {
         let after = &resp[start + 7..];
@@ -425,4 +403,23 @@ pub fn find_mxf_files(dir: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     results
+}
+
+/// The picture track of a package whose composition could not be resolved, by
+/// the `pic` naming convention DCP and IMP writers follow, falling back to the
+/// largest MXF when nothing declares itself.
+pub fn pick_picture_mxf(directory: &std::path::Path) -> Result<PathBuf, String> {
+    let mut candidates = find_mxf_files(directory);
+    if candidates.is_empty() {
+        return Err("No MXF files found in directory".to_string());
+    }
+    if let Some(picture) = candidates.iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("pic"))
+    }) {
+        return Ok(picture.clone());
+    }
+    candidates.sort_by_key(|path| std::cmp::Reverse(path.metadata().map(|m| m.len()).unwrap_or(0)));
+    Ok(candidates.remove(0))
 }

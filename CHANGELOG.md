@@ -4,6 +4,10 @@
 
 ### Added
 
+- `composition_timeline::mpv_source`: a package directory to the one mpv source
+  that plays its whole composition, `None` when nothing there resolves.
+  `assetmap::parse_ordered` gives the same pairs as `parse` in document order,
+  which is what makes the choice between several CPLs deterministic.
 - Encode progress carries where the time inside an encode went:
   `StreamProgress`, `PipelineProgress` and `grok_encoder::EncodeProgress` gain
   `decode_wait_secs`, `prepare_secs`, `encode_secs` and `write_secs`, all
@@ -92,6 +96,16 @@
   samples around, an audio delay or a trim, wants the exact pair.
 
 ### Fixed
+
+- Previewing a package plays the whole composition. `MpvPlayer::load_package_dir`
+  and `MpvRenderPlayer::load_package_dir` picked one picture MXF by filename
+  ("pic") or by size, so a three-reel DCP played as whichever single reel the
+  guess landed on. Both now resolve ASSETMAP → CPL → each reel's MainPicture and
+  hand mpv one `edl://` virtual timeline, which makes the reported duration the
+  composition total and lets a seek cross a reel boundary. An IMF CPL resolves
+  the same way through its MainImageSequence resource TrackFileIds. A package
+  with one picture asset loads as the plain path it always did, and a package
+  with no ASSETMAP, no CPL or no picture asset falls back to the old guess.
 
 - `accessibility`: the closed-caption probe recognises the ST 429-12 `ClosedCaption` reel element (the name the schema declares, which libdcp and dcpwizard write) as well as the older `MainClosedCaption`.
 

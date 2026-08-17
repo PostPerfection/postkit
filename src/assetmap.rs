@@ -18,13 +18,19 @@ pub fn find(dir: &Path) -> Option<PathBuf> {
 /// Bare lowercased asset uuid to its path relative to the package directory.
 /// Empty when the document holds no asset this could read.
 pub fn parse(path: &Path) -> HashMap<String, String> {
+    parse_ordered(path).into_iter().collect()
+}
+
+/// The same pairs in document order, which is the only order a package states
+/// for its assets.
+pub fn parse_ordered(path: &Path) -> Vec<(String, String)> {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return HashMap::new();
+        return Vec::new();
     };
     let Ok(asset) = regex::Regex::new(
         r"(?s)<(?:\w+:)?Asset\b.*?<(?:\w+:)?Id>\s*(?:urn:uuid:)?([0-9a-fA-F-]{36})\s*</(?:\w+:)?Id>.*?<(?:\w+:)?Path>\s*([^<]+?)\s*</(?:\w+:)?Path>",
     ) else {
-        return HashMap::new();
+        return Vec::new();
     };
     asset
         .captures_iter(&text)
