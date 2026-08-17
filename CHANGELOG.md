@@ -4,6 +4,23 @@
 
 ### Added
 
+- `pipeline::run_encode_and_wrap_picture`: encode a picture track and wrap its MXF
+  at the same time, instead of wrapping once the encode is done. The encoder's
+  writer thread hands each codestream to `mxf_wrap::OverlappedJ2kWrap` after it is
+  on disk, a reorder buffer there releases them in index order, and asdcplib
+  writes them as they come, so the wrap no longer waits for the last frame and no
+  longer reads every codestream back into memory (a 2000-frame feature was ~2.6 GB
+  of that). The J2K directory is written and left behind exactly as before, and
+  the MXF carries the same essence the sequential wrap does, frame for frame. The
+  pieces are usable on their own: `mxf_wrap::IncrementalJ2kWrap` takes one
+  codestream at a time and `grok_encoder::encode_pipeline_with_mxf_feed` /
+  `encode::stream_encode_inprocess_with_mxf_feed` are the existing encoders with
+  the feed attached. A cancel or a failure of either side deletes the
+  part-written MXF, which asdcplib cannot read without its footer, and leaves the
+  codestreams that finished. Inputs that never hand postkit a codestream, a J2K
+  sequence or an image sequence grk_compress reads for itself, are refused rather
+  than wrapped empty; stereoscopic and sound wraps are untouched.
+
 - `package_edit::edit_package`: retitle or re-annotate a package that is already
   written, a DCP or an IMP, without re-wrapping essence. It gives the CPL a new
   composition id, rewrites the title / annotation / content kind / issuer asked

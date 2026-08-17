@@ -729,9 +729,19 @@ impl FrameReorderBuffer {
 const WRAP_QUEUE_FRAMES: usize = 8;
 
 /// Frames the reorder buffer may hold while waiting for the next one in order.
-/// Well past the encoder's own queue depth and thread count, so reaching it means
-/// a frame is never coming.
-const WRAP_REORDER_FRAMES: usize = 256;
+///
+/// How far arrival order really runs ahead is the encoder's queue depth plus its
+/// thread count, and both follow the core count. This only has to be past that,
+/// so that reaching it means a frame is never coming rather than that the machine
+/// is a wide one.
+fn wrap_reorder_capacity() -> usize {
+    const PER_CORE: usize = 4;
+    const MINIMUM: usize = 64;
+    std::thread::available_parallelism()
+        .map(|cores| cores.get() * PER_CORE)
+        .unwrap_or(MINIMUM)
+        .max(MINIMUM)
+}
 
 /// One frame for a wrap running alongside the encoder, or the request to finish.
 enum WrapMessage {
@@ -771,7 +781,7 @@ impl OverlappedJ2kWrap {
         let mut wrap = IncrementalJ2kWrap::new(options)?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(WRAP_QUEUE_FRAMES);
         let thread = std::thread::spawn(move || {
-            let mut buffer = FrameReorderBuffer::new(WRAP_REORDER_FRAMES);
+            let mut buffer = FrameReorderBuffer::new(wrap_reorder_capacity());
             let mut expected_frames = None;
             for message in receiver {
                 match message {
