@@ -310,10 +310,12 @@ Dedup landed (uncommitted, app pin bumps pending):
   dcpdoctor switched: dropped `parse_cod_extras`, and `analyze_j2k_from_mxf` prefers
   `read_mxf_j2k_frame` with an ffprobe fallback for AS-02/OP1a essence the OP-Atom
   reader can't open.
-- bitrate: `j2k::analyse_mxf_bitrate(path) -> MxfBitrateStats` reads frame sizes via
-  the asdcplib picture descriptor + read_frame loop. dcpdoctor switched:
-  `FrameBitrateStats` is a type alias and `analyze_picture_bitrate` delegates to it.
-  The Note-producing `check_bitrate_compliance` stays app-side.
+- bitrate: MOOT as a shared measurement. `j2k::MxfBitrateStats` stays shared and
+  dcpdoctor aliases it as `FrameBitrateStats`, but since 2026-08-17 its
+  `analyze_picture_bitrate` measures the frames through its own key-aware reader,
+  which also opens the essence the postkit entry points could not. Those entry
+  points (`analyse_mxf_bitrate`, `analyse_as02_mxf_bitrate`) are deleted. The
+  Note-producing `check_bitrate_compliance` stays app-side.
 - timecode: `timecode::Timecode` (hours/minutes/seconds/frames/fps/drop_frame) with
   new/parse/to_frames/from_frames/Display, a superset of imfwizard-core's API (SMPTE
   drop-frame at 30/60 fps). imfwizard switched and deleted its local copy.
