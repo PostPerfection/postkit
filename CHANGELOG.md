@@ -4,6 +4,30 @@
 
 ### Added
 
+- `package_edit::edit_package`: retitle or re-annotate a package that is already
+  written, a DCP or an IMP, without re-wrapping essence. It gives the CPL a new
+  composition id, rewrites the title / annotation / content kind / issuer asked
+  for, and repoints the PKL entry (id, new hash and size) and the ASSETMAP entry
+  (id and Path) at the rewritten CPL. Essence files keep their asset ids and
+  their bytes. The two formats differ only in a `CplVocabulary`: ST 429-7 names
+  the title `ContentTitleText` and the annotation `AnnotationText` and may carry
+  a ST 429-16 `meta:FullContentTitleText` alongside, ST 2067-3 names them
+  `ContentTitle` and `Annotation` and has no metadata title. An annotation the
+  CPL lacks is inserted where both standards place it, between the composition
+  Id and IssueDate, so a reel's or a segment's own annotation is never mistaken
+  for the composition's. `normalized_content_kind` resolves an ISDCF
+  abbreviation (FTR, TLR, ...) for either format. An encrypted package is
+  refused: a KDM authorises its keys for one named composition id, and a
+  metadata edit mints a new one. A signed document is rewritten unsigned and
+  named in `unsigned_documents`. Documents are found by root element rather than
+  by file name, so an Interop `ASSETMAP` with no extension resolves. Setting a
+  field the CPL does not carry is an error rather than a silent no-op.
+- `xmldsig::strip_signature` drops a document's ds:Signature and the Signer
+  beside it, whatever namespace prefix they carry, reporting whether the
+  document was signed. Anything that rewrites a signed document needs it: a
+  signature left over edited bytes reads as tampering.
+- `cpl_xml::replace_tag`, `write_tag` that returns None when the element is
+  absent, so a caller can tell a rewritten document from an untouched one.
 - `composition_timeline::mpv_source`: a package directory to the one mpv source
   that plays its whole composition, `None` when nothing there resolves.
   `assetmap::parse_ordered` gives the same pairs as `parse` in document order,

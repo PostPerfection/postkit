@@ -408,6 +408,12 @@ fn verify_signed_info(
 
 /// Byte range of the ds:Signature element (from '<' through its end tag).
 fn find_signature_span(xml: &str) -> Result<(usize, usize), String> {
+    element_span(xml, b"Signature")?.ok_or_else(|| "document has no ds:Signature".into())
+}
+
+/// Byte range of the first element with this local name, from '<' through its
+/// end tag, whatever namespace prefix it carries.
+fn element_span(xml: &str, local_name: &[u8]) -> Result<Option<(usize, usize)>, String> {
     let mut reader = Reader::from_str(xml);
     loop {
         let start = reader.buffer_position() as usize;
@@ -415,17 +421,53 @@ fn find_signature_span(xml: &str) -> Result<(usize, usize), String> {
             .read_event()
             .map_err(|e| format!("document is not valid XML: {e}"))?
         {
-            Event::Start(e) if e.local_name().as_ref() == b"Signature" => {
+            Event::Start(e) if e.local_name().as_ref() == local_name => {
+                let name = String::from_utf8_lossy(local_name).into_owned();
                 reader
                     .read_to_end(e.name().to_owned())
-                    .map_err(|err| format!("cannot read ds:Signature subtree: {err}"))?;
+                    .map_err(|err| format!("cannot read {name} subtree: {err}"))?;
                 let end = reader.buffer_position() as usize;
-                return Ok((start, end));
+                return Ok(Some((start, end)));
             }
-            Event::Eof => return Err("document has no ds:Signature".into()),
+            Event::Eof => return Ok(None),
             _ => {}
         }
     }
+}
+
+/// Drop a document's ds:Signature, and the Signer that only means anything
+/// beside it, whatever namespace prefix they carry. Returns whether the document
+/// was signed.
+///
+/// Anything that rewrites a signed document has to call this: a signature left
+/// over an edited document no longer matches the bytes, and a verifier reports
+/// that as tampering rather than as an unsigned package.
+pub fn strip_signature(xml: &mut String) -> bool {
+    let Ok(Some(signature)) = element_span(xml, b"Signature") else {
+        return false;
+    };
+    cut_element(xml, signature);
+    if let Ok(Some(signer)) = element_span(xml, b"Signer") {
+        cut_element(xml, signer);
+    }
+    true
+}
+
+/// Cut an element's byte range, taking the indentation before it and the newline
+/// after it so the document keeps its line structure.
+fn cut_element(xml: &mut String, (start, end): (usize, usize)) {
+    let line_start = xml[..start].rfind('\n').map_or(0, |n| n + 1);
+    let cut_from = if xml[line_start..start].trim().is_empty() {
+        line_start
+    } else {
+        start
+    };
+    let cut_to = if xml[end..].starts_with('\n') {
+        end + 1
+    } else {
+        end
+    };
+    xml.replace_range(cut_from..cut_to, "");
 }
 
 /// Namespace declarations (prefix, uri) an element carries; "" is the default.
@@ -1685,5 +1727,32 @@ mod tests {
         let err = sign_enveloped(&cpl_doc(), &["ID_absent"], "Id", None, &leaf_signer(c))
             .expect_err("must fail when a referenced id is absent");
         assert!(err.contains("ID_absent"), "got: {err}");
+    }
+
+    #[test]
+    fn stripping_a_signature_restores_the_document_that_was_signed() {
+        let original = cpl_doc();
+        let mut signed =
+            sign_document_enveloped(&original, &leaf_signer(chain())).expect("sign document");
+        assert!(signed.contains("<ds:Signature"));
+
+        assert!(strip_signature(&mut signed));
+        assert_eq!(signed, original);
+    }
+
+    #[test]
+    fn stripping_reports_an_unsigned_document_unchanged() {
+        let mut unsigned = cpl_doc();
+        assert!(!strip_signature(&mut unsigned));
+        assert_eq!(unsigned, cpl_doc());
+    }
+
+    #[test]
+    fn stripping_takes_the_signer_beside_the_signature() {
+        let mut xml =
+            "<Root>\n  <Signer>key info</Signer>\n  <Signature>value</Signature>\n</Root>"
+                .to_string();
+        assert!(strip_signature(&mut xml));
+        assert_eq!(xml, "<Root>\n</Root>");
     }
 }

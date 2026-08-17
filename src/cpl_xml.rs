@@ -28,27 +28,25 @@ pub fn read_tag(xml: &str, tag: &str) -> Option<String> {
 /// XML special characters in `new_value`. Returns the input unchanged when the
 /// tag is not found.
 pub fn write_tag(xml: &str, tag: &str, new_value: &str) -> String {
+    replace_tag(xml, tag, new_value).unwrap_or_else(|| xml.to_string())
+}
+
+/// Same as [`write_tag`], but None when the tag is absent, so a caller can tell
+/// a rewritten element from an untouched document.
+pub fn replace_tag(xml: &str, tag: &str, new_value: &str) -> Option<String> {
     let open = format!("<{tag}");
     let close = format!("</{tag}>");
 
-    if let Some(start) = xml.find(&open)
-        && let Some(after_open) = xml[start..].find('>')
-    {
-        let text_start = start + after_open + 1;
-        if let Some(end) = xml[text_start..].find(&close) {
-            let escaped = new_value
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;");
-            return format!(
-                "{}{}{}",
-                &xml[..text_start],
-                escaped,
-                &xml[text_start + end..]
-            );
-        }
-    }
-    xml.to_string()
+    let start = xml.find(&open)?;
+    let after_open = xml[start..].find('>')?;
+    let text_start = start + after_open + 1;
+    let end = xml[text_start..].find(&close)?;
+    Some(format!(
+        "{}{}{}",
+        &xml[..text_start],
+        crate::packaging::escape_xml(new_value),
+        &xml[text_start + end..]
+    ))
 }
 
 #[cfg(test)]
