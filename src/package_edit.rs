@@ -75,17 +75,17 @@ pub fn normalized_content_kind(value: &str) -> String {
 /// The element names one composition playlist standard uses for the fields this
 /// module edits.
 #[derive(Debug, Clone, Copy)]
-struct CplVocabulary {
+pub(crate) struct CplVocabulary {
     content_title: &'static str,
     /// The composition-level annotation, which both standards place between the
     /// composition Id and IssueDate.
-    annotation: &'static str,
+    pub(crate) annotation: &'static str,
     /// The ST 429-16 metadata title, kept consistent with the content title when
     /// the CPL carries one. IMF has no counterpart.
     metadata_content_title: Option<&'static str>,
 }
 
-const DCP_VOCABULARY: CplVocabulary = CplVocabulary {
+pub(crate) const DCP_VOCABULARY: CplVocabulary = CplVocabulary {
     content_title: "ContentTitleText",
     annotation: "AnnotationText",
     metadata_content_title: Some("meta:FullContentTitleText"),
@@ -99,7 +99,7 @@ const IMF_VOCABULARY: CplVocabulary = CplVocabulary {
 
 /// Which standard wrote this CPL, told by the element holding its title. Checked
 /// in this order because `<ContentTitle` is also a prefix of `<ContentTitleText`.
-fn vocabulary_for(cpl: &str) -> Option<CplVocabulary> {
+pub(crate) fn vocabulary_for(cpl: &str) -> Option<CplVocabulary> {
     if cpl.contains("<ContentTitleText") {
         Some(DCP_VOCABULARY)
     } else if cpl.contains("<ContentTitle") {

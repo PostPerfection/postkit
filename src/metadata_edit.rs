@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::cpl_xml::{read_tag, strip_urn_uuid, write_tag};
+use crate::package_edit::{DCP_VOCABULARY, vocabulary_for};
 
 /// Editable metadata field.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,13 +71,16 @@ pub fn write_metadata(cpl_path: &Path, meta: &CompositionMetadata) -> i32 {
         }
     };
 
+    // ST 429-7 and ST 2067-3 spell the annotation differently, so the element to
+    // write depends on which standard wrote this CPL
+    let vocabulary = vocabulary_for(&content).unwrap_or(DCP_VOCABULARY);
     let mut updated = content;
 
     if !meta.title.is_empty() {
         updated = write_tag(&updated, "ContentTitle", &meta.title);
     }
     if !meta.annotation.is_empty() {
-        updated = write_tag(&updated, "AnnotationText", &meta.annotation);
+        updated = write_tag(&updated, vocabulary.annotation, &meta.annotation);
     }
     if !meta.issuer.is_empty() {
         updated = write_tag(&updated, "Issuer", &meta.issuer);
@@ -216,6 +220,63 @@ mod tests {
         let content = std::fs::read_to_string(&cpl).unwrap();
         assert!(content.contains("New Title"));
         assert!(!content.contains("Old"));
+    }
+
+    /// ST 2067-3 names the composition annotation `Annotation`, not the
+    /// `AnnotationText` ST 429-7 uses.
+    #[test]
+    fn an_imf_annotation_lands_in_the_element_its_standard_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cpl = dir.path().join("CPL.xml");
+        std::fs::write(
+            &cpl,
+            r#"<CompositionPlaylist xmlns="http://www.smpte-ra.org/schemas/2067-3/2016">
+  <Id>urn:uuid:abc-123</Id>
+  <Annotation>first pass</Annotation>
+  <ContentTitle>Film</ContentTitle>
+  <IssueDate>2026-08-17T09:00:00+00:00</IssueDate>
+</CompositionPlaylist>"#,
+        )
+        .unwrap();
+
+        let meta = CompositionMetadata {
+            annotation: "second pass".into(),
+            ..Default::default()
+        };
+        assert_eq!(write_metadata(&cpl, &meta), 0);
+
+        let content = std::fs::read_to_string(&cpl).unwrap();
+        assert!(content.contains("<Annotation>second pass</Annotation>"));
+        assert!(!content.contains("first pass"));
+        assert!(
+            !content.contains("AnnotationText"),
+            "an IMF CPL has no AnnotationText: {content}"
+        );
+    }
+
+    #[test]
+    fn a_dcp_annotation_lands_in_the_element_its_standard_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let cpl = dir.path().join("CPL.xml");
+        std::fs::write(
+            &cpl,
+            r#"<CompositionPlaylist xmlns="http://www.smpte-ra.org/schemas/429-7/2006/CPL">
+  <Id>urn:uuid:abc-123</Id>
+  <AnnotationText>first pass</AnnotationText>
+  <ContentTitleText>OLD-TITLE_FTR_S_EN-XX_51_2K</ContentTitleText>
+</CompositionPlaylist>"#,
+        )
+        .unwrap();
+
+        let meta = CompositionMetadata {
+            annotation: "second pass".into(),
+            ..Default::default()
+        };
+        assert_eq!(write_metadata(&cpl, &meta), 0);
+
+        let content = std::fs::read_to_string(&cpl).unwrap();
+        assert!(content.contains("<AnnotationText>second pass</AnnotationText>"));
+        assert!(!content.contains("first pass"));
     }
 
     #[test]
