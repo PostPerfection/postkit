@@ -24,6 +24,9 @@ const REELS: [(&str, &str, u32); 3] = [
     ("tail;rating.mxf", "33333333-3333-3333-3333-333333333333", 5),
 ];
 const FRAMES_PER_SECOND: u32 = 24;
+/// The reel the trimmed-composition test cuts down, and the seconds it keeps.
+const TRIMMED_REEL: usize = 1;
+const TRIMMED_REEL_SECONDS: u32 = 1;
 const DURATION_TOLERANCE_SECONDS: f64 = 0.2;
 const DURATION_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -59,8 +62,9 @@ fn write_clip(path: &Path, seconds: u32) {
 }
 
 /// A three-reel DCP: real ASSETMAP and CPL, clips standing in for the picture
-/// track files.
-fn write_package(dir: &Path) {
+/// track files. `edit_cpl` gets the CPL XML before it is written, which is how a
+/// test states what the CPL writer cannot express.
+fn write_package(dir: &Path, edit_cpl: impl Fn(String) -> String) {
     let mut assets = vec![AssetMapAsset {
         id: "cc10cc10-0000-0000-0000-000000000000".into(),
         path: "CPL_test.xml".into(),
@@ -101,7 +105,25 @@ fn write_package(dir: &Path) {
         reels,
         ..Default::default()
     };
-    std::fs::write(dir.join("CPL_test.xml"), cpl.to_xml()).unwrap();
+    std::fs::write(dir.join("CPL_test.xml"), edit_cpl(cpl.to_xml())).unwrap();
+}
+
+/// The CPL writer emits IntrinsicDuration equal to Duration and takes the entry
+/// point from the reel, so a reel playing less than its file holds has to be
+/// stated in the written XML.
+fn trim_one_reel(cpl_xml: String) -> String {
+    let whole_reel = REELS[TRIMMED_REEL].2 * FRAMES_PER_SECOND;
+    let kept = TRIMMED_REEL_SECONDS * FRAMES_PER_SECOND;
+    let stated = format!("<EntryPoint>0</EntryPoint>\n          <Duration>{whole_reel}</Duration>");
+    assert_eq!(
+        cpl_xml.matches(&stated).count(),
+        1,
+        "the reel to trim is not the only one of its length"
+    );
+    cpl_xml.replace(
+        &stated,
+        &format!("<EntryPoint>{kept}</EntryPoint>\n          <Duration>{kept}</Duration>"),
+    )
 }
 
 /// mpv reports the duration only once the first segment is demuxed.
@@ -125,7 +147,7 @@ fn a_three_reel_package_plays_as_one_timeline() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    write_package(dir.path());
+    write_package(dir.path(), |cpl| cpl);
 
     let player = MpvRenderPlayer::new().unwrap();
     player.init_software().unwrap();
@@ -152,4 +174,37 @@ fn a_three_reel_package_plays_as_one_timeline() {
         assert!(Instant::now() < deadline, "seek past the first reel failed");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn a_trimmed_reel_plays_only_the_span_the_cpl_states() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    write_package(dir.path(), trim_one_reel);
+
+    let player = MpvRenderPlayer::new().unwrap();
+    player.init_software().unwrap();
+    player
+        .load_package_dir(&dir.path().to_string_lossy())
+        .unwrap();
+
+    let total: u32 = REELS
+        .iter()
+        .enumerate()
+        .map(|(index, (_, _, seconds))| {
+            if index == TRIMMED_REEL {
+                TRIMMED_REEL_SECONDS
+            } else {
+                *seconds
+            }
+        })
+        .sum();
+    let duration = duration_when_ready(&player);
+    assert!(
+        (duration - f64::from(total)).abs() < DURATION_TOLERANCE_SECONDS,
+        "played {duration}s of a {total}s composition"
+    );
 }

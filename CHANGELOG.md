@@ -7,7 +7,12 @@
 - `composition_timeline::mpv_source`: a package directory to the one mpv source
   that plays its whole composition, `None` when nothing there resolves.
   `assetmap::parse_ordered` gives the same pairs as `parse` in document order,
-  which is what makes the choice between several CPLs deterministic.
+  which is what makes the choice between several CPLs deterministic. Each reel
+  plays only the span its CPL states: an `EntryPoint` or a `Duration` shorter
+  than the file's `IntrinsicDuration` becomes the EDL segment's `,start,length`
+  in seconds, converted with that segment's own `EditRate` (an IMF resource
+  without one falls back to the composition's). A trimmed segment whose edit
+  rate is missing plays whole rather than failing to resolve.
 - Encode progress carries where the time inside an encode went:
   `StreamProgress`, `PipelineProgress` and `grok_encoder::EncodeProgress` gain
   `decode_wait_secs`, `prepare_secs`, `encode_secs` and `write_secs`, all

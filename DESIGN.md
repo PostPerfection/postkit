@@ -42,7 +42,7 @@ Media tooling (ffmpeg/external-tool wrappers). These are honest about their limi
 - loudness: EBU R128 via loudnorm, with short-term max from a second ebur128 pass
 - trailer: ratings card and leader are concatenated ahead of the content; output is a media file, no CPL/DCP is produced
 - watermark: visible drawtext mark only, not forensic
-- composition_timeline: a package directory to the one mpv source that plays its whole composition, resolved ASSETMAP → first CPL in ASSETMAP order → each reel's MainPicture (DCP) or each MainImageSequence resource's TrackFileId (IMF). Several picture files become one `edl://` virtual timeline so duration is the composition total and a seek crosses reel boundaries; one file stays a plain path; anything unresolvable leaves both `load_package_dir` callers on the filename/size guess
+- composition_timeline: a package directory to the one mpv source that plays its whole composition, resolved ASSETMAP → first CPL in ASSETMAP order → each reel's MainPicture (DCP) or each MainImageSequence resource's TrackFileId (IMF). Several picture files become one `edl://` virtual timeline so duration is the composition total and a seek crosses reel boundaries; one whole-file reel stays a plain path; anything unresolvable leaves both `load_package_dir` callers on the filename/size guess. A reel the CPL enters late or leaves early carries `,start,length` seconds on its EDL segment, converted from edit units with the segment's EditRate, so a trimmed reel plays the span the composition states and nothing more
 - burnin, probe, mpv
 
 Audio DSP (pure PCM, no ffmpeg):
