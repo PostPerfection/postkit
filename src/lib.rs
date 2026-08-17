@@ -44,6 +44,7 @@ pub mod prores;
 pub mod report;
 pub mod rest_api;
 pub mod shell_completion;
+pub mod still;
 pub mod subtitle_formats;
 pub mod subtitle_raster;
 pub mod subtitle_retime;

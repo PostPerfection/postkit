@@ -4,6 +4,13 @@
 
 ### Added
 
+- `still`: a single image held for a duration, encoded once and hard-linked into
+  a directory of J2K frames, with a burnt-in subtitle breaking the repeat only
+  where the cues change. Moved up from the two wizards, which had drifted apart:
+  colour reaches it as what the encoder takes, `apply_xyz_transform` plus an
+  optional `DcdmTransform`, so both wizards' routes fit. `is_still_image`,
+  `STILL_EXTENSIONS` and `HELD_PICTURE_DIR` come with it.
+
 - `pipeline::run_encode_and_wrap_picture`: encode a picture track and wrap its MXF
   at the same time, instead of wrapping once the encode is done. The encoder's
   writer thread hands each codestream to `mxf_wrap::OverlappedJ2kWrap` after it is
