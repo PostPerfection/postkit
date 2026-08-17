@@ -396,6 +396,55 @@ fn compute_hash_and_size(path: &std::path::Path) -> (String, u64) {
     )
 }
 
+/// Bytes asdcplib reserves for the header partition, so it can rewrite the
+/// header in place at finalize.
+const MXF_HEADER_SIZE: u32 = 16384;
+
+/// Refuse a codestream the wrap cannot carry, naming `source` (a file path or a
+/// frame number) in the error.
+///
+/// DCI profile rules apply to DCP only; AS-02 (IMF) takes any codestream with an
+/// image area.
+fn check_j2k_codestream(
+    data: &[u8],
+    standard: MxfStandard,
+    source: &str,
+) -> Result<crate::j2k::J2kHeader, String> {
+    let Some(header) = crate::j2k::parse_j2k_header(data) else {
+        return Err(format!("invalid JPEG 2000 codestream: {source}"));
+    };
+    if standard == MxfStandard::AsDcp {
+        crate::j2k::validate_dci_header(&header)
+            .map_err(|error| format!("invalid DCI JPEG 2000 codestream: {error}: {source}"))?;
+    } else if header.width == 0 || header.height == 0 {
+        return Err(format!("JPEG 2000 codestream has no image area: {source}"));
+    }
+    Ok(header)
+}
+
+/// The picture descriptor a J2K wrap opens with, built from the first frame's
+/// codestream header.
+///
+/// `container_duration` is only what the caller knows at open time: asdcplib
+/// overwrites it with the frames actually written when it rewrites the header
+/// partition at finalize, so a wrap that does not know its length yet can pass 0.
+fn j2k_picture_descriptor(
+    header: &crate::j2k::J2kHeader,
+    fps_num: u32,
+    fps_den: u32,
+    container_duration: u32,
+) -> asdcplib::jp2k::PictureDescriptor {
+    asdcplib::jp2k::PictureDescriptor {
+        edit_rate: asdcplib::Rational::new(fps_num as i32, fps_den as i32),
+        sample_rate: asdcplib::Rational::new(fps_num as i32, fps_den as i32),
+        stored_width: header.width,
+        stored_height: header.height,
+        aspect_ratio: asdcplib::Rational::new(header.width as i32, header.height as i32),
+        container_duration,
+        component_count: header.num_components,
+    }
+}
+
 fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
     if opts.input_files.is_empty() {
         return MxfTrackFile {
@@ -418,54 +467,19 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     }
 
-    let Some(header) = crate::j2k::parse_j2k_header(&frames[0]) else {
-        return MxfTrackFile {
-            error: format!(
-                "invalid JPEG 2000 codestream: {}",
-                opts.input_files[0].display()
-            ),
-            ..Default::default()
-        };
-    };
-    // dci profile rules apply to dcp only; as-02 (imf) takes any codestream with an image area
-    if opts.standard == MxfStandard::AsDcp {
-        if let Err(error) = crate::j2k::validate_dci_header(&header) {
-            return MxfTrackFile {
-                error: format!(
-                    "invalid DCI JPEG 2000 codestream: {error}: {}",
-                    opts.input_files[0].display()
-                ),
-                ..Default::default()
-            };
-        }
-    } else if header.width == 0 || header.height == 0 {
-        return MxfTrackFile {
-            error: format!(
-                "JPEG 2000 codestream has no image area: {}",
-                opts.input_files[0].display()
-            ),
-            ..Default::default()
+    let mut first_header = None;
+    for (path, frame) in opts.input_files.iter().zip(frames.iter()) {
+        match check_j2k_codestream(frame, opts.standard, &path.display().to_string()) {
+            Ok(header) => first_header.get_or_insert(header),
+            Err(error) => {
+                return MxfTrackFile {
+                    error,
+                    ..Default::default()
+                };
+            }
         };
     }
-    for (path, frame) in opts.input_files.iter().zip(frames.iter()).skip(1) {
-        let Some(header) = crate::j2k::parse_j2k_header(frame) else {
-            return MxfTrackFile {
-                error: format!("invalid JPEG 2000 codestream: {}", path.display()),
-                ..Default::default()
-            };
-        };
-        if opts.standard == MxfStandard::AsDcp
-            && let Err(error) = crate::j2k::validate_dci_header(&header)
-        {
-            return MxfTrackFile {
-                error: format!(
-                    "invalid DCI JPEG 2000 codestream: {error}: {}",
-                    path.display()
-                ),
-                ..Default::default()
-            };
-        }
-    }
+    let header = first_header.expect("input_files is not empty");
 
     let mut info = make_writer_info(opts.asset_uuid);
     let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
@@ -477,19 +491,17 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
             };
         }
     };
-    let desc = asdcplib::jp2k::PictureDescriptor {
-        edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
-        sample_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
-        stored_width: header.width,
-        stored_height: header.height,
-        aspect_ratio: asdcplib::Rational::new(header.width as i32, header.height as i32),
-        container_duration: frames.len() as u32,
-        component_count: header.num_components,
-    };
+    let desc = j2k_picture_descriptor(&header, opts.fps_num, opts.fps_den, frames.len() as u32);
 
     let mut writer = J2kWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
-    if let Err(e) = writer.open_write(&output_str, &info, &desc, opts.hdr.as_ref(), 16384) {
+    if let Err(e) = writer.open_write(
+        &output_str,
+        &info,
+        &desc,
+        opts.hdr.as_ref(),
+        MXF_HEADER_SIZE,
+    ) {
         return MxfTrackFile {
             error: format!("JP2K open_write failed: {e}"),
             ..Default::default()
@@ -525,6 +537,321 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         path: opts.output.clone(),
         success: true,
         error: String::new(),
+    }
+}
+
+/// What a J2K picture wrap needs before its first frame arrives.
+///
+/// The [`MxfWrapOptions`] fields a frame-by-frame wrap cannot use are absent: it
+/// has no input files, its essence type is J2K by construction, and it learns its
+/// duration from the frames it is given.
+#[derive(Debug)]
+pub struct IncrementalWrapOptions {
+    pub output: PathBuf,
+    pub standard: MxfStandard,
+    pub fps_num: u32,
+    pub fps_den: u32,
+    /// When set, the essence is AES-128 encrypted as it is written, exactly as
+    /// [`MxfWrapOptions::encryption`] does it: the same key and key id produce
+    /// the same essence either way.
+    pub encryption: Option<MxfEncryption>,
+    pub hdr: Option<asdcplib::jp2k::HdrMetadata>,
+    pub asset_uuid: Option<[u8; 16]>,
+}
+
+/// A J2K picture MXF written one frame at a time, as an encoder finishes them,
+/// instead of from a directory of codestreams.
+///
+/// The descriptor comes from the first frame's codestream header, so asdcplib
+/// opens on the first [`Self::write_frame`] rather than in [`Self::new`].
+/// Dropping this without [`Self::finish`] deletes the part-written file: asdcplib
+/// writes the footer and the real duration at finalize, so an MXF that never got
+/// there cannot be read.
+pub struct IncrementalJ2kWrap {
+    output: PathBuf,
+    standard: MxfStandard,
+    fps_num: u32,
+    fps_den: u32,
+    hdr: Option<asdcplib::jp2k::HdrMetadata>,
+    info: asdcplib::WriterInfo,
+    crypto: EssenceCrypto,
+    writer: Option<J2kWriter>,
+    frames_written: u64,
+    finished: bool,
+}
+
+impl IncrementalJ2kWrap {
+    pub fn new(options: IncrementalWrapOptions) -> Result<Self, String> {
+        let mut info = make_writer_info(options.asset_uuid);
+        let crypto = setup_encryption(&mut info, &options.encryption)?;
+        Ok(Self {
+            output: options.output,
+            standard: options.standard,
+            fps_num: options.fps_num,
+            fps_den: options.fps_den,
+            hdr: options.hdr,
+            info,
+            crypto,
+            writer: None,
+            frames_written: 0,
+            finished: false,
+        })
+    }
+
+    /// Append one codestream. Frames land in the essence in the order they are
+    /// given here, so the caller owes them in presentation order.
+    pub fn write_frame(&mut self, data: &[u8]) -> Result<(), String> {
+        let header = check_j2k_codestream(
+            data,
+            self.standard,
+            &format!("frame {}", self.frames_written),
+        )?;
+        if self.writer.is_none() {
+            let desc = j2k_picture_descriptor(&header, self.fps_num, self.fps_den, 0);
+            let mut writer = J2kWriter::new(self.standard);
+            writer
+                .open_write(
+                    &self.output.to_string_lossy(),
+                    &self.info,
+                    &desc,
+                    self.hdr.as_ref(),
+                    MXF_HEADER_SIZE,
+                )
+                .map_err(|e| format!("JP2K open_write failed: {e}"))?;
+            self.writer = Some(writer);
+        }
+        let writer = self.writer.as_mut().expect("opened just above");
+        writer
+            .write_frame(data, &mut self.crypto)
+            .map_err(|e| format!("JP2K write_frame failed: {e}"))?;
+        self.frames_written += 1;
+        Ok(())
+    }
+
+    /// Write the footer and the duration, then hash the finished MXF.
+    pub fn finish(mut self) -> Result<MxfTrackFile, String> {
+        let Some(writer) = self.writer.as_mut() else {
+            return Err("no frames reached the wrap".to_string());
+        };
+        writer
+            .finalize()
+            .map_err(|e| format!("JP2K finalize failed: {e}"))?;
+        // close the file before hashing it
+        self.writer = None;
+        self.finished = true;
+        let (hash, size) = compute_hash_and_size(&self.output);
+        Ok(MxfTrackFile {
+            uuid: uuid::Uuid::from_bytes(self.info.asset_uuid)
+                .hyphenated()
+                .to_string(),
+            hash,
+            size,
+            duration: self.frames_written,
+            path: self.output.clone(),
+            success: true,
+            error: String::new(),
+        })
+    }
+}
+
+impl Drop for IncrementalJ2kWrap {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        // asdcplib closes the file when the writer goes, which has to happen
+        // before the file can be removed on windows
+        self.writer = None;
+        let _ = std::fs::remove_file(&self.output);
+    }
+}
+
+/// Frames arriving out of order, released as the contiguous run they form.
+///
+/// The in-process encoder hands frames to its writer in completion order and
+/// hands work to its encoder threads off a LIFO queue, so arrival order runs
+/// ahead of index order by roughly the queue depth plus the thread count.
+/// `capacity` caps how far ahead: past that the wrap fails rather than holding an
+/// unbounded number of frames, which is also what a frame that is never coming
+/// looks like.
+struct FrameReorderBuffer {
+    next_index: u64,
+    pending: std::collections::BTreeMap<u64, Vec<u8>>,
+    capacity: usize,
+}
+
+impl FrameReorderBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            next_index: 0,
+            pending: std::collections::BTreeMap::new(),
+            capacity,
+        }
+    }
+
+    /// Take one frame in.
+    fn accept(&mut self, index: u64, data: Vec<u8>) -> Result<(), String> {
+        if index < self.next_index {
+            return Err(format!(
+                "frame {index} arrived after the wrap moved past it to frame {}",
+                self.next_index
+            ));
+        }
+        if self.pending.contains_key(&index) {
+            return Err(format!("frame {index} arrived twice"));
+        }
+        if self.pending.len() >= self.capacity {
+            return Err(format!(
+                "{} frames are held waiting for frame {}, which is not coming",
+                self.pending.len(),
+                self.next_index
+            ));
+        }
+        self.pending.insert(index, data);
+        Ok(())
+    }
+
+    /// The next frame in order, once it has arrived.
+    fn take_next(&mut self) -> Option<Vec<u8>> {
+        let data = self.pending.remove(&self.next_index)?;
+        self.next_index += 1;
+        Some(data)
+    }
+
+    /// The frame the run is waiting on, while frames behind it are held.
+    fn stalled_on(&self) -> Option<u64> {
+        (!self.pending.is_empty()).then_some(self.next_index)
+    }
+}
+
+/// Frames the handoff to the wrap thread may hold. It blocks past this, so a disk
+/// slower than the encoder cannot let the queue grow without limit.
+const WRAP_QUEUE_FRAMES: usize = 8;
+
+/// Frames the reorder buffer may hold while waiting for the next one in order.
+/// Well past the encoder's own queue depth and thread count, so reaching it means
+/// a frame is never coming.
+const WRAP_REORDER_FRAMES: usize = 256;
+
+/// One frame for a wrap running alongside the encoder, or the request to finish.
+enum WrapMessage {
+    Frame { index: u64, data: Vec<u8> },
+    Finalize { expected_frames: u64 },
+}
+
+/// The sending end of a wrap running alongside the encoder.
+#[derive(Clone)]
+pub struct J2kFrameSender(std::sync::mpsc::SyncSender<WrapMessage>);
+
+impl J2kFrameSender {
+    /// Hand one encoded frame to the wrap, in any order. Blocks while the wrap is
+    /// behind, and errors once the wrap has stopped, which is how a failed wrap
+    /// reaches the encoder.
+    pub fn send(&self, index: u64, data: Vec<u8>) -> Result<(), String> {
+        self.0
+            .send(WrapMessage::Frame { index, data })
+            .map_err(|_| format!("the MXF wrap stopped before frame {index}"))
+    }
+}
+
+/// A J2K picture MXF written on its own thread while the encode still runs.
+///
+/// [`Self::sender`] hands out the end an encoder pushes finished codestreams
+/// into, in any order; a [`FrameReorderBuffer`] here releases them to an
+/// [`IncrementalJ2kWrap`] in index order, so no codestream is ever read back off
+/// disk. [`Self::finish`] is the only path that leaves an MXF behind: dropping
+/// this, or [`Self::abandon`], deletes the part-written file.
+pub struct OverlappedJ2kWrap {
+    sender: Option<std::sync::mpsc::SyncSender<WrapMessage>>,
+    thread: Option<std::thread::JoinHandle<Result<Option<MxfTrackFile>, String>>>,
+}
+
+impl OverlappedJ2kWrap {
+    pub fn start(options: IncrementalWrapOptions) -> Result<Self, String> {
+        let mut wrap = IncrementalJ2kWrap::new(options)?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(WRAP_QUEUE_FRAMES);
+        let thread = std::thread::spawn(move || {
+            let mut buffer = FrameReorderBuffer::new(WRAP_REORDER_FRAMES);
+            let mut expected_frames = None;
+            for message in receiver {
+                match message {
+                    WrapMessage::Frame { index, data } => {
+                        buffer.accept(index, data)?;
+                        while let Some(frame) = buffer.take_next() {
+                            wrap.write_frame(&frame)?;
+                        }
+                    }
+                    WrapMessage::Finalize { expected_frames: n } => {
+                        expected_frames = Some(n);
+                        break;
+                    }
+                }
+            }
+            // nobody asked for an MXF: the wrap drops unfinished and takes the
+            // part-written file with it
+            let Some(expected_frames) = expected_frames else {
+                return Ok(None);
+            };
+            if let Some(index) = buffer.stalled_on() {
+                return Err(format!("frame {index} never reached the wrap"));
+            }
+            if wrap.frames_written != expected_frames {
+                return Err(format!(
+                    "the wrap got {} of the {expected_frames} encoded frames",
+                    wrap.frames_written
+                ));
+            }
+            wrap.finish().map(Some)
+        });
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    pub fn sender(&self) -> J2kFrameSender {
+        J2kFrameSender(
+            self.sender
+                .clone()
+                .expect("the sender is only dropped by finish or abandon"),
+        )
+    }
+
+    /// Stop taking frames, write the footer and hash the MXF. `expected_frames`
+    /// is what the encoder says it produced: a wrap holding any other number
+    /// wrote the wrong essence, so it fails and deletes the file instead.
+    pub fn finish(mut self, expected_frames: u64) -> Result<MxfTrackFile, String> {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(WrapMessage::Finalize { expected_frames });
+        }
+        match self.join()? {
+            Some(track) => Ok(track),
+            None => Err("the MXF wrap stopped before it was asked to finish".to_string()),
+        }
+    }
+
+    /// Give up on the MXF and delete it, handing back the wrap's own error where
+    /// it had one. This is the cancel and encode-failure path: a wrap that failed
+    /// first explains more than the encoder's "the wrap stopped".
+    pub fn abandon(&mut self) -> Option<String> {
+        self.sender = None;
+        self.join().err()
+    }
+
+    fn join(&mut self) -> Result<Option<MxfTrackFile>, String> {
+        let Some(handle) = self.thread.take() else {
+            return Ok(None);
+        };
+        handle
+            .join()
+            .unwrap_or_else(|_| Err("the MXF wrap thread panicked".to_string()))
+    }
+}
+
+impl Drop for OverlappedJ2kWrap {
+    fn drop(&mut self) {
+        self.sender = None;
+        let _ = self.join();
     }
 }
 
@@ -1536,6 +1863,244 @@ mod tests {
 
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn the_reorder_buffer_holds_a_frame_until_the_ones_before_it_arrive() {
+        let mut buffer = FrameReorderBuffer::new(8);
+
+        buffer.accept(2, vec![2]).unwrap();
+        buffer.accept(1, vec![1]).unwrap();
+        assert!(
+            buffer.take_next().is_none(),
+            "frame 0 has not arrived, so nothing can be written yet"
+        );
+        assert_eq!(buffer.stalled_on(), Some(0));
+
+        buffer.accept(0, vec![0]).unwrap();
+        let released: Vec<Vec<u8>> = std::iter::from_fn(|| buffer.take_next()).collect();
+        assert_eq!(
+            released,
+            vec![vec![0], vec![1], vec![2]],
+            "the whole contiguous run should come out in index order"
+        );
+        assert_eq!(buffer.stalled_on(), None, "nothing is held any more");
+    }
+
+    /// A frame that never arrives is how an encode that failed mid-way looks from
+    /// the wrap's side, and the essence would be short if the wrap wrote what it
+    /// had. It has to be caught by the frames piling up behind the gap.
+    #[test]
+    fn the_reorder_buffer_refuses_more_frames_than_it_can_hold_behind_a_gap() {
+        let mut buffer = FrameReorderBuffer::new(3);
+        for index in 1..=3 {
+            buffer.accept(index, vec![index as u8]).unwrap();
+        }
+        let error = buffer
+            .accept(4, vec![4])
+            .expect_err("frame 0 is never coming");
+        assert!(error.contains("waiting for frame 0"), "{error}");
+        assert_eq!(buffer.stalled_on(), Some(0));
+    }
+
+    #[test]
+    fn the_reorder_buffer_refuses_a_frame_it_cannot_place() {
+        let mut buffer = FrameReorderBuffer::new(8);
+        buffer.accept(0, vec![0]).unwrap();
+        let error = buffer
+            .accept(0, vec![0])
+            .expect_err("frame 0 arrived twice");
+        assert!(error.contains("twice"), "{error}");
+
+        buffer.take_next().expect("frame 0");
+        let error = buffer
+            .accept(0, vec![0])
+            .expect_err("frame 0 is already in the essence");
+        assert!(error.contains("moved past it"), "{error}");
+    }
+
+    /// One codestream per frame, each carrying its index, so a wrap that reorders
+    /// or drops a frame cannot pass.
+    fn indexed_frames(count: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|index| {
+                let mut frame = synthetic_j2k();
+                frame.extend_from_slice(format!("FRAME{index:04}").as_bytes());
+                frame
+            })
+            .collect()
+    }
+
+    /// Read every frame of a J2K MXF back through asdcplib, decrypting under
+    /// `key` when the essence is encrypted.
+    fn read_j2k_essence(path: &std::path::Path, key: Option<[u8; 16]>) -> Vec<Vec<u8>> {
+        let mut reader = asdcplib::jp2k::MxfReader::new();
+        reader.open_read(&path.to_string_lossy()).unwrap();
+        let frames = reader.picture_descriptor().unwrap().container_duration;
+        let mut contexts = key.map(|k| read_contexts(&k));
+        (0..frames)
+            .map(|index| {
+                let mut buf = vec![0u8; 1 << 20];
+                let (dec, hmac) = match contexts.as_mut() {
+                    Some((dec, hmac)) => (Some(dec), Some(hmac)),
+                    None => (None, None),
+                };
+                let read = reader.read_frame(index, &mut buf, dec, hmac).unwrap();
+                buf.truncate(read);
+                buf
+            })
+            .collect()
+    }
+
+    fn overlapped_opts(output: std::path::PathBuf) -> IncrementalWrapOptions {
+        IncrementalWrapOptions {
+            output,
+            standard: MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            encryption: None,
+            hdr: None,
+            asset_uuid: None,
+        }
+    }
+
+    /// The overlapped wrap has to produce the essence the batch wrap does, even
+    /// when the encoder finishes the frames out of order, or the two paths make
+    /// different DCPs.
+    #[test]
+    fn an_overlapped_wrap_writes_the_same_essence_as_a_batch_wrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let frames = indexed_frames(5);
+
+        let batch_inputs: Vec<std::path::PathBuf> = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                let path = dir.path().join(format!("frame_{index:08}.j2c"));
+                std::fs::write(&path, frame).unwrap();
+                path
+            })
+            .collect();
+        let batch_out = dir.path().join("batch.mxf");
+        let batch = mxf_wrap(&wrap_opts(
+            EssenceType::J2k,
+            batch_inputs,
+            batch_out.clone(),
+            None,
+        ));
+        assert!(batch.success, "batch wrap failed: {}", batch.error);
+
+        let overlapped_out = dir.path().join("overlapped.mxf");
+        let wrap = OverlappedJ2kWrap::start(overlapped_opts(overlapped_out.clone())).unwrap();
+        let sender = wrap.sender();
+        // the encoder hands frames over as they finish, not in order
+        for index in [3usize, 1, 0, 4, 2] {
+            sender.send(index as u64, frames[index].clone()).unwrap();
+        }
+        drop(sender);
+        let track = wrap.finish(frames.len() as u64).expect("overlapped wrap");
+
+        assert_eq!(track.duration, frames.len() as u64);
+        assert_eq!(
+            read_j2k_essence(&overlapped_out, None),
+            frames,
+            "the overlapped wrap should carry every frame in index order"
+        );
+        assert_eq!(
+            read_j2k_essence(&overlapped_out, None),
+            read_j2k_essence(&batch_out, None),
+            "the two wraps should differ only in their ids and timestamps"
+        );
+    }
+
+    /// Encryption is per frame, so it has to survive being fed one frame at a
+    /// time: the essence must come back under the caller's key and must not be
+    /// findable in the file.
+    #[test]
+    fn an_overlapped_encrypted_wrap_reads_back_under_the_caller_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let frames = indexed_frames(3);
+        let output = dir.path().join("enc.mxf");
+        let key = [0x11u8; 16];
+
+        let wrap = OverlappedJ2kWrap::start(IncrementalWrapOptions {
+            encryption: Some(MxfEncryption {
+                content_key: key,
+                key_id: [0x22; 16],
+            }),
+            ..overlapped_opts(output.clone())
+        })
+        .unwrap();
+        let sender = wrap.sender();
+        for index in [2usize, 0, 1] {
+            sender.send(index as u64, frames[index].clone()).unwrap();
+        }
+        drop(sender);
+        wrap.finish(frames.len() as u64).expect("encrypted wrap");
+
+        assert_eq!(
+            read_j2k_essence(&output, Some(key)),
+            frames,
+            "every frame should decrypt to the codestream that went in"
+        );
+        assert!(
+            !contains(&std::fs::read(&output).unwrap(), PLAINTEXT_TAG),
+            "essence tag survived into the encrypted MXF: essence was not encrypted"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_overlapped_wrap_leaves_no_mxf() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("cancelled.mxf");
+        let frames = indexed_frames(2);
+
+        let mut wrap = OverlappedJ2kWrap::start(overlapped_opts(output.clone())).unwrap();
+        let sender = wrap.sender();
+        sender.send(0, frames[0].clone()).unwrap();
+        // the file has to exist before the abandon, or its deletion proves nothing
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !output.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(output.exists(), "the wrap never opened the MXF");
+        drop(sender);
+        assert_eq!(wrap.abandon(), None, "abandoning is not itself an error");
+        assert!(
+            !output.exists(),
+            "an MXF with no footer cannot be read, so it must not be left behind"
+        );
+    }
+
+    /// The wrap counts the frames it wrote; the encoder counts the frames it
+    /// encoded. An MXF is only worth keeping when the two agree.
+    #[test]
+    fn an_overlapped_wrap_refuses_to_finish_short_of_the_encoded_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("short.mxf");
+        let frames = indexed_frames(2);
+
+        let wrap = OverlappedJ2kWrap::start(overlapped_opts(output.clone())).unwrap();
+        let sender = wrap.sender();
+        sender.send(0, frames[0].clone()).unwrap();
+        drop(sender);
+        let error = wrap.finish(2).expect_err("only one frame reached the wrap");
+        assert!(error.contains("1 of the 2 encoded frames"), "{error}");
+        assert!(!output.exists(), "the short MXF must be deleted");
+    }
+
+    #[test]
+    fn an_overlapped_wrap_refuses_a_codestream_the_standard_cannot_carry() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bad.mxf");
+
+        let wrap = OverlappedJ2kWrap::start(overlapped_opts(output.clone())).unwrap();
+        let sender = wrap.sender();
+        sender.send(0, synthetic_j2k_with_profile(0)).unwrap();
+        drop(sender);
+        let error = wrap.finish(1).expect_err("profile 0 is not DCI");
+        assert!(error.contains("not a DCI JPEG 2000 profile"), "{error}");
+        assert!(!output.exists());
     }
 
     #[test]
