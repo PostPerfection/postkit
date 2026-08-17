@@ -147,8 +147,9 @@ asdcplib writes as the ResourceID of the timed-text resource. ST 429-5 wants
 that to be the id the document declares, and wants the track file, the document
 and the resource to be three different things, so libdcp and dcpdoctor both
 report the file id as reused. The wrap now reads the id out of the XML (DCST
-`<Id>`, Interop `SubtitleID` as an element or a root attribute) and refuses a
-document that declares none.
+`<Id>`, Interop `SubtitleID` as an element or a root attribute) and refuses an
+AS-DCP document that declares none. An AS-02 (IMF) wrap keeps the file id there
+when the TTML declares no id, since IMSC has no such element.
 
 ### Subtitle MXFs written before this release hid their fonts and images
 

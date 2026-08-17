@@ -883,14 +883,20 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
         }
     };
 
-    let Some(document_id) = timed_text_document_id(&xml_data) else {
-        return MxfTrackFile {
-            error: format!(
-                "timed text {} declares no document id: ST 429-5 makes the DCST <Id> (Interop SubtitleID) the MXF ResourceID",
-                opts.input_files[0].display()
-            ),
-            ..Default::default()
-        };
+    // ST 429-5 makes the DCST document id the ResourceID; IMSC carries no such
+    // id, so an AS-02 wrap without one keeps the track file id there as before
+    let document_id = match (timed_text_document_id(&xml_data), opts.standard) {
+        (Some(id), _) => Some(id),
+        (None, MxfStandard::As02) => None,
+        (None, MxfStandard::AsDcp) => {
+            return MxfTrackFile {
+                error: format!(
+                    "timed text {} declares no document id: ST 429-5 makes the DCST <Id> (Interop SubtitleID) the MXF ResourceID",
+                    opts.input_files[0].display()
+                ),
+                ..Default::default()
+            };
+        }
     };
 
     let fps = opts.fps_num as f64 / opts.fps_den.max(1) as f64;
@@ -950,7 +956,7 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
     let desc = asdcplib::timed_text::TimedTextDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         container_duration: duration_frames,
-        asset_id: document_id,
+        asset_id: document_id.unwrap_or(info.asset_uuid),
     };
 
     let declared: Vec<_> = resources

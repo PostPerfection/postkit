@@ -244,6 +244,45 @@ fn as02_timed_text_encrypts_the_subtitle_xml() {
     std::fs::remove_file(&output).ok();
 }
 
+/// IMSC has no document id element, so an AS-02 wrap of a TTML without one keeps
+/// the track file id as the ResourceID instead of refusing the way ST 429-5 asks
+/// for a DCST.
+#[test]
+fn as02_timed_text_without_a_document_id_wraps() {
+    const TTML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="en">
+  <body><div><p begin="00:00:01.000" end="00:00:02.000">Hello</p></div></body>
+</tt>"#;
+    let input = temp_path("imsc.ttml");
+    std::fs::write(&input, TTML).unwrap();
+    let output = temp_path("imsc.mxf");
+    let asset_uuid = [0x53; 16];
+    let result = mxf_wrap(&MxfWrapOptions {
+        input_files: vec![input.clone()],
+        output: output.clone(),
+        essence_type: EssenceType::TimedText,
+        standard: MxfStandard::As02,
+        fps_num: 24,
+        fps_den: 1,
+        partition_size: 1,
+        encryption: None,
+        mca_config: None,
+        resource_ids: vec![],
+        hdr: None,
+        asset_uuid: Some(asset_uuid),
+        timed_text_duration_frames: None,
+    });
+    assert!(result.success, "wrap failed: {}", result.error);
+
+    let mut reader = asdcplib::as02::timed_text::MxfReader::new();
+    reader.open_read(&output.to_string_lossy()).unwrap();
+    let descriptor = reader.descriptor().unwrap();
+    assert_eq!(descriptor.asset_id, asset_uuid);
+
+    std::fs::remove_file(&input).ok();
+    std::fs::remove_file(&output).ok();
+}
+
 /// asdcplib has no AS-02 entry point that declares ancillary resources in the
 /// header, and an undeclared resource is one no reader can find. Refusing beats
 /// embedding a font the player will never see.
