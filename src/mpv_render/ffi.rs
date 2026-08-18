@@ -21,6 +21,7 @@ pub const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
 pub const MPV_RENDER_PARAM_X11_DISPLAY: c_int = 8;
 pub const MPV_RENDER_PARAM_WL_DISPLAY: c_int = 9;
 pub const MPV_RENDER_PARAM_ADVANCED_CONTROL: c_int = 10;
+pub const MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME: c_int = 12;
 pub const MPV_RENDER_PARAM_SW_SIZE: c_int = 17;
 pub const MPV_RENDER_PARAM_SW_FORMAT: c_int = 18;
 pub const MPV_RENDER_PARAM_SW_STRIDE: c_int = 19;

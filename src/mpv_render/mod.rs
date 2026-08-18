@@ -42,7 +42,14 @@ const COMMON_OPTIONS: &[(&str, &str)] = &[
 /// decode rather than failing when VAAPI is unusable. Direct rendering is off
 /// because it freezes playback for good against advanced control: the decoder's
 /// buffers come from the render thread, which is waiting on the core.
-const OPENGL_OPTIONS: &[(&str, &str)] = &[("hwdec", "auto-safe"), ("vd-lavc-dr", "no")];
+/// `video-timing-offset` is zero because the render call is told not to wait
+/// for each frame's display time; mpv times frames for immediate display
+/// instead, and the app's own vsync paces the presentation.
+const OPENGL_OPTIONS: &[(&str, &str)] = &[
+    ("hwdec", "auto-safe"),
+    ("vd-lavc-dr", "no"),
+    ("video-timing-offset", "0"),
+];
 
 /// The software renderer has no GPU to hand frames to, and a test machine may
 /// have no sound device at all.
@@ -289,6 +296,10 @@ impl MpvRenderPlayer {
             internal_format: 0,
         };
         let mut flip: c_int = if flip_y { 1 } else { 0 };
+        // never wait for the frame's display time: this runs on the app's main
+        // thread, and the default wait parks it for most of each frame period,
+        // starving everything else the app runs there
+        let mut block_for_target_time: c_int = 0;
         let mut params = [
             ffi::mpv_render_param {
                 param_type: ffi::MPV_RENDER_PARAM_OPENGL_FBO,
@@ -297,6 +308,10 @@ impl MpvRenderPlayer {
             ffi::mpv_render_param {
                 param_type: ffi::MPV_RENDER_PARAM_FLIP_Y,
                 data: &mut flip as *mut _ as *mut c_void,
+            },
+            ffi::mpv_render_param {
+                param_type: ffi::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
+                data: &mut block_for_target_time as *mut _ as *mut c_void,
             },
             ffi::mpv_render_param {
                 param_type: ffi::MPV_RENDER_PARAM_INVALID,

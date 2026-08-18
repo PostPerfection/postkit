@@ -204,6 +204,14 @@
 
 ### Fixed
 
+- `MpvRenderPlayer::render_opengl` no longer waits for each frame's display
+  time. mpv's render call blocks until the frame is due, by default with 50ms
+  of `video-timing-offset` headroom, and the app renders on its main thread, so
+  playing video parked that thread for most of every frame period and the whole
+  UI starved until playback paused. The render returns immediately now and
+  `video-timing-offset` is zero, so mpv times frames for immediate display and
+  the app's own vsync paces the presentation.
+
 - The in-process encoder's work queue is FIFO. It was a stack, so while the
   decoder kept it full the frame at the bottom was never picked up until the
   decode ended. The sequential wrap never noticed, codestream files are named by
