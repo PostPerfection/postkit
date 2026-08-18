@@ -1,5 +1,19 @@
 # Planned
 
+- Verify the non-blocking render live (2026-08-17). `render_opengl` now passes
+  `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0` with `video-timing-offset` 0,
+  because the default wait parked the app's main thread for most of each frame
+  period and the whole wizard UI starved during playback (frozen play icon,
+  playhead and timecode until paused). Headless GL probes pass; what remains is
+  a hand pass in a wizard: transport controls track live during playback, A/V
+  sync and smoothness are unchanged.
+
+- Extract the wizards' job-queue IPC into postkit (2026-08-17, proposed, not
+  accepted). Both wizards carry a near-identical in-memory job queue and
+  progress-event plumbing in their src-tauri glue. Same consolidation shape as
+  the tms move: the queue and its event types default into postkit, the wizards
+  keep the tauri command registrations.
+
 - Embedded playback via the libmpv render API, for both wizard GUIs. Landed,
   manual verification remaining. Native Wayland has no foreign-window reparenting, so the spawned
   mpv preview can never sit inside the tauri window: mpv --wid is X11/Windows
