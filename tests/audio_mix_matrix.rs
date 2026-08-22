@@ -206,9 +206,14 @@ fn a_shorter_input_is_padded_with_silence() {
     assert_eq!(report.frames, 10);
 
     let (_, mixed) = read_ints(&output);
-    let second_channel: Vec<i32> = mixed.chunks_exact(2).map(|frame| frame[1]).collect();
+    let second_channel: Vec<i32> = mixed
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|frame| frame[1])
+        .collect();
     assert_eq!(second_channel, vec![9, 9, 9, 9, 0, 0, 0, 0, 0, 0]);
-    assert!(mixed.chunks_exact(2).all(|frame| frame[0] == 7));
+    assert!(mixed.as_chunks::<2>().0.iter().all(|frame| frame[0] == 7));
 }
 
 #[test]

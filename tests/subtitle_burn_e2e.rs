@@ -159,8 +159,10 @@ fn decode_frame(grk_decompress: &Path, codestream: &Path, out: &Path) -> Vec<u16
     }
     at += 1;
     bytes[at..]
-        .chunks_exact(2)
-        .map(|s| u16::from_be_bytes([s[0], s[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|s| u16::from_be_bytes(*s))
         .collect()
 }
 
@@ -386,8 +388,8 @@ fn text_burn(start_ms: u64, end_ms: u64, style: BurnStyle) -> Option<SubtitleBur
 /// Burn one frame over the flat background and return its 16-bit samples.
 fn burnt_frame(burn: &SubtitleBurn, frame_index: u64) -> Vec<u16> {
     let mut frame = vec![0u8; (TEXT_WIDTH * TEXT_HEIGHT * 6) as usize];
-    for sample in frame.chunks_exact_mut(2) {
-        sample.copy_from_slice(&BACKGROUND.to_be_bytes());
+    for sample in frame.as_chunks_mut::<2>().0 {
+        *sample = BACKGROUND.to_be_bytes();
     }
     burn.burn_rgb48(
         &mut frame,
@@ -398,8 +400,10 @@ fn burnt_frame(burn: &SubtitleBurn, frame_index: u64) -> Vec<u16> {
     )
     .expect("burn");
     frame
-        .chunks_exact(2)
-        .map(|s| u16::from_be_bytes([s[0], s[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|s| u16::from_be_bytes(*s))
         .collect()
 }
 

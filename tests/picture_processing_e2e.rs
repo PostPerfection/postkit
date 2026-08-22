@@ -165,8 +165,10 @@ fn decode_frame(grk_decompress: &Path, codestream: &Path, out: &Path) -> Decoded
         height: fields[2].parse().expect("ppm height"),
         full_scale: fields[3].parse().expect("ppm maxval"),
         samples: bytes[at..]
-            .chunks_exact(2)
-            .map(|s| u16::from_be_bytes([s[0], s[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|s| u16::from_be_bytes(*s))
             .collect(),
     }
 }

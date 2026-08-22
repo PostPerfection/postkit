@@ -103,7 +103,7 @@ fn convolve(ir: &[f32], x: &[f32]) -> Vec<f32> {
 fn split_stereo(x: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let mut l = Vec::with_capacity(x.len() / 2);
     let mut r = Vec::with_capacity(x.len() / 2);
-    for f in x.chunks_exact(2) {
+    for f in x.as_chunks::<2>().0 {
         l.push(f[0]);
         r.push(f[1]);
     }
@@ -217,7 +217,7 @@ mod tests {
 
     // per-channel samples of a 6-channel interleaved buffer.
     fn channel(buf: &[f32], ch: usize) -> Vec<f32> {
-        buf.chunks_exact(6).map(|f| f[ch]).collect()
+        buf.as_chunks::<6>().0.iter().map(|f| f[ch]).collect()
     }
 
     fn rms(x: &[f32]) -> f32 {

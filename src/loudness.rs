@@ -262,8 +262,8 @@ pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
         };
         carry.extend_from_slice(&byte_buf[..n]);
         let whole = carry.len() / 4 * 4;
-        for chunk in carry[..whole].chunks_exact(4) {
-            block.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for chunk in carry[..whole].as_chunks::<4>().0 {
+            block.push(f32::from_le_bytes(*chunk));
             if block.len() == LEQ_BLOCK {
                 total_energy += weighted_block_energy(fft.as_ref(), &block, SR);
                 total_samples += block.len() as u64;

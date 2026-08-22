@@ -1114,7 +1114,7 @@ fn scale_alpha(bitmap: &mut PositionedBitmap, alpha: u8) {
     if alpha == u8::MAX {
         return;
     }
-    for pixel in bitmap.pixels.chunks_exact_mut(4) {
+    for pixel in bitmap.pixels.as_chunks_mut::<4>().0 {
         pixel[3] = ((pixel[3] as u32 * alpha as u32 + 127) / 255) as u8;
     }
 }
@@ -1200,14 +1200,18 @@ fn decode_png_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), SubtitleError> {
     let rgba = match (info.color_type, info.bit_depth) {
         (png::ColorType::Rgba, png::BitDepth::Eight) => buffer,
         (png::ColorType::Rgba, png::BitDepth::Sixteen) => {
-            buffer.chunks_exact(2).map(|s| s[0]).collect()
+            buffer.as_chunks::<2>().0.iter().map(|s| s[0]).collect()
         }
         (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => buffer
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|s| [s[0], s[0], s[0], s[1]])
             .collect(),
         (png::ColorType::GrayscaleAlpha, png::BitDepth::Sixteen) => buffer
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|s| [s[0], s[0], s[0], s[2]])
             .collect(),
         (colour, depth) => {
@@ -1324,7 +1328,13 @@ mod tests {
 
     /// Total alpha in a bitmap, which is nonzero exactly when something drew.
     fn coverage(bitmap: &PositionedBitmap) -> u64 {
-        bitmap.pixels.chunks_exact(4).map(|p| p[3] as u64).sum()
+        bitmap
+            .pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[3] as u64)
+            .sum()
     }
 
     const WIDTH: u32 = 512;
@@ -1475,9 +1485,11 @@ mod tests {
             .unwrap();
         let opaque: Vec<[u8; 4]> = out[0]
             .pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] > 200)
-            .map(|p| [p[0], p[1], p[2], p[3]])
+            .copied()
             .collect();
         assert!(!opaque.is_empty(), "no solid text pixels to check");
         assert!(
@@ -1777,7 +1789,9 @@ mod tests {
             );
             let solid_green = out[0]
                 .pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|p| p[3] > 200 && p[1] > 200 && p[0] < 60 && p[2] < 60)
                 .count();
             assert!(solid_green > 0, "{effect:?} drew no effect-colour pixels");

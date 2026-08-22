@@ -259,7 +259,12 @@ impl DcdmTransform {
 
     /// Convert one rgb48le frame into `out`, three code values per pixel.
     pub fn frame_rgb48le(&self, rgb: &[u8], max_code: u16, out: &mut [u16]) {
-        for (px, xyz) in rgb.chunks_exact(6).zip(out.chunks_exact_mut(3)) {
+        for (px, xyz) in rgb
+            .as_chunks::<6>()
+            .0
+            .iter()
+            .zip(out.as_chunks_mut::<3>().0)
+        {
             let codes = self.pixel(
                 [
                     u16::from_le_bytes([px[0], px[1]]),
@@ -275,7 +280,7 @@ impl DcdmTransform {
     /// Convert one rgb48be frame in place, to 16-bit code values in the same
     /// layout. This is ffmpeg's rawvideo format and what the J2K encoder reads.
     pub fn frame_rgb48be_inplace(&self, buf: &mut [u8]) {
-        for px in buf.chunks_exact_mut(6) {
+        for px in buf.as_chunks_mut::<6>().0 {
             let codes = self.pixel(
                 [
                     u16::from_be_bytes([px[0], px[1]]),
@@ -457,7 +462,7 @@ impl XyzToSrgb {
     pub fn frame_xyz12le_to_srgb8(&self, raw: &[u8], out: &mut Vec<u8>) {
         out.clear();
         out.reserve(raw.len() / 2);
-        for px in raw.chunks_exact(6) {
+        for px in raw.as_chunks::<6>().0 {
             let x = u16::from_le_bytes([px[0], px[1]]) >> 4;
             let y = u16::from_le_bytes([px[2], px[3]]) >> 4;
             let z = u16::from_le_bytes([px[4], px[5]]) >> 4;
@@ -529,7 +534,7 @@ mod icc {
         pub fn frame_xyz12le_to_rgb8(&self, raw: &[u8], out: &mut Vec<u8>) {
             let n = raw.len() / 6;
             let mut pcs: Vec<[f32; 3]> = Vec::with_capacity(n);
-            for px in raw.chunks_exact(6) {
+            for px in raw.as_chunks::<6>().0 {
                 let x = (u16::from_le_bytes([px[0], px[1]]) >> 4).min(4095) as usize;
                 let y = (u16::from_le_bytes([px[2], px[3]]) >> 4).min(4095) as usize;
                 let z = (u16::from_le_bytes([px[4], px[5]]) >> 4).min(4095) as usize;
