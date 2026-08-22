@@ -64,7 +64,7 @@ jobs:
         if: runner.os != 'Windows'
         uses: PostPerfection/setup-grok@v1
         with:
-          grok-ref: v20.3.10
+          grok-ref: v20.3.12
 
       # grok-ffi links libgrokj2k (built above); skipped on windows where the
       # source build is not wired up.
