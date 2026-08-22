@@ -446,6 +446,8 @@ fn run_encode_and_maybe_wrap(
                 let result = encode_parallel(
                     &input_dir,
                     &j2k_dir,
+                    compression_ratio,
+                    options.codestream_byte_cap,
                     cancel,
                     pause,
                     |p: ParallelProgress| {

@@ -204,6 +204,13 @@
 
 ### Fixed
 
+- `encode_parallel` honours the job's compression ratio instead of a hardcoded
+  10:1, so a plain still-sequence encode follows the bitrate setting like every
+  other input, and it holds each finished frame to the `codestream_byte_cap` so
+  an over-cap still fails at that frame rather than at the post-encode sweep.
+  At 10:1 a 4K still sequence encoded near 760 Mb/s and every frame failed the
+  cap at the end of the run.
+
 - A `codestream_byte_cap` stops the encode at the first frame over it. The cap
   was a sweep of the finished J2K directory, so a bitrate set too high encoded
   every frame before the run failed: a 1443-frame job learned at the end that

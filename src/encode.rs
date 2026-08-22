@@ -1109,10 +1109,13 @@ pub struct ParallelProgress {
 ///
 /// Spawns up to `parallelism` grk_compress processes concurrently, each
 /// processing one frame with `-H 1` (single thread). Returns when all
-/// frames are encoded or an error occurs.
+/// frames are encoded or an error occurs. Each finished frame is held to
+/// `codestream_byte_cap` so a run fails at the frame that breaks it.
 pub fn encode_parallel<F>(
     input_dir: &Path,
     output_dir: &Path,
+    compression_ratio: f64,
+    codestream_byte_cap: Option<u64>,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     mut on_progress: F,
@@ -1217,7 +1220,7 @@ where
                                 &out_file.to_string_lossy(),
                                 "--xyz",
                                 "-r",
-                                "10",
+                                &format!("{compression_ratio}"),
                                 "-n",
                                 "6",
                                 "-b",
@@ -1234,6 +1237,16 @@ where
 
                         match result {
                             Ok(status) if status.success() => {
+                                if let Some(cap) = codestream_byte_cap
+                                    && let Err(e) = check_codestream_size(&out_file, cap)
+                                {
+                                    error_flag.store(true, Ordering::Relaxed);
+                                    let mut err = first_error.lock().unwrap();
+                                    if err.is_empty() {
+                                        *err = e;
+                                    }
+                                    continue;
+                                }
                                 done_count.fetch_add(1, Ordering::Relaxed);
                             }
                             Ok(status) => {
@@ -1322,6 +1335,75 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_noise_png(path: &Path, seed: u32) {
+        let (w, h) = (128u32, 128u32);
+        let mut state = seed;
+        let data: Vec<u8> = (0..(w * h * 3))
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect();
+        let file = std::fs::File::create(path).unwrap();
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&data)
+            .unwrap();
+    }
+
+    #[test]
+    fn parallel_encode_honours_the_ratio_and_the_cap() {
+        if crate::grok::find_grk_compress().is_none() {
+            eprintln!("skipping: grk_compress not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in");
+        std::fs::create_dir(&input).unwrap();
+        for i in 0..2u32 {
+            write_noise_png(&input.join(format!("frame_{i:03}.png")), 7 + i);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let sizes = |out: &Path| -> Vec<u64> {
+            let mut v: Vec<u64> = std::fs::read_dir(out)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.metadata().unwrap().len())
+                .collect();
+            v.sort();
+            v
+        };
+
+        let loose_dir = dir.path().join("r10");
+        let result = encode_parallel(&input, &loose_dir, 10.0, None, &cancel, &pause, |_| {});
+        assert!(result.success, "{}", result.error);
+        let tight_dir = dir.path().join("r40");
+        let result = encode_parallel(&input, &tight_dir, 40.0, None, &cancel, &pause, |_| {});
+        assert!(result.success, "{}", result.error);
+        let loose = sizes(&loose_dir);
+        let tight = sizes(&tight_dir);
+        assert_eq!(loose.len(), 2);
+        assert_eq!(tight.len(), 2);
+        assert!(
+            tight[1] < loose[0],
+            "noise at 40:1 must be smaller than at 10:1, got {tight:?} vs {loose:?}"
+        );
+
+        let capped_dir = dir.path().join("capped");
+        let result = encode_parallel(&input, &capped_dir, 10.0, Some(64), &cancel, &pause, |_| {});
+        assert!(!result.success, "a 64 byte cap cannot hold a codestream");
+        assert!(
+            result.error.contains("per-frame cap"),
+            "got: {}",
+            result.error
+        );
+    }
 
     #[test]
     fn a_fractional_rate_keeps_its_fraction_and_a_whole_one_prints_bare() {
