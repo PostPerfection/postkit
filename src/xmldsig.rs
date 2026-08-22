@@ -7,10 +7,12 @@
 //! accepts on a DCP. The KDM signer in `certificate.rs` builds its document body
 //! then calls `sign_enveloped`, so there is no second signer.
 //!
-//! Verification reads the declared DigestMethod (per Reference) and
-//! SignatureMethod (in SignedInfo) and dispatches on them, so it also accepts
-//! real SHA-1/rsa-sha1 DCPs (Interop and older SMPTE tools), not only the
-//! SHA-256 we sign with. An unsupported algorithm is a hard error.
+//! Verification reads the declared DigestMethod and canonicalization (per
+//! Reference) and SignatureMethod and CanonicalizationMethod (in SignedInfo) and
+//! dispatches on them, so it also accepts real SHA-1/rsa-sha1 DCPs (Interop and
+//! older SMPTE tools) and the plain comment-free c14n every other DCP tool
+//! declares, not only what we sign with. An unsupported algorithm is a hard
+//! error.
 //!
 //! Digests and SignedInfo are canonicalized by extracting the target element's
 //! subtree from the document and injecting the namespaces in scope at that
@@ -29,8 +31,22 @@ use quick_xml::reader::Reader;
 
 /// XML-DSig namespace.
 pub(crate) const DSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
-/// Inclusive Canonical XML 1.0, WithComments.
-pub(crate) const C14N_METHOD: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
+/// Inclusive Canonical XML 1.0. Comments are not part of this canonical form.
+pub(crate) const C14N_PLAIN: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
+/// Inclusive Canonical XML 1.0 keeping comments.
+pub(crate) const C14N_WITH_COMMENTS: &str =
+    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
+/// What the signer declares in ds:CanonicalizationMethod and canonicalizes
+/// SignedInfo and whole-document references with. WithComments is the stricter
+/// of the two: a comment added to a signed document breaks the digest.
+pub(crate) const C14N_METHOD: &str = C14N_WITH_COMMENTS;
+/// The comment mode `C14N_METHOD` means. `signer_declares_the_canonicalization_it_uses`
+/// is what keeps the two from drifting apart.
+const SIGNER_C14N_COMMENTS: Comments = Comments::Keep;
+/// A ds:Reference declaring no c14n transform is canonicalized without comments:
+/// that is the node-set serialization XML-DSig defaults to, and what xmlsec1
+/// computes. The by-Id signer declares no Transforms, so it digests under this.
+const REFERENCE_DEFAULT_COMMENTS: Comments = Comments::Omit;
 /// Enveloped-signature transform: digest the document with ds:Signature removed.
 pub(crate) const ENVELOPED_TRANSFORM: &str =
     "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
@@ -96,11 +112,13 @@ fn sign_enveloped_with(
     }
 
     // One ds:Reference per referenced element, digested over its canonical form.
+    // These references declare no Transforms, so the canonical form is the
+    // default one a verifier computes for them, comments omitted.
     let mut references = String::new();
     for id in reference_ids {
         let fragment = find_element_fragment(xml, &|e| element_has_id(e, id_attr, id))?
             .ok_or_else(|| format!("no element with {id_attr}=\"{id}\" to sign"))?;
-        let digest = b64(&digest_alg.digest(&c14n(&fragment)?));
+        let digest = b64(&digest_alg.digest(&c14n(&fragment, REFERENCE_DEFAULT_COMMENTS)?));
         references.push_str(&format!(
             r##"
       <ds:Reference URI="#{id}">
@@ -183,7 +201,7 @@ fn sign_document_enveloped_with(
     // declaration and whitespace outside the root, so this is c14n of the root.
     let root_fragment =
         find_element_fragment(xml, &|_| Ok(true))?.ok_or("document has no root element to sign")?;
-    let digest = b64(&digest_alg.digest(&c14n(&root_fragment)?));
+    let digest = b64(&digest_alg.digest(&c14n(&root_fragment, SIGNER_C14N_COMMENTS)?));
 
     let references = format!(
         r##"
@@ -270,7 +288,7 @@ fn build_signature_element(
     }
     let signed_info_fragment =
         format!("<ds:SignedInfo{ns_decls}>{signed_info_inner}</ds:SignedInfo>");
-    let signed_info_c14n = c14n(&signed_info_fragment)?;
+    let signed_info_c14n = c14n(&signed_info_fragment, SIGNER_C14N_COMMENTS)?;
     let signature_bytes = sig_alg
         .sign(&private_key, &signed_info_c14n)
         .map_err(|e| format!("RSA signing of SignedInfo failed: {e}"))?;
@@ -320,23 +338,25 @@ pub fn verify_enveloped(
     id_attr: &str,
     trusted_cert: Option<&Path>,
 ) -> Result<(), String> {
-    let signed_info_fragment =
-        find_element_fragment(xml, &|e| Ok(e.local_name().as_ref() == b"SignedInfo"))?
-            .ok_or("document has no ds:SignedInfo")?;
-    let signed_info_c14n = c14n(&signed_info_fragment)?;
-
     let parsed = parse_signature(xml)?;
     if parsed.references.is_empty() {
         return Err("signature has no ds:Reference".into());
     }
 
-    // Every referenced element must digest, under its declared DigestMethod, to
-    // the value in its Reference.
+    let signed_info_fragment =
+        find_element_fragment(xml, &|e| Ok(e.local_name().as_ref() == b"SignedInfo"))?
+            .ok_or("document has no ds:SignedInfo")?;
+    let signed_info_c14n = c14n(&signed_info_fragment, parsed.signed_info_comments)?;
+
+    // Every referenced element must digest, under its declared DigestMethod and
+    // canonicalization, to the value in its Reference.
     for reference in &parsed.references {
         let id = &reference.id;
         let fragment = find_element_fragment(xml, &|e| element_has_id(e, id_attr, id))?
             .ok_or_else(|| format!("reference #{id} resolves to no element"))?;
-        let actual = b64(&reference.digest_alg.digest(&c14n(&fragment)?));
+        let actual = b64(&reference
+            .digest_alg
+            .digest(&c14n(&fragment, reference.comments)?));
         if actual != reference.digest_b64 {
             return Err(format!("digest mismatch for reference #{id}"));
         }
@@ -350,15 +370,15 @@ pub fn verify_enveloped(
 /// document digest over the remaining canonical document, then check the RSA
 /// signature over SignedInfo. Needs no `--id-attr` hints, unlike the by-Id mode.
 pub fn verify_document_enveloped(xml: &str, trusted_cert: Option<&Path>) -> Result<(), String> {
-    let signed_info_fragment =
-        find_element_fragment(xml, &|e| Ok(e.local_name().as_ref() == b"SignedInfo"))?
-            .ok_or("document has no ds:SignedInfo")?;
-    let signed_info_c14n = c14n(&signed_info_fragment)?;
-
     let parsed = parse_signature(xml)?;
     if parsed.references.is_empty() {
         return Err("signature has no ds:Reference".into());
     }
+
+    let signed_info_fragment =
+        find_element_fragment(xml, &|e| Ok(e.local_name().as_ref() == b"SignedInfo"))?
+            .ok_or("document has no ds:SignedInfo")?;
+    let signed_info_c14n = c14n(&signed_info_fragment, parsed.signed_info_comments)?;
 
     // Enveloped-signature transform: digest the document with ds:Signature gone.
     // It is the last child inserted with no surrounding whitespace, so removing
@@ -370,7 +390,9 @@ pub fn verify_document_enveloped(xml: &str, trusted_cert: Option<&Path>) -> Resu
     let root_fragment =
         find_element_fragment(&unsigned, &|_| Ok(true))?.ok_or("document has no root element")?;
     let reference = &parsed.references[0];
-    let actual = b64(&reference.digest_alg.digest(&c14n(&root_fragment)?));
+    let actual = b64(&reference
+        .digest_alg
+        .digest(&c14n(&root_fragment, reference.comments)?));
     if actual != reference.digest_b64 {
         return Err("digest mismatch for the enveloped document reference".into());
     }
@@ -666,6 +688,9 @@ struct ParsedReference {
     digest_b64: String,
     /// The reference's declared DigestMethod.
     digest_alg: DigestAlg,
+    /// Comment mode of the reference's c14n transform, or the default when it
+    /// declares none.
+    comments: Comments,
 }
 
 /// The pieces of a ds:Signature a verifier needs.
@@ -673,6 +698,8 @@ struct ParsedSignature {
     signature_value: Vec<u8>,
     /// The SignedInfo's declared SignatureMethod.
     signature_method: RsaSigAlg,
+    /// Comment mode of the SignedInfo's declared CanonicalizationMethod.
+    signed_info_comments: Comments,
     references: Vec<ParsedReference>,
     /// DER of the first embedded X509Certificate (the signing leaf).
     leaf_cert_der: Vec<u8>,
@@ -689,7 +716,9 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
     let mut references = Vec::new();
     let mut signature_value = None;
     let mut signature_method = None;
+    let mut signed_info_comments = None;
     let mut current_digest_alg: Option<DigestAlg> = None;
+    let mut current_comments: Option<Comments> = None;
     let mut leaf_cert = None;
 
     loop {
@@ -704,6 +733,12 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
                 b"Signature" => in_signature = true,
                 b"SignatureMethod" if in_signature => {
                     signature_method = Some(RsaSigAlg::from_uri(&read_algorithm_attr(&e)?)?);
+                }
+                // CanonicalizationMethod appears only in SignedInfo, and governs
+                // SignedInfo alone. A Reference declares its own transforms.
+                b"CanonicalizationMethod" if in_signature => {
+                    signed_info_comments =
+                        Some(Comments::from_c14n_uri(&read_algorithm_attr(&e)?)?);
                 }
                 b"Reference" if in_signature => {
                     let mut uri = None;
@@ -720,6 +755,17 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
                     }
                     current_ref = uri.map(|u| u.trim().trim_start_matches('#').to_string());
                     current_digest_alg = None;
+                    current_comments = None;
+                }
+                // The enveloped-signature transform only detaches ds:Signature;
+                // any other transform here has to be a canonicalization, and one
+                // this verifier does not implement is a hard error rather than a
+                // digest computed over the wrong bytes.
+                b"Transform" if in_signature && current_ref.is_some() => {
+                    let algorithm = read_algorithm_attr(&e)?;
+                    if algorithm.trim() != ENVELOPED_TRANSFORM {
+                        current_comments = Some(Comments::from_c14n_uri(&algorithm)?);
+                    }
                 }
                 b"DigestMethod" if in_signature => {
                     current_digest_alg = Some(DigestAlg::from_uri(&read_algorithm_attr(&e)?)?);
@@ -757,6 +803,7 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
                         id,
                         digest_b64: buffer.split_whitespace().collect(),
                         digest_alg,
+                        comments: current_comments.unwrap_or(REFERENCE_DEFAULT_COMMENTS),
                     });
                     collecting = None;
                 }
@@ -780,6 +827,8 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
     Ok(ParsedSignature {
         signature_value: signature_value.ok_or("signature has no ds:SignatureValue")?,
         signature_method: signature_method.ok_or("SignedInfo has no ds:SignatureMethod")?,
+        signed_info_comments: signed_info_comments
+            .ok_or("SignedInfo has no ds:CanonicalizationMethod")?,
         references,
         leaf_cert_der: leaf_cert.ok_or("signature has no ds:X509Certificate")?,
     })
@@ -968,7 +1017,32 @@ impl RsaSigAlg {
     }
 }
 
-/// Inclusive Canonical XML 1.0 (WithComments) of a fragment, pure Rust.
+/// Whether a canonical form keeps XML comments. The two inclusive Canonical XML
+/// 1.0 algorithms differ in nothing else, and digesting a commented document
+/// under the wrong one yields a mismatch that reads as tampering.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Comments {
+    Omit,
+    Keep,
+}
+
+impl Comments {
+    /// Read the mode off a canonicalization algorithm URI. Inclusive Canonical
+    /// XML 1.0 only: exclusive c14n and c14n 1.1 are rejected rather than
+    /// canonicalized as if they were inclusive, which would digest wrong bytes.
+    fn from_c14n_uri(uri: &str) -> Result<Self, String> {
+        match uri.trim() {
+            C14N_PLAIN => Ok(Self::Omit),
+            C14N_WITH_COMMENTS => Ok(Self::Keep),
+            other => Err(format!(
+                "unsupported canonicalization algorithm \"{other}\""
+            )),
+        }
+    }
+}
+
+/// Inclusive Canonical XML 1.0 of a fragment, pure Rust, keeping comments only
+/// when `comments` is [`Comments::Keep`].
 ///
 /// libxml2 is the engine xmlsec1 canonicalizes with; this matches its output
 /// byte-for-byte for the fragments the signer emits. Scope is narrowed to
@@ -978,7 +1052,7 @@ impl RsaSigAlg {
 /// DOCTYPE, processing instruction, CDATA section, XML declaration, entity
 /// beyond the standard five, or namespaced attribute is a hard error: none can
 /// occur here, and canonicalizing one silently could yield a wrong digest.
-pub(crate) fn c14n(fragment: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn c14n(fragment: &str, comments: Comments) -> Result<Vec<u8>, String> {
     use quick_xml::escape::unescape;
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
@@ -1016,11 +1090,13 @@ pub(crate) fn c14n(fragment: &str) -> Result<Vec<u8>, String> {
                 out.push_str(&escape_text(&text));
             }
             Event::Comment(e) => {
-                let raw = std::str::from_utf8(&e)
-                    .map_err(|err| format!("c14n comment is not UTF-8: {err}"))?;
-                out.push_str("<!--");
-                out.push_str(&normalize_line_endings(raw));
-                out.push_str("-->");
+                if comments == Comments::Keep {
+                    let raw = std::str::from_utf8(&e)
+                        .map_err(|err| format!("c14n comment is not UTF-8: {err}"))?;
+                    out.push_str("<!--");
+                    out.push_str(&normalize_line_endings(raw));
+                    out.push_str("-->");
+                }
             }
             Event::Eof => break,
             other => {
@@ -1669,6 +1745,152 @@ mod tests {
     fn unsupported_algorithm_is_rejected() {
         assert!(DigestAlg::from_uri("http://example.com/md5").is_err());
         assert!(RsaSigAlg::from_uri("http://example.com/dsa").is_err());
+        assert!(Comments::from_c14n_uri("http://www.w3.org/2001/10/xml-exc-c14n#").is_err());
+    }
+
+    // ─── comments and the canonicalization a document declares ────────────
+
+    /// The same document with a comment in the signed region, which is what
+    /// tools like the ISDCF reference DCPs and orca_wrapping emit.
+    fn cpl_doc_with_comment() -> String {
+        let doc = cpl_doc().replace("    <Reel>", "    <!-- one reel -->\n    <Reel>");
+        assert!(doc.contains("<!--"), "the comment must be in the document");
+        doc
+    }
+
+    #[test]
+    fn signer_declares_the_canonicalization_it_uses() {
+        assert_eq!(
+            Comments::from_c14n_uri(C14N_METHOD).expect("the signer's own c14n must be supported"),
+            SIGNER_C14N_COMMENTS,
+            "SignedInfo is digested under the CanonicalizationMethod it declares"
+        );
+    }
+
+    #[test]
+    fn a_signed_document_with_a_comment_verifies() {
+        let c = chain();
+        let signed = sign_document_enveloped(&cpl_doc_with_comment(), &leaf_signer(c))
+            .expect("sign a document with a comment");
+        verify_document_enveloped(&signed, None).expect("a comment must not break verification");
+
+        // The signer declares #WithComments, so a comment added afterwards is
+        // caught the same way any other edit is.
+        let injected = signed.replacen("<Reel>", "<!-- added later --><Reel>", 1);
+        let err = verify_document_enveloped(&injected, None)
+            .expect_err("a comment added after signing must fail verification");
+        assert!(err.contains("digest mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn a_by_id_signed_document_with_a_comment_verifies() {
+        let c = chain();
+        let signed = sign_enveloped(
+            &cpl_doc_with_comment(),
+            &["ID_title", "ID_reels"],
+            "Id",
+            None,
+            &leaf_signer(c),
+        )
+        .expect("sign by-id with a comment in a referenced element");
+        verify_enveloped(&signed, "Id", None).expect("a comment must not break verification");
+
+        if xmlsec1_available() {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("cpl-byid-comment.xml");
+            std::fs::write(&out, &signed).unwrap();
+            let result = xmlsec1_verify(&out, &c.root);
+            assert!(
+                result.status.success(),
+                "xmlsec1 must verify it too: {}",
+                String::from_utf8_lossy(&result.stderr).trim()
+            );
+        }
+    }
+
+    /// Sign a template with xmlsec1, which fills in DigestValue, SignatureValue
+    /// and the X509Certificate. An independent signer is the only way to produce
+    /// a document declaring a canonicalization postkit does not sign with.
+    fn xmlsec1_sign(template: &str, key: &Path, cert: &Path, out: &Path) -> String {
+        std::fs::write(out.with_extension("tpl"), template).unwrap();
+        let result = std::process::Command::new("xmlsec1")
+            .arg("--sign")
+            .arg("--privkey-pem")
+            .arg(format!("{},{}", key.display(), cert.display()))
+            .arg("--output")
+            .arg(out)
+            .arg(out.with_extension("tpl"))
+            .output()
+            .expect("run xmlsec1 --sign");
+        assert!(
+            result.status.success(),
+            "xmlsec1 --sign failed: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
+        std::fs::read_to_string(out).unwrap()
+    }
+
+    // Real DCPs declare plain c14n, whose canonical form has no comments, and
+    // carry comments in the signed region. Digesting those with comments makes a
+    // valid signature look like tampering.
+    #[test]
+    fn a_plain_c14n_document_with_a_comment_verifies() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let template = cpl_doc_with_comment().replace(
+            "</CompositionPlaylist>",
+            &format!(
+                r#"  <ds:Signature xmlns:ds="{DSIG_NS}">
+    <ds:SignedInfo>
+      <ds:CanonicalizationMethod Algorithm="{C14N_PLAIN}"/>
+      <ds:SignatureMethod Algorithm="{SIG_METHOD}"/>
+      <ds:Reference URI="">
+        <ds:Transforms>
+          <ds:Transform Algorithm="{ENVELOPED_TRANSFORM}"/>
+        </ds:Transforms>
+        <ds:DigestMethod Algorithm="{DIGEST_METHOD}"/>
+        <ds:DigestValue></ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue/>
+    <ds:KeyInfo>
+      <ds:X509Data>
+        <ds:X509Certificate/>
+      </ds:X509Data>
+    </ds:KeyInfo>
+  </ds:Signature>
+</CompositionPlaylist>"#
+            ),
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let signed = xmlsec1_sign(
+            &template,
+            &c.signer_key,
+            &c.signer,
+            &dir.path().join("plain-c14n.xml"),
+        );
+        assert!(signed.contains("<!--"), "the comment must survive signing");
+        verify_document_enveloped(&signed, None)
+            .expect("a plain-c14n document with a comment must verify");
+
+        let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
+        let err =
+            verify_document_enveloped(&tampered, None).expect_err("tampering must still be caught");
+        assert!(err.contains("digest mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unsupported_declared_canonicalization_is_named_in_the_error() {
+        let c = chain();
+        let signed = sign_document_enveloped(&cpl_doc(), &leaf_signer(c)).expect("sign document");
+        let exclusive = signed.replacen(C14N_METHOD, "http://www.w3.org/2001/10/xml-exc-c14n#", 1);
+        let err = verify_document_enveloped(&exclusive, None)
+            .expect_err("exclusive c14n is not implemented and must not be treated as inclusive");
+        assert!(err.contains("xml-exc-c14n"), "got: {err}");
     }
 
     // Cross-check against real published DCPs: point POSTKIT_CLAIRMETA_DATA at a

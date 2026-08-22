@@ -237,6 +237,19 @@
 
 - `accessibility`: the closed-caption probe recognises the ST 429-12 `ClosedCaption` reel element (the name the schema declares, which libdcp and dcpwizard write) as well as the older `MainClosedCaption`.
 
+- `xmldsig` verification canonicalizes under the algorithm each signature
+  declares. It always kept comments, so a validly signed document carrying an
+  XML comment in the signed region, which the ISDCF reference DCPs and
+  orca_wrapping both emit, failed its digest check and looked tampered with. The
+  plain C14N URI omits comments, `#WithComments` keeps them, a `ds:Reference`
+  declaring no c14n transform gets the no-comments default every verifier
+  computes for it, and exclusive c14n is now an error naming the algorithm
+  instead of a digest over the wrong bytes. `sign_enveloped` digests its
+  references under that same default, so its output is unchanged unless a
+  referenced element contains a comment; `sign_document_enveloped` still
+  declares and uses `#WithComments`, where a comment added after signing breaks
+  the signature.
+
 ### Changed
 
 - The DCDM Rec.709 matrix is the sRGB/D65 one grok and libdcp use, where

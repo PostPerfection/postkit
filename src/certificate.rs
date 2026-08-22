@@ -2893,7 +2893,7 @@ pub fn der_base64_to_pem(b64: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::xmldsig::{C14N_METHOD, DIGEST_METHOD, SIG_METHOD, c14n};
+    use crate::xmldsig::{C14N_METHOD, Comments, DIGEST_METHOD, SIG_METHOD, c14n};
     use base64::Engine;
     use std::sync::OnceLock;
 
@@ -3142,7 +3142,8 @@ mod tests {
             ("AuthenticatedPrivate", &private),
             ("ds:SignedInfo", &signed_info),
         ] {
-            let ours = c14n(fragment).expect("pure-Rust c14n");
+            // xmllint --c14n keeps comments, so compare in that mode.
+            let ours = c14n(fragment, Comments::Keep).expect("pure-Rust c14n");
             let reference = xmllint_c14n(fragment);
             assert_eq!(
                 ours,
