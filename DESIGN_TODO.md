@@ -1,5 +1,20 @@
 # Planned
 
+- A #WithComments signature with a comment outside the root element
+  (2026-08-22). `verify_document_enveloped` canonicalizes the root element
+  subtree, so a comment before or after the root is never digested. Correct
+  under plain c14n, which drops comments anyway; under #WithComments xmlsec1
+  digests it and the two verifiers would disagree. No such document exists in
+  the dci-ctp corpus, ClairMeta's ECL set or any test tree, and the signer
+  cannot produce one. The fix is canonicalizing the document node rather than
+  the root element.
+
+- encode_parallel ignores the caller's bitrate (2026-08-22). It hardcodes
+  `-r 10` for grk_compress and drops the requested compression ratio, so an
+  image-sequence encode cannot honour a bitrate setting, and the post-encode
+  sweep is the only cap enforcement on that path. The video path passes the
+  ratio through and caps each codestream as it lands.
+
 - Verify the non-blocking render live (2026-08-17). `render_opengl` now passes
   `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0` with `video-timing-offset` 0,
   because the default wait parked the app's main thread for most of each frame
