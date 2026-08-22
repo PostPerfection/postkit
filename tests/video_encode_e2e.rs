@@ -320,3 +320,95 @@ fn an_image_sequence_refuses_a_source_read_rate() {
     };
     assert!(error.contains("another rate"), "{error}");
 }
+
+/// The cap has to reach the writer thread from `EncodeRunOptions`, and the run
+/// has to end at the frame that breaks it. The old sweep of the finished
+/// directory encoded the whole clip first.
+#[test]
+fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    const CAPPED_FRAME_COUNT: u64 = 48;
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mp4");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=s={WIDTH}x{HEIGHT}:d=1:r={CAPPED_FRAME_COUNT}"),
+            "-frames:v",
+            &CAPPED_FRAME_COUNT.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&video)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let options = |cap: Option<u64>| EncodeRunOptions {
+        fps: FrameRate::whole(CAPPED_FRAME_COUNT as u32),
+        codestream_byte_cap: cap,
+        ..Default::default()
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+
+    // encode with no cap first, so the cap below is under what these frames
+    // compress to by construction rather than by a guessed number
+    let uncapped = run_encode_with_options(
+        &video,
+        &dir.path().join("uncapped"),
+        &options(None),
+        &cancel,
+        &pause,
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    )
+    .expect("uncapped encode");
+    assert_eq!(uncapped.frames_encoded, CAPPED_FRAME_COUNT);
+    let smallest = std::fs::read_dir(&uncapped.j2k_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .min()
+        .expect("the uncapped encode wrote no codestreams");
+    let cap = smallest / 2;
+
+    let capped_output = dir.path().join("capped");
+    let outcome = run_encode_with_options(
+        &video,
+        &capped_output,
+        &options(Some(cap)),
+        &cancel,
+        &pause,
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    );
+    let Err(error) = outcome else {
+        panic!("every frame is over the {cap} byte cap, so the run has to fail");
+    };
+    assert!(
+        error.contains(&format!(
+            "over the {cap} byte per-frame cap: lower the bitrate"
+        )),
+        "{error}"
+    );
+
+    let written = std::fs::read_dir(capped_output.join("j2k"))
+        .map(|entries| entries.count() as u64)
+        .unwrap_or(0);
+    assert!(
+        written < CAPPED_FRAME_COUNT,
+        "the run wrote {written} of {CAPPED_FRAME_COUNT} frames instead of stopping at the \
+         first frame over the cap"
+    );
+}

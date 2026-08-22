@@ -378,6 +378,7 @@ where
         cancel,
         phase_clocks,
         None,
+        None,
         frame_producer,
         on_progress,
     )
@@ -390,6 +391,10 @@ where
 /// Frames reach the feed in the order they finish encoding, not in index order;
 /// the wrap end reorders them. A feed that has stopped fails the encode, which is
 /// how a wrap error gets out.
+///
+/// `codestream_byte_cap` is checked against each codestream as the writer puts it
+/// on disk, and the first frame over it fails the run there rather than after the
+/// whole sequence has been encoded.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_pipeline_with_mxf_feed<F, P>(
     output_dir: &Path,
@@ -398,6 +403,7 @@ pub fn encode_pipeline_with_mxf_feed<F, P>(
     cancel: &Arc<AtomicBool>,
     phase_clocks: &Arc<PhaseClocks>,
     mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
+    codestream_byte_cap: Option<u64>,
     mut frame_producer: F,
     mut on_progress: P,
 ) -> PipelineResult
@@ -444,6 +450,7 @@ where
     let writer_error_flag = error_flag.clone();
     let writer_first_error = first_error.clone();
     let writer_phase_clocks = phase_clocks.clone();
+    let writer_input_queue = input_queue.clone();
     let writer_handle = std::thread::spawn(move || {
         for frame in writer_rx {
             let path = writer_output_dir.join(format!("frame_{:08}.j2c", frame.index));
@@ -451,22 +458,35 @@ where
             let written = std::fs::write(&path, &frame.data);
             writer_phase_clocks.add(EncodePhase::CodestreamWrite, write_start.elapsed());
             if let Err(e) = written {
-                writer_error_flag.store(true, Ordering::Relaxed);
-                let mut err = writer_first_error.lock().unwrap();
-                if err.is_empty() {
-                    *err = format!("Write error frame {}: {e}", frame.index);
-                }
+                fail_pipeline(
+                    &writer_error_flag,
+                    &writer_first_error,
+                    &writer_input_queue,
+                    format!("Write error frame {}: {e}", frame.index),
+                );
+                break;
+            }
+            if let Some(cap) = codestream_byte_cap
+                && let Err(e) = crate::encode::check_codestream_size(&path, cap)
+            {
+                fail_pipeline(
+                    &writer_error_flag,
+                    &writer_first_error,
+                    &writer_input_queue,
+                    e,
+                );
                 break;
             }
             writer_encoded_count.fetch_add(1, Ordering::Relaxed);
             if let Some(feed) = &mxf_feed
                 && let Err(e) = feed.send(frame.index, frame.data)
             {
-                writer_error_flag.store(true, Ordering::Relaxed);
-                let mut err = writer_first_error.lock().unwrap();
-                if err.is_empty() {
-                    *err = e;
-                }
+                fail_pipeline(
+                    &writer_error_flag,
+                    &writer_first_error,
+                    &writer_input_queue,
+                    e,
+                );
                 break;
             }
         }
@@ -591,6 +611,23 @@ where
     }
 }
 
+/// Keep the first error and stop the rest of the pipeline. Closing the input
+/// queue is what releases a producer already blocked pushing into a full queue,
+/// which nothing drains once the encoder threads have gone.
+fn fail_pipeline(
+    error_flag: &AtomicBool,
+    first_error: &Mutex<String>,
+    input_queue: &BoundedQueue<RawFrame>,
+    message: String,
+) {
+    error_flag.store(true, Ordering::Relaxed);
+    let mut err = first_error.lock().unwrap();
+    if err.is_empty() {
+        *err = message;
+    }
+    input_queue.close();
+}
+
 /// Per-thread encoder function. Pops frames from the queue, compresses them
 /// in-process via Grok FFI, and sends encoded data to the writer channel.
 fn encoder_thread_fn(
@@ -618,11 +655,12 @@ fn encoder_thread_fn(
         phase_clocks.add(EncodePhase::Preparation, prepare_start.elapsed());
 
         if let Err(e) = prepared {
-            error_flag.store(true, Ordering::Relaxed);
-            let mut err = first_error.lock().unwrap();
-            if err.is_empty() {
-                *err = format!("Encode failed frame {}: {e}", frame.index());
-            }
+            fail_pipeline(
+                error_flag,
+                first_error,
+                input_queue,
+                format!("Encode failed frame {}: {e}", frame.index()),
+            );
             break;
         }
 
@@ -641,11 +679,12 @@ fn encoder_thread_fn(
                 }
             }
             Err(e) => {
-                error_flag.store(true, Ordering::Relaxed);
-                let mut err = first_error.lock().unwrap();
-                if err.is_empty() {
-                    *err = format!("Encode failed frame {}: {e}", frame.index());
-                }
+                fail_pipeline(
+                    error_flag,
+                    first_error,
+                    input_queue,
+                    format!("Encode failed frame {}: {e}", frame.index()),
+                );
                 break;
             }
         }
@@ -1649,6 +1688,138 @@ mod tests {
             .collect();
         for h in handles {
             h.join().unwrap();
+        }
+    }
+
+    /// One 128x128 frame of noise, incompressible enough that every frame lands
+    /// at about the rate ceiling rather than a few header bytes.
+    #[cfg(feature = "grok-ffi")]
+    fn noise_frame(index: u64, width: u32, height: u32) -> RawFrame {
+        let mut state = 7u32.wrapping_add(index as u32).wrapping_mul(2654435761);
+        let data: Vec<u8> = (0..(width * height * 6))
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            })
+            .collect();
+        RawFrame::Packed {
+            data,
+            width,
+            height,
+            precision: 16,
+            index,
+        }
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    fn encode_noise_frames(output_dir: &Path, total: u64, cap: Option<u64>) -> PipelineResult {
+        let (width, height) = (128u32, 128u32);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let phase_clocks = Arc::new(PhaseClocks::default());
+        let mut next = 0u64;
+        initialize(0);
+        encode_pipeline_with_mxf_feed(
+            output_dir,
+            &CompressParams::default(),
+            total,
+            &cancel,
+            &phase_clocks,
+            None,
+            cap,
+            || {
+                if next == total {
+                    return None;
+                }
+                let frame = noise_frame(next, width, height);
+                next += 1;
+                Some(frame)
+            },
+            |_| {},
+        )
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    fn written_codestreams(dir: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "j2c"))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_frame_over_the_cap_stops_the_encode_where_it_lands() {
+        const TOTAL: u64 = 64;
+        let dir = tempfile::tempdir().unwrap();
+
+        // encode one frame first, so the cap is below what these frames
+        // compress to by construction instead of by a guessed number
+        let reference = dir.path().join("reference");
+        let result = encode_noise_frames(&reference, 1, None);
+        assert!(result.success, "reference encode failed: {}", result.error);
+        let one_frame = std::fs::metadata(&written_codestreams(&reference)[0])
+            .unwrap()
+            .len();
+        let cap = one_frame / 2;
+        assert!(
+            cap > 0,
+            "a 128x128 noise frame compressed to {one_frame} bytes"
+        );
+
+        let capped = dir.path().join("capped");
+        let result = encode_noise_frames(&capped, TOTAL, Some(cap));
+        assert!(!result.success, "an over-cap frame has to fail the encode");
+        assert!(
+            result.error.contains(&format!(
+                "over the {cap} byte per-frame cap: lower the bitrate"
+            )),
+            "wrong refusal: {}",
+            result.error
+        );
+        let written = written_codestreams(&capped).len() as u64;
+        assert!(
+            written < TOTAL,
+            "the encode wrote {written} of {TOTAL} frames instead of stopping at the first \
+             frame over the cap"
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_generous_cap_encodes_the_same_frames_as_no_cap() {
+        const TOTAL: u64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+
+        let uncapped = dir.path().join("uncapped");
+        let result = encode_noise_frames(&uncapped, TOTAL, None);
+        assert!(result.success, "uncapped encode failed: {}", result.error);
+        let uncapped_frames = written_codestreams(&uncapped);
+        assert_eq!(uncapped_frames.len() as u64, TOTAL);
+
+        let largest = uncapped_frames
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .max()
+            .unwrap();
+
+        let capped = dir.path().join("capped");
+        let result = encode_noise_frames(&capped, TOTAL, Some(largest * 2));
+        assert!(result.success, "capped encode failed: {}", result.error);
+        assert_eq!(result.frames_encoded, TOTAL);
+        let capped_frames = written_codestreams(&capped);
+        assert_eq!(capped_frames.len() as u64, TOTAL);
+        for (with_cap, without) in capped_frames.iter().zip(&uncapped_frames) {
+            assert_eq!(
+                std::fs::read(with_cap).unwrap(),
+                std::fs::read(without).unwrap(),
+                "{} differs from {}",
+                with_cap.display(),
+                without.display()
+            );
         }
     }
 

@@ -150,7 +150,9 @@ pub struct EncodeRunOptions {
     /// the DCDM X'Y'Z' transform or leaves DCI PQ essence alone.
     pub source_colour: SourceColour,
     /// Per-codestream byte cap, e.g. the DCI HDR Addendum's raised cap. A frame
-    /// over it fails the run.
+    /// over it fails the run. Anything postkit compresses itself is checked as
+    /// each codestream is written, so the run stops on the first frame over the
+    /// cap instead of encoding the rest first.
     pub codestream_byte_cap: Option<u64>,
     /// Subtitles burnt into every decoded frame. Every burn decodes through
     /// ffmpeg, image sequences included: [`reject_unsupported_burn`] names the
@@ -385,6 +387,7 @@ fn run_encode_and_maybe_wrap(
                 source_colour: options.source_colour.clone(),
                 subtitle_burn: options.subtitle_burn.clone(),
                 picture: options.picture.clone(),
+                codestream_byte_cap: options.codestream_byte_cap,
                 ..StreamEncodeOptions::default()
             })?;
             on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
@@ -420,6 +423,7 @@ fn run_encode_and_maybe_wrap(
                     source_colour: options.source_colour.clone(),
                     subtitle_burn: options.subtitle_burn.clone(),
                     picture: options.picture.clone(),
+                    codestream_byte_cap: options.codestream_byte_cap,
                     decode_source: crate::encode::DecodeSource::ImageList,
                     ..StreamEncodeOptions::default()
                 })?;
@@ -491,6 +495,9 @@ fn run_encode_and_maybe_wrap(
         _ => j2k_dir,
     };
 
+    // the in-process encoder already refused anything over the cap frame by
+    // frame, but a J2K sequence was never encoded here and grk_compress writes
+    // an image sequence's codestreams itself, so those only get checked here
     if let Some(cap) = options.codestream_byte_cap {
         check_codestream_dir(&final_j2k_dir, cap)?;
     }

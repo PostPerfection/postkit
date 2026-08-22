@@ -526,6 +526,13 @@ pub struct StreamEncodeOptions {
     /// subtitle file and rebuilds it.
     #[serde(skip)]
     pub subtitle_burn: Option<std::sync::Arc<crate::subtitle_raster::SubtitleBurn>>,
+    /// Per-codestream byte cap, e.g. the DCI HDR Addendum's raised cap. Each
+    /// codestream is checked as it is written and the first one over the cap
+    /// fails the encode there, so a bitrate set too high costs one frame rather
+    /// than the whole sequence. Only the in-process encoder can hold to it;
+    /// [`stream_encode_subprocess`] refuses a cap instead of ignoring it.
+    #[serde(default)]
+    pub codestream_byte_cap: Option<u64>,
 }
 
 impl Default for StreamEncodeOptions {
@@ -545,6 +552,7 @@ impl Default for StreamEncodeOptions {
             decode_source: DecodeSource::Video,
             picture: crate::picture_processing::PictureProcessing::default(),
             subtitle_burn: None,
+            codestream_byte_cap: None,
         }
     }
 }
@@ -850,6 +858,7 @@ where
         cancel,
         &phase_clocks,
         mxf_feed,
+        opts.codestream_byte_cap,
         || {
             while pause.load(Ordering::Relaxed) {
                 if cancel.load(Ordering::Relaxed) {
@@ -938,6 +947,15 @@ where
                 "a {space:?} source needs the in-process encoder: the subprocess pool hands \
                  raw frames to grk_compress, which only converts Rec.709"
             ),
+            ..Default::default()
+        };
+    }
+    if opts.codestream_byte_cap.is_some() {
+        return EncodeResult {
+            success: false,
+            error: "a per-frame byte cap needs the in-process encoder: here grk_compress \
+                    writes each codestream itself, so postkit never has one to size"
+                .to_string(),
             ..Default::default()
         };
     }
@@ -1490,5 +1508,24 @@ mod tests {
         let error = check_codestream_size(&frame, 2047).unwrap_err();
         assert!(error.contains("2048 bytes"), "{error}");
         assert!(check_codestream_size(&dir.path().join("missing.j2c"), 2048).is_err());
+    }
+
+    #[test]
+    fn the_subprocess_encoder_refuses_a_byte_cap() {
+        let result = stream_encode_subprocess(
+            &StreamEncodeOptions {
+                input: PathBuf::from("/nonexistent.mov"),
+                codestream_byte_cap: Some(1_302_083),
+                ..StreamEncodeOptions::default()
+            },
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert!(!result.success);
+        assert!(
+            result.error.contains("needs the in-process encoder"),
+            "{}",
+            result.error
+        );
     }
 }

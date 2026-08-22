@@ -204,6 +204,23 @@
 
 ### Fixed
 
+- A `codestream_byte_cap` stops the encode at the first frame over it. The cap
+  was a sweep of the finished J2K directory, so a bitrate set too high encoded
+  every frame before the run failed: a 1443-frame job learned at the end that
+  frame 279 was 1302215 bytes against the 1302083 byte cap. The in-process
+  writer now sizes each codestream as it lands and fails there with the same
+  refusal, which stops the encoder threads and the decode instead of letting
+  them run out the sequence. `StreamEncodeOptions` carries the cap;
+  `stream_encode_subprocess` refuses one, because grk_compress writes those
+  codestreams itself. The sweep stays for the two inputs postkit never
+  compresses, a J2K sequence and an image sequence handed straight to
+  grk_compress.
+
+- The in-process encoder no longer hangs when a frame fails. The queue's
+  producer blocks while the queue is full, and every encoder thread stops on the
+  first error, so nothing was left to drain it. Recording the error now closes
+  the queue too, which is what releases the producer.
+
 - `MpvRenderPlayer::render_opengl` no longer waits for each frame's display
   time. mpv's render call blocks until the frame is due, by default with 50ms
   of `video-timing-offset` headroom, and the app renders on its main thread, so
