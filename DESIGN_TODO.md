@@ -8,11 +8,11 @@
   a hand pass in a wizard: transport controls track live during playback, A/V
   sync and smoothness are unchanged.
 
-- Extract the wizards' job-queue IPC into postkit (2026-08-17, proposed, not
-  accepted). Both wizards carry a near-identical in-memory job queue and
-  progress-event plumbing in their src-tauri glue. Same consolidation shape as
-  the tms move: the queue and its event types default into postkit, the wizards
-  keep the tauri command registrations.
+- Extract the wizards' progress event into postkit (2026-08-17, proposed, not
+  accepted). Both wizards emit the same `PipelineProgress` from their src-tauri
+  glue: job_id, stage, message, frame, total_frames, fps, elapsed_secs, percent.
+  Same shape as the gui_job_queue move: the event type defaults into postkit,
+  the wizards keep the tauri emit calls.
 
 - Embedded playback hand pass. The libmpv render engine (src/mpv_render, libmpv
   feature) and the three guikit hosts are in both wizards and CI compiles all

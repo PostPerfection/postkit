@@ -4,6 +4,16 @@
 
 ### Added
 
+- `gui_job_queue`: the queue of builds a wizard GUI runs, with its on-disk
+  record, held once instead of a copy in each wizard. `GuiJobQueue<C>` is
+  generic over the wizard's job config, which implements `GuiJob` for the id,
+  title and output_dir the queue reads and the serde bounds the file needs.
+  Alongside it `StoredJob<C>`, `StoredJobState`, `LoadedJobs<C>`, `record`,
+  `load`, `JobInfo`, `INTERRUPTED_MESSAGE`, and `jobs_path(environment_variable,
+  data_dir)`, which takes both from the wizard because postkit does not know
+  either wizard's name. No tauri dependency: the wizards keep their
+  `#[tauri::command]` wrappers and call these methods.
+
 - `quality_psnr` on `EncodeRunOptions`, `StreamEncodeOptions` and
   `CompressParams`: a PSNR target in dB that grok allocates layers by instead of
   the compression ratio. grok holds to `max_cs_size` under rate allocation but

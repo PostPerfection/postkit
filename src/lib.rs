@@ -20,6 +20,7 @@ pub mod free_space;
 pub mod fs;
 pub mod grok;
 pub mod grok_encoder;
+pub mod gui_job_queue;
 pub mod hash;
 pub mod ingest;
 pub mod j2k;
