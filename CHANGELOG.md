@@ -4,6 +4,18 @@
 
 ### Added
 
+- `picture_findings::PictureFindings` on `encode::EncodeResult` and
+  `pipeline::EncodeResult`: the black and frozen runs ffmpeg's `blackdetect` and
+  `freezedetect` saw while the source decoded, as inclusive output frame numbers
+  at the encode's `fps`. Both filters run on a `split` branch of the decode
+  chain, because neither accepts rgb48be and putting them in the main chain
+  makes ffmpeg round trip every frame through yuv444p16le on its way to the
+  compressor. The thresholds are ffmpeg's own defaults: 2 seconds minimum for
+  each filter and a 0.10 black pixel threshold. `freezedetect` prints no
+  `freeze_end` for a run that reaches the last frame, so the encoded frame count
+  closes that one. A J2K sequence and an image sequence `grk_compress` reads for
+  itself report nothing, since neither decodes through ffmpeg.
+
 - `ColourSpace::LogC` transforms in `DcdmTransform` instead of being refused, so
   an ARRI LogC3 master encodes through the same per-frame path P3 and Rec.2020
   use. Code values decode with ARRI's LogC3 curve for EI 800 and matrix through

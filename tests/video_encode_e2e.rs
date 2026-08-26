@@ -736,3 +736,100 @@ fn the_resumable_pipeline_encodes_a_window_and_resumes_inside_it() {
         past_end.error
     );
 }
+
+const DETECTION_FPS: u32 = 24;
+const DETECTION_SEGMENT_SECONDS: u64 = 3;
+const DETECTION_SEGMENT_FRAMES: u64 = DETECTION_FPS as u64 * DETECTION_SEGMENT_SECONDS;
+const DETECTION_WIDTH: u32 = 128;
+const DETECTION_HEIGHT: u32 = 72;
+
+fn within_one_frame(actual: u64, expected: u64) -> bool {
+    actual.abs_diff(expected) <= 1
+}
+
+#[test]
+fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mkv");
+    let size = format!("{DETECTION_WIDTH}x{DETECTION_HEIGHT}");
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=black:s={size}:r={DETECTION_FPS}:d={DETECTION_SEGMENT_SECONDS}"),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=s={size}:r={DETECTION_FPS}:d={DETECTION_SEGMENT_SECONDS}"),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=0x336699:s={size}:r={DETECTION_FPS}:d={DETECTION_SEGMENT_SECONDS}"),
+            "-filter_complex",
+            "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v]",
+            "-map",
+            "[v]",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv444p",
+        ])
+        .arg(&video)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        ffmpeg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ffmpeg.stderr)
+    );
+
+    let output = dir.path().join("out");
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    let result = run_encode_with_options(
+        &video,
+        &output,
+        &EncodeRunOptions {
+            fps: FrameRate::whole(DETECTION_FPS),
+            ..Default::default()
+        },
+        &cancel,
+        &pause,
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    )
+    .expect("video encode");
+
+    assert_eq!(result.frames_encoded, DETECTION_SEGMENT_FRAMES * 3);
+
+    let findings = &result.picture_findings;
+    let black = findings
+        .black
+        .first()
+        .unwrap_or_else(|| panic!("no black run reported, findings: {findings:?}"));
+    assert!(
+        within_one_frame(black.first_frame, 0)
+            && within_one_frame(black.last_frame, DETECTION_SEGMENT_FRAMES - 1),
+        "the black head is frames 0..={}, got {black:?}",
+        DETECTION_SEGMENT_FRAMES - 1
+    );
+
+    let last_frame = DETECTION_SEGMENT_FRAMES * 3 - 1;
+    let frozen = findings
+        .frozen
+        .last()
+        .unwrap_or_else(|| panic!("no frozen run reported, findings: {findings:?}"));
+    assert!(
+        within_one_frame(frozen.first_frame, DETECTION_SEGMENT_FRAMES * 2)
+            && within_one_frame(frozen.last_frame, last_frame),
+        "the still tail is frames {}..={last_frame}, got {frozen:?}",
+        DETECTION_SEGMENT_FRAMES * 2
+    );
+}

@@ -118,6 +118,11 @@ pub struct EncodeResult {
     pub error: String,
     pub frames_encoded: u64,
     pub output_dir: PathBuf,
+    /// Black and frozen runs blackdetect and freezedetect saw during the
+    /// decode. Empty where grk_compress read the source files itself, since
+    /// nothing decoded through ffmpeg there.
+    #[serde(default)]
+    pub picture_findings: crate::picture_findings::PictureFindings,
 }
 
 /// Image format detected from file extension.
@@ -293,6 +298,7 @@ pub fn encode(opts: &EncodeOptions) -> EncodeResult {
                     error: format!("Encode failed at frame {}: {}", encoded, stderr),
                     frames_encoded: encoded,
                     output_dir: opts.output_dir.clone(),
+                    ..Default::default()
                 };
             }
             Err(e) => {
@@ -301,6 +307,7 @@ pub fn encode(opts: &EncodeOptions) -> EncodeResult {
                     error: format!("Failed to spawn compressor: {e}"),
                     frames_encoded: encoded,
                     output_dir: opts.output_dir.clone(),
+                    ..Default::default()
                 };
             }
         }
@@ -311,6 +318,7 @@ pub fn encode(opts: &EncodeOptions) -> EncodeResult {
         error: String::new(),
         frames_encoded: encoded,
         output_dir: opts.output_dir.clone(),
+        ..Default::default()
     }
 }
 
@@ -877,7 +885,12 @@ where
     let frame_size = (width as usize) * (height as usize) * 3 * 2; // 16-bit RGB
 
     // Start ffmpeg: decode to raw 16-bit big-endian RGB
-    let filters = decode_filters(opts.fps, &opts.source_colour, &plan, opts.frame_range);
+    let filters = crate::picture_findings::with_detection_branch(&decode_filters(
+        opts.fps,
+        &opts.source_colour,
+        &plan,
+        opts.frame_range,
+    ));
     let input_args = match decode_input_args(opts.decode_source, opts.read_source_at) {
         Ok(args) => args,
         Err(e) => {
@@ -895,12 +908,15 @@ where
     );
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .arg("-y")
+        // the progress line carries no newline, so the reader would hold the
+        // whole run in one string
+        .arg("-nostats")
         .args(&input_args)
         .arg("-i")
         .arg(&opts.input)
         .args(decode_output_args(&filters, opts.frame_range))
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
@@ -912,6 +928,11 @@ where
             };
         }
     };
+
+    let detection_reader = ffmpeg
+        .stderr
+        .take()
+        .map(crate::picture_findings::read_detection_lines);
 
     let mut ffmpeg_stdout = match ffmpeg.stdout.take() {
         Some(s) => s,
@@ -954,6 +975,7 @@ where
 
     let mut frame_buf = vec![0u8; frame_size];
     let mut frame_index: u64 = 0;
+    let mut decode_read_to_end = false;
     let encode_start = std::time::Instant::now();
     let phase_clocks = Arc::new(grok_encoder::PhaseClocks::default());
 
@@ -980,7 +1002,10 @@ where
             phase_clocks.add(grok_encoder::EncodePhase::DecoderWait, read_start.elapsed());
             match read {
                 ReadResult::Ok => {}
-                ReadResult::Eof => return None,
+                ReadResult::Eof => {
+                    decode_read_to_end = true;
+                    return None;
+                }
                 ReadResult::Err(_) => return None,
             }
 
@@ -1012,13 +1037,20 @@ where
         },
     );
 
-    kill_child(&mut ffmpeg);
+    let picture_findings = crate::picture_findings::finish_detection(
+        &mut ffmpeg,
+        detection_reader,
+        decode_read_to_end,
+        opts.fps.as_f64(),
+        result.frames_encoded,
+    );
 
     EncodeResult {
         success: result.success,
         error: result.error,
         frames_encoded: result.frames_encoded,
         output_dir: opts.output_dir.clone(),
+        picture_findings,
     }
 }
 
@@ -1111,7 +1143,12 @@ where
     let frame_size = (width as usize) * (height as usize) * 3 * 2;
 
     // Start ffmpeg
-    let filters = decode_filters(opts.fps, &opts.source_colour, &plan, opts.frame_range);
+    let filters = crate::picture_findings::with_detection_branch(&decode_filters(
+        opts.fps,
+        &opts.source_colour,
+        &plan,
+        opts.frame_range,
+    ));
     let input_args = match decode_input_args(opts.decode_source, opts.read_source_at) {
         Ok(args) => args,
         Err(e) => {
@@ -1129,12 +1166,15 @@ where
     );
     let mut ffmpeg = match std::process::Command::new("ffmpeg")
         .arg("-y")
+        // the progress line carries no newline, so the reader would hold the
+        // whole run in one string
+        .arg("-nostats")
         .args(&input_args)
         .arg("-i")
         .arg(&opts.input)
         .args(decode_output_args(&filters, opts.frame_range))
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(child) => child,
@@ -1146,6 +1186,11 @@ where
             };
         }
     };
+
+    let detection_reader = ffmpeg
+        .stderr
+        .take()
+        .map(crate::picture_findings::read_detection_lines);
 
     let mut ffmpeg_stdout = match ffmpeg.stdout.take() {
         Some(s) => s,
@@ -1201,13 +1246,20 @@ where
         },
     );
 
-    kill_child(&mut ffmpeg);
+    let picture_findings = crate::picture_findings::finish_detection(
+        &mut ffmpeg,
+        detection_reader,
+        result.success,
+        opts.fps.as_f64(),
+        result.frames_encoded,
+    );
 
     EncodeResult {
         success: result.success,
         error: result.error,
         frames_encoded: result.frames_encoded,
         output_dir: opts.output_dir.clone(),
+        picture_findings,
     }
 }
 
@@ -1417,6 +1469,7 @@ where
             error: "Cancelled".to_string(),
             frames_encoded: done_count.load(Ordering::Relaxed),
             output_dir: output_dir.to_path_buf(),
+            ..Default::default()
         };
     }
 
@@ -1427,6 +1480,7 @@ where
             error: err_msg.clone(),
             frames_encoded: done_count.load(Ordering::Relaxed),
             output_dir: output_dir.to_path_buf(),
+            ..Default::default()
         };
     }
 
@@ -1435,6 +1489,7 @@ where
         error: String::new(),
         frames_encoded: total,
         output_dir: output_dir.to_path_buf(),
+        ..Default::default()
     }
 }
 

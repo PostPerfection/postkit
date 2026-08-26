@@ -75,6 +75,10 @@ pub struct EncodeResult {
     pub frames_encoded: u64,
     /// Total elapsed time in seconds.
     pub elapsed_secs: f64,
+    /// Black and frozen runs seen while the source decoded. Empty for a J2K
+    /// sequence and for an image sequence grk_compress read for itself, since
+    /// neither goes through ffmpeg.
+    pub picture_findings: crate::picture_findings::PictureFindings,
 }
 
 /// Run the encode pipeline: detect input type, encode to J2K if needed.
@@ -321,11 +325,15 @@ fn run_encode_and_maybe_wrap(
 
     let j2k_dir = output_dir.join("j2k");
     let mut frames_encoded = 0u64;
+    let mut picture_findings = crate::picture_findings::PictureFindings::default();
 
     // Everything ffmpeg decodes goes through one code path, so a subtitle burn
     // has a single place to hook into. `run_stream` is that path; the arms below
     // only decide what ffmpeg opens.
-    let mut run_stream = |opts: &StreamEncodeOptions| -> Result<u64, String> {
+    let mut run_stream = |opts: &StreamEncodeOptions| -> Result<
+        (u64, crate::picture_findings::PictureFindings),
+        String,
+    > {
         on_progress(&PipelineProgress {
             stage: "encode".to_string(),
             message: "Starting...".to_string(),
@@ -380,12 +388,12 @@ fn run_encode_and_maybe_wrap(
             }
             return Err(result.error);
         }
-        Ok(result.frames_encoded)
+        Ok((result.frames_encoded, result.picture_findings))
     };
 
     match input_type {
         InputType::Video => {
-            frames_encoded = run_stream(&StreamEncodeOptions {
+            (frames_encoded, picture_findings) = run_stream(&StreamEncodeOptions {
                 input: video.to_path_buf(),
                 output_dir: j2k_dir.clone(),
                 compression_ratio,
@@ -427,7 +435,7 @@ fn run_encode_and_maybe_wrap(
                     "[ENCODE] Taking {} images through ffmpeg",
                     frames.len()
                 ));
-                frames_encoded = run_stream(&StreamEncodeOptions {
+                (frames_encoded, picture_findings) = run_stream(&StreamEncodeOptions {
                     input: list,
                     output_dir: j2k_dir.clone(),
                     compression_ratio,
@@ -540,6 +548,7 @@ fn run_encode_and_maybe_wrap(
             j2k_dir: final_j2k_dir,
             frames_encoded,
             elapsed_secs,
+            picture_findings,
         },
         track_file,
     ))

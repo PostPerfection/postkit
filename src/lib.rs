@@ -35,6 +35,7 @@ pub mod mxf_wrap;
 pub mod otioz_import;
 pub mod package_edit;
 pub mod packaging;
+pub mod picture_findings;
 pub mod picture_processing;
 pub mod pipeline;
 pub mod plugin;
