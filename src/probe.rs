@@ -1,9 +1,11 @@
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 use crate::timecode::parse_frame_rate;
 
 /// Video stream metadata from ffprobe.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoInfo {
     pub width: u32,
     pub height: u32,

@@ -7,6 +7,7 @@
 
 use crate::wav_io::{read_interleaved, write_interleaved};
 use hound::WavSpec;
+use serde::{Deserialize, Serialize};
 use std::f32::consts::PI;
 use std::path::Path;
 
@@ -26,7 +27,7 @@ pub enum UpmixError {
 }
 
 /// Which DCP-o-matic upmixer variant to use.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum Upmixer {
     /// Band-split: L/R keep the highs, C the mids, LFE the lows, Ls/Rs the top.
     A,

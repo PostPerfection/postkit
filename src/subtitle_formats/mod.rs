@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::subtitle_retime::SrtCue;
@@ -55,7 +56,7 @@ pub enum VAlign {
 }
 
 /// 8-bit RGBA colour (matches SMPTE subtitle FontColor ARGB channels).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rgba {
     pub r: u8,
     pub g: u8,

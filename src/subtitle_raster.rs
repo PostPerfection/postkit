@@ -18,6 +18,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
+
 use cosmic_text::{
     Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent,
     Weight, Wrap,
@@ -54,7 +56,7 @@ const SHADOW_OFFSET_RATIO: f32 = 0.06;
 ///
 /// The names match the SMPTE subtitle `Effect` attribute, so a burnt track and
 /// a packaged track can be asked for the same way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum BurnEffect {
     None,
     Outline,
@@ -235,7 +237,7 @@ pub fn check_font_size_percent(percent: f32) -> Result<(), String> {
 
 /// The appearance settings a caller named on the command line, each left
 /// `None` when the flag was not given so the base style keeps its own value.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BurnStyleOverrides {
     /// Text height as a percent of the frame height, so 4.5 means 0.045.
     pub font_size_percent: Option<f32>,

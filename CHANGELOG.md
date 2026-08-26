@@ -4,6 +4,12 @@
 
 ### Added
 
+- `probe::VideoInfo`, `upmix::Upmixer`, `subtitle_raster::BurnEffect`,
+  `subtitle_raster::BurnStyleOverrides` and `subtitle_formats::Rgba` derive
+  `Serialize` and `Deserialize`, so a consumer storing them no longer needs a
+  `#[serde(remote)]` mirror. Field and variant names are unchanged, so the wire
+  format matches what those mirrors wrote.
+
 - `encode::FrameRange` with `EncodeRunOptions.frame_range` and
   `StreamEncodeOptions.frame_range`: encode one window of a source instead of
   all of it, so a wizard trimming five minutes out of a two hour source no
