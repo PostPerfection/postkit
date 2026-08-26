@@ -49,6 +49,8 @@ fn env_u64(key: &str, default: u64) -> u64 {
 fn base_params(res: &Res) -> CompressParams {
     CompressParams {
         compression_ratio: 10.0,
+        quality_psnr: None,
+        codestream_byte_cap: None,
         num_resolutions: 6,
         codeblock_size: 32,
         progression: ProgressionOrder::Cprl,

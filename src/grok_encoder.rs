@@ -71,6 +71,14 @@ pub struct EncodedFrame {
 pub struct CompressParams {
     /// Compression ratio (e.g. 10.0 for 10:1)
     pub compression_ratio: f64,
+    /// A PSNR target in dB that grok allocates layers by instead of the
+    /// compression ratio. `codestream_byte_cap` still holds: grok is given it
+    /// as `max_cs_size` and prefers it over the quality target.
+    pub quality_psnr: Option<f64>,
+    /// Per-codestream byte cap, the same one the writer thread checks. It only
+    /// reaches grok under `quality_psnr`, where the quality target is the only
+    /// other thing sizing the codestream.
+    pub codestream_byte_cap: Option<u64>,
     /// Number of decomposition levels (default 6 for 2K)
     pub num_resolutions: u8,
     /// Codeblock size (DCI requires 32×32)
@@ -182,6 +190,8 @@ impl Default for CompressParams {
     fn default() -> Self {
         Self {
             compression_ratio: 10.0,
+            quality_psnr: None,
+            codestream_byte_cap: None,
             num_resolutions: 6,
             codeblock_size: 32,
             progression: ProgressionOrder::Cprl,
@@ -693,6 +703,27 @@ fn encoder_thread_fn(
 
 // ─── Grok FFI compression ──────────────────────────────────────────────────
 
+/// How grok sizes one codestream.
+#[cfg(feature = "grok-ffi")]
+enum Allocation {
+    /// grok's rate/distortion curve at this compression ratio. A non-zero
+    /// `max_bytes` is a hard ceiling grok holds to, whatever the ratio asks for.
+    Ratio { ratio: f64, max_bytes: u64 },
+    /// grok's layer allocation at this PSNR target. `max_cs_size` does nothing
+    /// here, so the target alone decides the size.
+    Quality { psnr: f64 },
+}
+
+/// The cinema profiles encode 3 components at 12 bits, and grok measures its
+/// compression ratio against that rather than against the samples it was given.
+#[cfg(feature = "grok-ffi")]
+fn cinema_raw_frame_bytes(frame: &RawFrame) -> u64 {
+    const COMPONENTS: u64 = 3;
+    const BITS_PER_SAMPLE: u64 = 12;
+    const BITS_PER_BYTE: u64 = 8;
+    frame.width() as u64 * frame.height() as u64 * COMPONENTS * BITS_PER_SAMPLE / BITS_PER_BYTE
+}
+
 /// Compress a single frame using Grok's in-process C API via FFI.
 ///
 /// Safety: requires `grk_initialize()` to have been called once globally.
@@ -702,6 +733,37 @@ fn encoder_thread_fn(
 fn compress_frame_grok(
     frame: &RawFrame,
     params: &CompressParams,
+    output_buf: &mut Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    let Some(psnr) = params.quality_psnr else {
+        let by_ratio = Allocation::Ratio {
+            ratio: params.compression_ratio,
+            max_bytes: 0,
+        };
+        return compress_frame_once(frame, params, by_ratio, output_buf);
+    };
+
+    let compressed = compress_frame_once(frame, params, Allocation::Quality { psnr }, output_buf)?;
+    let Some(cap) = params.codestream_byte_cap else {
+        return Ok(compressed);
+    };
+    if compressed.len() as u64 <= cap {
+        return Ok(compressed);
+    }
+    // grok holds to max_cs_size by rate but ignores it by quality, so a frame
+    // the quality target cannot fit is compressed again by rate
+    let by_ratio = Allocation::Ratio {
+        ratio: cinema_raw_frame_bytes(frame) as f64 / cap as f64,
+        max_bytes: cap,
+    };
+    compress_frame_once(frame, params, by_ratio, output_buf)
+}
+
+#[cfg(feature = "grok-ffi")]
+fn compress_frame_once(
+    frame: &RawFrame,
+    params: &CompressParams,
+    allocation: Allocation,
     output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     use grokj2k_sys::*;
@@ -800,8 +862,18 @@ fn compress_frame_grok(
 
         cparams.cod_format = _GRK_SUPPORTED_FILE_FMT_GRK_FMT_J2K;
         cparams.numlayers = params.num_layers;
-        cparams.allocation_by_rate_distortion = true;
-        cparams.layer_rate[0] = params.compression_ratio;
+        match allocation {
+            Allocation::Ratio { ratio, max_bytes } => {
+                cparams.allocation_by_rate_distortion = true;
+                cparams.layer_rate[0] = ratio;
+                cparams.max_cs_size = max_bytes;
+            }
+            Allocation::Quality { psnr } => {
+                cparams.allocation_by_quality = true;
+                cparams.allocation_by_rate_distortion = false;
+                cparams.layer_distortion[0] = psnr;
+            }
+        }
         cparams.numresolution = params.num_resolutions;
         cparams.cblockw_init = params.codeblock_size;
         cparams.cblockh_init = params.codeblock_size;

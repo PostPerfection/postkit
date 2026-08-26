@@ -4,6 +4,18 @@
 
 ### Added
 
+- `quality_psnr` on `EncodeRunOptions`, `StreamEncodeOptions` and
+  `CompressParams`: a PSNR target in dB that grok allocates layers by instead of
+  the compression ratio. grok holds to `max_cs_size` under rate allocation but
+  ignores it under quality allocation, so a frame whose quality-allocated
+  codestream exceeds `codestream_byte_cap` is compressed again by rate at
+  `raw_frame_bytes / cap`, inside the encoder thread, before the writer sees it.
+  The writer's own size check is unchanged and still fails the run on anything
+  over the cap. `encode_parallel` passes `-q` instead of `-r` to grk_compress.
+  `stream_encode_subprocess` refuses a PSNR target the way it refuses a byte
+  cap: its cinema profile hands grk_compress a frame rate rather than a layer
+  allocation.
+
 - `picture_findings::PictureFindings` on `encode::EncodeResult` and
   `pipeline::EncodeResult`: the black and frozen runs ffmpeg's `blackdetect` and
   `freezedetect` saw while the source decoded, as inclusive output frame numbers

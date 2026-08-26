@@ -591,6 +591,11 @@ pub struct StreamEncodeOptions {
     pub output_dir: PathBuf,
     /// Target compression ratio (e.g. 10 for 10:1)
     pub compression_ratio: f64,
+    /// A PSNR target in dB that grok allocates layers by instead of the
+    /// compression ratio. `codestream_byte_cap` still holds: a frame the target
+    /// cannot fit under the cap is compressed again by rate.
+    #[serde(default)]
+    pub quality_psnr: Option<f64>,
     /// Number of decomposition levels
     pub num_resolutions: u32,
     /// Code block size
@@ -644,6 +649,7 @@ impl Default for StreamEncodeOptions {
             input: PathBuf::new(),
             output_dir: PathBuf::new(),
             compression_ratio: 10.0,
+            quality_psnr: None,
             num_resolutions: 6,
             codeblock_size: 32,
             progression: "CPRL".to_string(),
@@ -959,6 +965,8 @@ where
 
     let params = CompressParams {
         compression_ratio: opts.compression_ratio,
+        quality_psnr: opts.quality_psnr,
+        codestream_byte_cap: opts.codestream_byte_cap,
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
         // grok only sizes the per-frame byte budget from this, so the whole rate is enough
@@ -1097,6 +1105,15 @@ where
             ..Default::default()
         };
     }
+    if opts.quality_psnr.is_some() {
+        return EncodeResult {
+            success: false,
+            error: "a PSNR target needs the in-process encoder: the cinema profile hands \
+                    grk_compress a frame rate rather than a layer allocation"
+                .to_string(),
+            ..Default::default()
+        };
+    }
 
     let (source_width, source_height, source_frames) =
         probe_decode_source(&opts.input, opts.decode_source);
@@ -1205,6 +1222,8 @@ where
 
     let params = grok_encoder::CompressParams {
         compression_ratio: opts.compression_ratio,
+        quality_psnr: opts.quality_psnr,
+        codestream_byte_cap: opts.codestream_byte_cap,
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
         // grok only sizes the per-frame byte budget from this, so the whole rate is enough
@@ -1282,10 +1301,15 @@ pub struct ParallelProgress {
 ///
 /// The caller lists the sequence with [`find_source_frames`] and passes the
 /// frames it wants, so encoding a window is passing fewer of them.
+///
+/// `quality_psnr` replaces the compression ratio with a PSNR target grk_compress
+/// allocates layers by.
+#[allow(clippy::too_many_arguments)]
 pub fn encode_parallel<F>(
     frames: &[PathBuf],
     output_dir: &Path,
     compression_ratio: f64,
+    quality_psnr: Option<f64>,
     codestream_byte_cap: Option<u64>,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
@@ -1303,6 +1327,10 @@ where
     }
 
     let total = frames.len() as u64;
+    let (allocation_flag, allocation_value) = match quality_psnr {
+        Some(psnr) => ("-q", psnr),
+        None => ("-r", compression_ratio),
+    };
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         return EncodeResult {
@@ -1377,8 +1405,8 @@ where
                                 "-o",
                                 &out_file.to_string_lossy(),
                                 "--xyz",
-                                "-r",
-                                &format!("{compression_ratio}"),
+                                allocation_flag,
+                                &allocation_value.to_string(),
                                 "-n",
                                 "6",
                                 "-b",
@@ -1543,10 +1571,28 @@ mod tests {
 
         let frames = find_source_frames(&input).unwrap();
         let loose_dir = dir.path().join("r10");
-        let result = encode_parallel(&frames, &loose_dir, 10.0, None, &cancel, &pause, |_| {});
+        let result = encode_parallel(
+            &frames,
+            &loose_dir,
+            10.0,
+            None,
+            None,
+            &cancel,
+            &pause,
+            |_| {},
+        );
         assert!(result.success, "{}", result.error);
         let tight_dir = dir.path().join("r40");
-        let result = encode_parallel(&frames, &tight_dir, 40.0, None, &cancel, &pause, |_| {});
+        let result = encode_parallel(
+            &frames,
+            &tight_dir,
+            40.0,
+            None,
+            None,
+            &cancel,
+            &pause,
+            |_| {},
+        );
         assert!(result.success, "{}", result.error);
         let loose = sizes(&loose_dir);
         let tight = sizes(&tight_dir);
@@ -1562,6 +1608,7 @@ mod tests {
             &frames,
             &capped_dir,
             10.0,
+            None,
             Some(64),
             &cancel,
             &pause,
@@ -1600,6 +1647,7 @@ mod tests {
             window,
             &output,
             10.0,
+            None,
             None,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(AtomicBool::new(false)),

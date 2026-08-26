@@ -833,3 +833,137 @@ fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
         DETECTION_SEGMENT_FRAMES * 2
     );
 }
+
+const QUALITY_FPS: u32 = 24;
+const QUALITY_FRAMES: u64 = 4;
+const NOISE_WIDTH: u32 = 512;
+const NOISE_HEIGHT: u32 = 270;
+/// Well under what PSNR 60 needs for noise, so the fallback to rate allocation
+/// is the only thing that can hold the run to it.
+const NOISE_BYTE_CAP: u64 = 60_000;
+
+fn write_lavfi_clip(path: &std::path::Path, source: &str, filters: &str) {
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            source,
+            "-vf",
+            filters,
+            "-frames:v",
+            &QUALITY_FRAMES.to_string(),
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv444p",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        ffmpeg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ffmpeg.stderr)
+    );
+}
+
+fn encode_codestream_sizes(
+    video: &std::path::Path,
+    output: &std::path::Path,
+    quality_psnr: Option<f64>,
+    codestream_byte_cap: Option<u64>,
+) -> Vec<u64> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    let result = run_encode_with_options(
+        video,
+        output,
+        &EncodeRunOptions {
+            fps: FrameRate::whole(QUALITY_FPS),
+            quality_psnr,
+            codestream_byte_cap,
+            ..Default::default()
+        },
+        &cancel,
+        &pause,
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    )
+    .expect("encode");
+    assert_eq!(result.frames_encoded, QUALITY_FRAMES);
+
+    let mut sizes: Vec<u64> = std::fs::read_dir(&result.j2k_dir)
+        .expect("j2k dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "j2c"))
+        .map(|entry| entry.metadata().expect("codestream").len())
+        .collect();
+    sizes.sort_unstable();
+    assert_eq!(sizes.len() as u64, QUALITY_FRAMES);
+    sizes
+}
+
+#[test]
+fn a_higher_psnr_target_makes_larger_codestreams() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mkv");
+    write_lavfi_clip(
+        &video,
+        &format!("testsrc=s={NOISE_WIDTH}x{NOISE_HEIGHT}:r={QUALITY_FPS}:d=1"),
+        "format=yuv444p",
+    );
+
+    let at_40: u64 = encode_codestream_sizes(&video, &dir.path().join("psnr40"), Some(40.0), None)
+        .iter()
+        .sum();
+    let at_50: u64 = encode_codestream_sizes(&video, &dir.path().join("psnr50"), Some(50.0), None)
+        .iter()
+        .sum();
+
+    assert!(
+        at_50 > at_40,
+        "PSNR 50 should cost more than PSNR 40, got {at_50} and {at_40} bytes"
+    );
+}
+
+#[test]
+fn a_byte_cap_holds_where_the_psnr_target_cannot() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("noise.mkv");
+    write_lavfi_clip(
+        &video,
+        &format!("nullsrc=s={NOISE_WIDTH}x{NOISE_HEIGHT}:r={QUALITY_FPS}:d=1"),
+        "format=yuv444p,noise=alls=100:allf=t+u",
+    );
+
+    let uncapped = encode_codestream_sizes(&video, &dir.path().join("uncapped"), Some(60.0), None);
+    assert!(
+        uncapped[0] > NOISE_BYTE_CAP,
+        "the noise clip has to be one PSNR 60 cannot fit under {NOISE_BYTE_CAP} bytes, \
+         smallest codestream was {}",
+        uncapped[0]
+    );
+
+    let capped = encode_codestream_sizes(
+        &video,
+        &dir.path().join("capped"),
+        Some(60.0),
+        Some(NOISE_BYTE_CAP),
+    );
+    assert!(
+        capped.iter().all(|size| *size <= NOISE_BYTE_CAP),
+        "every codestream should be at or under {NOISE_BYTE_CAP} bytes, got {capped:?}"
+    );
+}

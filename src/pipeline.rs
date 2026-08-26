@@ -144,6 +144,10 @@ pub fn run_encode_with_ratio(
 pub struct EncodeRunOptions {
     /// J2K compression ratio (video input only).
     pub compression_ratio: f64,
+    /// A PSNR target in dB that grok allocates layers by instead of the
+    /// compression ratio. `codestream_byte_cap` still holds: a frame the target
+    /// cannot fit under the cap is compressed again by rate.
+    pub quality_psnr: Option<f64>,
     /// J2K edit rate.
     pub fps: FrameRate,
     /// Read the source as if it ran at this rate, ignoring its own timestamps.
@@ -178,6 +182,7 @@ impl Default for EncodeRunOptions {
     fn default() -> Self {
         Self {
             compression_ratio: 10.0,
+            quality_psnr: None,
             fps: FrameRate::default(),
             read_source_at: None,
             frame_range: None,
@@ -264,6 +269,7 @@ fn run_encode_and_maybe_wrap(
     on_log: impl Fn(&str),
 ) -> Result<(EncodeResult, Option<crate::mxf_wrap::MxfTrackFile>), String> {
     let compression_ratio = options.compression_ratio;
+    let quality_psnr = options.quality_psnr;
     let fps = options.fps;
     if !video.exists() {
         return Err(format!("Input not found: {}", video.display()));
@@ -397,6 +403,7 @@ fn run_encode_and_maybe_wrap(
                 input: video.to_path_buf(),
                 output_dir: j2k_dir.clone(),
                 compression_ratio,
+                quality_psnr,
                 num_resolutions: 6,
                 codeblock_size: 32,
                 progression: "CPRL".to_string(),
@@ -439,6 +446,7 @@ fn run_encode_and_maybe_wrap(
                     input: list,
                     output_dir: j2k_dir.clone(),
                     compression_ratio,
+                    quality_psnr,
                     num_resolutions: 6,
                     codeblock_size: 32,
                     progression: "CPRL".to_string(),
@@ -470,6 +478,7 @@ fn run_encode_and_maybe_wrap(
                     &frames,
                     &j2k_dir,
                     compression_ratio,
+                    quality_psnr,
                     options.codestream_byte_cap,
                     cancel,
                     pause,
