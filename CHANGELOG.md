@@ -27,6 +27,9 @@
   `freeze_end` for a run that reaches the last frame, so the encoded frame count
   closes that one. A J2K sequence and an image sequence `grk_compress` reads for
   itself report nothing, since neither decodes through ffmpeg.
+  `PictureFindings::describe` turns them into one log line per run, of the form
+  `black picture from 00:00:00:00 to 00:00:02:23 (frames 0 to 71)`, timecoded at
+  the encode's frame rate rounded to whole frames per second.
 
 - `ColourSpace::LogC` transforms in `DcdmTransform` instead of being refused, so
   an ARRI LogC3 master encodes through the same per-frame path P3 and Rec.2020

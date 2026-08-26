@@ -5,6 +5,7 @@
 //! `split` branch of their own: put them in the main chain and ffmpeg quietly
 //! round trips every frame through yuv444p16le on the way to the compressor.
 
+use crate::timecode::Timecode;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStderr};
@@ -49,6 +50,17 @@ impl FrameInterval {
             last_frame: last_frame.max(first_frame),
         }
     }
+
+    fn describe(&self, condition: &str, fps: f64) -> String {
+        let timecode_fps = fps.round() as u8;
+        format!(
+            "{condition} picture from {} to {} (frames {} to {})",
+            Timecode::from_frames(self.first_frame, timecode_fps),
+            Timecode::from_frames(self.last_frame, timecode_fps),
+            self.first_frame,
+            self.last_frame
+        )
+    }
 }
 
 /// The black and frozen runs one encode found.
@@ -56,6 +68,15 @@ impl FrameInterval {
 pub struct PictureFindings {
     pub black: Vec<FrameInterval>,
     pub frozen: Vec<FrameInterval>,
+}
+
+impl PictureFindings {
+    /// One log line per interval, black runs first.
+    pub fn describe(&self, fps: f64) -> Vec<String> {
+        let black = self.black.iter().map(|run| run.describe("black", fps));
+        let frozen = self.frozen.iter().map(|run| run.describe("frozen", fps));
+        black.chain(frozen).collect()
+    }
 }
 
 /// Run blackdetect and freezedetect on a copy of the finished frames, leaving
@@ -267,6 +288,47 @@ mod tests {
                 last_frame: 24,
             }]
         );
+    }
+
+    #[test]
+    fn each_interval_describes_itself_with_timecodes_and_frame_numbers() {
+        let findings = PictureFindings {
+            black: vec![FrameInterval {
+                first_frame: 0,
+                last_frame: 71,
+            }],
+            frozen: vec![FrameInterval {
+                first_frame: 144,
+                last_frame: 215,
+            }],
+        };
+        assert_eq!(
+            findings.describe(24.0),
+            vec![
+                "black picture from 00:00:00:00 to 00:00:02:23 (frames 0 to 71)".to_string(),
+                "frozen picture from 00:00:06:00 to 00:00:08:23 (frames 144 to 215)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_fractional_rate_timecodes_at_its_nearest_whole_rate() {
+        let findings = PictureFindings {
+            black: vec![FrameInterval {
+                first_frame: 0,
+                last_frame: 49,
+            }],
+            frozen: Vec::new(),
+        };
+        assert_eq!(
+            findings.describe(24000.0 / 1001.0),
+            vec!["black picture from 00:00:00:00 to 00:00:02:01 (frames 0 to 49)".to_string()]
+        );
+    }
+
+    #[test]
+    fn findings_with_nothing_in_them_describe_nothing() {
+        assert!(PictureFindings::default().describe(24.0).is_empty());
     }
 
     #[test]
