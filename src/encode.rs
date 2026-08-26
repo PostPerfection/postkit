@@ -378,19 +378,86 @@ impl SourceColour {
     }
 }
 
+/// The window of a source to encode, so a caller keeping five minutes of a two
+/// hour source encodes those five minutes and nothing else.
+///
+/// Frames are counted in output frames at the target `fps`, after the fps filter
+/// or the read-rate override, and numbered from zero: frame N of the window is
+/// the codestream a full encode would have written as frame
+/// `first_frame + N`. The window's own codestreams are numbered from zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameRange {
+    pub first_frame: u64,
+    pub frame_count: u64,
+}
+
+impl FrameRange {
+    /// One past the last output frame the window covers.
+    pub fn end_frame(&self) -> u64 {
+        self.first_frame.saturating_add(self.frame_count)
+    }
+
+    fn longer_than(&self, source_frames: u64) -> String {
+        format!(
+            "frames {}..{} were asked for, but the source is {source_frames} frames long",
+            self.first_frame,
+            self.end_frame()
+        )
+    }
+
+    /// Refuse a window the source cannot fill. A zero `source_frames` is a probe
+    /// that read no count rather than an empty source, so it is not checked.
+    pub fn check_against_probe(&self, source_frames: u64) -> Result<(), String> {
+        if source_frames == 0 || self.end_frame() <= source_frames {
+            return Ok(());
+        }
+        Err(self.longer_than(source_frames))
+    }
+
+    /// The window's frames of a source list, refusing a window the list cannot
+    /// fill.
+    pub fn window_of<'a, T>(&self, frames: &'a [T]) -> Result<&'a [T], String> {
+        let available = frames.len() as u64;
+        if self.end_frame() > available {
+            return Err(self.longer_than(available));
+        }
+        Ok(&frames[self.first_frame as usize..self.end_frame() as usize])
+    }
+
+    /// The ffmpeg filters that drop everything outside the window and restamp
+    /// the kept frames from zero.
+    fn trim_filters(&self) -> [String; 2] {
+        [
+            format!(
+                "trim=start_frame={}:end_frame={}",
+                self.first_frame,
+                self.end_frame()
+            ),
+            "setpts=PTS-STARTPTS".to_string(),
+        ]
+    }
+}
+
 /// The ffmpeg filter chain for a stream decode: the picture plan, the output
-/// frame rate at the position the plan names, plus the HDR-to-DCI LUT last when
-/// the source needs one, so the LUT sees the finished picture.
+/// frame rate at the position the plan names, the frame window right after that
+/// rate, plus the HDR-to-DCI LUT last when the source needs one, so the LUT sees
+/// the finished picture.
 pub(crate) fn decode_filters(
     fps: FrameRate,
     source_colour: &SourceColour,
     plan: &crate::picture_processing::PicturePlan,
+    frame_range: Option<FrameRange>,
 ) -> String {
     let mut filters = plan.filters.clone();
     filters.insert(
         plan.fps_position,
         format!("fps={}", fps.ffmpeg_filter_value()),
     );
+    // the window is counted in output frames, not source frames
+    if let Some(range) = frame_range {
+        let after_fps = plan.fps_position + 1;
+        filters.splice(after_fps..after_fps, range.trim_filters());
+    }
     if let SourceColour::DciLut(lut) = source_colour {
         filters.push(format!("lut3d={}", lut.display()));
     }
@@ -461,6 +528,24 @@ pub(crate) fn decode_input_args(
     Ok(args)
 }
 
+/// Every ffmpeg argument after `-i` for a stream decode: the filter chain and
+/// the raw output on stdout, plus a frame limit for a window so ffmpeg stops at
+/// the window's end instead of decoding the rest of the source.
+pub(crate) fn decode_output_args(filters: &str, frame_range: Option<FrameRange>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "-vf", filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_string())
+    .collect();
+    if let Some(range) = frame_range {
+        args.push("-frames:v".to_string());
+        args.push(range.frame_count.to_string());
+    }
+    args.push("pipe:1".to_string());
+    args
+}
+
 /// Write an ffmpeg concat list holding every frame of an image sequence for one
 /// frame period, in the order [`find_source_frames`] returns them.
 ///
@@ -507,6 +592,11 @@ pub struct StreamEncodeOptions {
     /// only, and the sound needs the matching pull-up.
     #[serde(default)]
     pub read_source_at: Option<FrameRate>,
+    /// Encode only this window of the source instead of all of it. The frames
+    /// before it are still decoded and thrown away, which costs far less than
+    /// compressing them.
+    #[serde(default)]
+    pub frame_range: Option<FrameRange>,
     /// Path to compressor binary (auto-detected if empty)
     pub compressor_path: PathBuf,
     /// Library directory for LD_LIBRARY_PATH (if needed)
@@ -546,6 +636,7 @@ impl Default for StreamEncodeOptions {
             progression: "CPRL".to_string(),
             fps: FrameRate::default(),
             read_source_at: None,
+            frame_range: None,
             compressor_path: PathBuf::new(),
             lib_dir: None,
             source_colour: SourceColour::DisplayRgb,
@@ -736,7 +827,7 @@ where
         };
     }
 
-    let (source_width, source_height, total_frames) =
+    let (source_width, source_height, source_frames) =
         probe_decode_source(&opts.input, opts.decode_source);
     if source_width == 0 || source_height == 0 {
         return EncodeResult {
@@ -745,6 +836,18 @@ where
             ..Default::default()
         };
     }
+    if let Some(range) = opts.frame_range
+        && let Err(e) = range.check_against_probe(source_frames)
+    {
+        return EncodeResult {
+            success: false,
+            error: e,
+            ..Default::default()
+        };
+    }
+    let total_frames = opts
+        .frame_range
+        .map_or(source_frames, |range| range.frame_count);
     let plan = match opts.picture.plan(source_width, source_height) {
         Ok(plan) => plan,
         Err(e) => {
@@ -769,7 +872,7 @@ where
     let frame_size = (width as usize) * (height as usize) * 3 * 2; // 16-bit RGB
 
     // Start ffmpeg: decode to raw 16-bit big-endian RGB
-    let filters = decode_filters(opts.fps, &opts.source_colour, &plan);
+    let filters = decode_filters(opts.fps, &opts.source_colour, &plan, opts.frame_range);
     let input_args = match decode_input_args(opts.decode_source, opts.read_source_at) {
         Ok(args) => args,
         Err(e) => {
@@ -790,9 +893,7 @@ where
         .args(&input_args)
         .arg("-i")
         .arg(&opts.input)
-        .args([
-            "-vf", &filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1",
-        ])
+        .args(decode_output_args(&filters, opts.frame_range))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -960,7 +1061,7 @@ where
         };
     }
 
-    let (source_width, source_height, total_frames) =
+    let (source_width, source_height, source_frames) =
         probe_decode_source(&opts.input, opts.decode_source);
     if source_width == 0 || source_height == 0 {
         return EncodeResult {
@@ -969,6 +1070,18 @@ where
             ..Default::default()
         };
     }
+    if let Some(range) = opts.frame_range
+        && let Err(e) = range.check_against_probe(source_frames)
+    {
+        return EncodeResult {
+            success: false,
+            error: e,
+            ..Default::default()
+        };
+    }
+    let total_frames = opts
+        .frame_range
+        .map_or(source_frames, |range| range.frame_count);
     let plan = match opts.picture.plan(source_width, source_height) {
         Ok(plan) => plan,
         Err(e) => {
@@ -993,7 +1106,7 @@ where
     let frame_size = (width as usize) * (height as usize) * 3 * 2;
 
     // Start ffmpeg
-    let filters = decode_filters(opts.fps, &opts.source_colour, &plan);
+    let filters = decode_filters(opts.fps, &opts.source_colour, &plan, opts.frame_range);
     let input_args = match decode_input_args(opts.decode_source, opts.read_source_at) {
         Ok(args) => args,
         Err(e) => {
@@ -1014,9 +1127,7 @@ where
         .args(&input_args)
         .arg("-i")
         .arg(&opts.input)
-        .args([
-            "-vf", &filters, "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1",
-        ])
+        .args(decode_output_args(&filters, opts.frame_range))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -1105,14 +1216,17 @@ pub struct ParallelProgress {
     pub elapsed_secs: f64,
 }
 
-/// Encode an image sequence using parallel single-threaded subprocesses.
+/// Encode the given image files using parallel single-threaded subprocesses.
 ///
 /// Spawns up to `parallelism` grk_compress processes concurrently, each
 /// processing one frame with `-H 1` (single thread). Returns when all
 /// frames are encoded or an error occurs. Each finished frame is held to
 /// `codestream_byte_cap` so a run fails at the frame that breaks it.
+///
+/// The caller lists the sequence with [`find_source_frames`] and passes the
+/// frames it wants, so encoding a window is passing fewer of them.
 pub fn encode_parallel<F>(
-    input_dir: &Path,
+    frames: &[PathBuf],
     output_dir: &Path,
     compression_ratio: f64,
     codestream_byte_cap: Option<u64>,
@@ -1123,17 +1237,6 @@ pub fn encode_parallel<F>(
 where
     F: FnMut(ParallelProgress),
 {
-    let frames = match find_source_frames(input_dir) {
-        Ok(f) => f,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: format!("Failed to read input dir: {e}"),
-                ..Default::default()
-            };
-        }
-    };
-
     if frames.is_empty() {
         return EncodeResult {
             success: false,
@@ -1173,7 +1276,6 @@ where
     let error_flag = Arc::new(AtomicBool::new(false));
     let first_error = Arc::new(std::sync::Mutex::new(String::new()));
 
-    let frame_paths: Vec<_> = frames.iter().map(|f| f.to_path_buf()).collect();
     let work_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     std::thread::scope(|s| {
@@ -1185,7 +1287,6 @@ where
                 let first_error = first_error.clone();
                 let grk_bin = &grk_bin;
                 let lib_path = &lib_path;
-                let frame_paths = &frame_paths;
 
                 s.spawn(move || {
                     loop {
@@ -1200,11 +1301,11 @@ where
                         }
 
                         let idx = work_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= frame_paths.len() {
+                        if idx >= frames.len() {
                             break;
                         }
 
-                        let frame = &frame_paths[idx];
+                        let frame = &frames[idx];
                         let stem = frame
                             .file_stem()
                             .and_then(|s| s.to_str())
@@ -1380,11 +1481,12 @@ mod tests {
             v
         };
 
+        let frames = find_source_frames(&input).unwrap();
         let loose_dir = dir.path().join("r10");
-        let result = encode_parallel(&input, &loose_dir, 10.0, None, &cancel, &pause, |_| {});
+        let result = encode_parallel(&frames, &loose_dir, 10.0, None, &cancel, &pause, |_| {});
         assert!(result.success, "{}", result.error);
         let tight_dir = dir.path().join("r40");
-        let result = encode_parallel(&input, &tight_dir, 40.0, None, &cancel, &pause, |_| {});
+        let result = encode_parallel(&frames, &tight_dir, 40.0, None, &cancel, &pause, |_| {});
         assert!(result.success, "{}", result.error);
         let loose = sizes(&loose_dir);
         let tight = sizes(&tight_dir);
@@ -1396,13 +1498,207 @@ mod tests {
         );
 
         let capped_dir = dir.path().join("capped");
-        let result = encode_parallel(&input, &capped_dir, 10.0, Some(64), &cancel, &pause, |_| {});
+        let result = encode_parallel(
+            &frames,
+            &capped_dir,
+            10.0,
+            Some(64),
+            &cancel,
+            &pause,
+            |_| {},
+        );
         assert!(!result.success, "a 64 byte cap cannot hold a codestream");
         assert!(
             result.error.contains("per-frame cap"),
             "got: {}",
             result.error
         );
+    }
+
+    #[test]
+    fn parallel_encode_compresses_only_the_frames_it_is_given() {
+        if crate::grok::find_grk_compress().is_none() {
+            eprintln!("skipping: grk_compress not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in");
+        std::fs::create_dir(&input).unwrap();
+        for i in 0..6u32 {
+            write_noise_png(&input.join(format!("frame_{i:03}.png")), 11 + i);
+        }
+        let frames = find_source_frames(&input).unwrap();
+        let window = FrameRange {
+            first_frame: 2,
+            frame_count: 3,
+        }
+        .window_of(&frames)
+        .unwrap();
+
+        let output = dir.path().join("out");
+        let result = encode_parallel(
+            window,
+            &output,
+            10.0,
+            None,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+        );
+        assert!(result.success, "{}", result.error);
+        assert_eq!(result.frames_encoded, 3);
+
+        let mut written: Vec<String> = std::fs::read_dir(&output)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        written.sort();
+        assert_eq!(
+            written,
+            vec!["frame_002.j2k", "frame_003.j2k", "frame_004.j2k"],
+            "only the window's stills may be compressed"
+        );
+    }
+
+    #[test]
+    fn a_frame_window_trims_after_the_fps_filter() {
+        let plain = crate::picture_processing::PictureProcessing::default()
+            .plan(1920, 1080)
+            .unwrap();
+        let window = FrameRange {
+            first_frame: 7200,
+            frame_count: 120,
+        };
+        assert_eq!(
+            decode_filters(
+                FrameRate::whole(24),
+                &SourceColour::DisplayRgb,
+                &plain,
+                Some(window)
+            ),
+            "fps=24,trim=start_frame=7200:end_frame=7320,setpts=PTS-STARTPTS"
+        );
+        assert_eq!(
+            decode_filters(
+                FrameRate::whole(24),
+                &SourceColour::DisplayRgb,
+                &plain,
+                None
+            ),
+            "fps=24",
+            "no window has to leave the chain as it was"
+        );
+
+        // a deinterlace runs before the fps filter, so the window still has to
+        // land after it and before the lut
+        let processed = crate::picture_processing::PictureProcessing {
+            deinterlace: true,
+            denoise: true,
+            ..crate::picture_processing::PictureProcessing::default()
+        }
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!(
+            decode_filters(
+                FrameRate::whole(24),
+                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+                &processed,
+                Some(window)
+            ),
+            "yadif,fps=24,trim=start_frame=7200:end_frame=7320,setpts=PTS-STARTPTS,hqdn3d,\
+             lut3d=/luts/hdr_to_dci.cube"
+        );
+    }
+
+    #[test]
+    fn a_frame_window_stops_ffmpeg_at_its_end() {
+        assert_eq!(
+            decode_output_args("fps=24", None),
+            vec![
+                "-vf", "fps=24", "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1"
+            ]
+        );
+        assert_eq!(
+            decode_output_args(
+                "fps=24",
+                Some(FrameRange {
+                    first_frame: 10,
+                    frame_count: 5,
+                })
+            ),
+            vec![
+                "-vf",
+                "fps=24",
+                "-pix_fmt",
+                "rgb48be",
+                "-f",
+                "rawvideo",
+                "-an",
+                "-frames:v",
+                "5",
+                "pipe:1"
+            ],
+            "ffmpeg has to stop at the window instead of decoding to the end"
+        );
+    }
+
+    #[test]
+    fn a_window_past_the_end_of_the_source_is_refused() {
+        let window = FrameRange {
+            first_frame: 10,
+            frame_count: 5,
+        };
+        assert_eq!(window.end_frame(), 15);
+        assert!(window.check_against_probe(15).is_ok());
+        assert!(window.check_against_probe(48).is_ok());
+        assert!(
+            window.check_against_probe(0).is_ok(),
+            "a probe that read no count says nothing about the length"
+        );
+        let error = window.check_against_probe(14).unwrap_err();
+        assert!(error.contains("10..15"), "{error}");
+        assert!(error.contains("14 frames long"), "{error}");
+
+        let frames: Vec<u64> = (0..15).collect();
+        assert_eq!(window.window_of(&frames).unwrap(), &[10, 11, 12, 13, 14]);
+        let error = window.window_of(&frames[..14]).unwrap_err();
+        assert!(error.contains("14 frames long"), "{error}");
+        assert!(
+            window.window_of(&[] as &[u64]).is_err(),
+            "an empty list cannot fill any window"
+        );
+    }
+
+    #[test]
+    fn a_concat_list_holds_only_the_windowed_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let frames: Vec<PathBuf> = (0..8)
+            .map(|index| {
+                let frame = dir.path().join(format!("frame_{index:03}.png"));
+                std::fs::write(&frame, b"not a real png").unwrap();
+                frame
+            })
+            .collect();
+        let window = FrameRange {
+            first_frame: 3,
+            frame_count: 2,
+        }
+        .window_of(&frames)
+        .unwrap();
+
+        let list_path = dir.path().join("frames.ffconcat");
+        write_image_concat_list(window, FrameRate::whole(24), &list_path).unwrap();
+        let list = std::fs::read_to_string(&list_path).unwrap();
+        assert_eq!(list.matches("file '").count(), 2, "{list}");
+        assert!(list.contains("frame_003.png"), "{list}");
+        assert!(list.contains("frame_004.png"), "{list}");
+        for outside in ["frame_000.png", "frame_002.png", "frame_005.png"] {
+            assert!(
+                !list.contains(outside),
+                "{outside} is outside the window\n{list}"
+            );
+        }
     }
 
     #[test]
@@ -1509,18 +1805,24 @@ mod tests {
             .plan(1920, 1080)
             .unwrap();
         assert_eq!(
-            decode_filters(FrameRate::whole(24), &SourceColour::DisplayRgb, &plain),
+            decode_filters(
+                FrameRate::whole(24),
+                &SourceColour::DisplayRgb,
+                &plain,
+                None
+            ),
             "fps=24"
         );
         assert_eq!(
-            decode_filters(FrameRate::whole(25), &SourceColour::AlreadyPq, &plain),
+            decode_filters(FrameRate::whole(25), &SourceColour::AlreadyPq, &plain, None),
             "fps=25"
         );
         assert_eq!(
             decode_filters(
                 FrameRate::whole(48),
                 &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
-                &plain
+                &plain,
+                None
             ),
             "fps=48,lut3d=/luts/hdr_to_dci.cube"
         );
@@ -1545,7 +1847,8 @@ mod tests {
             decode_filters(
                 FrameRate::whole(24),
                 &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
-                &plan
+                &plan,
+                None
             ),
             "yadif,fps=24,hqdn3d,format=gbrp16le,crop=1920:804:0:138,lut3d=/luts/hdr_to_dci.cube"
         );

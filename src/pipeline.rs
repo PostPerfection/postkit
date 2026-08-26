@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use crate::encode::FrameRange;
 use crate::encode::{
     FrameRate, ImageFormat, InputType, ParallelProgress, SourceColour, StreamEncodeOptions,
     StreamProgress, check_codestream_size, encode_parallel, stream_encode_inprocess_with_mxf_feed,
@@ -146,6 +147,11 @@ pub struct EncodeRunOptions {
     /// frame reaches the encoder once, none is duplicated or dropped. Video
     /// only, and the sound needs the matching pull-up.
     pub read_source_at: Option<FrameRate>,
+    /// Encode only this window of the source rather than all of it, so a caller
+    /// keeping five minutes of a two hour source never compresses the rest.
+    /// A J2K sequence is refused: it is not encoded here at all, so the caller
+    /// links the codestreams it wants.
+    pub frame_range: Option<FrameRange>,
     /// Colour the source frames carry, which decides whether the encoder runs
     /// the DCDM X'Y'Z' transform or leaves DCI PQ essence alone.
     pub source_colour: SourceColour,
@@ -170,6 +176,7 @@ impl Default for EncodeRunOptions {
             compression_ratio: 10.0,
             fps: FrameRate::default(),
             read_source_at: None,
+            frame_range: None,
             source_colour: SourceColour::DisplayRgb,
             codestream_byte_cap: None,
             subtitle_burn: None,
@@ -289,6 +296,9 @@ fn run_encode_and_maybe_wrap(
              another rate"
         ));
     }
+    if options.frame_range.is_some() {
+        reject_unsupported_frame_range(input_type)?;
+    }
     reject_unsupported_colour_path(input_type, &options.source_colour, decodes_through_ffmpeg)?;
     if options.subtitle_burn.is_some() {
         reject_unsupported_burn(input_type, &options.source_colour)?;
@@ -384,6 +394,7 @@ fn run_encode_and_maybe_wrap(
                 progression: "CPRL".to_string(),
                 fps,
                 read_source_at: options.read_source_at,
+                frame_range: options.frame_range,
                 source_colour: options.source_colour.clone(),
                 subtitle_burn: options.subtitle_burn.clone(),
                 picture: options.picture.clone(),
@@ -394,6 +405,15 @@ fn run_encode_and_maybe_wrap(
         }
         InputType::ImageSequence => {
             let input_dir = sequence_directory(video);
+            let frames = crate::encode::find_source_frames(&input_dir)
+                .map_err(|e| format!("cannot list {}: {e}", input_dir.display()))?;
+            if frames.is_empty() {
+                return Err(format!("no images in {}", input_dir.display()));
+            }
+            let frames = match options.frame_range {
+                Some(range) => range.window_of(&frames)?.to_vec(),
+                None => frames,
+            };
 
             if sequence_needs_ffmpeg {
                 // grk_compress reads the stills itself and never shows postkit a
@@ -401,11 +421,6 @@ fn run_encode_and_maybe_wrap(
                 // through ffmpeg instead: a concat list holding each still for
                 // one frame period decodes to the same rgb48be stream a video
                 // does.
-                let frames = crate::encode::find_source_frames(&input_dir)
-                    .map_err(|e| format!("cannot list {}: {e}", input_dir.display()))?;
-                if frames.is_empty() {
-                    return Err(format!("no images in {}", input_dir.display()));
-                }
                 let list = output_dir.join("frames.ffconcat");
                 crate::encode::write_image_concat_list(&frames, fps, &list)?;
                 on_log(&format!(
@@ -444,7 +459,7 @@ fn run_encode_and_maybe_wrap(
                 });
 
                 let result = encode_parallel(
-                    &input_dir,
+                    &frames,
                     &j2k_dir,
                     compression_ratio,
                     options.codestream_byte_cap,
@@ -613,6 +628,18 @@ fn reject_unsupported_burn(
         (_, SourceColour::AlreadyPq) => Err(
             "an X'Y'Z' PQ source is already in the projector's colour space, so burnt-in text \
              would be drawn in the wrong one"
+                .to_string(),
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Refuse a frame range on an input the encode never compresses.
+fn reject_unsupported_frame_range(input_type: InputType) -> Result<(), String> {
+    match input_type {
+        InputType::J2kSequence => Err(
+            "a J2K sequence is never encoded here, so a frame range has nothing to narrow: link \
+             the codestreams you want instead"
                 .to_string(),
         ),
         _ => Ok(()),
@@ -798,6 +825,15 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn compressed_input_refuses_a_frame_range() {
+        assert!(reject_unsupported_frame_range(InputType::Video).is_ok());
+        assert!(reject_unsupported_frame_range(InputType::ImageSequence).is_ok());
+        let compressed = reject_unsupported_frame_range(InputType::J2kSequence).unwrap_err();
+        assert!(compressed.contains("never encoded here"), "{compressed}");
+        assert!(compressed.contains("link the codestreams"), "{compressed}");
     }
 
     #[test]

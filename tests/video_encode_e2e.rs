@@ -5,7 +5,7 @@
 //! consumer that forgets the `grok-ffi` feature gets an error instead of an
 //! encode, and nothing else catches it.
 
-use postkit::encode::FrameRate;
+use postkit::encode::{FrameRange, FrameRate};
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_with_options};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -410,5 +410,175 @@ fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
         written < CAPPED_FRAME_COUNT,
         "the run wrote {written} of {CAPPED_FRAME_COUNT} frames instead of stopping at the \
          first frame over the cap"
+    );
+}
+
+/// A window is the whole point of `frame_range`: a wizard that keeps five
+/// minutes of a two hour source must not compress the other one hour fifty five
+/// and then throw the codestreams away.
+#[test]
+fn a_frame_range_encodes_only_its_window_and_the_frames_a_full_encode_wrote_there() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    const SOURCE_FRAMES: u64 = 48;
+    const FIRST_FRAME: u64 = 10;
+    const WINDOW_FRAMES: u64 = 5;
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mp4");
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=s={WIDTH}x{HEIGHT}:r=24"),
+            "-frames:v",
+            &SOURCE_FRAMES.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&video)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        ffmpeg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ffmpeg.stderr)
+    );
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    let encode = |name: &str, frame_range: Option<FrameRange>| {
+        run_encode_with_options(
+            &video,
+            &dir.path().join(name),
+            &EncodeRunOptions {
+                fps: FrameRate::whole(24),
+                frame_range,
+                ..Default::default()
+            },
+            &cancel,
+            &pause,
+            |_: &PipelineProgress| {},
+            |_: &str| {},
+        )
+    };
+    let codestream = |dir: &std::path::Path, index: u64| {
+        let path = dir.join(format!("frame_{index:08}.j2c"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+
+    let full = encode("full", None).expect("full encode");
+    assert_eq!(full.frames_encoded, SOURCE_FRAMES);
+
+    // the frame comparison below only means anything if the encoder writes the
+    // same bytes for the same picture, so prove that first
+    let repeat = encode("repeat", None).expect("second full encode");
+    for index in 0..SOURCE_FRAMES {
+        assert_eq!(
+            codestream(&full.j2k_dir, index),
+            codestream(&repeat.j2k_dir, index),
+            "frame {index} differs between two encodes of the same source"
+        );
+    }
+
+    let window = encode(
+        "window",
+        Some(FrameRange {
+            first_frame: FIRST_FRAME,
+            frame_count: WINDOW_FRAMES,
+        }),
+    )
+    .expect("windowed encode");
+
+    assert_eq!(window.frames_encoded, WINDOW_FRAMES);
+    assert_eq!(
+        postkit::grok_encoder::contiguous_encoded_frames(&window.j2k_dir),
+        WINDOW_FRAMES,
+        "the window's codestreams are numbered from zero"
+    );
+    assert_eq!(
+        std::fs::read_dir(&window.j2k_dir).unwrap().count() as u64,
+        WINDOW_FRAMES,
+        "nothing outside the window may be compressed"
+    );
+
+    for offset in 0..WINDOW_FRAMES {
+        assert_eq!(
+            codestream(&window.j2k_dir, offset),
+            codestream(&full.j2k_dir, FIRST_FRAME + offset),
+            "frame {offset} of the window has to be the frame a full encode wrote as {}",
+            FIRST_FRAME + offset
+        );
+    }
+    assert_ne!(
+        codestream(&window.j2k_dir, 0),
+        codestream(&full.j2k_dir, 0),
+        "a window starting at {FIRST_FRAME} that returned the head of the source would pass \
+         every count above"
+    );
+}
+
+#[test]
+fn a_frame_range_past_the_end_of_the_source_fails_before_anything_is_encoded() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    const SOURCE_FRAMES: u64 = 48;
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mp4");
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=s={WIDTH}x{HEIGHT}:r=24"),
+            "-frames:v",
+            &SOURCE_FRAMES.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&video)
+        .output()
+        .expect("ffmpeg");
+    assert!(ffmpeg.status.success());
+
+    let output = dir.path().join("out");
+    let outcome = run_encode_with_options(
+        &video,
+        &output,
+        &EncodeRunOptions {
+            fps: FrameRate::whole(24),
+            frame_range: Some(FrameRange {
+                first_frame: 46,
+                frame_count: 5,
+            }),
+            ..Default::default()
+        },
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(AtomicBool::new(false)),
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    );
+    let Err(error) = outcome else {
+        panic!("a window running past the {SOURCE_FRAMES} frame source has to fail");
+    };
+
+    assert!(error.contains("46..51"), "{error}");
+    assert!(error.contains("48 frames long"), "{error}");
+    assert_eq!(
+        std::fs::read_dir(output.join("j2k"))
+            .map(|entries| entries.count())
+            .unwrap_or(0),
+        0,
+        "nothing may be encoded before the window is refused"
     );
 }

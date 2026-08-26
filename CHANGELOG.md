@@ -4,6 +4,18 @@
 
 ### Added
 
+- `encode::FrameRange` with `EncodeRunOptions.frame_range` and
+  `StreamEncodeOptions.frame_range`: encode one window of a source instead of
+  all of it, so a wizard trimming five minutes out of a two hour source no
+  longer compresses the two hours and relinks the codestreams it kept. The
+  window counts output frames at the target `fps`, after the fps filter or the
+  read-rate override, numbered from zero, and its codestreams are numbered from
+  zero. A stream decode reaches it as `trim`/`setpts` right after the `fps`
+  filter plus `-frames:v`, so ffmpeg stops at the window's end. An image
+  sequence gets only the window's stills, in the concat list or handed to
+  `grk_compress`. A window running past the source fails before ffmpeg starts,
+  and a J2K sequence refuses one, since it is never encoded here.
+
 - `picture_processing` grew the crop resolution both wizards each carried:
   `require_one_crop_decider`, `fill_crop` (with the quarter-turn aspect swap),
   `detect_crop` (auto-crop through a video or an image-sequence concat list,
@@ -296,6 +308,9 @@
 
 ### Changed
 
+- `encode_parallel` takes the image files to compress rather than a directory to
+  list, so the caller picks the frames and a window is fewer of them. Callers
+  list the sequence with `find_source_frames` first.
 - The DCDM Rec.709 matrix is the sRGB/D65 one grok and libdcp use, where
   `create_dcdm` had a BT.709-derived variant differing in the fourth decimal.
   Blue moves by up to 5 code values at 16 bits, under one at 12.
