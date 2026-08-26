@@ -82,6 +82,12 @@ impl PictureFindings {
 /// Run blackdetect and freezedetect on a copy of the finished frames, leaving
 /// `picture_filters` as the chain the encoder reads.
 pub(crate) fn with_detection_branch(picture_filters: &str) -> String {
+    // `null` stands in for a decode that has no picture filters of its own
+    let picture_filters = if picture_filters.is_empty() {
+        "null"
+    } else {
+        picture_filters
+    };
     format!(
         "{picture_filters},split=2[picture][detect];[detect]\
          blackdetect=black_min_duration={BLACK_MINIMUM_DURATION_SECONDS}:\
@@ -197,6 +203,15 @@ mod tests {
             "fps=24,lut3d=/luts/hdr.cube,split=2[picture][detect];\
              [detect]blackdetect=black_min_duration=2:pixel_black_th=0.1,\
              freezedetect=duration=2,nullsink;[picture]null"
+        );
+    }
+
+    #[test]
+    fn a_decode_with_no_picture_filters_still_gets_the_branch() {
+        assert!(
+            with_detection_branch("").starts_with("null,split=2[picture][detect];"),
+            "got {}",
+            with_detection_branch("")
         );
     }
 

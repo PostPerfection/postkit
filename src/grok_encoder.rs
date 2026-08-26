@@ -294,6 +294,11 @@ pub struct PipelineResult {
     pub error: String,
     pub frames_encoded: u64,
     pub output_dir: PathBuf,
+    /// Black and frozen runs blackdetect and freezedetect saw during the
+    /// decode. Only a pipeline that runs ffmpeg itself fills this in: one fed
+    /// frames by its caller reports nothing, because the caller's own decode is
+    /// where the filters run.
+    pub picture_findings: crate::picture_findings::PictureFindings,
 }
 
 /// Bounded work queue with condition-variable backpressure (mirrors dcpomatic's design).
@@ -427,6 +432,7 @@ where
             error: format!("Failed to create output directory: {e}"),
             frames_encoded: 0,
             output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
         };
     }
 
@@ -600,6 +606,7 @@ where
             error: "Cancelled".to_string(),
             frames_encoded: frames_encoded.load(Ordering::Relaxed),
             output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
         };
     }
 
@@ -610,6 +617,7 @@ where
             error: err.clone(),
             frames_encoded: frames_encoded.load(Ordering::Relaxed),
             output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
         };
     }
 
@@ -618,6 +626,7 @@ where
         error: String::new(),
         frames_encoded: frames_encoded.load(Ordering::Relaxed),
         output_dir: output_dir.to_path_buf(),
+        picture_findings: crate::picture_findings::PictureFindings::default(),
     }
 }
 
@@ -1048,6 +1057,7 @@ where
                 error: e,
                 frames_encoded: 0,
                 output_dir: output_dir.to_path_buf(),
+                picture_findings: crate::picture_findings::PictureFindings::default(),
             };
         }
     }
@@ -1058,6 +1068,7 @@ where
             error: format!("Failed to create output directory: {e}"),
             frames_encoded: 0,
             output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
         };
     }
 
@@ -1075,16 +1086,25 @@ where
             error: String::new(),
             frames_encoded: 0,
             output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
         };
     }
 
     // Launch ffmpeg to decode video → raw rgb48be frames on stdout
     let mut command = Command::new("ffmpeg");
-    command.arg("-y").arg("-i").arg(input_video);
-    if let Some(filter) = window_filter_chain(video_filter, frame_range) {
-        command.arg("-vf").arg(filter);
-    }
     command
+        .arg("-y")
+        // the progress line carries no newline, so the reader would hold the
+        // whole run in one string
+        .arg("-nostats")
+        .arg("-i")
+        .arg(input_video);
+    let picture_filters = window_filter_chain(video_filter, frame_range).unwrap_or_default();
+    command
+        .arg("-vf")
+        .arg(crate::picture_findings::with_detection_branch(
+            &picture_filters,
+        ))
         .arg("-pix_fmt")
         .arg("rgb48be")
         .arg("-f")
@@ -1095,7 +1115,7 @@ where
     let mut child = match command
         .arg("pipe:1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
@@ -1105,15 +1125,22 @@ where
                 error: format!("Failed to spawn ffmpeg: {e}"),
                 frames_encoded: 0,
                 output_dir: output_dir.to_path_buf(),
+                picture_findings: crate::picture_findings::PictureFindings::default(),
             };
         }
     };
+
+    let detection_reader = child
+        .stderr
+        .take()
+        .map(crate::picture_findings::read_detection_lines);
 
     let frame_size = (width as usize) * (height as usize) * 6; // rgb48be = 6 bytes/pixel
     let mut stdout = child.stdout.take().unwrap();
 
     // discard the already-encoded prefix so ffmpeg stays frame-aligned.
     let mut frame_index: u64 = 0;
+    let mut decode_read_to_end = false;
     if start_frame > 0 {
         let mut skip_buf = vec![0u8; frame_size];
         let mut aligned = true;
@@ -1134,6 +1161,7 @@ where
                 ),
                 frames_encoded: 0,
                 output_dir: output_dir.to_path_buf(),
+                picture_findings: crate::picture_findings::PictureFindings::default(),
             };
         }
     }
@@ -1168,17 +1196,29 @@ where
                         index: idx,
                     })
                 }
-                Err(_) => None, // EOF or error — no more frames
+                Err(e) => {
+                    decode_read_to_end = e.kind() == std::io::ErrorKind::UnexpectedEof;
+                    None // EOF or error — no more frames
+                }
             }
         },
         &mut on_progress,
     );
 
-    // Clean up ffmpeg
-    let _ = child.kill();
-    let _ = child.wait();
+    // the detection timestamps are on ffmpeg's whole output, which after a
+    // resume is longer than the frames this run encoded
+    let picture_findings = crate::picture_findings::finish_detection(
+        &mut child,
+        detection_reader,
+        decode_read_to_end,
+        params.frame_rate as f64,
+        frame_index,
+    );
 
-    result
+    PipelineResult {
+        picture_findings,
+        ..result
+    }
 }
 
 // ─── Subprocess-based encoder pipeline ─────────────────────────────────────────
@@ -1226,6 +1266,7 @@ where
                 .to_string(),
             frames_encoded: 0,
             output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
         };
     }
 
@@ -1235,6 +1276,7 @@ where
             error: format!("Failed to create output directory: {e}"),
             frames_encoded: 0,
             output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
         };
     }
 
@@ -1254,6 +1296,7 @@ where
             error: format!("Failed to create tmp dir: {e}"),
             frames_encoded: 0,
             output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
         };
     }
 
@@ -1464,6 +1507,7 @@ where
         error: err,
         frames_encoded: final_count,
         output_dir: output_dir.to_path_buf(),
+        picture_findings: crate::picture_findings::PictureFindings::default(),
     }
 }
 

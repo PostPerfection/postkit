@@ -747,15 +747,8 @@ fn within_one_frame(actual: u64, expected: u64) -> bool {
     actual.abs_diff(expected) <= 1
 }
 
-#[test]
-fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let video = dir.path().join("clip.mkv");
+/// Three seconds of black, three of testsrc, then three of one still colour.
+fn write_detection_clip(path: &std::path::Path) {
     let size = format!("{DETECTION_WIDTH}x{DETECTION_HEIGHT}");
     let ffmpeg = std::process::Command::new("ffmpeg")
         .args([
@@ -781,7 +774,7 @@ fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
             "-pix_fmt",
             "yuv444p",
         ])
-        .arg(&video)
+        .arg(path)
         .output()
         .expect("ffmpeg");
     assert!(
@@ -789,6 +782,18 @@ fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
         "{}",
         String::from_utf8_lossy(&ffmpeg.stderr)
     );
+}
+
+#[test]
+fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mkv");
+    write_detection_clip(&video);
 
     let output = dir.path().join("out");
     let cancel = Arc::new(AtomicBool::new(false));
@@ -965,5 +970,67 @@ fn a_byte_cap_holds_where_the_psnr_target_cannot() {
     assert!(
         capped.iter().all(|size| *size <= NOISE_BYTE_CAP),
         "every codestream should be at or under {NOISE_BYTE_CAP} bytes, got {capped:?}"
+    );
+}
+
+/// dcpwizard's CLI `create` decodes through `encode_video_pipeline_resumable`,
+/// which runs its own ffmpeg, so the findings have to come back from there too.
+#[test]
+fn the_resumable_pipeline_reports_its_own_findings() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    use postkit::grok_encoder::{CompressParams, EncodeProgress, encode_video_pipeline_resumable};
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mkv");
+    write_detection_clip(&video);
+
+    postkit::grok_encoder::initialize(0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let total_frames = DETECTION_SEGMENT_FRAMES * 3;
+    let result = encode_video_pipeline_resumable(
+        &video,
+        &dir.path().join("j2k"),
+        &CompressParams {
+            frame_rate: DETECTION_FPS as u16,
+            ..CompressParams::default()
+        },
+        total_frames,
+        DETECTION_WIDTH,
+        DETECTION_HEIGHT,
+        &cancel,
+        false,
+        None,
+        None,
+        |_: EncodeProgress| {},
+    );
+    assert!(result.success, "{}", result.error);
+    assert_eq!(result.frames_encoded, total_frames);
+
+    let findings = &result.picture_findings;
+    let black = findings
+        .black
+        .first()
+        .unwrap_or_else(|| panic!("no black run reported, findings: {findings:?}"));
+    assert!(
+        within_one_frame(black.first_frame, 0)
+            && within_one_frame(black.last_frame, DETECTION_SEGMENT_FRAMES - 1),
+        "the black head is frames 0..={}, got {black:?}",
+        DETECTION_SEGMENT_FRAMES - 1
+    );
+
+    let frozen = findings
+        .frozen
+        .last()
+        .unwrap_or_else(|| panic!("no frozen run reported, findings: {findings:?}"));
+    assert!(
+        within_one_frame(frozen.first_frame, DETECTION_SEGMENT_FRAMES * 2)
+            && within_one_frame(frozen.last_frame, total_frames - 1),
+        "the still tail is frames {}..={}, got {frozen:?}",
+        DETECTION_SEGMENT_FRAMES * 2,
+        total_frames - 1
     );
 }

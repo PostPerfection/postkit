@@ -16,17 +16,22 @@
   cap: its cinema profile hands grk_compress a frame rate rather than a layer
   allocation.
 
-- `picture_findings::PictureFindings` on `encode::EncodeResult` and
-  `pipeline::EncodeResult`: the black and frozen runs ffmpeg's `blackdetect` and
-  `freezedetect` saw while the source decoded, as inclusive output frame numbers
-  at the encode's `fps`. Both filters run on a `split` branch of the decode
-  chain, because neither accepts rgb48be and putting them in the main chain
-  makes ffmpeg round trip every frame through yuv444p16le on its way to the
-  compressor. The thresholds are ffmpeg's own defaults: 2 seconds minimum for
-  each filter and a 0.10 black pixel threshold. `freezedetect` prints no
-  `freeze_end` for a run that reaches the last frame, so the encoded frame count
-  closes that one. A J2K sequence and an image sequence `grk_compress` reads for
-  itself report nothing, since neither decodes through ffmpeg.
+- `picture_findings::PictureFindings` on `encode::EncodeResult`,
+  `pipeline::EncodeResult` and `grok_encoder::PipelineResult`: the black and
+  frozen runs ffmpeg's `blackdetect` and `freezedetect` saw while the source
+  decoded, as inclusive output frame numbers at the encode's `fps`. Every encode
+  path that decodes through ffmpeg reports them, `encode_video_pipeline` and
+  `encode_video_pipeline_resumable` included, which is the route dcpwizard's
+  `create` takes. A pipeline handed frames by its caller reports nothing: the
+  caller's own decode is where the filters run. Both filters sit on a `split`
+  branch of the decode chain, because neither accepts rgb48be and putting them
+  in the main chain makes ffmpeg round trip every frame through yuv444p16le on
+  its way to the compressor. The thresholds are ffmpeg's own defaults: 2 seconds
+  minimum for each filter and a 0.10 black pixel threshold. `freezedetect`
+  prints no `freeze_end` for a run that reaches the last frame, so the decoded
+  frame count closes that one. A J2K sequence and an image sequence
+  `grk_compress` reads for itself also report nothing, since neither decodes
+  through ffmpeg.
   `PictureFindings::describe` turns them into one log line per run, of the form
   `black picture from 00:00:00:00 to 00:00:02:23 (frames 0 to 71)`, timecoded at
   the encode's frame rate rounded to whole frames per second.
