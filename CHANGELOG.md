@@ -4,6 +4,15 @@
 
 ### Added
 
+- `ColourSpace::LogC` transforms in `DcdmTransform` instead of being refused, so
+  an ARRI LogC3 master encodes through the same per-frame path P3 and Rec.2020
+  use. Code values decode with ARRI's LogC3 curve for EI 800 and matrix through
+  ALEXA Wide Gamut RGB (D65) into X'Y'Z'. The curve reaches well past 1.0 scene
+  linear and everything above that clips to white, the same clip libdcp's S-Log3
+  path applies, so no tone mapping happens here. `create_dcdm` accepts `logc`,
+  `logc3` and `arrilogc` as source space names. `Aces` and `AcesCg` are still
+  refused.
+
 - `probe::VideoInfo`, `upmix::Upmixer`, `subtitle_raster::BurnEffect`,
   `subtitle_raster::BurnStyleOverrides` and `subtitle_formats::Rgba` derive
   `Serialize` and `Deserialize`, so a consumer storing them no longer needs a

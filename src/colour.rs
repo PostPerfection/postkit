@@ -130,19 +130,54 @@ mod tests {
 
 // ─── In-memory RGB → X'Y'Z' transform for DCI ─────────────────────────────
 
+/// ARRI ALEXA Log C (LogC3) decode parameters for EI 800, relative scene
+/// exposure, from "ALEXA Log C Curve - Usage in VFX" (Brendel, rev 2017-03-09).
+const LOGC3_EI800_CUT: f32 = 0.010_591;
+const LOGC3_EI800_A: f32 = 5.555_556;
+const LOGC3_EI800_B: f32 = 0.052_272;
+const LOGC3_EI800_C: f32 = 0.247_190;
+const LOGC3_EI800_D: f32 = 0.385_537;
+const LOGC3_EI800_E: f32 = 5.367_655;
+const LOGC3_EI800_F: f32 = 0.092_809;
+
+/// How a source's normalised code values become linear light.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Linearisation {
+    Gamma(f32),
+    /// ARRI LogC3 at EI 800. It reaches well past 1.0 scene linear, and
+    /// everything above that clips to white in the DCDM encode's clamp.
+    LogC3,
+}
+
+impl Linearisation {
+    fn to_linear(self, code: f32) -> f32 {
+        match self {
+            Self::Gamma(gamma) => code.powf(gamma),
+            Self::LogC3 => {
+                if code > LOGC3_EI800_E * LOGC3_EI800_CUT + LOGC3_EI800_F {
+                    (10.0f32.powf((code - LOGC3_EI800_D) / LOGC3_EI800_C) - LOGC3_EI800_B)
+                        / LOGC3_EI800_A
+                } else {
+                    (code - LOGC3_EI800_F) / LOGC3_EI800_E
+                }
+            }
+        }
+    }
+}
+
 /// Source colour space description for the DCDM transform: the linear RGB to
-/// CIE XYZ matrix, the gamma that linearises its code values, and the scale that
+/// CIE XYZ matrix, the curve that linearises its code values, and the scale that
 /// lands source white on the DCI reference white.
 pub(crate) struct SourceSpace {
     pub to_xyz: [[f32; 3]; 3],
-    pub gamma: f32,
+    pub linearisation: Linearisation,
     pub scale: f32,
 }
 
-/// Resolve a source colour space to its matrix, gamma and DCI scale.
+/// Resolve a source colour space to its matrix, linearisation and DCI scale.
 ///
-/// The scene-referred and log spaces are refused: no 3x3 matrix reaches X'Y'Z'
-/// from them, and approximating one silently would be wrong colour.
+/// The scene-referred spaces are refused: no 3x3 matrix reaches X'Y'Z' from
+/// them, and approximating one silently would be wrong colour.
 pub(crate) fn source_space(space: ColourSpace) -> Result<SourceSpace, String> {
     let dci_scale = DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
     let resolved = match space {
@@ -156,7 +191,7 @@ pub(crate) fn source_space(space: ColourSpace) -> Result<SourceSpace, String> {
             ],
             // gamma 2.2 for display-referred Rec.709, matching libdcp rec709_to_xyz,
             // DoM and grok. Was 2.4 (Rec.1886); harmonized 2026-07-23.
-            gamma: 2.2,
+            linearisation: Linearisation::Gamma(2.2),
             scale: dci_scale,
         },
         ColourSpace::P3 => SourceSpace {
@@ -165,7 +200,7 @@ pub(crate) fn source_space(space: ColourSpace) -> Result<SourceSpace, String> {
                 [0.209_491_7, 0.721_595_2, 0.068_913_1],
                 [0.0, 0.047_060_6, 0.907_378_4],
             ],
-            gamma: DCDM_GAMMA,
+            linearisation: Linearisation::Gamma(DCDM_GAMMA),
             scale: dci_scale,
         },
         ColourSpace::Rec2020 => SourceSpace {
@@ -174,18 +209,29 @@ pub(crate) fn source_space(space: ColourSpace) -> Result<SourceSpace, String> {
                 [0.262_700_2, 0.677_998_1, 0.059_301_7],
                 [0.0, 0.028_072_7, 1.060_985_1],
             ],
-            gamma: 2.4,
+            linearisation: Linearisation::Gamma(2.4),
             scale: dci_scale,
         },
         // already X'Y'Z': decode and requantise, the luminance scaling is baked in
         ColourSpace::Xyz => SourceSpace {
             to_xyz: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-            gamma: DCDM_GAMMA,
+            linearisation: Linearisation::Gamma(DCDM_GAMMA),
             scale: 1.0,
         },
-        ColourSpace::Aces | ColourSpace::AcesCg | ColourSpace::LogC => {
+        // ALEXA Wide Gamut RGB with D65 white, from the same ARRI document as the
+        // LogC3 decode. Scene linear above 1.0 clips to white, no tone mapping.
+        ColourSpace::LogC => SourceSpace {
+            to_xyz: [
+                [0.638_008, 0.214_704, 0.097_744],
+                [0.291_954, 0.823_841, -0.115_795],
+                [0.002_798, -0.067_034, 1.153_294],
+            ],
+            linearisation: Linearisation::LogC3,
+            scale: dci_scale,
+        },
+        ColourSpace::Aces | ColourSpace::AcesCg => {
             return Err(format!(
-                "{space:?} is scene-referred or log: no 3x3 matrix reaches X'Y'Z' from it, \
+                "{space:?} is scene-referred: no 3x3 matrix reaches X'Y'Z' from it, \
                  so it needs a 3D LUT that lands on one of rec709, p3, rec2020 or xyz"
             ));
         }
@@ -196,10 +242,11 @@ pub(crate) fn source_space(space: ColourSpace) -> Result<SourceSpace, String> {
 /// The DCDM encode transform for one source colour space, built once and applied
 /// to every frame of a run.
 ///
-/// Per pixel: linearise the source's code values with its gamma, matrix them
-/// into the output space, scale to the DCI reference white, then re-encode with
-/// the 2.6 gamma SMPTE 428-1 stores. For Rec.709 this is the transform grok
-/// applies itself and libdcp/DoM's `rgb_xyz.cc` agrees with.
+/// Per pixel: linearise the source's code values with its own curve (a gamma, or
+/// the LogC3 decode), matrix them into the output space, scale to the DCI
+/// reference white, then re-encode with the 2.6 gamma SMPTE 428-1 stores. For
+/// Rec.709 this is the transform grok applies itself and libdcp/DoM's
+/// `rgb_xyz.cc` agrees with.
 pub struct DcdmTransform {
     space: ColourSpace,
     /// linear source RGB to the output space (X'Y'Z' or P3-D65 linear RGB)
@@ -225,18 +272,23 @@ impl DcdmTransform {
         Ok(Self::new(
             space,
             resolved.to_xyz,
-            resolved.gamma,
+            resolved.linearisation,
             resolved.scale,
         ))
     }
 
-    pub(crate) fn new(space: ColourSpace, matrix: [[f32; 3]; 3], gamma: f32, scale: f32) -> Self {
+    pub(crate) fn new(
+        space: ColourSpace,
+        matrix: [[f32; 3]; 3],
+        linearisation: Linearisation,
+        scale: f32,
+    ) -> Self {
         Self {
             space,
             matrix,
             scale,
             linear: (0..=u16::MAX)
-                .map(|v| (v as f32 / 65535.0).powf(gamma))
+                .map(|v| linearisation.to_linear(v as f32 / 65535.0))
                 .collect(),
         }
     }
@@ -827,11 +879,64 @@ mod tests_xyz {
     }
 
     #[test]
-    fn the_scene_referred_and_log_spaces_are_refused() {
-        for space in [ColourSpace::Aces, ColourSpace::AcesCg, ColourSpace::LogC] {
+    fn the_scene_referred_spaces_are_refused() {
+        for space in [ColourSpace::Aces, ColourSpace::AcesCg] {
             let err = DcdmTransform::to_xyz(space).unwrap_err();
             assert!(err.contains("3D LUT"), "{space:?}: {err}");
         }
+    }
+
+    // ITU-R BT.709 primaries with D65, the sRGB matrix, gamma 2.2.
+    const REC709_TO_XYZ: [[f64; 3]; 3] = [
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041],
+    ];
+    // the LogC3 code value ARRI publishes for an 18% grey card at EI 800
+    const LOGC3_GREY_CODE: f64 = 0.391;
+    // a LogC3 code decoding above 1.0 scene linear
+    const LOGC3_OVER_WHITE_CODE: f64 = 0.6;
+    // the f constant, the LogC3 code decoding to 0 scene linear
+    const LOGC3_BLACK_CODE: f64 = 0.092809;
+
+    #[test]
+    fn logc_grey_matches_rec709_grey() {
+        let code = (LOGC3_GREY_CODE * 65535.0).round() as u16;
+        let got = DcdmTransform::to_xyz(ColourSpace::LogC)
+            .unwrap()
+            .pixel([code; 3], 4095);
+
+        // 0.18 linear on all three channels through the Rec.709 arm: both are
+        // D65 neutral at the same luminance, so they land on the same X'Y'Z'
+        let coeff = 48.0f64 / 52.37;
+        let mut want = [0u16; 3];
+        for (i, row) in REC709_TO_XYZ.iter().enumerate() {
+            let xyz = (row[0] + row[1] + row[2]) * 0.18 * coeff;
+            want[i] = (xyz.powf(1.0 / 2.6) * 4095.0).round() as u16;
+        }
+
+        for i in 0..3 {
+            let d = (got[i] as i32 - want[i] as i32).abs();
+            assert!(d <= 1, "channel {i}: got {got:?} want {want:?}");
+        }
+    }
+
+    #[test]
+    fn logc_above_diffuse_white_clips() {
+        let transform = DcdmTransform::to_xyz(ColourSpace::LogC).unwrap();
+        let clipped = transform.pixel([65535; 3], 4095);
+        assert_eq!(clipped, [4095; 3]);
+        let code = (LOGC3_OVER_WHITE_CODE * 65535.0).round() as u16;
+        assert_eq!(transform.pixel([code; 3], 4095), clipped);
+    }
+
+    #[test]
+    fn logc_black_is_black() {
+        let code = (LOGC3_BLACK_CODE * 65535.0) as u16;
+        let got = DcdmTransform::to_xyz(ColourSpace::LogC)
+            .unwrap()
+            .pixel([code; 3], 4095);
+        assert_eq!(got, [0, 0, 0]);
     }
 
     #[test]

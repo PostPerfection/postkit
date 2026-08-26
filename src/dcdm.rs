@@ -352,9 +352,10 @@ fn source_space(name: &str) -> Result<ColourSpace, String> {
         "p3" | "dcip3" | "dci-p3" | "p3dci" | "smpte431" => Ok(ColourSpace::P3),
         "rec2020" | "bt2020" => Ok(ColourSpace::Rec2020),
         "xyz" | "ciexyz" => Ok(ColourSpace::Xyz),
+        "logc" | "logc3" | "arrilogc" => Ok(ColourSpace::LogC),
         other => Err(format!(
             "Unsupported source colour space '{other}' for DCDM conversion. \
-             Use rec709, p3, rec2020 or xyz, or supply a 3D LUT that lands in one of those."
+             Use rec709, p3, rec2020, xyz or logc, or supply a 3D LUT that lands in one of those."
         )),
     }
 }
@@ -364,12 +365,14 @@ fn source_transform(name: &str, target: DcdmTarget) -> Result<DcdmTransform, Str
     let space = source_space(name)?;
     let source = crate::colour::source_space(space)?;
     Ok(match target {
-        DcdmTarget::Xyz => DcdmTransform::new(space, source.to_xyz, source.gamma, source.scale),
+        DcdmTarget::Xyz => {
+            DcdmTransform::new(space, source.to_xyz, source.linearisation, source.scale)
+        }
         DcdmTarget::P3D65 => DcdmTransform::new(
             space,
             // linear source RGB -> XYZ -> P3-D65 linear RGB
             mat_mul(&xyz_to_p3d65(), &source.to_xyz),
-            source.gamma,
+            source.linearisation,
             // rgb mastering target: source white -> full-scale, no dci companding
             1.0,
         ),
@@ -638,8 +641,8 @@ mod tests {
     fn rejects_colour_spaces_it_cannot_transform() {
         assert!(source_space("aces").is_err());
         assert!(source_space("acescg").is_err());
-        assert!(source_space("logc").is_err());
         assert!(source_space("rec709").is_ok());
+        assert!(source_space("logc").is_ok());
         assert!(source_space("P3").is_ok(), "names are case insensitive");
         assert!(source_space("").is_ok(), "empty defaults to rec709");
     }
