@@ -627,7 +627,7 @@ fn the_resumable_pipeline_encodes_a_window_and_resumes_inside_it() {
     postkit::grok_encoder::initialize(0);
     let params = CompressParams {
         compression_ratio: 10.0,
-        frame_rate: 24,
+        edit_rate: FrameRate::whole(24),
         ..CompressParams::default()
     };
     let cancel = Arc::new(AtomicBool::new(false));
@@ -995,7 +995,7 @@ fn the_resumable_pipeline_reports_its_own_findings() {
         &video,
         &dir.path().join("j2k"),
         &CompressParams {
-            frame_rate: DETECTION_FPS as u16,
+            edit_rate: FrameRate::whole(DETECTION_FPS),
             ..CompressParams::default()
         },
         total_frames,
@@ -1032,5 +1032,105 @@ fn the_resumable_pipeline_reports_its_own_findings() {
         "the still tail is frames {}..={}, got {frozen:?}",
         DETECTION_SEGMENT_FRAMES * 2,
         total_frames - 1
+    );
+}
+
+/// 24000/1001 for as long as it takes the two conversions to disagree: the
+/// black head ends at 25.025 s, which is 600.0 frames at the exact rate and
+/// 600.6 at a rounded 24.
+const NTSC_BLACK_FRAMES: u64 = 600;
+const NTSC_TAIL_FRAMES: u64 = 24;
+
+/// 600 frames of black then 24 of testsrc, all at 24000/1001. `d=25` stops the
+/// black source at frame 600, whose pts is 25.025 s, so that is where the
+/// testsrc starts.
+fn write_ntsc_detection_clip(path: &std::path::Path) {
+    let size = format!("{DETECTION_WIDTH}x{DETECTION_HEIGHT}");
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=black:s={size}:r=24000/1001:d=25"),
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=s={size}:r=24000/1001:d=1"),
+            "-filter_complex",
+            "[0:v][1:v]concat=n=2:v=1:a=0[v]",
+            "-map",
+            "[v]",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv444p",
+        ])
+        .arg(path)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        ffmpeg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ffmpeg.stderr)
+    );
+}
+
+/// The findings come back as frame numbers, so the pipeline has to convert the
+/// detection seconds at the rate the frames are actually at. Rounding
+/// 24000/1001 to 24 puts the end of the black head one frame late, on the first
+/// frame of the testsrc.
+#[test]
+fn the_resumable_pipeline_converts_findings_at_the_exact_rate() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    use postkit::grok_encoder::{CompressParams, EncodeProgress, encode_video_pipeline_resumable};
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("ntsc.mkv");
+    write_ntsc_detection_clip(&video);
+
+    let total_frames = NTSC_BLACK_FRAMES + NTSC_TAIL_FRAMES;
+    assert_eq!(
+        postkit::encode::probe_video(&video).2,
+        total_frames,
+        "the clip itself has to be {NTSC_BLACK_FRAMES} black frames then {NTSC_TAIL_FRAMES}"
+    );
+
+    postkit::grok_encoder::initialize(0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let result = encode_video_pipeline_resumable(
+        &video,
+        &dir.path().join("j2k"),
+        &CompressParams {
+            edit_rate: FrameRate::new(24000, 1001),
+            ..CompressParams::default()
+        },
+        total_frames,
+        DETECTION_WIDTH,
+        DETECTION_HEIGHT,
+        &cancel,
+        false,
+        None,
+        None,
+        |_: EncodeProgress| {},
+    );
+    assert!(result.success, "{}", result.error);
+    assert_eq!(result.frames_encoded, total_frames);
+
+    let findings = &result.picture_findings;
+    let black = findings
+        .black
+        .first()
+        .unwrap_or_else(|| panic!("no black run reported, findings: {findings:?}"));
+    assert_eq!(black.first_frame, 0, "got {black:?}");
+    assert_eq!(
+        black.last_frame,
+        NTSC_BLACK_FRAMES - 1,
+        "the black head is frames 0..={}, got {black:?}",
+        NTSC_BLACK_FRAMES - 1
     );
 }

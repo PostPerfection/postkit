@@ -91,8 +91,9 @@ pub struct CompressParams {
     pub profile: u16,
     /// Guard bits
     pub num_guard_bits: u8,
-    /// Frame rate (used for rate control)
-    pub frame_rate: u16,
+    /// The exact rate the frames are at, 24000/1001 and not 24, so a detection
+    /// timestamp converts to the frame number the CPL will carry
+    pub edit_rate: crate::encode::FrameRate,
     /// Enable irreversible (lossy) wavelet
     pub irreversible: bool,
     /// Enable MCT (multi-component transform)
@@ -186,6 +187,14 @@ pub enum ProgressionOrder {
     Cprl,
 }
 
+impl CompressParams {
+    /// grok sizes the per-frame byte budget from a whole rate, and DCI has only
+    /// 24 and 48, so a 23.976 stream is a 24 fps one to the compressor.
+    fn grok_frame_rate(&self) -> u16 {
+        self.edit_rate.as_f64().round() as u16
+    }
+}
+
 impl Default for CompressParams {
     fn default() -> Self {
         Self {
@@ -198,7 +207,7 @@ impl Default for CompressParams {
             num_layers: 1,
             profile: 0x0003, // GRK_PROFILE_CINEMA_2K
             num_guard_bits: 1,
-            frame_rate: 24,
+            edit_rate: crate::encode::FrameRate::whole(24),
             irreversible: true,
             mct: true,
             apply_xyz_transform: false,
@@ -890,7 +899,7 @@ fn compress_frame_once(
         cparams.mct = if params.mct { 1 } else { 0 };
         cparams.rsiz = params.profile;
         cparams.numgbits = params.num_guard_bits;
-        cparams.framerate = params.frame_rate;
+        cparams.framerate = params.grok_frame_rate();
         cparams.num_threads = params.threads_per_codec;
         cparams.apply_xyz_transform = params.apply_xyz_transform;
         // Bv2.1 requires a TLM marker in every codestream (libdcp's
@@ -1211,7 +1220,7 @@ where
         &mut child,
         detection_reader,
         decode_read_to_end,
-        params.frame_rate as f64,
+        params.edit_rate.as_f64(),
         frame_index,
     );
 
@@ -1317,7 +1326,7 @@ where
     let mut cinema_flag: Vec<String> = if params.profile == 0x0003 {
         vec![
             "-w".to_string(),
-            params.frame_rate.to_string(),
+            params.grok_frame_rate().to_string(),
             "-H".to_string(),
             threads_per_worker.to_string(),
         ]
@@ -1817,7 +1826,7 @@ mod tests {
         let params = CompressParams {
             compression_ratio: raw_bits / (DEFAULT_TARGET_MBPS * 1_000_000.0 / FPS as f64),
             apply_xyz_transform: true,
-            frame_rate: FPS as u16,
+            edit_rate: crate::encode::FrameRate::whole(FPS),
             ..CompressParams::default()
         };
 

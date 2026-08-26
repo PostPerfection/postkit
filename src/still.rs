@@ -133,8 +133,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         .map_err(|e| format!("cannot create {}: {e}", out_dir.display()))?;
 
     let params = CompressParams {
-        // grok only sizes the per-frame byte budget from this, so the whole rate is enough
-        frame_rate: fps.as_f64().round() as u16,
+        edit_rate: fps,
         apply_xyz_transform: *apply_xyz_transform,
         source_preparation: SourcePreparation {
             subtitle_burn: burn.clone(),

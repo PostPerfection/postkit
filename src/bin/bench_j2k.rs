@@ -57,7 +57,7 @@ fn base_params(res: &Res) -> CompressParams {
         num_layers: 1,
         profile: res.profile,
         num_guard_bits: 1,
-        frame_rate: 24,
+        edit_rate: postkit::encode::FrameRate::whole(24),
         irreversible: true,
         mct: true,
         apply_xyz_transform: false,

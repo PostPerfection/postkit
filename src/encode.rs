@@ -970,7 +970,7 @@ where
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
         // grok only sizes the per-frame byte budget from this, so the whole rate is enough
-        frame_rate: opts.fps.as_f64().round() as u16,
+        edit_rate: opts.fps,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         source_preparation: grok_encoder::SourcePreparation {
             subtitle_burn: opts.subtitle_burn.clone(),
@@ -1227,7 +1227,7 @@ where
         num_resolutions: opts.num_resolutions as u8,
         codeblock_size: opts.codeblock_size,
         // grok only sizes the per-frame byte budget from this, so the whole rate is enough
-        frame_rate: opts.fps.as_f64().round() as u16,
+        edit_rate: opts.fps,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         ..grok_encoder::CompressParams::default()
     };

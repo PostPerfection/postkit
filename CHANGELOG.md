@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Changed
+
+- `CompressParams.frame_rate: u16` is now `CompressParams.edit_rate:
+  encode::FrameRate`. `encode_video_pipeline_resumable` converts blackdetect's
+  and freezedetect's seconds to frame numbers with it, and the rounded rate put
+  a 23.976 finding about a frame per thousand late: the end of a 25 second black
+  head came back as frame 600, the first frame after it, instead of 599. grok is
+  still given the whole rate, rounded from the rational in one place for both
+  `cparams.framerate` and grk_compress's `-w`.
+
 ### Added
 
 - `gui_job_queue`: the queue of builds a wizard GUI runs, with its on-disk
