@@ -1,11 +1,5 @@
 # Planned
 
-- encode_parallel ignores the caller's bitrate (2026-08-22). It hardcodes
-  `-r 10` for grk_compress and drops the requested compression ratio, so an
-  image-sequence encode cannot honour a bitrate setting, and the post-encode
-  sweep is the only cap enforcement on that path. The video path passes the
-  ratio through and caps each codestream as it lands.
-
 - Verify the non-blocking render live (2026-08-17). `render_opengl` now passes
   `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0` with `video-timing-offset` 0,
   because the default wait parked the app's main thread for most of each frame
@@ -103,6 +97,10 @@
 # Done
 
 ## 2026-08-26
+
+`encode_parallel` passes the caller's compression ratio to grk_compress and
+checks each codestream against `codestream_byte_cap` as it lands (commit
+1b96703). The Planned entry describing the hardcoded `-r 10` outlived the fix.
 
 What a `ds:Reference URI=""` digests (xmldsig.rs). It is the document node, not
 the root element subtree, so `c14n_document_reference` now emits the root
