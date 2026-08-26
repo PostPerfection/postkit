@@ -424,9 +424,15 @@ impl FrameRange {
         Ok(&frames[self.first_frame as usize..self.end_frame() as usize])
     }
 
+    /// The ffmpeg output option that stops the decode at the window's end
+    /// instead of running the source out.
+    pub(crate) fn frame_limit_args(&self) -> [String; 2] {
+        ["-frames:v".to_string(), self.frame_count.to_string()]
+    }
+
     /// The ffmpeg filters that drop everything outside the window and restamp
     /// the kept frames from zero.
-    fn trim_filters(&self) -> [String; 2] {
+    pub(crate) fn trim_filters(&self) -> [String; 2] {
         [
             format!(
                 "trim=start_frame={}:end_frame={}",
@@ -539,8 +545,7 @@ pub(crate) fn decode_output_args(filters: &str, frame_range: Option<FrameRange>)
     .map(|arg| (*arg).to_string())
     .collect();
     if let Some(range) = frame_range {
-        args.push("-frames:v".to_string());
-        args.push(range.frame_count.to_string());
+        args.extend(range.frame_limit_args());
     }
     args.push("pipe:1".to_string());
     args

@@ -904,6 +904,7 @@ where
         cancel,
         false,
         None,
+        None,
         on_progress,
     )
 }
@@ -918,12 +919,32 @@ pub fn contiguous_encoded_frames(dir: &Path) -> u64 {
     n
 }
 
+/// The `-vf` chain for a decode that may be windowed. The caller's filters run
+/// at source timing and the window is cut out of what they produced, so a fade
+/// lands where a full encode would have put it and frame N of the window is the
+/// frame a full encode would have written at `first_frame + N`.
+fn window_filter_chain(
+    video_filter: Option<&str>,
+    frame_range: Option<crate::encode::FrameRange>,
+) -> Option<String> {
+    let Some(range) = frame_range else {
+        return video_filter.map(str::to_string);
+    };
+    let mut chain: Vec<String> = video_filter.into_iter().map(str::to_string).collect();
+    chain.extend(range.trim_filters());
+    Some(chain.join(","))
+}
+
 /// Like [`encode_video_pipeline`], but when `resume` is true it skips frames
 /// already encoded on disk (dom#344: an interrupted encode picks up where it
 /// left off). The already-present contiguous prefix is decoded-and-discarded so
 /// ffmpeg stays frame-aligned, then encoding continues from the next index. The
 /// last existing frame is always re-encoded in case it was truncated by the
 /// interruption.
+///
+/// `frame_range` encodes one window of the source instead of all of it. With a
+/// window, `total_frames` is the window's length rather than the source's, the
+/// codestreams are numbered from zero, and `resume` counts inside the window.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_video_pipeline_resumable<P>(
     input_video: &Path,
@@ -938,6 +959,7 @@ pub fn encode_video_pipeline_resumable<P>(
     // not change the frame size or count: the reader slices stdout into fixed
     // width*height frames and the CPL already declares the count.
     video_filter: Option<&str>,
+    frame_range: Option<crate::encode::FrameRange>,
     mut on_progress: P,
 ) -> PipelineResult
 where
@@ -945,6 +967,18 @@ where
 {
     use std::io::Read;
     use std::process::{Command, Stdio};
+
+    if let Some(range) = frame_range {
+        let (_, _, source_frames) = crate::encode::probe_video(input_video);
+        if let Err(e) = range.check_against_probe(source_frames) {
+            return PipelineResult {
+                success: false,
+                error: e,
+                frames_encoded: 0,
+                output_dir: output_dir.to_path_buf(),
+            };
+        }
+    }
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         return PipelineResult {
@@ -975,14 +1009,18 @@ where
     // Launch ffmpeg to decode video → raw rgb48be frames on stdout
     let mut command = Command::new("ffmpeg");
     command.arg("-y").arg("-i").arg(input_video);
-    if let Some(filter) = video_filter {
+    if let Some(filter) = window_filter_chain(video_filter, frame_range) {
         command.arg("-vf").arg(filter);
     }
-    let mut child = match command
+    command
         .arg("-pix_fmt")
         .arg("rgb48be")
         .arg("-f")
-        .arg("rawvideo")
+        .arg("rawvideo");
+    if let Some(range) = frame_range {
+        command.args(range.frame_limit_args());
+    }
+    let mut child = match command
         .arg("pipe:1")
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1360,6 +1398,37 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The window is cut after the caller's filters, so a fade keeps the timing
+    /// a full encode would have given it.
+    #[test]
+    fn a_frame_range_trims_the_decode_after_the_callers_filters() {
+        let window = crate::encode::FrameRange {
+            first_frame: 10,
+            frame_count: 5,
+        };
+
+        assert_eq!(window_filter_chain(None, None), None);
+        assert_eq!(
+            window_filter_chain(Some("crop=1920:804:0:138"), None).as_deref(),
+            Some("crop=1920:804:0:138"),
+            "no window has to leave the caller's chain as it was"
+        );
+        assert_eq!(
+            window_filter_chain(None, Some(window)).as_deref(),
+            Some("trim=start_frame=10:end_frame=15,setpts=PTS-STARTPTS")
+        );
+        assert_eq!(
+            window_filter_chain(Some("crop=1920:804:0:138,fade=out:96:24"), Some(window))
+                .as_deref(),
+            Some(
+                "crop=1920:804:0:138,fade=out:96:24,\
+                 trim=start_frame=10:end_frame=15,setpts=PTS-STARTPTS"
+            )
+        );
+
+        assert_eq!(window.frame_limit_args(), ["-frames:v", "5"]);
+    }
 
     #[test]
     fn contiguous_frames_counts_prefix_and_stops_at_gap() {

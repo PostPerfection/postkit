@@ -16,6 +16,15 @@
   `grk_compress`. A window running past the source fails before ffmpeg starts,
   and a J2K sequence refuses one, since it is never encoded here.
 
+- `grok_encoder::encode_video_pipeline_resumable` takes the same
+  `Option<FrameRange>`, for the callers that encode through it rather than
+  through the pipeline. The window is trimmed after the caller's `video_filter`,
+  so a fade keeps the timing a full encode would have given it, and `-frames:v`
+  stops the decode at the window's end. With a window, `total_frames` is the
+  window's length, the codestreams are numbered from zero, and a `resume` counts
+  inside the window. The window is checked against an ffprobe frame count, which
+  only runs when a window is asked for.
+
 - `picture_processing` grew the crop resolution both wizards each carried:
   `require_one_crop_decider`, `fill_crop` (with the quarter-turn aspect swap),
   `detect_crop` (auto-crop through a video or an image-sequence concat list,
@@ -311,6 +320,8 @@
 - `encode_parallel` takes the image files to compress rather than a directory to
   list, so the caller picks the frames and a window is fewer of them. Callers
   list the sequence with `find_source_frames` first.
+- `encode_video_pipeline_resumable` takes a `frame_range` after `video_filter`.
+  A caller encoding the whole source passes `None`.
 - The DCDM Rec.709 matrix is the sRGB/D65 one grok and libdcp use, where
   `create_dcdm` had a BT.709-derived variant differing in the fourth decimal.
   Blue moves by up to 5 code values at 16 bits, under one at 12.

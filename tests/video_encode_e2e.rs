@@ -582,3 +582,157 @@ fn a_frame_range_past_the_end_of_the_source_fails_before_anything_is_encoded() {
         "nothing may be encoded before the window is refused"
     );
 }
+
+/// dcpwizard's CLI `create` encodes through `encode_video_pipeline_resumable`
+/// rather than the pipeline above, so the window has to hold there too, resume
+/// included.
+#[test]
+fn the_resumable_pipeline_encodes_a_window_and_resumes_inside_it() {
+    if !have_ffmpeg() {
+        eprintln!("skipping: ffmpeg not available");
+        return;
+    }
+
+    use postkit::grok_encoder::{
+        CompressParams, EncodeProgress, contiguous_encoded_frames, encode_video_pipeline_resumable,
+    };
+
+    const SOURCE_FRAMES: u64 = 48;
+    const FIRST_FRAME: u64 = 10;
+    const WINDOW_FRAMES: u64 = 5;
+
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mp4");
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=s={WIDTH}x{HEIGHT}:r=24"),
+            "-frames:v",
+            &SOURCE_FRAMES.to_string(),
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&video)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        ffmpeg.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ffmpeg.stderr)
+    );
+
+    postkit::grok_encoder::initialize(0);
+    let params = CompressParams {
+        compression_ratio: 10.0,
+        frame_rate: 24,
+        ..CompressParams::default()
+    };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let encode =
+        |output: &std::path::Path, frames: u64, resume: bool, range: Option<FrameRange>| {
+            encode_video_pipeline_resumable(
+                &video,
+                output,
+                &params,
+                frames,
+                WIDTH,
+                HEIGHT,
+                &cancel,
+                resume,
+                None,
+                range,
+                |_: EncodeProgress| {},
+            )
+        };
+    let codestream = |dir: &std::path::Path, index: u64| {
+        let path = dir.join(format!("frame_{index:08}.j2c"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    };
+
+    let full_dir = dir.path().join("full");
+    let full = encode(&full_dir, SOURCE_FRAMES, false, None);
+    assert!(full.success, "{}", full.error);
+    assert_eq!(full.frames_encoded, SOURCE_FRAMES);
+
+    let window = FrameRange {
+        first_frame: FIRST_FRAME,
+        frame_count: WINDOW_FRAMES,
+    };
+    let window_dir = dir.path().join("window");
+    let windowed = encode(&window_dir, WINDOW_FRAMES, false, Some(window));
+    assert!(windowed.success, "{}", windowed.error);
+    assert_eq!(windowed.frames_encoded, WINDOW_FRAMES);
+    assert_eq!(
+        std::fs::read_dir(&window_dir).unwrap().count() as u64,
+        WINDOW_FRAMES,
+        "nothing outside the window may be compressed"
+    );
+    for offset in 0..WINDOW_FRAMES {
+        assert_eq!(
+            codestream(&window_dir, offset),
+            codestream(&full_dir, FIRST_FRAME + offset),
+            "frame {offset} of the window has to be the frame a full encode wrote as {}",
+            FIRST_FRAME + offset
+        );
+    }
+    assert_ne!(
+        codestream(&window_dir, 0),
+        codestream(&full_dir, 0),
+        "a window starting at {FIRST_FRAME} that returned the head of the source would pass \
+         every count above"
+    );
+
+    // an interrupted windowed encode: three codestreams on disk, the third
+    // truncated the way a killed write leaves it
+    let resume_dir = dir.path().join("resume");
+    std::fs::create_dir_all(&resume_dir).unwrap();
+    for index in 0..3u64 {
+        let data = if index == 2 {
+            codestream(&window_dir, index)[..8].to_vec()
+        } else {
+            codestream(&window_dir, index)
+        };
+        std::fs::write(resume_dir.join(format!("frame_{index:08}.j2c")), data).unwrap();
+    }
+
+    let resumed = encode(&resume_dir, WINDOW_FRAMES, true, Some(window));
+    assert!(resumed.success, "{}", resumed.error);
+    assert_eq!(
+        resumed.frames_encoded,
+        WINDOW_FRAMES - 2,
+        "resume re-encodes the suspect frame and everything after it"
+    );
+    assert_eq!(
+        contiguous_encoded_frames(&resume_dir),
+        WINDOW_FRAMES,
+        "the resumed window has to end up with every frame"
+    );
+    for offset in 0..WINDOW_FRAMES {
+        assert_eq!(
+            codestream(&resume_dir, offset),
+            codestream(&full_dir, FIRST_FRAME + offset),
+            "resumed frame {offset} has to be the frame a full encode wrote as {}",
+            FIRST_FRAME + offset
+        );
+    }
+
+    let past_end = encode(
+        &dir.path().join("past_end"),
+        WINDOW_FRAMES,
+        false,
+        Some(FrameRange {
+            first_frame: 46,
+            frame_count: 5,
+        }),
+    );
+    assert!(!past_end.success);
+    assert!(past_end.error.contains("46..51"), "{}", past_end.error);
+    assert!(
+        past_end.error.contains("48 frames long"),
+        "{}",
+        past_end.error
+    );
+}
