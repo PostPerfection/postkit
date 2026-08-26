@@ -23,6 +23,16 @@
   black, so eyeball after any render change. Off linux nothing about linking
   (mpv.lib or libmpv.dll.a in MPV_LIB_DIR on windows, homebrew's mpv.pc on
   macos) or running is verified.
+- GPU J2K encoding. The grok library itself has no GPU encode path: the
+  pinned grok.h exposes acceleration only through a separately licensed
+  accelerator plugin (`grk_plugin_load`, then `grk_plugin_init` with a device
+  id, a licence key and an optional licence server), which speeds up T1 entropy
+  coding and falls back to the CPU when it is absent. That plugin is what
+  `grk_compress -G` and DCP-o-matic's `config grok-licence` drive. Landing it
+  here means binding those two calls through grokj2k-sys (check whether the
+  bindings already carry them), a device and licence setting in both wizards
+  passed into `grok_encoder`, and a machine with the plugin and a licence to
+  prove the speed-up. Listed in both wizards' DESIGN_TODO as well.
 - GPU J2K decode path. Prerequisite for real-time preview and for the features that
   gate on it: SDI output, and the dcpdoctor/wizard player controls (loop dom#2700,
   speed dom#2917, markers dom#2893, waveform dom#3091, 3D view modes
