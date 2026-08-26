@@ -1,14 +1,5 @@
 # Planned
 
-- A #WithComments signature with a comment outside the root element
-  (2026-08-22). `verify_document_enveloped` canonicalizes the root element
-  subtree, so a comment before or after the root is never digested. Correct
-  under plain c14n, which drops comments anyway; under #WithComments xmlsec1
-  digests it and the two verifiers would disagree. No such document exists in
-  the dci-ctp corpus, ClairMeta's ECL set or any test tree, and the signer
-  cannot produce one. The fix is canonicalizing the document node rather than
-  the root element.
-
 - encode_parallel ignores the caller's bitrate (2026-08-22). It hardcodes
   `-r 10` for grk_compress and drops the requested compression ratio, so an
   image-sequence encode cannot honour a bitrate setting, and the post-encode
@@ -110,6 +101,37 @@
   decodes frames of its own.
 
 # Done
+
+## 2026-08-26
+
+What a `ds:Reference URI=""` digests (xmldsig.rs). It is the document node, not
+the root element subtree, so `c14n_document_reference` now emits the root
+element plus the processing instructions outside it, with the line feed C14N 1.0
+puts after one that precedes the root element and before one that follows it,
+and drops the XML declaration, the DOCTYPE and the whitespace out there.
+`sign_document_enveloped_with` and `verify_document_enveloped` are its only two
+callers, so the signer and the verifier cannot compute different bytes.
+
+The comment half of what was planned here was wrong, and xmlsec1 said so. A
+template declaring enveloped-signature plus #WithComments c14n, signed by
+xmlsec1 over a document with comments inside and outside the root element,
+produced the digest of postkit's comment-free canonicalization. That is
+XML-DSig's dereference rule: `URI=""` and a barename `URI="#id"` both resolve to
+a node-set with the comments already removed, whichever inclusive c14n the
+reference then declares. So postkit was signing every commented document with a
+digest xmlsec1 rejects, comment inside the root element or outside it,
+whole-document reference or by-Id, and the planned fix would have widened that
+rather than closed it. `SAME_DOCUMENT_REFERENCE_COMMENTS` holds both reference
+paths at comments-omitted, `ParsedReference` no longer carries a comment mode at
+all, and the with-comments mode is left where it does apply, on SignedInfo.
+
+Each of our signer's own documents (a comment on each side of the root element,
+a comment inside it, a processing instruction before it) goes through both
+postkit and `xmlsec1 --verify`, intact and edited, and the test requires the two
+verdicts to match. The 58 signed CPL and PKL documents in ClairMeta's ECL set,
+all plain c14n, verify unchanged. What this gives up is strictness postkit never
+meant to have: a comment added to a signed document no longer breaks the
+signature, the same as with every other verifier.
 
 ## 2026-08-16
 

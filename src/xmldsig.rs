@@ -18,7 +18,12 @@
 //! subtree from the document and injecting the namespaces in scope at that
 //! element onto its apex. Under inclusive c14n a subtree node-set renders all
 //! in-scope namespaces on its apex, so this matches byte-for-byte what a
-//! verifier (xmlsec1/libxml2) computes in place. Referenced elements must not
+//! verifier (xmlsec1/libxml2) computes in place. A whole-document `URI=""`
+//! reference canonicalizes the document node instead, through
+//! `c14n_document_reference`, which adds the processing instructions outside the
+//! root element and drops every comment.
+//!
+//! Referenced elements must not
 //! contain the inserted ds:Signature, which is the standard enveloped rule; the
 //! signature goes in as the last child of the root or a caller-named parent, a
 //! sibling of the referenced elements.
@@ -37,16 +42,18 @@ pub(crate) const C14N_PLAIN: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-2001
 pub(crate) const C14N_WITH_COMMENTS: &str =
     "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments";
 /// What the signer declares in ds:CanonicalizationMethod and canonicalizes
-/// SignedInfo and whole-document references with. WithComments is the stricter
-/// of the two: a comment added to a signed document breaks the digest.
+/// SignedInfo with. It says nothing about the references: those are
+/// same-document ones, and their canonical form never holds a comment.
 pub(crate) const C14N_METHOD: &str = C14N_WITH_COMMENTS;
-/// The comment mode `C14N_METHOD` means. `signer_declares_the_canonicalization_it_uses`
-/// is what keeps the two from drifting apart.
-const SIGNER_C14N_COMMENTS: Comments = Comments::Keep;
-/// A ds:Reference declaring no c14n transform is canonicalized without comments:
-/// that is the node-set serialization XML-DSig defaults to, and what xmlsec1
-/// computes. The by-Id signer declares no Transforms, so it digests under this.
-const REFERENCE_DEFAULT_COMMENTS: Comments = Comments::Omit;
+/// The comment mode `C14N_METHOD` means, for SignedInfo alone.
+/// `signer_declares_the_canonicalization_it_uses` keeps the two from drifting.
+const SIGNED_INFO_COMMENTS: Comments = Comments::Keep;
+/// Every ds:Reference here is a same-document one: `URI=""` or a barename
+/// `URI="#id"`. XML-DSig dereferences both to a node-set with the comments
+/// removed, so whichever inclusive c14n a reference declares, its digest is over
+/// comment-free bytes. xmlsec1 signs and verifies them that way, and digesting a
+/// commented document any other way makes an intact signature read as tampering.
+const SAME_DOCUMENT_REFERENCE_COMMENTS: Comments = Comments::Omit;
 /// Enveloped-signature transform: digest the document with ds:Signature removed.
 pub(crate) const ENVELOPED_TRANSFORM: &str =
     "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
@@ -118,7 +125,7 @@ fn sign_enveloped_with(
     for id in reference_ids {
         let fragment = find_element_fragment(xml, &|e| element_has_id(e, id_attr, id))?
             .ok_or_else(|| format!("no element with {id_attr}=\"{id}\" to sign"))?;
-        let digest = b64(&digest_alg.digest(&c14n(&fragment, REFERENCE_DEFAULT_COMMENTS)?));
+        let digest = b64(&digest_alg.digest(&c14n(&fragment, SAME_DOCUMENT_REFERENCE_COMMENTS)?));
         references.push_str(&format!(
             r##"
       <ds:Reference URI="#{id}">
@@ -196,12 +203,10 @@ fn sign_document_enveloped_with(
     digest_alg: DigestAlg,
     sig_alg: RsaSigAlg,
 ) -> Result<String, String> {
-    // The reference digest is over the whole document with ds:Signature removed.
-    // Before signing there is no ds:Signature, and c14n drops the XML
-    // declaration and whitespace outside the root, so this is c14n of the root.
-    let root_fragment =
-        find_element_fragment(xml, &|_| Ok(true))?.ok_or("document has no root element to sign")?;
-    let digest = b64(&digest_alg.digest(&c14n(&root_fragment, SIGNER_C14N_COMMENTS)?));
+    // The reference digest is over the whole document with ds:Signature removed,
+    // and before signing there is no ds:Signature. `verify_document_enveloped`
+    // recomputes it through the same `c14n_document_reference`.
+    let digest = b64(&digest_alg.digest(&c14n_document_reference(xml)?));
 
     let references = format!(
         r##"
@@ -288,7 +293,7 @@ fn build_signature_element(
     }
     let signed_info_fragment =
         format!("<ds:SignedInfo{ns_decls}>{signed_info_inner}</ds:SignedInfo>");
-    let signed_info_c14n = c14n(&signed_info_fragment, SIGNER_C14N_COMMENTS)?;
+    let signed_info_c14n = c14n(&signed_info_fragment, SIGNED_INFO_COMMENTS)?;
     let signature_bytes = sig_alg
         .sign(&private_key, &signed_info_c14n)
         .map_err(|e| format!("RSA signing of SignedInfo failed: {e}"))?;
@@ -356,7 +361,7 @@ pub fn verify_enveloped(
             .ok_or_else(|| format!("reference #{id} resolves to no element"))?;
         let actual = b64(&reference
             .digest_alg
-            .digest(&c14n(&fragment, reference.comments)?));
+            .digest(&c14n(&fragment, SAME_DOCUMENT_REFERENCE_COMMENTS)?));
         if actual != reference.digest_b64 {
             return Err(format!("digest mismatch for reference #{id}"));
         }
@@ -381,18 +386,14 @@ pub fn verify_document_enveloped(xml: &str, trusted_cert: Option<&Path>) -> Resu
     let signed_info_c14n = c14n(&signed_info_fragment, parsed.signed_info_comments)?;
 
     // Enveloped-signature transform: digest the document with ds:Signature gone.
-    // It is the last child inserted with no surrounding whitespace, so removing
-    // it restores the original document, whose c14n is the c14n of its root.
     let (start, end) = find_signature_span(xml)?;
     let mut unsigned = String::with_capacity(xml.len() - (end - start));
     unsigned.push_str(&xml[..start]);
     unsigned.push_str(&xml[end..]);
-    let root_fragment =
-        find_element_fragment(&unsigned, &|_| Ok(true))?.ok_or("document has no root element")?;
     let reference = &parsed.references[0];
     let actual = b64(&reference
         .digest_alg
-        .digest(&c14n(&root_fragment, reference.comments)?));
+        .digest(&c14n_document_reference(&unsigned)?));
     if actual != reference.digest_b64 {
         return Err("digest mismatch for the enveloped document reference".into());
     }
@@ -688,9 +689,6 @@ struct ParsedReference {
     digest_b64: String,
     /// The reference's declared DigestMethod.
     digest_alg: DigestAlg,
-    /// Comment mode of the reference's c14n transform, or the default when it
-    /// declares none.
-    comments: Comments,
 }
 
 /// The pieces of a ds:Signature a verifier needs.
@@ -718,7 +716,6 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
     let mut signature_method = None;
     let mut signed_info_comments = None;
     let mut current_digest_alg: Option<DigestAlg> = None;
-    let mut current_comments: Option<Comments> = None;
     let mut leaf_cert = None;
 
     loop {
@@ -755,16 +752,16 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
                     }
                     current_ref = uri.map(|u| u.trim().trim_start_matches('#').to_string());
                     current_digest_alg = None;
-                    current_comments = None;
                 }
                 // The enveloped-signature transform only detaches ds:Signature;
                 // any other transform here has to be a canonicalization, and one
                 // this verifier does not implement is a hard error rather than a
-                // digest computed over the wrong bytes.
+                // digest computed over the wrong bytes. Which of the two
+                // inclusive ones it names changes nothing about the digest.
                 b"Transform" if in_signature && current_ref.is_some() => {
                     let algorithm = read_algorithm_attr(&e)?;
                     if algorithm.trim() != ENVELOPED_TRANSFORM {
-                        current_comments = Some(Comments::from_c14n_uri(&algorithm)?);
+                        Comments::from_c14n_uri(&algorithm)?;
                     }
                 }
                 b"DigestMethod" if in_signature => {
@@ -803,7 +800,6 @@ fn parse_signature(xml: &str) -> Result<ParsedSignature, String> {
                         id,
                         digest_b64: buffer.split_whitespace().collect(),
                         digest_alg,
-                        comments: current_comments.unwrap_or(REFERENCE_DEFAULT_COMMENTS),
                     });
                     collecting = None;
                 }
@@ -1109,6 +1105,103 @@ pub(crate) fn c14n(fragment: &str, comments: Comments) -> Result<Vec<u8>, String
     }
 
     Ok(out.into_bytes())
+}
+
+/// The canonical bytes a `ds:Reference URI=""` digests: inclusive Canonical XML
+/// 1.0 of the document node, with the comments removed the way XML-DSig removes
+/// them when it dereferences a same-document URI. The whole-document signer and
+/// `verify_document_enveloped` both go through here, so they cannot compute
+/// different bytes for the same document.
+///
+/// So the canonical form is the root element, plus the processing instructions
+/// outside it in document order: one before the root element is followed by a
+/// line feed, one after it is preceded by a line feed. The XML declaration, the
+/// DOCTYPE, comments and whitespace outside the root element render nothing.
+fn c14n_document_reference(xml: &str) -> Result<Vec<u8>, String> {
+    // a byte order mark is encoding metadata, not a node
+    let xml = xml.strip_prefix('\u{feff}').unwrap_or(xml);
+    let mut reader = Reader::from_str(xml);
+    let mut before = String::new();
+    let mut after = String::new();
+    let mut root: Option<Vec<u8>> = None;
+
+    loop {
+        let start = reader.buffer_position() as usize;
+        let outside = match reader
+            .read_event()
+            .map_err(|e| format!("document is not valid XML: {e}"))?
+        {
+            Event::Start(e) if root.is_none() => {
+                reader
+                    .read_to_end(e.name().to_owned())
+                    .map_err(|err| format!("cannot read the root element subtree: {err}"))?;
+                let end = reader.buffer_position() as usize;
+                root = Some(c14n(&xml[start..end], SAME_DOCUMENT_REFERENCE_COMMENTS)?);
+                None
+            }
+            Event::Empty(_) if root.is_none() => {
+                let end = reader.buffer_position() as usize;
+                root = Some(c14n(&xml[start..end], SAME_DOCUMENT_REFERENCE_COMMENTS)?);
+                None
+            }
+            Event::PI(e) => {
+                let raw = std::str::from_utf8(&e)
+                    .map_err(|err| format!("c14n processing instruction is not UTF-8: {err}"))?;
+                Some(c14n_processing_instruction(raw))
+            }
+            Event::Comment(_) | Event::Decl(_) | Event::DocType(_) => None,
+            Event::Text(e) => {
+                let raw = std::str::from_utf8(&e)
+                    .map_err(|err| format!("c14n text is not UTF-8: {err}"))?;
+                if !raw.trim().is_empty() {
+                    return Err(format!(
+                        "the document has text outside its root element ({raw:?})"
+                    ));
+                }
+                None
+            }
+            Event::Eof => break,
+            other => {
+                return Err(format!(
+                    "the document has an unsupported node outside its root element ({other:?})"
+                ));
+            }
+        };
+        if let Some(node) = outside {
+            if root.is_some() {
+                after.push('\n');
+                after.push_str(&node);
+            } else {
+                before.push_str(&node);
+                before.push('\n');
+            }
+        }
+    }
+
+    let root = root.ok_or("document has no root element")?;
+    let mut out = before.into_bytes();
+    out.extend_from_slice(&root);
+    out.extend_from_slice(after.as_bytes());
+    Ok(out)
+}
+
+/// Canonical form of a processing instruction: its target, then one space and
+/// the data when the data is not empty.
+fn c14n_processing_instruction(raw: &str) -> String {
+    let normalized = normalize_line_endings(raw);
+    let split = normalized.find([' ', '\t', '\n']);
+    let (target, data) = match split {
+        Some(i) => (
+            &normalized[..i],
+            normalized[i..].trim_start_matches([' ', '\t', '\n']),
+        ),
+        None => (normalized.as_str(), ""),
+    };
+    if data.is_empty() {
+        format!("<?{target}?>")
+    } else {
+        format!("<?{target} {data}?>")
+    }
 }
 
 /// Current in-scope URI of `prefix` ("" is the default), searching innermost
@@ -1758,11 +1851,20 @@ mod tests {
         doc
     }
 
+    /// The same document with a comment on each side of the root element.
+    fn cpl_doc_with_comments_outside_the_root() -> String {
+        let doc = cpl_doc().replace(
+            "<CompositionPlaylist",
+            "<!-- above the root -->\n<CompositionPlaylist",
+        );
+        format!("{doc}<!-- below the root -->\n")
+    }
+
     #[test]
     fn signer_declares_the_canonicalization_it_uses() {
         assert_eq!(
             Comments::from_c14n_uri(C14N_METHOD).expect("the signer's own c14n must be supported"),
-            SIGNER_C14N_COMMENTS,
+            SIGNED_INFO_COMMENTS,
             "SignedInfo is digested under the CanonicalizationMethod it declares"
         );
     }
@@ -1774,12 +1876,33 @@ mod tests {
             .expect("sign a document with a comment");
         verify_document_enveloped(&signed, None).expect("a comment must not break verification");
 
-        // The signer declares #WithComments, so a comment added afterwards is
-        // caught the same way any other edit is.
+        // A URI="" reference dereferences to a node-set with the comments
+        // removed, so one added afterwards changes no digest. xmlsec1 accepts
+        // this document too, and rejecting it here would reject every commented
+        // document xmlsec1 signs.
         let injected = signed.replacen("<Reel>", "<!-- added later --><Reel>", 1);
-        let err = verify_document_enveloped(&injected, None)
-            .expect_err("a comment added after signing must fail verification");
-        assert!(err.contains("digest mismatch"), "got: {err}");
+        verify_document_enveloped(&injected, None)
+            .expect("a comment is not part of what URI=\"\" digests");
+
+        if !xmlsec1_available() {
+            eprintln!("skipping the xmlsec1 half: xmlsec1 not installed");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for (name, document) in [("intact", &signed), ("commented", &injected)] {
+            let out = dir.path().join(format!("cpl-comment-{name}.xml"));
+            std::fs::write(&out, document).unwrap();
+            let result = xmlsec1_verify_no_id(&out, &c.root);
+            eprintln!(
+                "xmlsec1 --verify (comment inside the root, {name}):\n  status: {}\n  stderr: {}",
+                result.status,
+                String::from_utf8_lossy(&result.stderr).trim(),
+            );
+            assert!(
+                result.status.success(),
+                "xmlsec1 must accept the {name} document"
+            );
+        }
     }
 
     #[test]
@@ -1830,17 +1953,10 @@ mod tests {
         std::fs::read_to_string(out).unwrap()
     }
 
-    // Real DCPs declare plain c14n, whose canonical form has no comments, and
-    // carry comments in the signed region. Digesting those with comments makes a
-    // valid signature look like tampering.
-    #[test]
-    fn a_plain_c14n_document_with_a_comment_verifies() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
-        let c = chain();
-        let template = cpl_doc_with_comment().replace(
+    /// A whole-document enveloped signature template declaring plain c14n, ready
+    /// for `xmlsec1_sign` to fill in.
+    fn plain_c14n_template(document: &str) -> String {
+        document.replace(
             "</CompositionPlaylist>",
             &format!(
                 r#"  <ds:Signature xmlns:ds="{DSIG_NS}">
@@ -1864,7 +1980,20 @@ mod tests {
   </ds:Signature>
 </CompositionPlaylist>"#
             ),
-        );
+        )
+    }
+
+    // Real DCPs declare plain c14n, whose canonical form has no comments, and
+    // carry comments in the signed region. Digesting those with comments makes a
+    // valid signature look like tampering.
+    #[test]
+    fn a_plain_c14n_document_with_a_comment_verifies() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let template = plain_c14n_template(&cpl_doc_with_comment());
 
         let dir = tempfile::tempdir().unwrap();
         let signed = xmlsec1_sign(
@@ -1880,6 +2009,143 @@ mod tests {
         let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
         let err =
             verify_document_enveloped(&tampered, None).expect_err("tampering must still be caught");
+        assert!(err.contains("digest mismatch"), "got: {err}");
+    }
+
+    /// Both verdicts on one document, ours and xmlsec1's, so a change that makes
+    /// the two disagree cannot pass as a signing bug or a verifying bug alone.
+    fn both_verdicts(document: &str, name: &str, root_pem: &Path) -> (bool, bool) {
+        let ours = verify_document_enveloped(document, None);
+        if let Err(e) = &ours {
+            eprintln!("postkit ({name}): {e}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join(format!("{name}.xml"));
+        std::fs::write(&out, document).unwrap();
+        let result = xmlsec1_verify_no_id(&out, root_pem);
+        eprintln!(
+            "xmlsec1 --verify ({name}):\n  status: {}\n  stdout: {}\n  stderr: {}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout).trim(),
+            String::from_utf8_lossy(&result.stderr).trim(),
+        );
+        (ours.is_ok(), result.status.success())
+    }
+
+    // A comment outside the root element is the one place the two inclusive c14n
+    // algorithms were read as differing here. They do not: URI="" drops every
+    // comment, and xmlsec1 signs and verifies these documents that way.
+    #[test]
+    fn comments_outside_the_root_are_not_part_of_the_document_digest() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let signed =
+            sign_document_enveloped(&cpl_doc_with_comments_outside_the_root(), &leaf_signer(c))
+                .expect("sign a document with comments outside the root");
+        assert!(signed.contains("<!-- above the root -->"));
+        assert!(signed.contains("<!-- below the root -->"));
+        assert_eq!(
+            both_verdicts(&signed, "outside-comments", &c.root),
+            (true, true),
+            "both verifiers must accept the document as signed"
+        );
+
+        let edited = signed.replacen("<!-- below the root -->", "<!-- edited -->", 1);
+        assert_ne!(signed, edited, "the edit must change the document");
+        assert_eq!(
+            both_verdicts(&edited, "outside-comment-edited", &c.root),
+            (true, true),
+            "an edited comment outside the root changes no digest, for either verifier"
+        );
+    }
+
+    // The plain-c14n twin of the same edit, on a document xmlsec1 signed.
+    #[test]
+    fn editing_a_comment_outside_the_root_leaves_a_plain_c14n_signature_valid() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let dir = tempfile::tempdir().unwrap();
+        let signed = xmlsec1_sign(
+            &plain_c14n_template(&cpl_doc_with_comments_outside_the_root()),
+            &c.signer_key,
+            &c.signer,
+            &dir.path().join("plain-c14n-outside-comments.xml"),
+        );
+        assert!(signed.contains("<!-- below the root -->"));
+        verify_document_enveloped(&signed, None).expect("the intact document must verify");
+
+        let edited = signed.replacen("<!-- below the root -->", "<!-- edited -->", 1);
+        assert_ne!(signed, edited, "the edit must change the document");
+        verify_document_enveloped(&edited, None)
+            .expect("plain c14n drops comments, so editing one changes no digest");
+    }
+
+    /// The same document with a processing instruction before the root element,
+    /// which every inclusive c14n keeps.
+    fn cpl_doc_with_a_processing_instruction() -> String {
+        cpl_doc().replace(
+            "<CompositionPlaylist",
+            "<?xml-stylesheet   type=\"text/xsl\" href=\"cpl.xsl\"?>\n<CompositionPlaylist",
+        )
+    }
+
+    #[test]
+    fn a_processing_instruction_outside_the_root_is_part_of_the_document_digest() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let signed =
+            sign_document_enveloped(&cpl_doc_with_a_processing_instruction(), &leaf_signer(c))
+                .expect("sign a document with a processing instruction outside the root");
+        assert_eq!(
+            both_verdicts(&signed, "outside-pi", &c.root),
+            (true, true),
+            "both verifiers must accept the document as signed"
+        );
+
+        let edited = signed.replacen("cpl.xsl", "other.xsl", 1);
+        assert_ne!(signed, edited, "the edit must change the document");
+        assert_eq!(
+            both_verdicts(&edited, "outside-pi-edited", &c.root),
+            (false, false),
+            "an edited processing instruction outside the root must fail both verifiers"
+        );
+    }
+
+    // The plain-c14n twin: a processing instruction is digested there too.
+    #[test]
+    fn editing_a_processing_instruction_outside_the_root_fails_plain_c14n() {
+        if !xmlsec1_available() {
+            eprintln!("skipping: xmlsec1 not installed");
+            return;
+        }
+        let c = chain();
+        let dir = tempfile::tempdir().unwrap();
+        let signed = xmlsec1_sign(
+            &plain_c14n_template(&cpl_doc_with_a_processing_instruction()),
+            &c.signer_key,
+            &c.signer,
+            &dir.path().join("plain-c14n-outside-pi.xml"),
+        );
+        assert!(
+            signed.contains("xml-stylesheet"),
+            "the processing instruction must survive signing"
+        );
+        verify_document_enveloped(&signed, None)
+            .expect("a plain-c14n document with a processing instruction must verify");
+
+        let edited = signed.replacen("cpl.xsl", "other.xsl", 1);
+        assert_ne!(signed, edited, "the edit must change the document");
+        let err = verify_document_enveloped(&edited, None)
+            .expect_err("an edited processing instruction must fail verification");
         assert!(err.contains("digest mismatch"), "got: {err}");
     }
 

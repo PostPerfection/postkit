@@ -204,6 +204,26 @@
 
 ### Fixed
 
+- A signed document carrying an XML comment now verifies with xmlsec1. The
+  whole-document signer digested `URI=""` with comments kept, because that is
+  what the `#WithComments` canonicalization it declares says, but XML-DSig
+  dereferences `URI=""` and a barename `URI="#id"` to a node-set with the
+  comments already removed, so xmlsec1 digests comment-free bytes whichever
+  inclusive c14n the reference declares. Every CPL, PKL and KDM postkit signed
+  with a comment anywhere in it failed `xmlsec1 --verify` with a digest
+  mismatch. Both reference paths now canonicalize without comments, and the
+  with-comments mode is left where it does apply, on SignedInfo. A comment added
+  to a signed document no longer breaks the signature, which is what every other
+  verifier already accepted.
+
+- The `URI=""` digest covers the whole document node, not just the root element
+  subtree: the processing instructions outside the root element are digested
+  too, with the line feed C14N 1.0 puts after one that precedes the root element
+  and before one that follows it. Editing an `<?xml-stylesheet?>` above the root
+  used to leave the signature valid here while xmlsec1 rejected the document.
+  `c14n_document_reference` is the single entry point the signer and the
+  verifier both compute those bytes with.
+
 - `encode_parallel` honours the job's compression ratio instead of a hardcoded
   10:1, so a plain still-sequence encode follows the bitrate setting like every
   other input, and it holds each finished frame to the `codestream_byte_cap` so
