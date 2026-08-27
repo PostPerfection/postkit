@@ -4,6 +4,23 @@
 
 ### Added
 
+- **Every encoder entry point carries the IMF profile**: `StreamEncodeOptions`
+  learned the Rsiz and `KeepRgb` a release ago, but the pipeline, the parallel
+  image-sequence encoder and the still hold all built their own compress
+  parameters and left both at the cinema defaults. `EncodeRunOptions.rsiz`
+  forwards into both `StreamEncodeOptions` the pipeline builds,
+  `encode_parallel` takes the Rsiz and the source colour and passes grk_compress
+  `-Z` for a non-cinema profile and `--xyz` only for a colour that asks for it,
+  and `StillHold.rsiz` sets `CompressParams.profile`. `encode_parallel` refuses
+  an IMF Rsiz with the X'Y'Z' transform, as the in-process encoder already did,
+  and the image sequence branch of `reject_unsupported_colour_path` now lets
+  `KeepRgb` through, since grk_compress compresses those frames as they are.
+  grk_compress writes each codestream at the precision of the file it read, so
+  an IMF image sequence starts at 12 bits. `tests/imf_encode.rs` covers each
+  entry point from the written codestreams only: the declared Rsiz, 12-bit
+  components, and a red frame that decodes back to 4095,0,0 (4048,0,0 for the
+  compressed hold), where an X'Y'Z' encode leaves all three components large.
+
 - **The preview shows IMF App 2E picture**: `extract_frame` had no display path
   for RGB samples, so an App 2E frame went to ffmpeg and an encrypted one was
   refused outright. A codestream declaring an IMF profile now takes
