@@ -1307,6 +1307,30 @@ pub struct ParallelProgress {
     pub elapsed_secs: f64,
 }
 
+/// grk_compress's profile flags. A DCI Rsiz goes in as grok's own cinema mode,
+/// which brings the frame rate, the DCI per-frame byte cap, the TLM marker and
+/// the 12-bit X'Y'Z' output with it, and grok holds to the tighter of that cap
+/// and `-r`. Any other Rsiz is declared as it is.
+fn grk_compress_profile_args(
+    rsiz: u16,
+    fps: FrameRate,
+    codestream_byte_cap: Option<u64>,
+) -> Vec<String> {
+    const BITS_PER_BYTE: u64 = 8;
+    let cinema_flag = match crate::j2k::J2kProfile::from(rsiz) {
+        crate::j2k::J2kProfile::Cinema2k => "-w",
+        crate::j2k::J2kProfile::Cinema4k => "-x",
+        _ => return vec!["-Z".to_string(), rsiz.to_string()],
+    };
+    let frame_rate = fps.as_f64().round() as u64;
+    let cinema_mode = match codestream_byte_cap {
+        // grk_compress takes the cap as a bit rate it divides back by the frame rate
+        Some(cap) => format!("{frame_rate},{}", cap * BITS_PER_BYTE * frame_rate),
+        None => frame_rate.to_string(),
+    };
+    vec![cinema_flag.to_string(), cinema_mode]
+}
+
 /// Encode the given image files using parallel single-threaded subprocesses.
 ///
 /// Spawns up to `parallelism` grk_compress processes concurrently, each
@@ -1320,10 +1344,12 @@ pub struct ParallelProgress {
 /// `quality_psnr` replaces the compression ratio with a PSNR target grk_compress
 /// allocates layers by.
 ///
-/// `source_colour` decides whether grk_compress runs its X'Y'Z' transform, and
-/// an `rsiz` outside the DCI cinema family is declared in the codestream.
-/// grk_compress writes each frame at the precision of the file it read, so an
-/// IMF caller passes 12-bit frames.
+/// `source_colour` decides whether grk_compress runs its X'Y'Z' transform. A
+/// cinema `rsiz` runs grk_compress in its cinema mode at `fps`, which writes
+/// 12-bit X'Y'Z' from stills of any depth and refuses a PSNR target, since
+/// that mode allocates by rate. Any other `rsiz` is declared as given, and
+/// grk_compress then writes each frame at the precision of the file it read,
+/// so an IMF caller passes 12-bit frames.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_parallel<F>(
     frames: &[PathBuf],
@@ -1332,6 +1358,7 @@ pub fn encode_parallel<F>(
     quality_psnr: Option<f64>,
     codestream_byte_cap: Option<u64>,
     rsiz: u16,
+    fps: FrameRate,
     source_colour: &SourceColour,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
@@ -1359,6 +1386,16 @@ where
             ..Default::default()
         };
     }
+    if crate::j2k::J2kProfile::from(rsiz).is_dci_cinema() && quality_psnr.is_some() {
+        return EncodeResult {
+            success: false,
+            error: format!(
+                "RSIZ {rsiz:#06x} is a cinema profile, which grk_compress allocates by rate \
+                 under the DCI cap, so a PSNR target cannot be honoured"
+            ),
+            ..Default::default()
+        };
+    }
 
     let total = frames.len() as u64;
     let (allocation_flag, allocation_value) = match quality_psnr {
@@ -1381,11 +1418,7 @@ where
     if apply_xyz_transform {
         compress_args.push("--xyz".to_string());
     }
-    // grk_compress checks a frame against a cinema rsiz and refuses an 8-bit one
-    if !crate::j2k::J2kProfile::from(rsiz).is_dci_cinema() {
-        compress_args.push("-Z".to_string());
-        compress_args.push(rsiz.to_string());
-    }
+    compress_args.extend(grk_compress_profile_args(rsiz, fps, codestream_byte_cap));
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         return EncodeResult {
@@ -1623,12 +1656,26 @@ mod tests {
             None,
             None,
             default_rsiz(),
+            FrameRate::whole(24),
             &SourceColour::DisplayRgb,
             &cancel,
             &pause,
             |_| {},
         );
         assert!(result.success, "{}", result.error);
+        let codestream = std::fs::read(loose_dir.join("frame_000.j2k")).unwrap();
+        let header = crate::j2k::parse_j2k_header(&codestream).expect("codestream header");
+        assert_eq!(
+            header.profile, 0x0003,
+            "a DCP image sequence has to declare the cinema 2K Rsiz"
+        );
+        assert_eq!(
+            header.bit_depths,
+            vec![12, 12, 12],
+            "grok widens 8-bit stills to the 12 bits cinema requires"
+        );
+        crate::j2k::validate_dci_header(&header).expect("the AS-DCP wrap accepts the codestream");
+
         let tight_dir = dir.path().join("r40");
         let result = encode_parallel(
             &frames,
@@ -1637,6 +1684,7 @@ mod tests {
             None,
             None,
             default_rsiz(),
+            FrameRate::whole(24),
             &SourceColour::DisplayRgb,
             &cancel,
             &pause,
@@ -1660,6 +1708,7 @@ mod tests {
             None,
             Some(64),
             default_rsiz(),
+            FrameRate::whole(24),
             &SourceColour::DisplayRgb,
             &cancel,
             &pause,
@@ -1701,6 +1750,7 @@ mod tests {
             None,
             None,
             default_rsiz(),
+            FrameRate::whole(24),
             &SourceColour::DisplayRgb,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(AtomicBool::new(false)),

@@ -487,6 +487,7 @@ fn run_encode_and_maybe_wrap(
                     quality_psnr,
                     options.codestream_byte_cap,
                     options.rsiz,
+                    fps,
                     &options.source_colour,
                     cancel,
                     pause,

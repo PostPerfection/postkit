@@ -9,8 +9,9 @@
   image-sequence encoder and the still hold all built their own compress
   parameters and left both at the cinema defaults. `EncodeRunOptions.rsiz`
   forwards into both `StreamEncodeOptions` the pipeline builds,
-  `encode_parallel` takes the Rsiz and the source colour and passes grk_compress
-  `-Z` for a non-cinema profile and `--xyz` only for a colour that asks for it,
+  `encode_parallel` takes the Rsiz, the frame rate and the source colour, runs
+  grk_compress in its cinema mode for a cinema Rsiz and passes `-Z` for any
+  other, with `--xyz` only for a colour that asks for it,
   and `StillHold.rsiz` sets `CompressParams.profile`. `encode_parallel` refuses
   an IMF Rsiz with the X'Y'Z' transform, as the in-process encoder already did,
   and the image sequence branch of `reject_unsupported_colour_path` now lets
@@ -78,6 +79,18 @@
   and `StreamEncodeOptions.rsiz` carries the profile into both encoders,
   defaulting to the cinema 2K they wrote before. Nothing in either wizard selects
   an IMF profile yet.
+
+### Fixed
+
+- **Image-sequence DCPs declared Rsiz 0x0000**: `encode_parallel` never handed
+  grk_compress a cinema profile, because grok refused every still under 12 bits
+  under one, so the codestreams carried no profile and `validate_dci_header`
+  rejected them at the AS-DCP wrap. A cinema Rsiz now runs grk_compress in its
+  cinema mode (`-w`/`-x` with the frame rate and, when a cap is set, the bit
+  rate), and grok, from the release after v20.3.13, widens an 8-bit still to
+  12-bit X'Y'Z' and keeps a ratio tighter than the DCI cap.
+  `parallel_encode_honours_the_ratio_and_the_cap` reads a codestream back: Rsiz
+  0x0003, three 12-bit components, and `validate_dci_header` passes.
 
 ### Changed
 

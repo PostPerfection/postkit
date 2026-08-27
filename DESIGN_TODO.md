@@ -5,12 +5,6 @@
   `EncodeRunOptions` at its cinema defaults, so it hands the AS-02 wrap X'Y'Z'
   cinema picture and the wrap refuses it. IMP creation stays broken until that
   caller passes an IMF Rsiz, `KeepRgb` and the picture's colour ULs.
-- An image sequence encoded for a DCP declares Rsiz 0x0000, because
-  `encode_parallel` cannot hand grk_compress a cinema Rsiz without it refusing
-  every frame under 12 bits. `validate_dci_header` refuses 0x0000, so the
-  AS-DCP wrap rejects those codestreams. The fix is grok's own cinema mode
-  (`-w`/`-x`) on that path, which also brings the frame rate and the per-frame
-  byte budget with it.
 - The preview shows only Rec.709 App 2E picture. `render_imf_frame` refuses
   ST 2084, HLG, BT.2020 and P3-D65 by name, which is most of what a real IMP
   carries: the display transform for them is a tone map plus a gamut conversion
