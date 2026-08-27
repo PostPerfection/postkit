@@ -23,6 +23,15 @@ pub fn to_visual(logical: &str) -> String {
         .join("\n")
 }
 
+/// Does the text hold any right-to-left run, and so need reordering at all?
+///
+/// The bidi algorithm answers rather than a list of script ranges, so every RTL
+/// script Unicode defines counts, and so does a Latin line with one Hebrew
+/// phrase in it: the server that does not reorder mirrors that phrase too.
+pub fn has_rtl(text: &str) -> bool {
+    BidiInfo::new(text, None).has_rtl()
+}
+
 fn reorder_line(line: &str, reshaper: &ArabicReshaper) -> String {
     let shaped = reshaper.reshape(line);
     let info = BidiInfo::new(&shaped, None);
@@ -43,6 +52,16 @@ mod tests {
         let visual = to_visual(logical);
         let rev: String = logical.chars().rev().collect();
         assert_eq!(visual, rev);
+    }
+
+    #[test]
+    fn only_text_with_an_rtl_run_needs_reordering() {
+        assert!(!has_rtl("hello world"));
+        assert!(has_rtl("\u{05d0}\u{05d1}"));
+        // a latin sentence with one hebrew word in it still has an rtl run
+        assert!(has_rtl("read \u{05d0}\u{05d1} now"));
+        // thaana, an rtl script that is neither hebrew nor arabic
+        assert!(has_rtl("\u{0780}\u{0781}"));
     }
 
     #[test]

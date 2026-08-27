@@ -14,6 +14,15 @@
 
 ### Added
 
+- `burnin::BurninOptions.video_codec` and `.video_crf`, passed as ffmpeg's
+  `-c:v` and `-crf`, so a burnt copy names its encoder and quality instead of
+  taking whatever ffmpeg guesses from the output file name.
+  `video_codec: "libx264"` with `video_crf: Some(0)` writes a lossless copy. The
+  command line is built by `ffmpeg_args`, which a test reads without encoding.
+- `subtitle_formats::bidi::has_rtl`, which answers whether text holds a
+  right-to-left run and so needs `to_visual`. The bidi algorithm decides, so
+  every RTL script counts and not only the six code-point ranges dcpwizard's
+  `--subtitle-rtl auto` used to test.
 - `gui_job_queue`: the queue of builds a wizard GUI runs, with its on-disk
   record, held once instead of a copy in each wizard. `GuiJobQueue<C>` is
   generic over the wizard's job config, which implements `GuiJob` for the id,

@@ -24,6 +24,12 @@ pub struct BurninOptions {
     /// bottom. Empty means bottom for burnt-in text and the subtitle file's own
     /// placement for subtitles.
     pub position: String,
+    /// Video encoder for the burnt copy, e.g. "libx264" or "prores_ks". Empty
+    /// leaves the encoder to ffmpeg's guess from the output file name.
+    pub video_codec: String,
+    /// Constant rate factor for the encoders that take one, where 0 is lossless
+    /// x264/x265 and higher is smaller. None keeps the encoder's own default.
+    pub video_crf: Option<u32>,
 }
 
 /// Both SMPTE ST 428-7 and Interop subtitle XML, matched as substrings so a
@@ -35,19 +41,7 @@ const DEFAULT_TEXT_COLOUR: &str = "white";
 
 /// Burn subtitles or text into video frames using ffmpeg.
 pub fn burnin(opts: &BurninOptions) -> std::io::Result<()> {
-    let mut args = vec!["-i".to_string(), opts.input.to_string_lossy().to_string()];
-
-    if let Some(ref sub) = opts.subtitle_file {
-        args.push("-vf".to_string());
-        args.push(subtitle_filter(opts, sub)?);
-    } else if let Some(ref text) = opts.text {
-        args.push("-vf".to_string());
-        args.push(text_filter(opts, text));
-    }
-
-    args.push("-y".to_string());
-    args.push(opts.output.to_string_lossy().to_string());
-
+    let args = ffmpeg_args(opts)?;
     let output = std::process::Command::new("ffmpeg").args(&args).output()?;
 
     if !output.status.success() {
@@ -58,6 +52,33 @@ pub fn burnin(opts: &BurninOptions) -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+/// The ffmpeg command line `burnin` runs, built on its own so a test can read
+/// it without encoding anything.
+fn ffmpeg_args(opts: &BurninOptions) -> std::io::Result<Vec<String>> {
+    let mut args = vec!["-i".to_string(), opts.input.to_string_lossy().to_string()];
+
+    if let Some(ref sub) = opts.subtitle_file {
+        args.push("-vf".to_string());
+        args.push(subtitle_filter(opts, sub)?);
+    } else if let Some(ref text) = opts.text {
+        args.push("-vf".to_string());
+        args.push(text_filter(opts, text));
+    }
+
+    if !opts.video_codec.is_empty() {
+        args.push("-c:v".to_string());
+        args.push(opts.video_codec.clone());
+    }
+    if let Some(crf) = opts.video_crf {
+        args.push("-crf".to_string());
+        args.push(crf.to_string());
+    }
+
+    args.push("-y".to_string());
+    args.push(opts.output.to_string_lossy().to_string());
+    Ok(args)
 }
 
 /// Build the `subtitles` filter, carrying the styling options as ASS style
@@ -347,6 +368,67 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("none.srt"), "unhelpful error: {error}");
+    }
+
+    #[test]
+    fn the_named_encoder_and_quality_reach_the_command_line() {
+        let dir = TempDir::new().unwrap();
+        let opts = BurninOptions {
+            input: dir.path().join("in.mov"),
+            output: dir.path().join("out.mov"),
+            subtitle_file: Some(srt(dir.path())),
+            video_codec: "libx264".into(),
+            video_crf: Some(0),
+            ..Default::default()
+        };
+        let args = ffmpeg_args(&opts).unwrap();
+        let pairs: Vec<_> = args.windows(2).map(|w| (&w[0], &w[1])).collect();
+        assert!(
+            pairs.iter().any(|(k, v)| *k == "-c:v" && *v == "libx264"),
+            "encoder missing from {args:?}"
+        );
+        assert!(
+            pairs.iter().any(|(k, v)| *k == "-crf" && *v == "0"),
+            "quality missing from {args:?}"
+        );
+        assert_eq!(
+            args.last().unwrap(),
+            &opts.output.to_string_lossy().to_string(),
+            "the output has to stay last"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_encoder_leaves_the_command_line_to_ffmpeg() {
+        let dir = TempDir::new().unwrap();
+        let opts = BurninOptions {
+            input: dir.path().join("in.mov"),
+            output: dir.path().join("out.mov"),
+            subtitle_file: Some(srt(dir.path())),
+            ..Default::default()
+        };
+        let args = ffmpeg_args(&opts).unwrap();
+        assert!(!args.contains(&"-c:v".to_string()), "{args:?}");
+        assert!(!args.contains(&"-crf".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn ffmpeg_burns_in_subtitles_losslessly_when_asked() {
+        if !have_ffmpeg() {
+            eprintln!("skipping burn-in test: ffmpeg not found");
+            return;
+        }
+        let root = TempDir::new().unwrap();
+        let opts = BurninOptions {
+            input: one_frame_video(root.path()),
+            output: root.path().join("lossless.mkv"),
+            subtitle_file: Some(srt(root.path())),
+            video_codec: "libx264".into(),
+            video_crf: Some(0),
+            ..Default::default()
+        };
+        burnin(&opts).unwrap();
+        assert!(opts.output.exists());
     }
 
     #[test]
