@@ -64,56 +64,77 @@ pub struct J2kHeader {
 /// DCI compliance profile identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum J2kProfile {
-    /// No profile / unrestricted
+    /// Rsiz 0, unrestricted
     None,
-    /// Profile 0 (DCI 2K)
-    Dci2k,
-    /// Profile 1 (DCI 4K)
-    Dci4k,
-    /// Cinema 2K
-    CinemaS2k,
-    /// Cinema 4K
-    CinemaS4k,
-    /// Profile 3 (broadcast)
+    /// Rsiz 3, 2K digital cinema
+    Cinema2k,
+    /// Rsiz 4, 4K digital cinema
+    Cinema4k,
+    /// Rsiz 5, scalable 2K digital cinema
+    CinemaScalable2k,
+    /// Rsiz 6, scalable 4K digital cinema
+    CinemaScalable4k,
+    /// Rsiz 7, cinema long-term storage
+    CinemaLongTermStorage,
+    /// Rsiz 0x0100 to 0x03ff, broadcast contribution. The low bits carry a main
+    /// level this does not keep.
     Broadcast,
-    /// Unknown profile
+    /// Rsiz 0x0400 to 0x09ff, IMF. The low bits carry main and sub levels this
+    /// does not keep.
+    Imf,
+    /// Rsiz this does not name
     Unknown(u16),
-}
-
-impl From<u16> for J2kProfile {
-    fn from(rsiz: u16) -> Self {
-        match rsiz {
-            0 => J2kProfile::None,
-            1 => J2kProfile::Dci2k,
-            2 => J2kProfile::Dci4k,
-            3 => J2kProfile::CinemaS2k,
-            4 => J2kProfile::CinemaS4k,
-            5 => J2kProfile::Broadcast,
-            v => J2kProfile::Unknown(v),
-        }
-    }
 }
 
 /// Rsiz carries the profile in its low 12 bits; the Part 2 extension bit is above.
 const RSIZ_PROFILE_MASK: u16 = 0x0fff;
-/// The DCI cinema Rsiz profiles (ISO/IEC 15444-1 Amd 1): 2K, 4K, scalable 2K,
-/// scalable 4K, and long-term storage.
-const DCI_CINEMA_PROFILES: [u16; 5] = [0x0003, 0x0004, 0x0005, 0x0006, 0x0007];
 
-/// Whether an Rsiz value is a DCI cinema profile, so its samples are X'Y'Z'
-/// rather than the RGB or YCbCr an IMF or broadcast codestream carries.
-pub fn is_dci_cinema_profile(rsiz: u16) -> bool {
-    DCI_CINEMA_PROFILES.contains(&(rsiz & RSIZ_PROFILE_MASK))
+impl From<u16> for J2kProfile {
+    /// Classify an Rsiz value per ISO/IEC 15444-1 Amd 1. These are the values
+    /// grok's own `GRK_PROFILE_*` constants use, and what a DCP carries: a 2K
+    /// picture is Rsiz 3, not 1.
+    fn from(rsiz: u16) -> Self {
+        match rsiz & RSIZ_PROFILE_MASK {
+            0x0000 => J2kProfile::None,
+            0x0003 => J2kProfile::Cinema2k,
+            0x0004 => J2kProfile::Cinema4k,
+            0x0005 => J2kProfile::CinemaScalable2k,
+            0x0006 => J2kProfile::CinemaScalable4k,
+            0x0007 => J2kProfile::CinemaLongTermStorage,
+            0x0100..=0x03ff => J2kProfile::Broadcast,
+            0x0400..=0x09ff => J2kProfile::Imf,
+            other => J2kProfile::Unknown(other),
+        }
+    }
+}
+
+impl J2kProfile {
+    /// Whether this is a digital cinema profile, so the samples are X'Y'Z'
+    /// rather than the RGB or YCbCr an IMF or broadcast codestream carries.
+    pub fn is_dci_cinema(self) -> bool {
+        matches!(
+            self,
+            J2kProfile::Cinema2k
+                | J2kProfile::Cinema4k
+                | J2kProfile::CinemaScalable2k
+                | J2kProfile::CinemaScalable4k
+                | J2kProfile::CinemaLongTermStorage
+        )
+    }
 }
 
 /// Check the header fields DCP picture wrapping requires.
 pub fn validate_dci_header(header: &J2kHeader) -> Result<(), String> {
-    let max_dimensions = match header.profile {
-        1 | 3 => (2048, 1080),
-        2 | 4 => (4096, 2160),
-        profile => {
+    // a DCP carries the plain 2K or 4K cinema profile; the scalable and
+    // long-term-storage ones are cinema too but SMPTE 429-4 does not wrap them
+    let profile = J2kProfile::from(header.profile);
+    let max_dimensions = match profile {
+        J2kProfile::Cinema2k => (2048, 1080),
+        J2kProfile::Cinema4k => (4096, 2160),
+        _ => {
             return Err(format!(
-                "RSIZ {profile:#06x} is not a DCI JPEG 2000 profile"
+                "RSIZ {:#06x} is not a DCI JPEG 2000 profile",
+                header.profile
             ));
         }
     };
@@ -124,8 +145,8 @@ pub fn validate_dci_header(header: &J2kHeader) -> Result<(), String> {
     if header.width > max_dimensions.0 || header.height > max_dimensions.1 {
         return Err(format!(
             "JPEG 2000 {} profile exceeds its {}x{} limit: {}x{}",
-            match header.profile {
-                1 | 3 => "2K",
+            match profile {
+                J2kProfile::Cinema2k => "2K",
                 _ => "4K",
             },
             max_dimensions.0,
@@ -428,26 +449,6 @@ pub struct MxfBitrateStats {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn the_cinema_profiles_are_dci() {
-        for rsiz in DCI_CINEMA_PROFILES {
-            assert!(is_dci_cinema_profile(rsiz), "rsiz {rsiz:#06x}");
-        }
-    }
-
-    #[test]
-    fn imf_and_broadcast_profiles_are_not_dci() {
-        // IMF 2K and 4K, broadcast single-tile, and an unconstrained codestream
-        for rsiz in [0x0400u16, 0x0500, 0x0100, 0x0000] {
-            assert!(!is_dci_cinema_profile(rsiz), "rsiz {rsiz:#06x}");
-        }
-    }
-
-    #[test]
-    fn a_part2_extension_bit_does_not_hide_the_cinema_profile() {
-        assert!(is_dci_cinema_profile(0x8000 | 0x0003));
-    }
     use super::*;
 
     #[test]
@@ -464,11 +465,59 @@ mod tests {
 
     #[test]
     fn profile_from_rsiz() {
-        assert_eq!(J2kProfile::from(0), J2kProfile::None);
-        assert_eq!(J2kProfile::from(1), J2kProfile::Dci2k);
-        assert_eq!(J2kProfile::from(2), J2kProfile::Dci4k);
-        assert_eq!(J2kProfile::from(3), J2kProfile::CinemaS2k);
-        assert_eq!(J2kProfile::from(4), J2kProfile::CinemaS4k);
+        // the values grok writes and a DCP carries: 2K is 3, not 1
+        assert_eq!(J2kProfile::from(0x0000), J2kProfile::None);
+        assert_eq!(J2kProfile::from(0x0003), J2kProfile::Cinema2k);
+        assert_eq!(J2kProfile::from(0x0004), J2kProfile::Cinema4k);
+        assert_eq!(J2kProfile::from(0x0005), J2kProfile::CinemaScalable2k);
+        assert_eq!(J2kProfile::from(0x0006), J2kProfile::CinemaScalable4k);
+        assert_eq!(J2kProfile::from(0x0007), J2kProfile::CinemaLongTermStorage);
+        // broadcast and IMF carry level bits below the profile
+        assert_eq!(J2kProfile::from(0x0100), J2kProfile::Broadcast);
+        assert_eq!(J2kProfile::from(0x0302), J2kProfile::Broadcast);
+        assert_eq!(J2kProfile::from(0x0400), J2kProfile::Imf);
+        assert_eq!(J2kProfile::from(0x0900), J2kProfile::Imf);
+        // 1 and 2 are not cinema profiles, whatever the DCI spec calls its own
+        assert_eq!(J2kProfile::from(0x0001), J2kProfile::Unknown(1));
+        assert_eq!(J2kProfile::from(0x0002), J2kProfile::Unknown(2));
+    }
+
+    #[test]
+    fn the_cinema_profiles_are_dci() {
+        for rsiz in [0x0003u16, 0x0004, 0x0005, 0x0006, 0x0007] {
+            assert!(J2kProfile::from(rsiz).is_dci_cinema(), "rsiz {rsiz:#06x}");
+        }
+    }
+
+    #[test]
+    fn imf_and_broadcast_profiles_are_not_dci() {
+        for rsiz in [0x0400u16, 0x0500, 0x0100, 0x0000, 0x0001] {
+            assert!(!J2kProfile::from(rsiz).is_dci_cinema(), "rsiz {rsiz:#06x}");
+        }
+    }
+
+    #[test]
+    fn a_part2_extension_bit_does_not_hide_the_cinema_profile() {
+        assert_eq!(J2kProfile::from(0x8000 | 0x0003), J2kProfile::Cinema2k);
+        assert!(J2kProfile::from(0x8000 | 0x0003).is_dci_cinema());
+    }
+
+    #[test]
+    fn dci_wrapping_takes_only_the_plain_cinema_profiles() {
+        // scalable and long-term storage are cinema, but SMPTE 429-4 wraps 2K/4K
+        for rsiz in [0x0005u16, 0x0006, 0x0007, 0x0001, 0x0002] {
+            let header =
+                parse_j2k_header(&synth_codestream(rsiz, 2048, 1080, 0, 0, 3, 12)).unwrap();
+            assert!(
+                validate_dci_header(&header).is_err(),
+                "rsiz {rsiz:#06x} should not wrap into a DCP"
+            );
+        }
+        for rsiz in [0x0003u16, 0x0004] {
+            let header =
+                parse_j2k_header(&synth_codestream(rsiz, 2048, 1080, 0, 0, 3, 12)).unwrap();
+            assert!(validate_dci_header(&header).is_ok(), "rsiz {rsiz:#06x}");
+        }
     }
 
     /// Build a minimal SOC + SIZ + SOD codestream for testing.
@@ -514,7 +563,7 @@ mod tests {
         assert_eq!(hdr.num_components, 3);
         assert_eq!(hdr.bit_depth, 12);
         assert!(!hdr.is_signed);
-        assert_eq!(J2kProfile::from(hdr.profile), J2kProfile::CinemaS4k);
+        assert_eq!(J2kProfile::from(hdr.profile), J2kProfile::Cinema4k);
     }
 
     #[test]

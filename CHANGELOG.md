@@ -4,6 +4,19 @@
 
 ### Changed
 
+- **`j2k::J2kProfile` carries the Rsiz values a codestream actually holds**: it
+  mapped Rsiz 1 to `Dci2k` and 2 to `Dci4k`, which are not cinema profiles, named
+  Rsiz 3 and 4 (the plain 2K and 4K digital cinema profiles, and what every DCP
+  and grok itself writes) `CinemaS2k` and `CinemaS4k` as though they were the
+  scalable ones, and called Rsiz 5, scalable 2K, `Broadcast`. The variants are now
+  `Cinema2k`, `Cinema4k`, `CinemaScalable2k`, `CinemaScalable4k`,
+  `CinemaLongTermStorage`, `Broadcast` for 0x0100 to 0x03ff and `Imf` for 0x0400
+  to 0x09ff, matching ISO/IEC 15444-1 Amd 1 and grok's own `GRK_PROFILE_*`. The
+  Part 2 extension bit no longer hides a profile. `validate_dci_header` follows,
+  so it no longer wraps Rsiz 1 or 2 essence into a DCP as though it were DCI; the
+  profiles it accepts are unchanged otherwise. imfwizard's `check_j2k_dci` is the
+  one caller outside postkit and accepts the same two profiles it did before, but
+  names the rejected one correctly now.
 - **`extract_frame` decodes DCP picture essence with grok**: the thumbnail path
   both wizards call, `dcpwizard frame-extract` and imfwizard's alike, ran ffmpeg
   over whatever it was given, and its `-ss` sits after `-i`, so a late frame
@@ -53,9 +66,9 @@
 
 ### Added
 
-- `j2k::is_dci_cinema_profile(rsiz)`, whether an Rsiz value is one of the DCI
-  cinema profiles and so carries X'Y'Z' samples rather than the RGB or YCbCr an
-  IMF or broadcast codestream holds. `extract_frame` routes on it.
+- `j2k::J2kProfile::is_dci_cinema`, whether a profile is a digital cinema one and
+  so carries X'Y'Z' samples rather than the RGB or YCbCr an IMF or broadcast
+  codestream holds. `extract_frame` routes on it.
 - `grok_decoder`: in-process JPEG 2000 decoding through the grok FFI. Bytes in,
   planar samples out, so nothing is written to disk and no process is spawned.
   `decode(codestream, reduce)` discards `reduce` highest resolution levels and

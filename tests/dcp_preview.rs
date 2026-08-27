@@ -224,7 +224,7 @@ fn extract_frame_decodes_dcp_essence_through_grok() {
     let j2c = make_real_j2c(w, h, CINEMA_2K_PROFILE);
     let header = postkit::j2k::parse_j2k_header(&j2c).expect("fixture is a codestream");
     assert!(
-        postkit::j2k::is_dci_cinema_profile(header.profile),
+        postkit::j2k::J2kProfile::from(header.profile).is_dci_cinema(),
         "the fixture has to carry a cinema profile or extraction will not route to grok, \
          found rsiz {:#06x}",
         header.profile

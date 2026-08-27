@@ -162,7 +162,9 @@ fn frame_route(input: &Path, frame: u32) -> FrameRoute {
         ));
     }
     match crate::j2k::parse_j2k_from_mxf(&resolved.mxf, frame) {
-        Ok(header) if crate::j2k::is_dci_cinema_profile(header.profile) => FrameRoute::Dcp,
+        Ok(header) if crate::j2k::J2kProfile::from(header.profile).is_dci_cinema() => {
+            FrameRoute::Dcp
+        }
         Ok(header) => {
             tracing::debug!(
                 "codestream profile {:#06x} is not DCI cinema, decoding with ffmpeg",
