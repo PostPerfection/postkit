@@ -554,7 +554,7 @@ fn decode_dcp_frame(
 }
 
 /// Decode a single DCP picture frame, colour-manage it, and write it to an
-/// image file (format from the extension, encoded by ffmpeg).
+/// image file, format from the extension.
 pub fn render_dcp_frame(
     opts: &DcpPreviewOptions,
     frame: u32,
@@ -574,8 +574,18 @@ pub fn render_dcp_frame(
     write_rgb8_image(&img, out_image)
 }
 
-/// Encode a raw RGB frame to an image file via ffmpeg.
+/// Write a raw RGB frame to an image file, format from the extension.
+///
+/// A binary PPM is the frame's own rgb24 bytes behind a short header, so it is
+/// written here. Every other format goes through ffmpeg.
 fn write_rgb8_image(img: &Rgb8Frame, out_image: &Path) -> Result<(), PreviewError> {
+    if out_image
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("ppm"))
+    {
+        return write_ppm(img, out_image);
+    }
+
     let mut child = std::process::Command::new("ffmpeg")
         .args([
             "-hide_banner",
@@ -614,6 +624,14 @@ fn write_rgb8_image(img: &Rgb8Frame, out_image: &Path) -> Result<(), PreviewErro
             String::from_utf8_lossy(&out.stderr).into_owned(),
         ));
     }
+    Ok(())
+}
+
+/// Write the frame as a binary PPM (P6), 8 bits a channel.
+fn write_ppm(img: &Rgb8Frame, out_image: &Path) -> Result<(), PreviewError> {
+    let mut file = std::fs::File::create(out_image)?;
+    write!(file, "P6\n{} {}\n255\n", img.width, img.height)?;
+    file.write_all(&img.data)?;
     Ok(())
 }
 
