@@ -2,11 +2,10 @@
 
 - Nothing selects an IMF profile yet. The encoder writes IMF picture when
   `StreamEncodeOptions.rsiz` carries an `imf_rsiz` and `source_colour` is
-  `KeepRgb`, but every caller leaves both at their cinema defaults, so imfwizard
-  still ships X'Y'Z' picture under an App 2E label. The picture MXF descriptor
-  is a separate gap: the AS-02 wrap signals no colour at all, and asdcplib-rs
-  writes a zeroed JPEG2000 sub-descriptor because nothing parses the codestream
-  into it.
+  `KeepRgb`, but every caller leaves both at their cinema defaults. imfwizard's
+  `create` therefore hands the AS-02 wrap X'Y'Z' cinema picture and the wrap
+  refuses it, so IMP creation is broken until that caller passes an IMF Rsiz,
+  `KeepRgb` and the picture's colour ULs.
 - IMF App 2E picture still decodes with ffmpeg. `extract_frame` routes only
   codestreams declaring a DCI cinema profile to grok, because App 2E samples are
   RGB or YCbCr in Rec.709 or Rec.2020, not X'Y'Z', and the DCDM inverse in
@@ -14,8 +13,10 @@
   missing is the display transform for those spaces:
   `DcdmTransform::to_xyz(Rec709)` into `XyzToSrgb` would chain two transforms
   that already exist, and 4:2:2 essence would still need chroma upsampling, which
-  `grok_decoder` refuses by name today. Needs a real App 2E track file to verify
-  against. Same entry in imfwizard's DESIGN_TODO.
+  `grok_decoder` refuses by name today. A real App 2E codestream to verify
+  against is now in `tests/fixtures/imf4k_black_3840x2160.j2c`, though a black
+  leader frame proves nothing about a display transform, so a frame with picture
+  in it is still wanted. Same entry in imfwizard's DESIGN_TODO.
 - Verify the non-blocking render live (2026-08-17). `render_opengl` now passes
   `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0` with `video-timing-offset` 0,
   because the default wait parked the app's main thread for most of each frame

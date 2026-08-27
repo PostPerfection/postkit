@@ -33,34 +33,20 @@ fn temp_path(tag: &str) -> PathBuf {
     ))
 }
 
-/// JPEG 2000 codestream with a real SOC/SIZ so postkit's header parse accepts it.
-/// asdcplib stores the frame opaquely, so payload bytes survive a write/read cycle.
-fn synthetic_j2c(width: u32, height: u32, seed: u8, payload_len: usize) -> Vec<u8> {
-    let comps: u16 = 3;
-    let mut siz = Vec::new();
-    siz.extend_from_slice(&0u16.to_be_bytes()); // Rsiz
-    siz.extend_from_slice(&width.to_be_bytes()); // Xsiz
-    siz.extend_from_slice(&height.to_be_bytes()); // Ysiz
-    siz.extend_from_slice(&0u32.to_be_bytes()); // XOsiz
-    siz.extend_from_slice(&0u32.to_be_bytes()); // YOsiz
-    siz.extend_from_slice(&width.to_be_bytes()); // XTsiz
-    siz.extend_from_slice(&height.to_be_bytes()); // YTsiz
-    siz.extend_from_slice(&0u32.to_be_bytes()); // XTOsiz
-    siz.extend_from_slice(&0u32.to_be_bytes()); // YTOsiz
-    siz.extend_from_slice(&comps.to_be_bytes()); // Csiz
-    for _ in 0..comps {
-        siz.extend_from_slice(&[0x0b, 0x01, 0x01]); // Ssiz, XRsiz, YRsiz
-    }
-
-    let mut data = vec![0xff, 0x4f]; // SOC
-    data.extend_from_slice(&[0xff, 0x51]); // SIZ marker
-    data.extend_from_slice(&((siz.len() + 2) as u16).to_be_bytes()); // Lsiz includes itself
-    data.extend_from_slice(&siz);
-    data.extend_from_slice(&[0xff, 0x93]); // SOD
-    data.extend((0..payload_len).map(|i| seed.wrapping_add(i as u8)));
-    data.extend_from_slice(&[0xff, 0xd9]); // EOC
-    data
+/// The Netflix IMF 4K codestream, with `filler` bytes appended after its EOC so
+/// a multi-frame wrap has payloads of distinct content and length: a frame
+/// mix-up would otherwise read back as a pass.
+fn imf_frame(filler: usize) -> Vec<u8> {
+    let mut frame = std::fs::read(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/imf4k_black_3840x2160.j2c"),
+    )
+    .expect("IMF fixture codestream");
+    frame.extend(std::iter::repeat_n(filler as u8, filler));
+    frame
 }
+
+/// The raster the IMF fixture carries.
+const IMF_FIXTURE_SIZE: (u32, u32) = (3840, 2160);
 
 /// Minimal 44-byte WAV header + raw PCM body of the requested length.
 fn synthetic_wav(pcm: &[u8]) -> Vec<u8> {
@@ -86,9 +72,7 @@ fn synthetic_wav(pcm: &[u8]) -> Vec<u8> {
 fn as02_j2k_roundtrip() {
     let dir = temp_path("j2k-in");
     std::fs::create_dir_all(&dir).unwrap();
-    let frames: Vec<Vec<u8>> = (0..3)
-        .map(|i| synthetic_j2c(2048, 1080, i as u8 * 40 + 1, 4096 + i * 32))
-        .collect();
+    let frames: Vec<Vec<u8>> = (0..3).map(|i| imf_frame(i * 32 + 1)).collect();
     let mut input_files = Vec::new();
     for (i, frame) in frames.iter().enumerate() {
         let p = dir.join(format!("frame{i}.j2c"));
@@ -108,7 +92,7 @@ fn as02_j2k_roundtrip() {
         encryption: None,
         mca_config: None,
         resource_ids: vec![],
-        hdr: None,
+        hdr: Some(postkit::mxf_wrap::rec709_sdr_picture_colour()),
         asset_uuid: None,
         timed_text_duration_frames: None,
     });
@@ -123,10 +107,10 @@ fn as02_j2k_roundtrip() {
     let mut reader = asdcplib::as02::jp2k::MxfReader::new();
     reader.open_read(&out_str).unwrap();
     let desc = reader.picture_descriptor().unwrap();
-    assert_eq!(desc.stored_width, 2048);
-    assert_eq!(desc.stored_height, 1080);
+    assert_eq!(desc.stored_width, IMF_FIXTURE_SIZE.0);
+    assert_eq!(desc.stored_height, IMF_FIXTURE_SIZE.1);
     assert_eq!(desc.container_duration, frames.len() as u32);
-    let mut buf = vec![0u8; 16 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
     let size = reader.read_frame(0, &mut buf, None, None).unwrap();
     assert_eq!(&buf[..size], frames[0].as_slice());
     reader.close().unwrap();

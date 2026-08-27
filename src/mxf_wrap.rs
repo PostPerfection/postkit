@@ -403,8 +403,9 @@ const MXF_HEADER_SIZE: u32 = 16384;
 /// Refuse a codestream the wrap cannot carry, naming `source` (a file path or a
 /// frame number) in the error.
 ///
-/// DCI profile rules apply to DCP only; AS-02 (IMF) takes any codestream with an
-/// image area.
+/// A DCI cinema codestream carries X'Y'Z' samples and an IMF one carries RGB, so
+/// each standard takes only its own family: neither reader is told which space
+/// the samples are in, it follows from the wrap.
 fn check_j2k_codestream(
     data: &[u8],
     standard: MxfStandard,
@@ -413,6 +414,21 @@ fn check_j2k_codestream(
     let Some(header) = crate::j2k::parse_j2k_header(data) else {
         return Err(format!("invalid JPEG 2000 codestream: {source}"));
     };
+    let profile = crate::j2k::J2kProfile::from(header.profile);
+    if standard == MxfStandard::As02 && profile.is_dci_cinema() {
+        return Err(format!(
+            "RSIZ {:#06x} is a DCI cinema profile, so its samples are X'Y'Z': \
+             a DCP codestream cannot go in an IMF track file: {source}",
+            header.profile
+        ));
+    }
+    if standard == MxfStandard::AsDcp && profile == crate::j2k::J2kProfile::Imf {
+        return Err(format!(
+            "RSIZ {:#06x} is an IMF profile, so its samples are RGB: \
+             an IMF codestream cannot go in a DCP track file: {source}",
+            header.profile
+        ));
+    }
     if standard == MxfStandard::AsDcp {
         crate::j2k::validate_dci_header(&header)
             .map_err(|error| format!("invalid DCI JPEG 2000 codestream: {error}: {source}"))?;
@@ -420,6 +436,40 @@ fn check_j2k_codestream(
         return Err(format!("JPEG 2000 codestream has no image area: {source}"));
     }
     Ok(header)
+}
+
+/// The colour ULs a Rec.709 SDR IMF App 2E picture signals, for the
+/// [`MxfWrapOptions::hdr`] of a wrap that has no mastering display to declare.
+pub fn rec709_sdr_picture_colour() -> asdcplib::jp2k::HdrMetadata {
+    asdcplib::jp2k::HdrMetadata {
+        color_primaries: Some(asdcplib::jp2k::COLOR_PRIMARIES_BT709),
+        transfer_characteristic: Some(asdcplib::jp2k::TRANSFER_CHARACTERISTIC_BT709),
+        ..Default::default()
+    }
+}
+
+/// Refuse an AS-02 picture wrap that would leave the reader guessing the colour
+/// the samples are in: ST 2067-21 App 2E puts ColorPrimaries and
+/// TransferCharacteristic on the RGBA essence descriptor, and
+/// [`MxfWrapOptions::hdr`] is the only thing that writes them.
+fn check_as02_picture_colour(
+    standard: MxfStandard,
+    hdr: Option<&asdcplib::jp2k::HdrMetadata>,
+) -> Result<(), String> {
+    if standard != MxfStandard::As02 {
+        return Ok(());
+    }
+    const REQUIREMENT: &str = "an IMF App 2E picture must signal ColorPrimaries and \
+                               TransferCharacteristic on its essence descriptor";
+    match hdr {
+        None => Err(format!(
+            "{REQUIREMENT}, and this wrap carries no colour metadata"
+        )),
+        Some(hdr) if hdr.color_primaries.is_none() && hdr.transfer_characteristic.is_none() => Err(
+            format!("{REQUIREMENT}, and this wrap's colour metadata sets neither"),
+        ),
+        Some(_) => Ok(()),
+    }
 }
 
 /// The picture descriptor a J2K wrap opens with, built from the first frame's
@@ -430,19 +480,22 @@ fn check_j2k_codestream(
 /// partition at finalize, so a wrap that does not know its length yet can pass 0.
 fn j2k_picture_descriptor(
     header: &crate::j2k::J2kHeader,
+    first_frame: &[u8],
     fps_num: u32,
     fps_den: u32,
     container_duration: u32,
-) -> asdcplib::jp2k::PictureDescriptor {
-    asdcplib::jp2k::PictureDescriptor {
+) -> Result<asdcplib::jp2k::PictureDescriptor, String> {
+    let codestream = asdcplib::jp2k::CodestreamHeader::parse(first_frame)
+        .map_err(|error| format!("cannot read the JPEG 2000 codestream header: {error}"))?;
+    Ok(asdcplib::jp2k::PictureDescriptor {
         edit_rate: asdcplib::Rational::new(fps_num as i32, fps_den as i32),
         sample_rate: asdcplib::Rational::new(fps_num as i32, fps_den as i32),
         stored_width: header.width,
         stored_height: header.height,
         aspect_ratio: asdcplib::Rational::new(header.width as i32, header.height as i32),
         container_duration,
-        component_count: header.num_components,
-    }
+        codestream,
+    })
 }
 
 fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
@@ -480,6 +533,12 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
     let header = first_header.expect("input_files is not empty");
+    if let Err(error) = check_as02_picture_colour(opts.standard, opts.hdr.as_ref()) {
+        return MxfTrackFile {
+            error,
+            ..Default::default()
+        };
+    }
 
     let mut info = make_writer_info(opts.asset_uuid);
     let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
@@ -491,7 +550,21 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
             };
         }
     };
-    let desc = j2k_picture_descriptor(&header, opts.fps_num, opts.fps_den, frames.len() as u32);
+    let desc = match j2k_picture_descriptor(
+        &header,
+        &frames[0],
+        opts.fps_num,
+        opts.fps_den,
+        frames.len() as u32,
+    ) {
+        Ok(desc) => desc,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
 
     let mut writer = J2kWriter::new(opts.standard);
     let output_str = opts.output.to_string_lossy().to_string();
@@ -583,6 +656,7 @@ pub struct IncrementalJ2kWrap {
 impl IncrementalJ2kWrap {
     pub fn new(options: IncrementalWrapOptions) -> Result<Self, String> {
         let mut info = make_writer_info(options.asset_uuid);
+        check_as02_picture_colour(options.standard, options.hdr.as_ref())?;
         let crypto = setup_encryption(&mut info, &options.encryption)?;
         Ok(Self {
             output: options.output,
@@ -607,7 +681,7 @@ impl IncrementalJ2kWrap {
             &format!("frame {}", self.frames_written),
         )?;
         if self.writer.is_none() {
-            let desc = j2k_picture_descriptor(&header, self.fps_num, self.fps_den, 0);
+            let desc = j2k_picture_descriptor(&header, data, self.fps_num, self.fps_den, 0)?;
             let mut writer = J2kWriter::new(self.standard);
             writer
                 .open_write(
@@ -1577,14 +1651,20 @@ pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
         }
     };
     // container_duration counts stereo frame pairs, not individual eye writes.
-    let desc = asdcplib::jp2k::PictureDescriptor {
-        edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
-        sample_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
-        stored_width: header.width,
-        stored_height: header.height,
-        aspect_ratio: asdcplib::Rational::new(header.width as i32, header.height as i32),
-        container_duration: left.len() as u32,
-        component_count: header.num_components,
+    let desc = match j2k_picture_descriptor(
+        &header,
+        &left[0],
+        opts.fps_num,
+        opts.fps_den,
+        left.len() as u32,
+    ) {
+        Ok(desc) => desc,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
     };
 
     let mut writer = asdcplib::jp2k::StereoMxfWriter::new();
@@ -1756,6 +1836,9 @@ mod tests {
     fn synthetic_j2k() -> Vec<u8> {
         synthetic_j2k_with_profile(3)
     }
+
+    /// IMF 2K, main level 4 sub level 2: an Rsiz an AS-02 picture wrap accepts.
+    const IMF_2K_RSIZ: u16 = 0x0424;
 
     fn synthetic_j2k_with_profile(profile: u16) -> Vec<u8> {
         let mut d = vec![0xFF, 0x4F]; // SOC
@@ -2920,7 +3003,7 @@ mod tests {
     fn as02_wraps_write_the_caller_supplied_asset_uuid_into_the_file() {
         let dir = tempfile::tempdir().unwrap();
         let frame = dir.path().join("0001.j2c");
-        std::fs::write(&frame, synthetic_j2k()).unwrap();
+        std::fs::write(&frame, synthetic_j2k_with_profile(IMF_2K_RSIZ)).unwrap();
         let wav = dir.path().join("in.wav");
         std::fs::write(&wav, make_wav(2, 48000, 24, 48000)).unwrap();
         let dcst = dir.path().join("sub.xml");
@@ -2950,6 +3033,7 @@ mod tests {
             let mut opts = j2k_opts(input.to_path_buf(), output.clone(), None);
             opts.essence_type = essence_type;
             opts.standard = MxfStandard::As02;
+            opts.hdr = Some(rec709_sdr_picture_colour());
             opts.asset_uuid = Some(asset_uuid);
             let result = mxf_wrap(&opts);
             assert!(result.success, "{id} wrap failed: {}", result.error);

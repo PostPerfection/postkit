@@ -4,6 +4,22 @@
 
 ### Added
 
+- **A conformance test that reads the App 2E track file back**:
+  `tests/app2e_conformance.rs` encodes a pure red Rec.709 frame under an IMF
+  Rsiz, wraps it AS-02, and then asserts only against the written MXF, so an
+  encoder that agrees with itself cannot pass it. From the file it reads a
+  12-bit RGB pixel layout with component max reference 4095 and min 0, an IMF 2K
+  lossy PictureEssenceCoding label rather than the cinema 2K one a DCP encode
+  would have produced, BT.709 primaries and BT.709 transfer, a sub-descriptor
+  whose Rsiz is an IMF profile with three 12-bit components at 1:1, and a frame
+  that decodes back to 4095,0,0 at the centre pixel, where an X'Y'Z' encode
+  would leave all three components large. Two real codestreams come with it in
+  `tests/fixtures`: a 64x64 DCI cinema frame at Rsiz 0x0003 and frame 0 of the
+  picture track of Netflix Open Content's Sol Levante IMF at Rsiz 0x0536, which
+  parses as 12-bit RGB, decodes at reduce 2, and wraps as the
+  `IMFProfile_4K_Lossy_6_3` label the Netflix CPL carries. The three refusals
+  below have a test each.
+
 - **The J2K encoder can write IMF picture, not just DCI cinema**: every
   codestream it produced declared Rsiz 0x0003 and carried X'Y'Z' samples, which
   is why imfwizard shipped IMPs whose App 2E picture was cinema essence under an
@@ -27,6 +43,26 @@
 
 ### Changed
 
+- **A picture wrap refuses a codestream the standard cannot carry**: `mxf_wrap`
+  took any codestream for either standard, and the picture descriptor it opened
+  asdcplib with left the JPEG2000 sub-descriptor zeroed, so a DCP's X'Y'Z'
+  picture at Rsiz 0x0003 wrapped into an IMF track file and nothing in the stack
+  said otherwise. That is what imfwizard shipped for two months. Three refusals
+  now stand in both wrap paths, the batch `mxf_wrap` and the frame-at-a-time
+  `IncrementalJ2kWrap`. A DCI cinema Rsiz into AS-02 is refused, because those
+  samples are X'Y'Z' and an IMF reader will render them as RGB. An IMF Rsiz into
+  AS-DCP is refused for the mirror reason. An AS-02 J2K wrap whose `hdr` is
+  absent, or sets neither ColorPrimaries nor TransferCharacteristic, is refused,
+  because ST 2067-21 signals the picture's colour on the RGBA essence descriptor
+  and nothing else writes those two properties. Each profile refusal names the
+  Rsiz it found. The descriptor now carries the real codestream header, parsed
+  out of the first frame by asdcplib-rs `CodestreamHeader::parse`, so the
+  sub-descriptor and the PictureEssenceCoding label the AS-02 writer derives from
+  it describe the essence rather than zeroes. `rec709_sdr_picture_colour()` is
+  the BT.709 primaries and transfer pair an SDR App 2E picture signals, for a
+  caller with no mastering display to declare. imfwizard's `create` wraps X'Y'Z'
+  cinema picture into AS-02 today, so it fails loud at the wrap until the slice
+  that gives it an IMF encode lands.
 - **`extract_frame` takes a content key, so encrypted DCP essence extracts**: it
   refused encrypted essence outright before, since it had nowhere to take a key.
   The signature gains `key: Option<[u8; 16]>` and both wizards' `frame-extract`

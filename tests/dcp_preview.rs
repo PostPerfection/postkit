@@ -5,7 +5,7 @@
 //! reads it back with, so the end-to-end test needs no external tool.
 
 use asdcplib::crypto::{AesEncContext, HmacContext};
-use asdcplib::jp2k::{MxfWriter, PictureDescriptor};
+use asdcplib::jp2k::{CodestreamHeader, MxfWriter, PictureDescriptor};
 use asdcplib::{LabelSet, Rational, WriterInfo};
 use postkit::preview::{self, DcpPreviewOptions};
 use std::path::{Path, PathBuf};
@@ -18,7 +18,7 @@ fn tmp(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("postkit-preview-{tag}-{}-{n}", std::process::id()))
 }
 
-fn descriptor(frames: u32, w: u32, h: u32) -> PictureDescriptor {
+fn descriptor(first_frame: &[u8], frames: u32, w: u32, h: u32) -> PictureDescriptor {
     PictureDescriptor {
         edit_rate: Rational::new(24, 1),
         sample_rate: Rational::new(24, 1),
@@ -26,7 +26,7 @@ fn descriptor(frames: u32, w: u32, h: u32) -> PictureDescriptor {
         stored_height: h,
         aspect_ratio: Rational::new(1998, 1080),
         container_duration: frames,
-        component_count: 3,
+        codestream: CodestreamHeader::parse(first_frame).expect("fixture is a codestream"),
     }
 }
 
@@ -51,7 +51,7 @@ fn write_mxf(path: &Path, frames: &[Vec<u8>], key: Option<[u8; 16]>, w: u32, h: 
         .open_write(
             &path.to_string_lossy(),
             &info,
-            &descriptor(frames.len() as u32, w, h),
+            &descriptor(&frames[0], frames.len() as u32, w, h),
             16_384,
         )
         .unwrap();
@@ -72,19 +72,12 @@ fn write_mxf(path: &Path, frames: &[Vec<u8>], key: Option<[u8; 16]>, w: u32, h: 
     writer.finalize().unwrap();
 }
 
-/// Fake but structurally valid J2K codestream (never decoded).
-fn synthetic_j2c(seed: u8) -> Vec<u8> {
-    let mut d = vec![0xff, 0x4f, 0xff, 0x51];
-    d.extend((0..64).map(|i| seed.wrapping_add(i as u8)));
-    d.extend([0xff, 0x93, 0xff, 0xd9]);
-    d
-}
-
 #[test]
 fn encrypted_essence_without_key_fails_loud() {
+    let (w, h) = (128u32, 128u32);
     let mxf = tmp("nodec").with_extension("mxf");
-    let frames = vec![synthetic_j2c(1), synthetic_j2c(2)];
-    write_encrypted_mxf(&mxf, &frames, [0x2b; 16], 2048, 1080);
+    let j2c = make_real_j2c(w, h, CINEMA_2K_PROFILE);
+    write_encrypted_mxf(&mxf, &[j2c.clone(), j2c], [0x2b; 16], w, h);
 
     let resolved = preview::resolve_picture(&mxf).unwrap();
     assert!(resolved.encrypted, "essence must report as encrypted");
