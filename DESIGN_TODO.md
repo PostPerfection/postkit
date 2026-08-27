@@ -6,17 +6,15 @@
   `create` therefore hands the AS-02 wrap X'Y'Z' cinema picture and the wrap
   refuses it, so IMP creation is broken until that caller passes an IMF Rsiz,
   `KeepRgb` and the picture's colour ULs.
-- IMF App 2E picture still decodes with ffmpeg. `extract_frame` routes only
-  codestreams declaring a DCI cinema profile to grok, because App 2E samples are
-  RGB or YCbCr in Rec.709 or Rec.2020, not X'Y'Z', and the DCDM inverse in
-  `XyzToSrgb` does not apply to them. grok decodes them either way, so what is
-  missing is the display transform for those spaces:
-  `DcdmTransform::to_xyz(Rec709)` into `XyzToSrgb` would chain two transforms
-  that already exist, and 4:2:2 essence would still need chroma upsampling, which
-  `grok_decoder` refuses by name today. A real App 2E codestream to verify
-  against is now in `tests/fixtures/imf4k_black_3840x2160.j2c`, though a black
-  leader frame proves nothing about a display transform, so a frame with picture
-  in it is still wanted. Same entry in imfwizard's DESIGN_TODO.
+- The preview shows only Rec.709 App 2E picture. `render_imf_frame` refuses
+  ST 2084, HLG, BT.2020 and P3-D65 by name, which is most of what a real IMP
+  carries: the display transform for them is a tone map plus a gamut conversion
+  into sRGB, and neither exists in `colour` yet. 4:2:2 essence would also need
+  chroma upsampling, which `grok_decoder` refuses by name today. The App 2E
+  codestream in `tests/fixtures/imf4k_black_3840x2160.j2c` is P3D65 PQ per its
+  CPL, so it pins the refusal, but it is a black leader frame and will prove
+  nothing about a tone map. A frame with picture in it is wanted before that
+  work starts. Same entry in imfwizard's DESIGN_TODO.
 - Verify the non-blocking render live (2026-08-17). `render_opengl` now passes
   `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0` with `video-timing-offset` 0,
   because the default wait parked the app's main thread for most of each frame

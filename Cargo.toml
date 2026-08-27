@@ -78,6 +78,10 @@ name = "dcp_preview"
 required-features = ["grok-ffi"]
 
 [[test]]
+name = "imf_preview"
+required-features = ["grok-ffi"]
+
+[[test]]
 name = "video_encode_e2e"
 required-features = ["grok-ffi"]
 

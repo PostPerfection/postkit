@@ -4,6 +4,27 @@
 
 ### Added
 
+- **The preview shows IMF App 2E picture**: `extract_frame` had no display path
+  for RGB samples, so an App 2E frame went to ffmpeg and an encrypted one was
+  refused outright. A codestream declaring an IMF profile now takes
+  `render_imf_frame`: the same resolve, decrypt and grok decode the DCP path
+  uses, and then the 12-bit RGB code values to 8-bit sRGB with their low four
+  bits dropped, no matrix and no curve, because Rec.709 and sRGB share primaries
+  and white point. Every read now picks its asdcplib reader from the essence
+  type, AS-DCP or AS-02: the AS-DCP reader opens an AS-02 file and then fails
+  every `read_frame`, which is what `frame-extract` on an IMP hit. The colour is
+  read off the essence descriptor's ColorPrimaries and TransferCharacteristic,
+  and anything the pass-through would show wrong is refused by name: ST 2084
+  (PQ), the BT.2020 transfer, P3-D65 and BT.2020
+  primaries, any UL the module does not know (HLG lands here), and a codestream
+  that decodes at some depth other than 12 bits or with other than 3 components.
+  A descriptor that signals no colour warns and is taken as Rec.709, since
+  packages exist that signal nothing. Encrypted App 2E essence follows the same
+  key rules as the DCP route. `tests/imf_preview.rs` wraps a pure red Rec.709
+  frame AS-02 and asserts every pixel of the extracted PPM is 255,0,0, where the
+  DCDM inverse would have given 255,0,70, and asserts the refusal on the same
+  frame and on the real Netflix codestream wrapped as P3D65 PQ.
+
 - **A conformance test that reads the App 2E track file back**:
   `tests/app2e_conformance.rs` encodes a pure red Rec.709 frame under an IMF
   Rsiz, wraps it AS-02, and then asserts only against the written MXF, so an
@@ -96,9 +117,8 @@
   0.23 s, and the time no longer grows with the frame number. Encrypted essence
   is refused by name rather than handed to ffmpeg, which cannot decrypt it and
   renders the ciphertext as a picture, so extracting one still needs
-  `render_dcp_frame` and a key. Everything else still goes through ffmpeg,
-  including IMF App 2E track files, whose samples are RGB or YCbCr rather than
-  X'Y'Z'. DCP essence comes out 8-bit sRGB where ffmpeg wrote 16-bit.
+  `render_dcp_frame` and a key. Everything else still goes through ffmpeg. DCP
+  essence comes out 8-bit sRGB where ffmpeg wrote 16-bit.
 - **The DCP preview adapts no illuminant**: `XyzToSrgb` applied a Bradford
   adaptation from DCI white to D65 that the encode side never applied, so every
   DCP built from a Rec.709 or P3-D65 master previewed desaturated and faintly
