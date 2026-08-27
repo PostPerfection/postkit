@@ -102,8 +102,90 @@ pub fn read_frame_rate(input: &Path) -> f64 {
     if fps > 0.0 { fps } else { 24.0 }
 }
 
-/// Extract a single frame as image (thumbnail/QC) using ffmpeg.
+/// Extract a single frame as an image (thumbnail/QC).
+///
+/// DCP picture essence goes through the grok decoder and the DCDM inverse
+/// transform, which decodes a 2K frame in 68 ms against ffmpeg's 302 ms and does
+/// not decode every earlier frame to reach a late one. Everything else, IMF App
+/// 2E track files included, goes through ffmpeg: their samples are RGB or YCbCr,
+/// not X'Y'Z', so the transform on the grok path does not apply to them.
 pub fn extract_frame(input: &Path, frame: u32, output_image: &Path) -> i32 {
+    match frame_route(input, frame) {
+        FrameRoute::Dcp => {
+            let opts = DcpPreviewOptions {
+                source: input.to_path_buf(),
+                ..Default::default()
+            };
+            match render_dcp_frame(&opts, frame, output_image) {
+                Ok(()) => 0,
+                Err(e) => {
+                    tracing::error!("Frame extraction failed: {e}");
+                    -1
+                }
+            }
+        }
+        FrameRoute::Ffmpeg => extract_frame_with_ffmpeg(input, frame, output_image),
+        FrameRoute::Refused(reason) => {
+            tracing::error!("Frame extraction failed: {reason}");
+            -1
+        }
+    }
+}
+
+/// What decodes an [`extract_frame`] input.
+enum FrameRoute {
+    /// DCP picture essence, decoded by grok and colour-managed from X'Y'Z'.
+    Dcp,
+    /// Anything else, decoded by ffmpeg.
+    Ffmpeg,
+    /// Refused, with the reason.
+    Refused(String),
+}
+
+/// Pick the decoder for one frame of `input`.
+///
+/// Encrypted picture essence is refused rather than handed to ffmpeg, which
+/// cannot decrypt it and renders the ciphertext as a picture. Extraction takes no
+/// key, so the keyed path is [`render_dcp_frame`].
+fn frame_route(input: &Path, frame: u32) -> FrameRoute {
+    if !cfg!(feature = "grok-ffi") || !is_jpeg2000_mxf(input) {
+        return FrameRoute::Ffmpeg;
+    }
+    let resolved = match resolve_picture(input) {
+        Ok(resolved) => resolved,
+        Err(e) => return FrameRoute::Refused(e.to_string()),
+    };
+    if resolved.encrypted {
+        return FrameRoute::Refused(format!(
+            "{} is encrypted and frame extraction has no key to decrypt it with",
+            input.display()
+        ));
+    }
+    match crate::j2k::parse_j2k_from_mxf(&resolved.mxf, frame) {
+        Ok(header) if crate::j2k::is_dci_cinema_profile(header.profile) => FrameRoute::Dcp,
+        Ok(header) => {
+            tracing::debug!(
+                "codestream profile {:#06x} is not DCI cinema, decoding with ffmpeg",
+                header.profile
+            );
+            FrameRoute::Ffmpeg
+        }
+        Err(e) => FrameRoute::Refused(e),
+    }
+}
+
+/// Whether the input is mono JPEG 2000 picture essence in an MXF.
+///
+/// Stereoscopic essence needs asdcplib's stereo reader, which the DCP-native
+/// path does not use.
+fn is_jpeg2000_mxf(input: &Path) -> bool {
+    matches!(
+        asdcplib::essence_type(&input.to_string_lossy()),
+        Ok(asdcplib::EssenceType::Jpeg2000 | asdcplib::EssenceType::As02Jpeg2000)
+    )
+}
+
+fn extract_frame_with_ffmpeg(input: &Path, frame: u32, output_image: &Path) -> i32 {
     // Seek by the file's real frame rate, not a hardcoded 24 fps.
     let seconds = frame as f64 / read_frame_rate(input);
 

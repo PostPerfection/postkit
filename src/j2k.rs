@@ -94,6 +94,18 @@ impl From<u16> for J2kProfile {
     }
 }
 
+/// Rsiz carries the profile in its low 12 bits; the Part 2 extension bit is above.
+const RSIZ_PROFILE_MASK: u16 = 0x0fff;
+/// The DCI cinema Rsiz profiles (ISO/IEC 15444-1 Amd 1): 2K, 4K, scalable 2K,
+/// scalable 4K, and long-term storage.
+const DCI_CINEMA_PROFILES: [u16; 5] = [0x0003, 0x0004, 0x0005, 0x0006, 0x0007];
+
+/// Whether an Rsiz value is a DCI cinema profile, so its samples are X'Y'Z'
+/// rather than the RGB or YCbCr an IMF or broadcast codestream carries.
+pub fn is_dci_cinema_profile(rsiz: u16) -> bool {
+    DCI_CINEMA_PROFILES.contains(&(rsiz & RSIZ_PROFILE_MASK))
+}
+
 /// Check the header fields DCP picture wrapping requires.
 pub fn validate_dci_header(header: &J2kHeader) -> Result<(), String> {
     let max_dimensions = match header.profile {
@@ -416,6 +428,26 @@ pub struct MxfBitrateStats {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_cinema_profiles_are_dci() {
+        for rsiz in DCI_CINEMA_PROFILES {
+            assert!(is_dci_cinema_profile(rsiz), "rsiz {rsiz:#06x}");
+        }
+    }
+
+    #[test]
+    fn imf_and_broadcast_profiles_are_not_dci() {
+        // IMF 2K and 4K, broadcast single-tile, and an unconstrained codestream
+        for rsiz in [0x0400u16, 0x0500, 0x0100, 0x0000] {
+            assert!(!is_dci_cinema_profile(rsiz), "rsiz {rsiz:#06x}");
+        }
+    }
+
+    #[test]
+    fn a_part2_extension_bit_does_not_hide_the_cinema_profile() {
+        assert!(is_dci_cinema_profile(0x8000 | 0x0003));
+    }
     use super::*;
 
     #[test]

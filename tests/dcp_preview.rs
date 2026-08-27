@@ -32,12 +32,17 @@ fn descriptor(frames: u32, w: u32, h: u32) -> PictureDescriptor {
 
 /// Write an encrypted JPEG 2000 MXF wrapping the given codestreams.
 fn write_encrypted_mxf(path: &Path, frames: &[Vec<u8>], key: [u8; 16], w: u32, h: u32) {
+    write_mxf(path, frames, Some(key), w, h)
+}
+
+/// Write a JPEG 2000 MXF, encrypted when a key is given.
+fn write_mxf(path: &Path, frames: &[Vec<u8>], key: Option<[u8; 16]>, w: u32, h: u32) {
     let info = WriterInfo {
         asset_uuid: [8; 16],
         context_id: [0xc7; 16],
         cryptographic_key_id: [0xd4; 16],
-        encrypted_essence: true,
-        uses_hmac: true,
+        encrypted_essence: key.is_some(),
+        uses_hmac: key.is_some(),
         label_set: LabelSet::Smpte,
         ..Default::default()
     };
@@ -50,15 +55,19 @@ fn write_encrypted_mxf(path: &Path, frames: &[Vec<u8>], key: [u8; 16], w: u32, h
             16_384,
         )
         .unwrap();
-    let mut enc = AesEncContext::new();
-    enc.init_key(&key).unwrap();
-    enc.set_ivec(&[0x9c; 16]).unwrap();
-    let mut hmac = HmacContext::new();
-    hmac.init_key(&key, LabelSet::Smpte).unwrap();
+    let mut crypto = key.map(|key| {
+        let mut enc = AesEncContext::new();
+        enc.init_key(&key).unwrap();
+        enc.set_ivec(&[0x9c; 16]).unwrap();
+        let mut hmac = HmacContext::new();
+        hmac.init_key(&key, LabelSet::Smpte).unwrap();
+        (enc, hmac)
+    });
     for f in frames {
-        writer
-            .write_frame(f, Some(&mut enc), Some(&mut hmac))
-            .unwrap();
+        match crypto.as_mut() {
+            Some((enc, hmac)) => writer.write_frame(f, Some(enc), Some(hmac)).unwrap(),
+            None => writer.write_frame(f, None, None).unwrap(),
+        }
     }
     writer.finalize().unwrap();
 }
@@ -97,7 +106,7 @@ fn encrypted_essence_without_key_fails_loud() {
 
 /// A real raw J2K codestream, encoded in process by grok so the test needs no
 /// external tool. Mid-grey so a colour-managed frame is plainly not black.
-fn make_real_j2c(w: u32, h: u32) -> Vec<u8> {
+fn make_real_j2c(w: u32, h: u32, profile: u16) -> Vec<u8> {
     const MID_GREY_12BIT: i32 = 2048;
     let samples = (w * h) as usize;
     let components = [
@@ -110,7 +119,7 @@ fn make_real_j2c(w: u32, h: u32) -> Vec<u8> {
         compression_ratio: 1.0,
         mct: false,
         apply_xyz_transform: false,
-        profile: 0,
+        profile,
         num_resolutions: 3,
         ..postkit::grok_encoder::CompressParams::default()
     };
@@ -139,7 +148,7 @@ fn make_real_j2c(w: u32, h: u32) -> Vec<u8> {
 #[test]
 fn encrypted_frame_decodes_and_colour_manages_with_key() {
     let (w, h) = (128u32, 72u32);
-    let j2c = make_real_j2c(w, h);
+    let j2c = make_real_j2c(w, h, 0);
     let key = [0x2b; 16];
     let mxf = tmp("dec").with_extension("mxf");
     write_encrypted_mxf(&mxf, &[j2c.clone(), j2c], key, w, h);
@@ -202,4 +211,68 @@ fn read_ppm(path: &Path, w: u32, h: u32) -> Vec<u8> {
         "the ppm holds the wrong number of samples"
     );
     pixels
+}
+
+/// The DCI Cinema 2K profile, which routes an input to the grok decoder.
+const CINEMA_2K_PROFILE: u16 = 0x0003;
+/// The mid-grey the fixtures encode, at 12 bits.
+const MID_GREY_12BIT: u16 = 2048;
+
+#[test]
+fn extract_frame_decodes_dcp_essence_through_grok() {
+    let (w, h) = (128u32, 128u32);
+    let j2c = make_real_j2c(w, h, CINEMA_2K_PROFILE);
+    let header = postkit::j2k::parse_j2k_header(&j2c).expect("fixture is a codestream");
+    assert!(
+        postkit::j2k::is_dci_cinema_profile(header.profile),
+        "the fixture has to carry a cinema profile or extraction will not route to grok, \
+         found rsiz {:#06x}",
+        header.profile
+    );
+
+    let mxf = tmp("extract").with_extension("mxf");
+    write_mxf(&mxf, &[j2c.clone(), j2c], None, w, h);
+
+    // ppm so the pixels read back without a decoder
+    let out = tmp("extract").with_extension("ppm");
+    assert_eq!(
+        preview::extract_frame(&mxf, 1, &out),
+        0,
+        "extraction should succeed"
+    );
+
+    let pixels = read_ppm(&out, w, h);
+    // grok decodes the flat field losslessly, so every pixel is the colour
+    // postkit's own X'Y'Z' transform gives that code. ffmpeg's conversion lands
+    // elsewhere, so this pins the output to the grok path.
+    let expected =
+        postkit::colour::XyzToSrgb::new().pixel(MID_GREY_12BIT, MID_GREY_12BIT, MID_GREY_12BIT);
+    assert!(
+        pixels.chunks(3).all(|px| px == expected),
+        "expected every pixel to be {expected:?}, found {:?}",
+        pixels.chunks(3).find(|px| *px != expected)
+    );
+
+    std::fs::remove_file(&mxf).ok();
+    std::fs::remove_file(&out).ok();
+}
+
+#[test]
+fn extract_frame_refuses_encrypted_essence() {
+    let (w, h) = (128u32, 128u32);
+    let j2c = make_real_j2c(w, h, CINEMA_2K_PROFILE);
+    let mxf = tmp("extractenc").with_extension("mxf");
+    write_mxf(&mxf, &[j2c.clone(), j2c], Some([0x2b; 16]), w, h);
+
+    // ffmpeg cannot decrypt this and renders the ciphertext as a picture, so
+    // extraction has to refuse rather than write one
+    let out = tmp("extractenc").with_extension("ppm");
+    assert_ne!(
+        preview::extract_frame(&mxf, 0, &out),
+        0,
+        "encrypted essence must not extract without a key"
+    );
+    assert!(!out.exists(), "no image should be written");
+
+    std::fs::remove_file(&mxf).ok();
 }
