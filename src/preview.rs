@@ -9,8 +9,9 @@
 //! The DCP-native path ([`render_dcp_frame`], [`play_dcp`]) resolves a DCP
 //! directory / CPL / picture MXF to its picture essence, decrypts it in Rust
 //! when it is encrypted (asdcplib-rs `AesDecContext`, key from a dcpwizard
-//! `KEYS.json` or a raw hex key), decodes the JPEG 2000 codestream with ffmpeg
-//! to raw X'Y'Z' code values, and colour-manages those to an sRGB monitor via
+//! `KEYS.json` or a raw hex key), decodes the JPEG 2000 codestream in process
+//! with grok ([`crate::grok_decoder`]) to raw X'Y'Z' code values, and
+//! colour-manages those to an sRGB monitor via
 //! [`crate::colour::XyzToSrgb`] (the inverse of the DCDM encode). An optional
 //! monitor ICC profile routes the transform through littleCMS instead (the
 //! `icc` cargo feature). Encrypted essence with no key fails loud rather than
@@ -493,54 +494,6 @@ fn read_j2c_frame(
     Ok(buf)
 }
 
-/// Decode a JPEG 2000 codestream to raw `xyz12le` (12-bit X'Y'Z' code values)
-/// via ffmpeg. Requesting `xyz12le` output keeps ffmpeg from applying its own
-/// XYZ→RGB conversion, so we get the untouched component code values.
-fn decode_j2c_to_xyz12le(j2c: Vec<u8>) -> Result<Vec<u8>, PreviewError> {
-    let mut child = std::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "j2k_pipe",
-            "-i",
-            "pipe:0",
-            "-pix_fmt",
-            "xyz12le",
-            "-f",
-            "rawvideo",
-            "pipe:1",
-        ])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| PreviewError::Decode(format!("spawn ffmpeg: {e}")))?;
-
-    // write stdin from a thread so a full stdout pipe cannot deadlock the write
-    let mut stdin = child.stdin.take().unwrap();
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&j2c);
-        drop(stdin);
-    });
-
-    let out = child
-        .wait_with_output()
-        .map_err(|e| PreviewError::Decode(format!("ffmpeg wait: {e}")))?;
-    let _ = writer.join();
-
-    if !out.status.success() {
-        return Err(PreviewError::Decode(
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        ));
-    }
-    if out.stdout.is_empty() {
-        return Err(PreviewError::Decode("ffmpeg produced no pixels".into()));
-    }
-    Ok(out.stdout)
-}
-
 /// A decoded, colour-managed frame as packed 8-bit RGB.
 struct Rgb8Frame {
     width: u32,
@@ -589,14 +542,13 @@ fn decode_dcp_frame(
     display: &Display,
 ) -> Result<Rgb8Frame, PreviewError> {
     let j2c = read_j2c_frame(reader, frame, dec)?;
-    let hdr = crate::j2k::parse_j2k_header(&j2c)
-        .ok_or_else(|| PreviewError::Decode("decrypted data is not a J2K codestream".into()))?;
-    let raw = decode_j2c_to_xyz12le(j2c)?;
+    let decoded = crate::grok_decoder::decode(j2c, 0).map_err(PreviewError::Decode)?;
+    let raw = decoded.to_xyz12le().map_err(PreviewError::Decode)?;
     let mut data = Vec::new();
     display.apply(&raw, &mut data);
     Ok(Rgb8Frame {
-        width: hdr.width,
-        height: hdr.height,
+        width: decoded.width,
+        height: decoded.height,
         data,
     })
 }

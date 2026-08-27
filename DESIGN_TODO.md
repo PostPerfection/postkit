@@ -28,16 +28,21 @@
   accelerator plugin (`grk_plugin_load`, then `grk_plugin_init` with a device
   id, a licence key and an optional licence server), which speeds up T1 entropy
   coding and falls back to the CPU when it is absent. That plugin is what
-  `grk_compress -G` and DCP-o-matic's `config grok-licence` drive. Landing it
-  here means binding those two calls through grokj2k-sys (check whether the
-  bindings already carry them), a device and licence setting in both wizards
-  passed into `grok_encoder`, and a machine with the plugin and a licence to
-  prove the speed-up. Listed in both wizards' DESIGN_TODO as well.
-- GPU J2K decode path. Prerequisite for real-time preview and for the features that
-  gate on it: SDI output, and the dcpdoctor/wizard player controls (loop dom#2700,
-  speed dom#2917, markers dom#2893, waveform dom#3091, 3D view modes
-  dom#1974/dom#3165, A/V sync offset dom#3083). CPU openjpeg/grok can't sustain 4K
-  at frame rate.
+  `grk_compress -G` and DCP-o-matic's `config grok-licence` drive. grokj2k-sys
+  runs bindgen over the whole header with no allowlist, so `grk_plugin_load` and
+  `grk_plugin_init` are already bound and nothing upstream is needed. What is
+  left is a device and licence setting in both wizards passed into
+  `grok_encoder`, and a machine with the plugin and a licence to prove the
+  speed-up. Listed in both wizards' DESIGN_TODO as well.
+- GPU J2K decode path. What CPU grok manages in process, measured on 2048x1080
+  frames at 125 Mb/s: 68 ms a frame at full resolution (14.6 fps), 19 ms at
+  `reduce` 1 and 5 ms at `reduce` 2. So 2K at 24 fps needs either two decode
+  threads or a reduce, and 4K, four times the samples, is out of reach at full
+  resolution however it is threaded. That is what the GPU path is for, and what
+  the features gating on it wait for: SDI output, and the dcpdoctor/wizard player
+  controls (loop dom#2700, speed dom#2917, markers dom#2893, waveform dom#3091,
+  3D view modes dom#1974/dom#3165, A/V sync offset dom#3083). The accelerator
+  plugin above is the same one that would serve this.
 - SDI output via Blackmagic DeckLink (easyDCP Player+ parity). A playback sink
   pushing decoded, colour-managed frames to an SDI board for reference monitoring.
   FFI to the DeckLink SDK (COM-style C++, likely a C shim) in a separate crate,

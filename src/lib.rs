@@ -19,6 +19,7 @@ pub mod frame_compare;
 pub mod free_space;
 pub mod fs;
 pub mod grok;
+pub mod grok_decoder;
 pub mod grok_encoder;
 pub mod gui_job_queue;
 pub mod hash;

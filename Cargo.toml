@@ -70,6 +70,14 @@ name = "bench_j2k"
 required-features = ["grok-ffi"]
 
 [[test]]
+name = "grok_decode"
+required-features = ["grok-ffi"]
+
+[[test]]
+name = "dcp_preview"
+required-features = ["grok-ffi"]
+
+[[test]]
 name = "video_encode_e2e"
 required-features = ["grok-ffi"]
 

@@ -1,8 +1,8 @@
 //! DCP-native preview: encrypted read fails loud without a key, and the full
 //! decrypt → decode → colour-manage pipeline produces a real frame.
 //!
-//! The end-to-end decode test is `#[ignore]` because it shells out to ffmpeg
-//! (encode a J2K fixture, decode it back); run with `cargo test -- --ignored`.
+//! The fixture codestream is encoded in process by the same grok the decode
+//! reads it back with, so the end-to-end test needs no external tool.
 
 use asdcplib::crypto::{AesEncContext, HmacContext};
 use asdcplib::jp2k::{MxfWriter, PictureDescriptor};
@@ -95,59 +95,51 @@ fn encrypted_essence_without_key_fails_loud() {
     std::fs::remove_file(&mxf).ok();
 }
 
-/// A real raw J2K codestream (as DCP essence stores it), or None if the tools
-/// are unavailable. ffmpeg's jpeg2000 muxer only writes JP2 boxes, so we make
-/// the raw codestream with opj_compress.
-fn make_real_j2c(w: u32, h: u32) -> Option<Vec<u8>> {
-    let tif = tmp("fixture").with_extension("tif");
-    let j2c = tmp("fixture").with_extension("j2c");
-    let made_tif = std::process::Command::new("ffmpeg")
-        .args([
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-f",
-            "lavfi",
-            "-i",
-            &format!("testsrc2=size={w}x{h}"),
-            "-frames:v",
-            "1",
-            "-pix_fmt",
-            "rgb48le",
-        ])
-        .arg(&tif)
-        .status()
-        .ok()?
-        .success();
-    if !made_tif {
-        return None;
-    }
-    let made = std::process::Command::new("opj_compress")
-        .arg("-i")
-        .arg(&tif)
-        .arg("-o")
-        .arg(&j2c)
-        .status()
-        .ok()
-        .is_some_and(|s| s.success());
-    std::fs::remove_file(&tif).ok();
-    if !made {
-        return None;
-    }
-    let bytes = std::fs::read(&j2c).ok();
-    std::fs::remove_file(&j2c).ok();
-    bytes.filter(|b| !b.is_empty())
+/// A real raw J2K codestream, encoded in process by grok so the test needs no
+/// external tool. Mid-grey so a colour-managed frame is plainly not black.
+fn make_real_j2c(w: u32, h: u32) -> Vec<u8> {
+    const MID_GREY_12BIT: i32 = 2048;
+    let samples = (w * h) as usize;
+    let components = [
+        vec![MID_GREY_12BIT; samples],
+        vec![MID_GREY_12BIT; samples],
+        vec![MID_GREY_12BIT; samples],
+    ];
+    let params = postkit::grok_encoder::CompressParams {
+        irreversible: false,
+        compression_ratio: 1.0,
+        mct: false,
+        apply_xyz_transform: false,
+        profile: 0,
+        num_resolutions: 3,
+        ..postkit::grok_encoder::CompressParams::default()
+    };
+    postkit::grok_encoder::initialize(0);
+    let dir = tempfile::tempdir().unwrap();
+    let mut frame = Some(postkit::grok_encoder::RawFrame::Planar {
+        components,
+        width: w,
+        height: h,
+        precision: 12,
+        index: 0,
+    });
+    let result = postkit::grok_encoder::encode_pipeline(
+        dir.path(),
+        &params,
+        1,
+        &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        &std::sync::Arc::new(postkit::grok_encoder::PhaseClocks::default()),
+        || frame.take(),
+        |_| {},
+    );
+    assert!(result.success, "fixture encode failed: {}", result.error);
+    std::fs::read(dir.path().join("frame_00000000.j2c")).expect("fixture codestream")
 }
 
 #[test]
-#[ignore = "shells out to ffmpeg for a real J2K fixture"]
 fn encrypted_frame_decodes_and_colour_manages_with_key() {
     let (w, h) = (128u32, 72u32);
-    let Some(j2c) = make_real_j2c(w, h) else {
-        eprintln!("ffmpeg unavailable, skipping");
-        return;
-    };
+    let j2c = make_real_j2c(w, h);
     let key = [0x2b; 16];
     let mxf = tmp("dec").with_extension("mxf");
     write_encrypted_mxf(&mxf, &[j2c.clone(), j2c], key, w, h);
@@ -157,11 +149,57 @@ fn encrypted_frame_decodes_and_colour_manages_with_key() {
         key: Some(key),
         ..Default::default()
     };
-    let out = tmp("dec").with_extension("png");
+    // ppm so the pixels can be read back without a decoder
+    let out = tmp("dec").with_extension("ppm");
     preview::render_dcp_frame(&opts, 0, &out).expect("frame should decode with the key");
-    let meta = std::fs::metadata(&out).expect("png written");
-    assert!(meta.len() > 100, "png looks empty: {} bytes", meta.len());
+
+    let pixels = read_ppm(&out, w, h);
+    let first = &pixels[..3];
+    assert!(
+        pixels.chunks(3).all(|px| px == first),
+        "a flat field has to stay flat: found {:?} beside {first:?}",
+        pixels.chunks(3).find(|px| *px != first)
+    );
+    assert!(
+        first.iter().all(|&channel| channel > 8 && channel < 248),
+        "mid grey came out at {first:?}, so the decode or the colour path is wrong"
+    );
 
     std::fs::remove_file(&mxf).ok();
     std::fs::remove_file(&out).ok();
+}
+
+/// The RGB bytes of a binary PPM, checking it is the size that was asked for.
+fn read_ppm(path: &Path, w: u32, h: u32) -> Vec<u8> {
+    let bytes = std::fs::read(path).expect("ppm written");
+    assert!(bytes.starts_with(b"P6"), "not a binary ppm");
+    // P6, width, height, maxval, then the samples, each field whitespace separated
+    let mut fields = 0;
+    let mut index = 2;
+    while fields < 3 && index < bytes.len() {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let start = index;
+        while index < bytes.len() && !bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        let field: u32 = std::str::from_utf8(&bytes[start..index])
+            .unwrap()
+            .parse()
+            .unwrap();
+        match fields {
+            0 => assert_eq!(field, w, "ppm width"),
+            1 => assert_eq!(field, h, "ppm height"),
+            _ => assert_eq!(field, 255, "8 bits per channel"),
+        }
+        fields += 1;
+    }
+    let pixels = bytes[index + 1..].to_vec();
+    assert_eq!(
+        pixels.len(),
+        (w * h * 3) as usize,
+        "the ppm holds the wrong number of samples"
+    );
+    pixels
 }

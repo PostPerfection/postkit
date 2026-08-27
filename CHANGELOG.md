@@ -4,6 +4,17 @@
 
 ### Changed
 
+- **The DCP-native preview decodes with grok, not ffmpeg**: `render_dcp_frame`
+  and `play_dcp` no longer pipe each codestream to an ffmpeg process. The frame's
+  size comes from the decoder rather than from a second parse of the codestream
+  header, and a codestream that is not one is refused by grok instead of by that
+  parse. Decoding needs the `grok-ffi` feature now: without it `grok_decoder`
+  refuses by name rather than falling back, because a decoder at a few frames a
+  second reads as a hang. Both wizards already enable the feature, and dcpdoctor,
+  which does not, never calls this path. The end-to-end preview test encodes its
+  fixture in process with the same grok, so it needs no `opj_compress` and is no
+  longer ignored, and it checks that a flat mid-grey field comes back flat and
+  mid-range instead of checking that a file was written.
 - `CompressParams.frame_rate: u16` is now `CompressParams.edit_rate:
   encode::FrameRate`. `encode_video_pipeline_resumable` converts blackdetect's
   and freezedetect's seconds to frame numbers with it, and the rounded rate put
@@ -14,6 +25,15 @@
 
 ### Added
 
+- `grok_decoder`: in-process JPEG 2000 decoding through the grok FFI. Bytes in,
+  planar samples out, so nothing is written to disk and no process is spawned.
+  `decode(codestream, reduce)` discards `reduce` highest resolution levels and
+  `DecodedFrame::to_xyz12le` packs the samples into the layout the colour
+  transforms read. Measured on 2048x1080 frames at 125 Mb/s: 68 ms a frame at
+  full resolution against ffmpeg's 302, 19 ms at `reduce` 1 and 5 ms at `reduce`
+  2. grok returns 16-bit samples for a 12-bit codestream, not the 32-bit its
+  struct name suggests, and rows carry a stride that need not equal the width, so
+  both are read from the component rather than assumed.
 - `picture_findings::detect_in_essence(essence, fps, frame_count)`, the same two
   detectors over finished picture essence rather than over a decode that is on
   its way to the encoder. ffmpeg reads the whole file, so the frame numbers are
