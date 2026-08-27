@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Added
+
+- **The J2K encoder can write IMF picture, not just DCI cinema**: every
+  codestream it produced declared Rsiz 0x0003 and carried X'Y'Z' samples, which
+  is why imfwizard shipped IMPs whose App 2E picture was cinema essence under an
+  IMF label. `j2k` now composes an IMF Rsiz: `ImfProfile::for_raster` picks 2K,
+  4K or 8K from the picture size, `imf_levels` reads the main level off the
+  sample rate and the sub level off the bit rate, and `imf_rsiz` puts the three
+  together, so 3840x2160 at 24 fps under 800 Mb/s comes out 0x0536, the Rsiz a
+  real Netflix App 2E picture carries. A raster or a rate past the top level is
+  refused rather than clamped, and a sub level of 2 or more raises the main level
+  to two above it, which Table A.53 requires. Given an IMF Rsiz the in-process
+  encoder shifts each sample down to 12 bits and declares that depth, because
+  grok only reduces precision itself as part of the X'Y'Z' transform the cinema
+  profiles run, and leaves the code block size, progression, layer count and
+  wavelet to grok's own IMF parameters. An IMF profile with the X'Y'Z' transform
+  still set is refused by name, as is one on the subprocess encoder, which hands
+  grk_compress 16-bit frames it has no way to reduce. `SourceColour::KeepRgb`
+  compresses display RGB untouched for picture whose descriptor names the colour,
+  and `StreamEncodeOptions.rsiz` carries the profile into both encoders,
+  defaulting to the cinema 2K they wrote before. Nothing in either wizard selects
+  an IMF profile yet.
+
 ### Changed
 
 - **`extract_frame` takes a content key, so encrypted DCP essence extracts**: it

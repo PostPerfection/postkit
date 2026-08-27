@@ -1,5 +1,12 @@
 # Planned
 
+- Nothing selects an IMF profile yet. The encoder writes IMF picture when
+  `StreamEncodeOptions.rsiz` carries an `imf_rsiz` and `source_colour` is
+  `KeepRgb`, but every caller leaves both at their cinema defaults, so imfwizard
+  still ships X'Y'Z' picture under an App 2E label. The picture MXF descriptor
+  is a separate gap: the AS-02 wrap signals no colour at all, and asdcplib-rs
+  writes a zeroed JPEG2000 sub-descriptor because nothing parses the codestream
+  into it.
 - IMF App 2E picture still decodes with ffmpeg. `extract_frame` routes only
   codestreams declaring a DCI cinema profile to grok, because App 2E samples are
   RGB or YCbCr in Rec.709 or Rec.2020, not X'Y'Z', and the DCDM inverse in
