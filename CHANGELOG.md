@@ -14,6 +14,13 @@
 
 ### Added
 
+- `picture_findings::detect_in_essence(essence, fps, frame_count)`, the same two
+  detectors over finished picture essence rather than over a decode that is on
+  its way to the encoder. ffmpeg reads the whole file, so the frame numbers are
+  the essence's own, and a file it cannot decode comes back as an error naming
+  the reason instead of as empty findings. Encrypted essence is the caller's to
+  refuse, since ffmpeg cannot decrypt AS-DCP. The thresholds now live in one
+  `detection_filters`, which the encode's split branch shares.
 - `burnin::BurninOptions.video_codec` and `.video_crf`, passed as ffmpeg's
   `-c:v` and `-crf`, so a burnt copy names its encoder and quality instead of
   taking whatever ffmpeg guesses from the output file name.

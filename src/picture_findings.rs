@@ -8,6 +8,7 @@
 use crate::timecode::Timecode;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::process::{Child, ChildStderr};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -79,6 +80,15 @@ impl PictureFindings {
     }
 }
 
+/// The two detectors at the thresholds every pass uses.
+fn detection_filters() -> String {
+    format!(
+        "blackdetect=black_min_duration={BLACK_MINIMUM_DURATION_SECONDS}:\
+         pixel_black_th={BLACK_PIXEL_THRESHOLD},\
+         freezedetect=duration={FREEZE_MINIMUM_DURATION_SECONDS}"
+    )
+}
+
 /// Run blackdetect and freezedetect on a copy of the finished frames, leaving
 /// `picture_filters` as the chain the encoder reads.
 pub(crate) fn with_detection_branch(picture_filters: &str) -> String {
@@ -89,11 +99,55 @@ pub(crate) fn with_detection_branch(picture_filters: &str) -> String {
         picture_filters
     };
     format!(
-        "{picture_filters},split=2[picture][detect];[detect]\
-         blackdetect=black_min_duration={BLACK_MINIMUM_DURATION_SECONDS}:\
-         pixel_black_th={BLACK_PIXEL_THRESHOLD},\
-         freezedetect=duration={FREEZE_MINIMUM_DURATION_SECONDS},nullsink;[picture]null"
+        "{picture_filters},split=2[picture][detect];[detect]{},nullsink;[picture]null",
+        detection_filters()
     )
+}
+
+/// Run the detectors over finished picture essence, for a package this process
+/// did not encode.
+///
+/// ffmpeg decodes the whole file, so the frame numbers are the essence's own: a
+/// reel the composition enters late still reports from its first frame. The
+/// decode is ffmpeg's software J2K decoder, which manages a few frames a second
+/// at DCP bitrates, so a feature takes hours. Encrypted essence is the caller's
+/// to refuse, because ffmpeg cannot decrypt AS-DCP and reads it as garbage.
+pub fn detect_in_essence(
+    essence: &Path,
+    fps: f64,
+    frame_count: u64,
+) -> Result<PictureFindings, String> {
+    let mut ffmpeg = std::process::Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostats", "-i"])
+        .arg(essence)
+        .arg("-vf")
+        .arg(detection_filters())
+        .args(["-f", "null", "-"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run ffmpeg: {e}"))?;
+
+    let stderr = ffmpeg.stderr.take().expect("stderr is piped");
+    let mut detection = Vec::new();
+    let mut last_other = String::new();
+    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        if is_detection_line(&line) {
+            detection.push(line);
+        } else if !line.trim().is_empty() {
+            last_other = line;
+        }
+    }
+    let status = ffmpeg
+        .wait()
+        .map_err(|e| format!("cannot wait for ffmpeg: {e}"))?;
+    if !status.success() {
+        return Err(match last_other.trim() {
+            "" => format!("ffmpeg could not decode {}", essence.display()),
+            reason => reason.to_string(),
+        });
+    }
+    Ok(parse_ffmpeg_stderr(&detection, fps, frame_count))
 }
 
 fn is_detection_line(line: &str) -> bool {
@@ -194,6 +248,58 @@ mod tests {
 
     fn lines(text: &[&str]) -> Vec<String> {
         text.iter().map(|line| line.to_string()).collect()
+    }
+
+    fn have_ffmpeg() -> bool {
+        std::process::Command::new("ffmpeg")
+            .arg("-version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn a_black_clip_reports_black_and_frozen_over_finished_essence() {
+        if !have_ffmpeg() {
+            eprintln!("skipping essence detection test: ffmpeg not found");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("black.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .arg("color=c=black:size=320x240:rate=24:duration=3")
+            .args(["-pix_fmt", "yuv420p", "-y"])
+            .arg(&clip)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "fixture encode failed: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+
+        let findings = detect_in_essence(&clip, 24.0, 72).unwrap();
+        assert_eq!(findings.black.len(), 1, "{findings:?}");
+        assert_eq!(findings.black[0].first_frame, 0, "{findings:?}");
+        assert_eq!(findings.frozen.len(), 1, "{findings:?}");
+        assert!(
+            findings.black[0].last_frame >= 47,
+            "a three second run at 24 fps covers most of 72 frames: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn essence_ffmpeg_cannot_read_fails_loud() {
+        if !have_ffmpeg() {
+            eprintln!("skipping essence detection test: ffmpeg not found");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let not_video = dir.path().join("notes.txt");
+        std::fs::write(&not_video, "this is not picture essence").unwrap();
+        let error = detect_in_essence(&not_video, 24.0, 24).unwrap_err();
+        assert!(!error.trim().is_empty(), "the reason has to be named");
     }
 
     #[test]
