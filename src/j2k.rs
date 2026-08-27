@@ -123,6 +123,144 @@ impl J2kProfile {
     }
 }
 
+/// The IMF profile a raster picks. Each one caps the picture size, and its Rsiz
+/// base carries the main and sub level in the low byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImfProfile {
+    /// Rsiz 0x0400 plus levels, up to 2048x1556
+    Imf2k,
+    /// Rsiz 0x0500 plus levels, up to 4096x3112
+    Imf4k,
+    /// Rsiz 0x0600 plus levels, up to 8192x6224
+    Imf8k,
+}
+
+const IMF_2K_MAX_RASTER: (u32, u32) = (2048, 1556);
+const IMF_4K_MAX_RASTER: (u32, u32) = (4096, 3112);
+const IMF_8K_MAX_RASTER: (u32, u32) = (8192, 6224);
+
+const IMF_2K_RSIZ_BASE: u16 = 0x0400;
+const IMF_4K_RSIZ_BASE: u16 = 0x0500;
+const IMF_8K_RSIZ_BASE: u16 = 0x0600;
+
+impl ImfProfile {
+    /// The smallest IMF profile that holds a `width` x `height` picture.
+    pub fn for_raster(width: u32, height: u32) -> Result<Self, String> {
+        for (profile, (max_width, max_height)) in [
+            (ImfProfile::Imf2k, IMF_2K_MAX_RASTER),
+            (ImfProfile::Imf4k, IMF_4K_MAX_RASTER),
+            (ImfProfile::Imf8k, IMF_8K_MAX_RASTER),
+        ] {
+            if width <= max_width && height <= max_height {
+                return Ok(profile);
+            }
+        }
+        Err(format!(
+            "{width}x{height} is past the {}x{} the IMF 8K profile allows",
+            IMF_8K_MAX_RASTER.0, IMF_8K_MAX_RASTER.1
+        ))
+    }
+
+    fn rsiz_base(self) -> u16 {
+        match self {
+            ImfProfile::Imf2k => IMF_2K_RSIZ_BASE,
+            ImfProfile::Imf4k => IMF_4K_RSIZ_BASE,
+            ImfProfile::Imf8k => IMF_8K_RSIZ_BASE,
+        }
+    }
+}
+
+/// The two levels an IMF Rsiz carries: the main level bounds the sample rate a
+/// decoder must keep up with, the sub level bounds the bit rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImfLevels {
+    pub main_level: u8,
+    pub sub_level: u8,
+}
+
+/// Main level 1 to 11, in megasamples per second.
+const IMF_MAIN_LEVEL_MEGASAMPLES_PER_SECOND: [u32; 11] =
+    [65, 130, 195, 260, 520, 1200, 2400, 4800, 9600, 19200, 38400];
+
+/// Sub level 1 to 9, in megabits per second.
+const IMF_SUB_LEVEL_MEGABITS_PER_SECOND: [u32; 9] =
+    [200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200];
+
+/// The sample rate counts all three components of an IMF picture.
+const IMF_COMPONENTS: f64 = 3.0;
+
+/// Table A.53 pairs the levels: sub level 2 and up needs a main level two above
+/// it, so a high bit rate can raise the main level past what the sample rate
+/// alone asks for.
+const IMF_MAIN_LEVEL_ABOVE_SUB_LEVEL: u8 = 2;
+
+/// The lowest levels that cover a picture of this size and rate at this bit
+/// rate. Refuses anything past level 11 or sub level 9 rather than declaring a
+/// level the essence exceeds.
+pub fn imf_levels(
+    width: u32,
+    height: u32,
+    frame_rate: f64,
+    max_bits_per_second: u64,
+) -> Result<ImfLevels, String> {
+    if frame_rate <= 0.0 {
+        return Err(format!(
+            "IMF levels need a positive frame rate, got {frame_rate}"
+        ));
+    }
+    let megasamples_per_second =
+        width as f64 * height as f64 * IMF_COMPONENTS * frame_rate / 1_000_000.0;
+    let sample_rate_level = IMF_MAIN_LEVEL_MEGASAMPLES_PER_SECOND
+        .iter()
+        .position(|&limit| megasamples_per_second <= limit as f64)
+        .map(|index| index as u8 + 1)
+        .ok_or_else(|| {
+            format!(
+                "{width}x{height} at {frame_rate} fps is {megasamples_per_second:.1} \
+                 megasamples per second, past the {} of IMF main level {}",
+                IMF_MAIN_LEVEL_MEGASAMPLES_PER_SECOND.last().unwrap(),
+                IMF_MAIN_LEVEL_MEGASAMPLES_PER_SECOND.len()
+            )
+        })?;
+
+    let megabits_per_second = max_bits_per_second as f64 / 1_000_000.0;
+    let sub_level = IMF_SUB_LEVEL_MEGABITS_PER_SECOND
+        .iter()
+        .position(|&limit| megabits_per_second <= limit as f64)
+        .map(|index| index as u8 + 1)
+        .ok_or_else(|| {
+            format!(
+                "{megabits_per_second:.1} megabits per second is past the {} of IMF sub level {}",
+                IMF_SUB_LEVEL_MEGABITS_PER_SECOND.last().unwrap(),
+                IMF_SUB_LEVEL_MEGABITS_PER_SECOND.len()
+            )
+        })?;
+
+    let main_level_the_sub_level_needs = if sub_level > 1 {
+        sub_level + IMF_MAIN_LEVEL_ABOVE_SUB_LEVEL
+    } else {
+        1
+    };
+    let main_level = sample_rate_level.max(main_level_the_sub_level_needs);
+    if main_level as usize > IMF_MAIN_LEVEL_MEGASAMPLES_PER_SECOND.len() {
+        return Err(format!(
+            "sub level {sub_level} needs main level {main_level}, past the {} IMF allows",
+            IMF_MAIN_LEVEL_MEGASAMPLES_PER_SECOND.len()
+        ));
+    }
+
+    Ok(ImfLevels {
+        main_level,
+        sub_level,
+    })
+}
+
+/// The Rsiz an IMF codestream declares: the profile with its two levels in the
+/// low byte, sub level above main level.
+pub fn imf_rsiz(profile: ImfProfile, levels: ImfLevels) -> u16 {
+    profile.rsiz_base() | ((levels.sub_level as u16) << 4) | levels.main_level as u16
+}
+
 /// Check the header fields DCP picture wrapping requires.
 pub fn validate_dci_header(header: &J2kHeader) -> Result<(), String> {
     // a DCP carries the plain 2K or 4K cinema profile; the scalable and
@@ -480,6 +618,120 @@ mod tests {
         // 1 and 2 are not cinema profiles, whatever the DCI spec calls its own
         assert_eq!(J2kProfile::from(0x0001), J2kProfile::Unknown(1));
         assert_eq!(J2kProfile::from(0x0002), J2kProfile::Unknown(2));
+    }
+
+    #[test]
+    fn netflix_app_2e_picture_composes_its_rsiz() {
+        // a real App 2E picture: 3840x2160 at 24 fps under 800 Mb/s carries
+        // Rsiz 0x0536, IMF 4K at main level 6 and sub level 3
+        let levels = imf_levels(3840, 2160, 24.0, 800_000_000).unwrap();
+        assert_eq!(
+            levels,
+            ImfLevels {
+                main_level: 6,
+                sub_level: 3
+            }
+        );
+        let profile = ImfProfile::for_raster(3840, 2160).unwrap();
+        assert_eq!(profile, ImfProfile::Imf4k);
+        assert_eq!(imf_rsiz(profile, levels), 0x0536);
+        assert_eq!(J2kProfile::from(0x0536), J2kProfile::Imf);
+    }
+
+    #[test]
+    fn a_2k_picture_at_the_dci_rate_composes_its_rsiz() {
+        // 2048x1080 at 24 fps is 159.3 megasamples per second, main level 3 by
+        // rate alone, and 250 Mb/s is sub level 2, which needs main level 4
+        let levels = imf_levels(2048, 1080, 24.0, 250_000_000).unwrap();
+        assert_eq!(
+            levels,
+            ImfLevels {
+                main_level: 4,
+                sub_level: 2
+            }
+        );
+        let profile = ImfProfile::for_raster(2048, 1080).unwrap();
+        assert_eq!(profile, ImfProfile::Imf2k);
+        assert_eq!(imf_rsiz(profile, levels), 0x0424);
+    }
+
+    #[test]
+    fn a_low_bit_rate_leaves_the_main_level_where_the_sample_rate_puts_it() {
+        // sub level 1 pairs with any main level, so 190 Mb/s keeps main level 3
+        let levels = imf_levels(2048, 1080, 24.0, 190_000_000).unwrap();
+        assert_eq!(
+            levels,
+            ImfLevels {
+                main_level: 3,
+                sub_level: 1
+            }
+        );
+    }
+
+    #[test]
+    fn imf_levels_refuse_a_rate_no_level_covers() {
+        // 8192x6224 at 300 fps is 45,885 megasamples per second, past level 11
+        assert!(imf_levels(8192, 6224, 300.0, 200_000_000).is_err());
+        // 60 Gb/s is past sub level 9
+        assert!(imf_levels(1920, 1080, 24.0, 60_000_000_000).is_err());
+        assert!(imf_levels(1920, 1080, 0.0, 200_000_000).is_err());
+    }
+
+    #[test]
+    fn imf_profiles_cover_their_rasters() {
+        assert_eq!(ImfProfile::for_raster(2048, 1556), Ok(ImfProfile::Imf2k));
+        // 2048x1080 is 2K, but a 2160-high picture needs 4K
+        assert_eq!(ImfProfile::for_raster(2048, 2160), Ok(ImfProfile::Imf4k));
+        assert_eq!(ImfProfile::for_raster(4096, 3112), Ok(ImfProfile::Imf4k));
+        assert_eq!(ImfProfile::for_raster(4097, 2160), Ok(ImfProfile::Imf8k));
+        assert!(ImfProfile::for_raster(8193, 4320).is_err());
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn the_imf_level_tables_match_grok() {
+        use grokj2k_sys::*;
+        assert_eq!(
+            IMF_MAIN_LEVEL_MEGASAMPLES_PER_SECOND,
+            [
+                GRK_IMF_MAINLEVEL_1_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_2_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_3_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_4_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_5_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_6_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_7_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_8_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_9_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_10_MSAMPLESSEC,
+                GRK_IMF_MAINLEVEL_11_MSAMPLESSEC,
+            ]
+        );
+        assert_eq!(
+            IMF_SUB_LEVEL_MEGABITS_PER_SECOND,
+            [
+                GRK_IMF_SUBLEVEL_1_MBITSSEC,
+                GRK_IMF_SUBLEVEL_2_MBITSSEC,
+                GRK_IMF_SUBLEVEL_3_MBITSSEC,
+                GRK_IMF_SUBLEVEL_4_MBITSSEC,
+                GRK_IMF_SUBLEVEL_5_MBITSSEC,
+                GRK_IMF_SUBLEVEL_6_MBITSSEC,
+                GRK_IMF_SUBLEVEL_7_MBITSSEC,
+                GRK_IMF_SUBLEVEL_8_MBITSSEC,
+                GRK_IMF_SUBLEVEL_9_MBITSSEC,
+            ]
+        );
+        assert_eq!(
+            IMF_MAIN_LEVEL_MEGASAMPLES_PER_SECOND.len() as u32,
+            GRK_LEVEL_MAX
+        );
+        assert_eq!(
+            IMF_SUB_LEVEL_MEGABITS_PER_SECOND.len() as u32,
+            GRK_IMF_SUBLEVEL_MAX
+        );
+        assert_eq!(IMF_2K_RSIZ_BASE as u32, GRK_PROFILE_IMF_2K);
+        assert_eq!(IMF_4K_RSIZ_BASE as u32, GRK_PROFILE_IMF_4K);
+        assert_eq!(IMF_8K_RSIZ_BASE as u32, GRK_PROFILE_IMF_8K);
     }
 
     #[test]

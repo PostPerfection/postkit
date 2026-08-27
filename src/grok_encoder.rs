@@ -777,6 +777,10 @@ fn compress_frame_grok(
     compress_frame_once(frame, params, by_ratio, output_buf)
 }
 
+/// The bit depth IMF App 2E picture is written at.
+#[cfg(feature = "grok-ffi")]
+const IMF_SAMPLE_PRECISION: u8 = 12;
+
 #[cfg(feature = "grok-ffi")]
 fn compress_frame_once(
     frame: &RawFrame,
@@ -791,7 +795,27 @@ fn compress_frame_once(
     let height = frame.height();
     // grok reduces deeper samples to the 12 bits cinema profiles require,
     // fused with its X'Y'Z' transform, so frames pass through at full precision
-    let precision = frame.precision();
+    let mut precision = frame.precision();
+    let mut bits_to_drop = 0u8;
+
+    if crate::j2k::J2kProfile::from(params.profile) == crate::j2k::J2kProfile::Imf {
+        if params.apply_xyz_transform {
+            return Err(format!(
+                "RSIZ {:#06x} is an IMF profile, whose picture is RGB, so the X'Y'Z' \
+                 transform cannot be applied to it",
+                params.profile
+            ));
+        }
+        // grok writes an IMF codestream at whatever precision it is handed
+        if precision < IMF_SAMPLE_PRECISION {
+            return Err(format!(
+                "IMF picture is written at {IMF_SAMPLE_PRECISION} bits and the frame is \
+                 {precision}-bit"
+            ));
+        }
+        bits_to_drop = precision - IMF_SAMPLE_PRECISION;
+        precision = IMF_SAMPLE_PRECISION;
+    }
 
     // Ensure buffer is large enough for this frame
     let needed = (width as usize) * (height as usize) * 3 * 2;
@@ -839,7 +863,13 @@ fn compress_frame_once(
                     for y in 0..h {
                         let dst_row = comp_data.add(y * stride);
                         let src_row = &src[y * w..(y + 1) * w];
-                        ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, w);
+                        if bits_to_drop == 0 {
+                            ptr::copy_nonoverlapping(src_row.as_ptr(), dst_row, w);
+                            continue;
+                        }
+                        for (x, &sample) in src_row.iter().enumerate() {
+                            *dst_row.add(x) = sample >> bits_to_drop;
+                        }
                     }
                 }
             }
@@ -866,9 +896,9 @@ fn compress_frame_once(
                         let r = ((data[off] as i32) << 8) | (data[off + 1] as i32);
                         let g = ((data[off + 2] as i32) << 8) | (data[off + 3] as i32);
                         let b = ((data[off + 4] as i32) << 8) | (data[off + 5] as i32);
-                        *r_data.add(row_offset + x) = r;
-                        *g_data.add(row_offset + x) = g;
-                        *b_data.add(row_offset + x) = b;
+                        *r_data.add(row_offset + x) = r >> bits_to_drop;
+                        *g_data.add(row_offset + x) = g >> bits_to_drop;
+                        *b_data.add(row_offset + x) = b >> bits_to_drop;
                     }
                 }
             }
@@ -1265,6 +1295,19 @@ where
     P: FnMut(EncodeProgress),
 {
     use std::process::{Command, Stdio};
+
+    if crate::j2k::J2kProfile::from(params.profile) == crate::j2k::J2kProfile::Imf {
+        return PipelineResult {
+            success: false,
+            error: "grk_compress reads the pipeline's frames as 16-bit and has no way to \
+                    reduce them to the 12 bits IMF picture is written at: use the in-process \
+                    pipeline"
+                .to_string(),
+            frames_encoded: 0,
+            output_dir: output_dir.to_path_buf(),
+            picture_findings: crate::picture_findings::PictureFindings::default(),
+        };
+    }
 
     if !params.source_preparation.is_empty() {
         return PipelineResult {

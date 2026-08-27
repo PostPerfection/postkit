@@ -96,3 +96,7 @@ required-features = ["grok-ffi"]
 [[test]]
 name = "overlapped_wrap_e2e"
 required-features = ["grok-ffi"]
+
+[[test]]
+name = "imf_encode"
+required-features = ["grok-ffi"]

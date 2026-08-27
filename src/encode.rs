@@ -349,8 +349,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// What colour the source frames carry when they reach the J2K compressor.
 ///
 /// The compressor's own DCDM X'Y'Z' transform is applied if and only if this is
-/// `DisplayRgb`, so essence that a caller later labels ST 2084 PQ can never hold
-/// frames the encoder transformed itself.
+/// `DisplayRgb`, so essence that a caller later labels ST 2084 PQ or RGB can
+/// never hold frames the encoder transformed itself.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SourceColour {
     /// Display RGB. The compressor runs the DCDM X'Y'Z' transform.
@@ -366,6 +366,9 @@ pub enum SourceColour {
     /// Source is already DCI X'Y'Z' with the ST 2084 PQ transfer function, and
     /// is compressed untransformed.
     AlreadyPq,
+    /// Display RGB compressed as it is, for IMF picture whose descriptor names
+    /// the colour the samples are already in.
+    KeepRgb,
 }
 
 impl SourceColour {
@@ -622,6 +625,10 @@ pub struct StreamEncodeOptions {
     /// Colour the decoded frames carry, which decides the encoder transform.
     #[serde(default)]
     pub source_colour: SourceColour,
+    /// The Rsiz the codestreams declare: cinema 2K, cinema 4K, or an IMF
+    /// profile with its levels from [`crate::j2k::imf_rsiz`].
+    #[serde(default = "default_rsiz")]
+    pub rsiz: u16,
     /// Whether `input` is a container or a concat list of stills.
     #[serde(default)]
     pub decode_source: DecodeSource,
@@ -643,6 +650,11 @@ pub struct StreamEncodeOptions {
     pub codestream_byte_cap: Option<u64>,
 }
 
+/// Cinema 2K, the profile a DCP picture declares.
+fn default_rsiz() -> u16 {
+    crate::grok_encoder::CompressParams::default().profile
+}
+
 impl Default for StreamEncodeOptions {
     fn default() -> Self {
         Self {
@@ -659,6 +671,7 @@ impl Default for StreamEncodeOptions {
             compressor_path: PathBuf::new(),
             lib_dir: None,
             source_colour: SourceColour::DisplayRgb,
+            rsiz: default_rsiz(),
             decode_source: DecodeSource::Video,
             picture: crate::picture_processing::PictureProcessing::default(),
             subtitle_burn: None,
@@ -971,6 +984,7 @@ where
         codeblock_size: opts.codeblock_size,
         // grok only sizes the per-frame byte budget from this, so the whole rate is enough
         edit_rate: opts.fps,
+        profile: opts.rsiz,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         source_preparation: grok_encoder::SourcePreparation {
             subtitle_burn: opts.subtitle_burn.clone(),
@@ -1228,6 +1242,7 @@ where
         codeblock_size: opts.codeblock_size,
         // grok only sizes the per-frame byte budget from this, so the whole rate is enough
         edit_rate: opts.fps,
+        profile: opts.rsiz,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         ..grok_encoder::CompressParams::default()
     };
