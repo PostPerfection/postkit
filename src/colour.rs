@@ -365,14 +365,17 @@ pub fn rgb_to_xyz_inplace(buf: &mut [u8]) {
 // ─── Display transform: DCI X'Y'Z' code values → sRGB ─────────────────────
 //
 // Inverse of the DCDM encode in `dcdm.rs`, for showing a real DCP picture
-// (12-bit CIE X'Y'Z', DCI white, 2.6 gamma per SMPTE 428-1) correctly on an
-// sRGB monitor. Pipeline, per SMPTE 428-1 decode + a Bradford illuminant
-// adaptation the encode side never applied:
+// (12-bit CIE X'Y'Z', 2.6 gamma per SMPTE 428-1) on an sRGB monitor. Pipeline:
 //   code/4095 → ^2.6 (peak-relative linear XYZ)
 //   × 52.37/48 (Y = 1 at the DCI reference white)
-//   Bradford-adapt DCI white → D65
 //   XYZ(D65) → linear sRGB
 //   sRGB OETF → 8-bit.
+//
+// No illuminant adaptation, because a DCDM stores absolute XYZ and does not say
+// what its neutral is. The encode side leaves a Rec.709 or P3-D65 master's
+// neutral at D65, as libdcp and DCP-o-matic do, so adapting here would tint
+// every DCP built from one. A picture graded against DCI white renders green,
+// which is what it measures.
 
 /// Rendering intent for the optional ICC display path.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -392,12 +395,15 @@ const DCI_PEAK_LUMINANCE: f32 = 52.37;
 /// DCI reference white luminance (cd/m²).
 const DCI_REFERENCE_WHITE: f32 = 48.0;
 
-// Bradford cone-response matrix and its inverse.
+// Bradford cone-response matrix and its inverse. Only the ICC display path
+// adapts an illuminant; the sRGB one renders the DCDM's XYZ as measured.
+#[cfg(feature = "icc")]
 const BRADFORD: [[f32; 3]; 3] = [
     [0.8951, 0.2664, -0.1614],
     [-0.7502, 1.7135, 0.0367],
     [0.0389, -0.0685, 1.0296],
 ];
+#[cfg(feature = "icc")]
 const BRADFORD_INV: [[f32; 3]; 3] = [
     [0.9869929, -0.1470543, 0.1599627],
     [0.4323053, 0.5183603, 0.0492912],
@@ -409,9 +415,8 @@ const XYZ_D65_TO_SRGB: [[f32; 3]; 3] = [
     [-0.969266, 1.876011, 0.041556],
     [0.055643, -0.204026, 1.057225],
 ];
-// White points as XYZ with Y = 1.
-// DCI white x=0.314 y=0.351, D65 x=0.3127 y=0.3290.
-const DCI_WHITE_XYZ: [f32; 3] = [0.894_587, 1.0, 0.954_416];
+// D65 as XYZ with Y = 1, x=0.3127 y=0.3290.
+#[cfg(any(feature = "icc", test))]
 const D65_WHITE_XYZ: [f32; 3] = [0.950_456, 1.0, 1.088_754];
 
 fn mat_vec(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
@@ -422,6 +427,7 @@ fn mat_vec(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+#[cfg(feature = "icc")]
 fn mat_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
     let mut r = [[0.0f32; 3]; 3];
     for i in 0..3 {
@@ -435,6 +441,7 @@ fn mat_mul(a: &[[f32; 3]; 3], b: &[[f32; 3]; 3]) -> [[f32; 3]; 3] {
 }
 
 /// Bradford chromatic adaptation from `src` white to `dst` white (both XYZ, Y=1).
+#[cfg(feature = "icc")]
 fn bradford(src: [f32; 3], dst: [f32; 3]) -> [[f32; 3]; 3] {
     let rs = mat_vec(&BRADFORD, src);
     let rd = mat_vec(&BRADFORD, dst);
@@ -476,8 +483,7 @@ impl Default for XyzToSrgb {
 impl XyzToSrgb {
     pub fn new() -> Self {
         let scale = DCI_PEAK_LUMINANCE / DCI_REFERENCE_WHITE;
-        let cat = bradford(DCI_WHITE_XYZ, D65_WHITE_XYZ);
-        let mut mat = mat_mul(&XYZ_D65_TO_SRGB, &cat);
+        let mut mat = XYZ_D65_TO_SRGB;
         for row in mat.iter_mut() {
             for c in row.iter_mut() {
                 *c *= scale;
@@ -525,8 +531,8 @@ impl XyzToSrgb {
 
 #[cfg(feature = "icc")]
 mod icc {
+    use super::{D65_WHITE_XYZ, DCI_PEAK_LUMINANCE, DCI_REFERENCE_WHITE, MAX_CODE_12BIT};
     use super::{DCDM_GAMMA, RenderingIntent, bradford, mat_vec};
-    use super::{DCI_PEAK_LUMINANCE, DCI_REFERENCE_WHITE, DCI_WHITE_XYZ, MAX_CODE_12BIT};
     use lcms2::{Intent, PixelFormat, Profile, Transform};
 
     // D50 PCS white (lcms2's XYZ profile connection space).
@@ -534,7 +540,7 @@ mod icc {
 
     /// DCI X'Y'Z' → device RGB through a monitor ICC profile.
     ///
-    /// Decodes to peak-relative linear XYZ, adapts DCI white → the D50 PCS,
+    /// Decodes to peak-relative linear XYZ, adapts D65 → the D50 PCS,
     /// then runs the ICC engine (littleCMS) into the profile's 8-bit RGB.
     pub struct XyzToIcc {
         expand: Vec<f32>,
@@ -566,7 +572,7 @@ mod icc {
             .map_err(|e| format!("failed to build ICC transform: {e}"))?;
 
             let scale = DCI_PEAK_LUMINANCE / DCI_REFERENCE_WHITE;
-            let mut to_pcs = bradford(DCI_WHITE_XYZ, D50_WHITE_XYZ);
+            let mut to_pcs = bradford(D65_WHITE_XYZ, D50_WHITE_XYZ);
             for row in to_pcs.iter_mut() {
                 for c in row.iter_mut() {
                     *c *= scale;
@@ -613,14 +619,50 @@ pub use icc::XyzToIcc;
 mod tests_display {
     use super::*;
 
-    // DCI reference white as 12-bit X'Y'Z' code values.
-    fn dci_white_codes() -> [u16; 3] {
-        let mut c = [0u16; 3];
+    // DCI white x=0.314 y=0.351 as XYZ with Y = 1, for the codes a picture graded
+    // against the projector's own white carries.
+    const DCI_WHITE_XYZ: [f32; 3] = [0.894_587, 1.0, 0.954_416];
+
+    /// A white's 12-bit X'Y'Z' codes at `luminance` of the DCI reference white.
+    fn white_codes(white: [f32; 3], luminance: f32) -> [u16; 3] {
+        let mut codes = [0u16; 3];
         for i in 0..3 {
-            let peak = DCI_WHITE_XYZ[i] * DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
-            c[i] = (peak.powf(1.0 / DCDM_GAMMA) * MAX_CODE_12BIT).round() as u16;
+            let peak = white[i] * luminance * DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
+            codes[i] = (peak.powf(1.0 / DCDM_GAMMA) * MAX_CODE_12BIT).round() as u16;
         }
-        c
+        codes
+    }
+
+    /// Encoding Rec.709 to X'Y'Z' and previewing it has to return the picture
+    /// that went in. An illuminant adaptation on one side only is what broke
+    /// this, and it showed up as a desaturated, faintly magenta preview of every
+    /// DCP built from a Rec.709 master.
+    #[test]
+    fn the_preview_inverts_the_rec709_encode() {
+        let encode = DcdmTransform::to_xyz(ColourSpace::Rec709).unwrap();
+        let preview = XyzToSrgb::new();
+        // gamma 2.2 on the way in against the sRGB OETF on the way out costs a
+        // code or two, so this is not bit-exact
+        const TOLERANCE: i32 = 3;
+        for rgb16 in [
+            [65535u16, 65535, 65535],
+            [65535, 0, 0],
+            [0, 65535, 0],
+            [0, 0, 65535],
+            [32768, 32768, 32768],
+            [49152, 16384, 32768],
+        ] {
+            let xyz = encode.pixel(rgb16, 4095);
+            let out = preview.pixel(xyz[0], xyz[1], xyz[2]);
+            for channel in 0..3 {
+                let want = (f32::from(rgb16[channel]) / 65535.0 * 255.0).round() as i32;
+                let got = i32::from(out[channel]);
+                assert!(
+                    (got - want).abs() <= TOLERANCE,
+                    "channel {channel} of {rgb16:?} came back {got}, not {want} (got {out:?})"
+                );
+            }
+        }
     }
 
     #[test]
@@ -630,25 +672,35 @@ mod tests_display {
     }
 
     #[test]
-    fn dci_reference_white_maps_to_srgb_white() {
+    fn d65_reference_white_maps_to_srgb_white() {
         let t = XyzToSrgb::new();
-        let [x, y, z] = dci_white_codes();
+        let [x, y, z] = white_codes(D65_WHITE_XYZ, 1.0);
         let rgb = t.pixel(x, y, z);
         // neutral and near full-scale
         for c in rgb {
-            assert!(c >= 253, "channel {c} not near 255 for DCI white {rgb:?}");
+            assert!(c >= 253, "channel {c} not near 255 for D65 white {rgb:?}");
         }
+    }
+
+    #[test]
+    fn dci_white_chromaticity_renders_green() {
+        // The transform adapts no illuminant, so a picture graded against DCI
+        // white shows the green cast it measures rather than being neutralised.
+        // Neutralising it is what tinted every DCP built from a D65 master.
+        let t = XyzToSrgb::new();
+        let [x, y, z] = white_codes(DCI_WHITE_XYZ, 1.0);
+        let [r, g, b] = t.pixel(x, y, z);
+        assert!(
+            g > r && g > b,
+            "DCI white should stay green, got {:?}",
+            [r, g, b]
+        );
     }
 
     #[test]
     fn mid_grey_is_neutral_and_between_black_and_white() {
         let t = XyzToSrgb::new();
-        // DCI-white chromaticity at 18% of reference-white luminance
-        let mut codes = [0u16; 3];
-        for i in 0..3 {
-            let peak = DCI_WHITE_XYZ[i] * 0.18 * DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
-            codes[i] = (peak.powf(1.0 / DCDM_GAMMA) * MAX_CODE_12BIT).round() as u16;
-        }
+        let codes = white_codes(D65_WHITE_XYZ, 0.18);
         let rgb = t.pixel(codes[0], codes[1], codes[2]);
         let max = *rgb.iter().max().unwrap();
         let min = *rgb.iter().min().unwrap();
@@ -691,17 +743,17 @@ mod tests_display {
         assert_eq!(&out[3..6], &[0, 0, 0]);
     }
 
-    // Generate an sRGB ICC in-test and push DCI white through the ICC engine.
+    // Generate an sRGB ICC in-test and push D65 white through the ICC engine.
     // sRGB is our built-in target, so the result must land near-neutral white.
     #[cfg(feature = "icc")]
     #[test]
-    fn icc_path_maps_dci_white_to_plausible_neutral() {
+    fn icc_path_maps_d65_white_to_plausible_neutral() {
         let icc = lcms2::Profile::new_srgb().icc().unwrap();
         let path = std::env::temp_dir().join(format!("postkit-srgb-{}.icc", uuid::Uuid::new_v4()));
         std::fs::write(&path, &icc).unwrap();
 
         let t = XyzToIcc::new(&path, RenderingIntent::RelativeColorimetric).unwrap();
-        let [x, y, z] = dci_white_codes();
+        let [x, y, z] = white_codes(D65_WHITE_XYZ, 1.0);
         let mut raw = Vec::new();
         raw.extend_from_slice(&(x << 4).to_le_bytes());
         raw.extend_from_slice(&(y << 4).to_le_bytes());
@@ -713,9 +765,9 @@ mod tests_display {
         let min = *out.iter().min().unwrap();
         assert!(
             max >= 240,
-            "DCI white not near full-scale through ICC: {out:?}"
+            "D65 white not near full-scale through ICC: {out:?}"
         );
-        assert!(max - min <= 8, "DCI white not neutral through ICC: {out:?}");
+        assert!(max - min <= 8, "D65 white not neutral through ICC: {out:?}");
         std::fs::remove_file(&path).ok();
     }
 }
