@@ -87,6 +87,9 @@ pub struct StillHold<'a> {
     /// The compressor's own Rec.709 to X'Y'Z' pass. Off when the image is
     /// already X'Y'Z', or when `colour_transform` converts it instead.
     pub apply_xyz_transform: bool,
+    /// The Rsiz the held codestreams declare: cinema 2K, cinema 4K, or an IMF
+    /// profile with its levels from [`crate::j2k::imf_rsiz`].
+    pub rsiz: u16,
     /// Per-frame matrix for a source space the compressor's own transform does
     /// not model.
     pub colour_transform: Option<Arc<crate::colour::DcdmTransform>>,
@@ -115,6 +118,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         height,
         filters,
         apply_xyz_transform,
+        rsiz,
         colour_transform,
         burn,
         out_dir,
@@ -135,6 +139,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
     let params = CompressParams {
         edit_rate: fps,
         apply_xyz_transform: *apply_xyz_transform,
+        profile: *rsiz,
         source_preparation: SourcePreparation {
             subtitle_burn: burn.clone(),
             colour_transform: colour_transform.clone(),
@@ -264,6 +269,7 @@ mod tests {
             height: 1080,
             filters: &[],
             apply_xyz_transform: true,
+            rsiz: crate::encode::default_rsiz(),
             colour_transform: None,
             burn: None,
             out_dir: &dir.path().join("held"),

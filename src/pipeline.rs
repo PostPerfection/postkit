@@ -163,6 +163,9 @@ pub struct EncodeRunOptions {
     /// Colour the source frames carry, which decides whether the encoder runs
     /// the DCDM X'Y'Z' transform or leaves DCI PQ essence alone.
     pub source_colour: SourceColour,
+    /// The Rsiz the codestreams declare: cinema 2K, cinema 4K, or an IMF profile
+    /// with its levels from [`crate::j2k::imf_rsiz`].
+    pub rsiz: u16,
     /// Per-codestream byte cap, e.g. the DCI HDR Addendum's raised cap. A frame
     /// over it fails the run. Anything postkit compresses itself is checked as
     /// each codestream is written, so the run stops on the first frame over the
@@ -187,6 +190,7 @@ impl Default for EncodeRunOptions {
             read_source_at: None,
             frame_range: None,
             source_colour: SourceColour::DisplayRgb,
+            rsiz: crate::encode::default_rsiz(),
             codestream_byte_cap: None,
             subtitle_burn: None,
             picture: PictureProcessing::default(),
@@ -411,6 +415,7 @@ fn run_encode_and_maybe_wrap(
                 read_source_at: options.read_source_at,
                 frame_range: options.frame_range,
                 source_colour: options.source_colour.clone(),
+                rsiz: options.rsiz,
                 subtitle_burn: options.subtitle_burn.clone(),
                 picture: options.picture.clone(),
                 codestream_byte_cap: options.codestream_byte_cap,
@@ -452,6 +457,7 @@ fn run_encode_and_maybe_wrap(
                     progression: "CPRL".to_string(),
                     fps,
                     source_colour: options.source_colour.clone(),
+                    rsiz: options.rsiz,
                     subtitle_burn: options.subtitle_burn.clone(),
                     picture: options.picture.clone(),
                     codestream_byte_cap: options.codestream_byte_cap,
@@ -480,6 +486,8 @@ fn run_encode_and_maybe_wrap(
                     compression_ratio,
                     quality_psnr,
                     options.codestream_byte_cap,
+                    options.rsiz,
+                    &options.source_colour,
                     cancel,
                     pause,
                     |p: ParallelProgress| {
@@ -608,10 +616,12 @@ fn reject_unsupported_colour_path(
             ))
         }
         (InputType::ImageSequence, colour)
-            if !decodes_through_ffmpeg && !colour.applies_xyz_transform() =>
+            if !decodes_through_ffmpeg
+                && !matches!(colour, SourceColour::DisplayRgb | SourceColour::KeepRgb) =>
         {
             Err(format!(
-                "image sequences are always encoded through the DCDM X'Y'Z' transform, so {colour:?} would be mislabelled"
+                "grk_compress either runs the DCDM X'Y'Z' transform over an image sequence or \
+                 compresses it as it is, so {colour:?} would be mislabelled"
             ))
         }
         (InputType::J2kSequence, SourceColour::DciLut(lut)) => Err(format!(
@@ -758,7 +768,7 @@ mod tests {
     const STRAIGHT_FROM_FILE: bool = false;
 
     #[test]
-    fn image_sequences_refuse_an_untransformed_source() {
+    fn image_sequences_refuse_a_source_grk_compress_cannot_convert() {
         assert!(
             reject_unsupported_colour_path(
                 InputType::ImageSequence,
@@ -766,6 +776,15 @@ mod tests {
                 STRAIGHT_FROM_FILE
             )
             .is_ok()
+        );
+        assert!(
+            reject_unsupported_colour_path(
+                InputType::ImageSequence,
+                &SourceColour::KeepRgb,
+                STRAIGHT_FROM_FILE
+            )
+            .is_ok(),
+            "IMF picture is compressed straight from file with no transform"
         );
         assert!(
             reject_unsupported_colour_path(

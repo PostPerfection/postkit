@@ -651,7 +651,7 @@ pub struct StreamEncodeOptions {
 }
 
 /// Cinema 2K, the profile a DCP picture declares.
-fn default_rsiz() -> u16 {
+pub fn default_rsiz() -> u16 {
     crate::grok_encoder::CompressParams::default().profile
 }
 
@@ -1319,6 +1319,11 @@ pub struct ParallelProgress {
 ///
 /// `quality_psnr` replaces the compression ratio with a PSNR target grk_compress
 /// allocates layers by.
+///
+/// `source_colour` decides whether grk_compress runs its X'Y'Z' transform, and
+/// an `rsiz` outside the DCI cinema family is declared in the codestream.
+/// grk_compress writes each frame at the precision of the file it read, so an
+/// IMF caller passes 12-bit frames.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_parallel<F>(
     frames: &[PathBuf],
@@ -1326,6 +1331,8 @@ pub fn encode_parallel<F>(
     compression_ratio: f64,
     quality_psnr: Option<f64>,
     codestream_byte_cap: Option<u64>,
+    rsiz: u16,
+    source_colour: &SourceColour,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     mut on_progress: F,
@@ -1341,11 +1348,44 @@ where
         };
     }
 
+    let apply_xyz_transform = source_colour.applies_xyz_transform();
+    if crate::j2k::J2kProfile::from(rsiz) == crate::j2k::J2kProfile::Imf && apply_xyz_transform {
+        return EncodeResult {
+            success: false,
+            error: format!(
+                "RSIZ {rsiz:#06x} is an IMF profile, whose picture is RGB, so the X'Y'Z' \
+                 transform cannot run"
+            ),
+            ..Default::default()
+        };
+    }
+
     let total = frames.len() as u64;
     let (allocation_flag, allocation_value) = match quality_psnr {
         Some(psnr) => ("-q", psnr),
         None => ("-r", compression_ratio),
     };
+    let mut compress_args: Vec<String> = vec![
+        allocation_flag.to_string(),
+        allocation_value.to_string(),
+        "-n".to_string(),
+        "6".to_string(),
+        "-b".to_string(),
+        "32,32".to_string(),
+        "-p".to_string(),
+        "CPRL".to_string(),
+        "-H".to_string(),
+        "1".to_string(),
+        "-X".to_string(),
+    ];
+    if apply_xyz_transform {
+        compress_args.push("--xyz".to_string());
+    }
+    // grk_compress checks a frame against a cinema rsiz and refuses an 8-bit one
+    if !crate::j2k::J2kProfile::from(rsiz).is_dci_cinema() {
+        compress_args.push("-Z".to_string());
+        compress_args.push(rsiz.to_string());
+    }
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
         return EncodeResult {
@@ -1387,6 +1427,7 @@ where
                 let first_error = first_error.clone();
                 let grk_bin = &grk_bin;
                 let lib_path = &lib_path;
+                let compress_args = &compress_args;
 
                 s.spawn(move || {
                     loop {
@@ -1419,19 +1460,8 @@ where
                                 &frame.to_string_lossy(),
                                 "-o",
                                 &out_file.to_string_lossy(),
-                                "--xyz",
-                                allocation_flag,
-                                &allocation_value.to_string(),
-                                "-n",
-                                "6",
-                                "-b",
-                                "32,32",
-                                "-p",
-                                "CPRL",
-                                "-H",
-                                "1",
-                                "-X",
                             ])
+                            .args(compress_args)
                             .stdout(Stdio::null())
                             .stderr(Stdio::null())
                             .status();
@@ -1592,6 +1622,8 @@ mod tests {
             10.0,
             None,
             None,
+            default_rsiz(),
+            &SourceColour::DisplayRgb,
             &cancel,
             &pause,
             |_| {},
@@ -1604,6 +1636,8 @@ mod tests {
             40.0,
             None,
             None,
+            default_rsiz(),
+            &SourceColour::DisplayRgb,
             &cancel,
             &pause,
             |_| {},
@@ -1625,6 +1659,8 @@ mod tests {
             10.0,
             None,
             Some(64),
+            default_rsiz(),
+            &SourceColour::DisplayRgb,
             &cancel,
             &pause,
             |_| {},
@@ -1664,6 +1700,8 @@ mod tests {
             10.0,
             None,
             None,
+            default_rsiz(),
+            &SourceColour::DisplayRgb,
             &Arc::new(AtomicBool::new(false)),
             &Arc::new(AtomicBool::new(false)),
             |_| {},
