@@ -1,10 +1,5 @@
 # Planned
 
-- `extract_frame` takes no content key, so a frame of encrypted DCP essence
-  cannot be extracted. It refuses by name rather than handing the ciphertext to
-  ffmpeg, which renders it as a picture. `render_dcp_frame` already takes a key,
-  so closing this is a `--key` / `--keys-json` flag on both wizards'
-  `frame-extract` and passing it through. Same entry in dcpwizard's DESIGN_TODO.
 - IMF App 2E picture still decodes with ffmpeg. `extract_frame` routes only
   codestreams declaring a DCI cinema profile to grok, because App 2E samples are
   RGB or YCbCr in Rec.709 or Rec.2020, not X'Y'Z', and the DCDM inverse in

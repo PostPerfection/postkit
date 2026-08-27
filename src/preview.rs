@@ -109,11 +109,15 @@ pub fn read_frame_rate(input: &Path) -> f64 {
 /// not decode every earlier frame to reach a late one. Everything else, IMF App
 /// 2E track files included, goes through ffmpeg: their samples are RGB or YCbCr,
 /// not X'Y'Z', so the transform on the grok path does not apply to them.
-pub fn extract_frame(input: &Path, frame: u32, output_image: &Path) -> i32 {
-    match frame_route(input, frame) {
+///
+/// `key` is the picture essence's AES-128 content key, needed only for encrypted
+/// essence. [`key_from_hex`] and [`picture_key_from_keys_json`] produce one.
+pub fn extract_frame(input: &Path, frame: u32, output_image: &Path, key: Option<[u8; 16]>) -> i32 {
+    match frame_route(input, frame, key) {
         FrameRoute::Dcp => {
             let opts = DcpPreviewOptions {
                 source: input.to_path_buf(),
+                key,
                 ..Default::default()
             };
             match render_dcp_frame(&opts, frame, output_image) {
@@ -144,36 +148,61 @@ enum FrameRoute {
 
 /// Pick the decoder for one frame of `input`.
 ///
-/// Encrypted picture essence is refused rather than handed to ffmpeg, which
-/// cannot decrypt it and renders the ciphertext as a picture. Extraction takes no
-/// key, so the keyed path is [`render_dcp_frame`].
-fn frame_route(input: &Path, frame: u32) -> FrameRoute {
+/// Encrypted essence never goes to ffmpeg, which cannot decrypt it and would
+/// render the ciphertext as a picture. Without a key it is refused; with one it
+/// takes the grok path, and an encrypted codestream that is not DCI cinema is
+/// refused outright because neither decoder can render it correctly.
+fn frame_route(input: &Path, frame: u32, key: Option<[u8; 16]>) -> FrameRoute {
     if !cfg!(feature = "grok-ffi") || !is_jpeg2000_mxf(input) {
+        if key.is_some() {
+            return FrameRoute::Refused(format!(
+                "a content key decrypts JPEG 2000 MXF essence, and {} is not that",
+                input.display()
+            ));
+        }
         return FrameRoute::Ffmpeg;
     }
     let resolved = match resolve_picture(input) {
         Ok(resolved) => resolved,
         Err(e) => return FrameRoute::Refused(e.to_string()),
     };
-    if resolved.encrypted {
+    if resolved.encrypted && key.is_none() {
         return FrameRoute::Refused(format!(
-            "{} is encrypted and frame extraction has no key to decrypt it with",
+            "{} is encrypted, so extracting a frame from it needs its content key",
             input.display()
         ));
     }
-    match crate::j2k::parse_j2k_from_mxf(&resolved.mxf, frame) {
-        Ok(header) if crate::j2k::J2kProfile::from(header.profile).is_dci_cinema() => {
-            FrameRoute::Dcp
-        }
-        Ok(header) => {
-            tracing::debug!(
-                "codestream profile {:#06x} is not DCI cinema, decoding with ffmpeg",
-                header.profile
-            );
-            FrameRoute::Ffmpeg
-        }
-        Err(e) => FrameRoute::Refused(e),
+    if !resolved.encrypted && key.is_some() {
+        tracing::warn!(
+            "{} is not encrypted, so the content key goes unused",
+            input.display()
+        );
     }
+
+    let j2c = match read_picture_codestream(&resolved, key, frame) {
+        Ok(j2c) => j2c,
+        Err(e) => return FrameRoute::Refused(e.to_string()),
+    };
+    let Some(header) = crate::j2k::parse_j2k_header(&j2c) else {
+        return FrameRoute::Refused(format!(
+            "frame {frame} of {} is not a JPEG 2000 codestream",
+            resolved.mxf.display()
+        ));
+    };
+    if crate::j2k::J2kProfile::from(header.profile).is_dci_cinema() {
+        return FrameRoute::Dcp;
+    }
+    if resolved.encrypted {
+        return FrameRoute::Refused(format!(
+            "codestream profile {:#06x} is not DCI cinema, and ffmpeg cannot decrypt this essence",
+            header.profile
+        ));
+    }
+    tracing::debug!(
+        "codestream profile {:#06x} is not DCI cinema, decoding with ffmpeg",
+        header.profile
+    );
+    FrameRoute::Ffmpeg
 }
 
 /// Whether the input is mono JPEG 2000 picture essence in an MXF.
@@ -383,6 +412,8 @@ pub struct DcpPreviewOptions {
 #[derive(Debug, Clone)]
 pub struct ResolvedPicture {
     pub mxf: PathBuf,
+    /// Bare UUID of the track file, the form a dcpwizard `KEYS.json` records.
+    pub asset_uuid: String,
     pub encrypted: bool,
     pub frame_count: u32,
     pub width: u32,
@@ -426,6 +457,37 @@ pub fn key_from_keys_json(path: &Path, asset_uuid: Option<&str>) -> Result<[u8; 
     key_from_hex(hex)
 }
 
+/// The picture content key from whichever source a caller was given: a raw hex
+/// key, a dcpwizard `KEYS.json`, or neither.
+///
+/// `Ok(None)` means no key was asked for, which is what unencrypted essence
+/// needs. The two sources are mutually exclusive, and the hex one wins if both
+/// arrive.
+pub fn resolve_picture_key(
+    source: &Path,
+    key_hex: Option<&str>,
+    keys_json: Option<&Path>,
+) -> Result<Option<[u8; 16]>, PreviewError> {
+    match (key_hex, keys_json) {
+        (Some(hex), _) => key_from_hex(hex).map(Some),
+        (None, Some(path)) => picture_key_from_keys_json(source, path).map(Some),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Load the content key for `source`'s picture essence from a dcpwizard
+/// `KEYS.json`, matching the track file's own asset UUID.
+///
+/// [`key_from_keys_json`] alone takes the first image key in the file, which is
+/// the wrong one when a package carries a picture asset per reel.
+pub fn picture_key_from_keys_json(
+    source: &Path,
+    keys_json: &Path,
+) -> Result<[u8; 16], PreviewError> {
+    let resolved = resolve_picture(source)?;
+    key_from_keys_json(keys_json, Some(&resolved.asset_uuid))
+}
+
 /// Resolve a DCP directory, CPL XML, or picture MXF to the picture essence.
 pub fn resolve_picture(source: &Path) -> Result<ResolvedPicture, PreviewError> {
     let mxf = find_picture_mxf(source)?;
@@ -451,6 +513,7 @@ pub fn resolve_picture(source: &Path) -> Result<ResolvedPicture, PreviewError> {
 
     Ok(ResolvedPicture {
         mxf,
+        asset_uuid: uuid::Uuid::from_bytes(info.asset_uuid).to_string(),
         encrypted: info.encrypted_essence,
         frame_count: desc.container_duration,
         width: desc.stored_width,
@@ -576,6 +639,26 @@ fn read_j2c_frame(
         .map_err(|e| PreviewError::Mxf(format!("read frame {frame}: {e}")))?;
     buf.truncate(size);
     Ok(buf)
+}
+
+/// One frame's codestream, decrypted when the essence is encrypted.
+///
+/// The routing in [`frame_route`] reads the profile from this rather than from
+/// the raw essence, because a frame of encrypted essence read without its key is
+/// ciphertext and carries no readable header.
+fn read_picture_codestream(
+    resolved: &ResolvedPicture,
+    key: Option<[u8; 16]>,
+    frame: u32,
+) -> Result<Vec<u8>, PreviewError> {
+    let mut dec = dec_context(resolved, key)?;
+    let mut reader = MxfReader::new();
+    reader
+        .open_read(&resolved.mxf.to_string_lossy())
+        .map_err(|e| PreviewError::Mxf(format!("open: {e}")))?;
+    let j2c = read_j2c_frame(&mut reader, frame, dec.as_mut())?;
+    let _ = reader.close();
+    Ok(j2c)
 }
 
 /// A decoded, colour-managed frame as packed 8-bit RGB.

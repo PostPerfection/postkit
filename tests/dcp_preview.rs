@@ -236,7 +236,7 @@ fn extract_frame_decodes_dcp_essence_through_grok() {
     // ppm so the pixels read back without a decoder
     let out = tmp("extract").with_extension("ppm");
     assert_eq!(
-        preview::extract_frame(&mxf, 1, &out),
+        preview::extract_frame(&mxf, 1, &out, None),
         0,
         "extraction should succeed"
     );
@@ -258,6 +258,49 @@ fn extract_frame_decodes_dcp_essence_through_grok() {
 }
 
 #[test]
+fn extract_frame_decodes_encrypted_essence_with_a_key() {
+    let (w, h) = (128u32, 128u32);
+    let j2c = make_real_j2c(w, h, CINEMA_2K_PROFILE);
+    let key = [0x2b; 16];
+    let mxf = tmp("extractkey").with_extension("mxf");
+    write_mxf(&mxf, &[j2c.clone(), j2c], Some(key), w, h);
+
+    let out = tmp("extractkey").with_extension("ppm");
+    assert_eq!(
+        preview::extract_frame(&mxf, 1, &out, Some(key)),
+        0,
+        "a key should let the frame decode"
+    );
+
+    // the same flat field the unencrypted case produces, so the decrypt fed the
+    // decoder real samples rather than ciphertext
+    let pixels = read_ppm(&out, w, h);
+    let expected =
+        postkit::colour::XyzToSrgb::new().pixel(MID_GREY_12BIT, MID_GREY_12BIT, MID_GREY_12BIT);
+    assert!(
+        pixels.chunks(3).all(|px| px == expected),
+        "expected every pixel to be {expected:?}, found {:?}",
+        pixels.chunks(3).find(|px| *px != expected)
+    );
+
+    std::fs::remove_file(&mxf).ok();
+    std::fs::remove_file(&out).ok();
+}
+
+#[test]
+fn extract_frame_refuses_a_key_for_essence_that_is_not_jpeg2000() {
+    let notmxf = tmp("notmxf").with_extension("mp4");
+    std::fs::write(&notmxf, b"not an mxf").unwrap();
+    let out = tmp("notmxf").with_extension("ppm");
+    assert_ne!(
+        preview::extract_frame(&notmxf, 0, &out, Some([0x2b; 16])),
+        0,
+        "a key on non-MXF input must not be silently ignored"
+    );
+    std::fs::remove_file(&notmxf).ok();
+}
+
+#[test]
 fn extract_frame_refuses_encrypted_essence() {
     let (w, h) = (128u32, 128u32);
     let j2c = make_real_j2c(w, h, CINEMA_2K_PROFILE);
@@ -268,7 +311,7 @@ fn extract_frame_refuses_encrypted_essence() {
     // extraction has to refuse rather than write one
     let out = tmp("extractenc").with_extension("ppm");
     assert_ne!(
-        preview::extract_frame(&mxf, 0, &out),
+        preview::extract_frame(&mxf, 0, &out, None),
         0,
         "encrypted essence must not extract without a key"
     );

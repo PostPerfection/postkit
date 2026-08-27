@@ -4,6 +4,17 @@
 
 ### Changed
 
+- **`extract_frame` takes a content key, so encrypted DCP essence extracts**: it
+  refused encrypted essence outright before, since it had nowhere to take a key.
+  The signature gains `key: Option<[u8; 16]>` and both wizards' `frame-extract`
+  gain `--key` (raw hex) and `--keys-json`. The profile that picks the decoder is
+  now read from the decrypted codestream rather than the raw essence, because a
+  frame read without its key is ciphertext and carries no readable header. A key
+  handed to an input that is not JPEG 2000 MXF essence is refused rather than
+  ignored, and one handed to unencrypted essence warns and goes unused. An
+  encrypted codestream that is not DCI cinema is refused outright: grok would
+  decode it but the DCDM transform does not fit its samples, and ffmpeg cannot
+  decrypt it at all.
 - **`j2k::J2kProfile` carries the Rsiz values a codestream actually holds**: it
   mapped Rsiz 1 to `Dci2k` and 2 to `Dci4k`, which are not cinema profiles, named
   Rsiz 3 and 4 (the plain 2K and 4K digital cinema profiles, and what every DCP
@@ -66,6 +77,12 @@
 
 ### Added
 
+- `preview::resolve_picture_key(source, key_hex, keys_json)`, the content key
+  from whichever source a caller was given, and
+  `preview::picture_key_from_keys_json(source, keys_json)`, which matches the
+  picture's own asset UUID rather than taking the first image key in the file, so
+  it picks the right one for a package carrying a picture asset per reel.
+  `ResolvedPicture` carries that `asset_uuid`.
 - `j2k::J2kProfile::is_dci_cinema`, whether a profile is a digital cinema one and
   so carries X'Y'Z' samples rather than the RGB or YCbCr an IMF or broadcast
   codestream holds. `extract_frame` routes on it.
