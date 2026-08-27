@@ -4,6 +4,34 @@
 
 ### Changed
 
+- **`extract_frame` decodes DCP picture essence with grok**: the thumbnail path
+  both wizards call, `dcpwizard frame-extract` and imfwizard's alike, ran ffmpeg
+  over whatever it was given, and its `-ss` sits after `-i`, so a late frame
+  decoded every frame before it. A picture MXF whose codestream declares a DCI
+  cinema profile now goes through the DCP-native path. On a 2K 125 Mb/s DCP of
+  120 frames, frame 119 fell from 13.64 s to 0.24 s and frame 0 from 2.12 s to
+  0.23 s, and the time no longer grows with the frame number. Encrypted essence
+  is refused by name rather than handed to ffmpeg, which cannot decrypt it and
+  renders the ciphertext as a picture, so extracting one still needs
+  `render_dcp_frame` and a key. Everything else still goes through ffmpeg,
+  including IMF App 2E track files, whose samples are RGB or YCbCr rather than
+  X'Y'Z'. DCP essence comes out 8-bit sRGB where ffmpeg wrote 16-bit.
+- **The DCP preview adapts no illuminant**: `XyzToSrgb` applied a Bradford
+  adaptation from DCI white to D65 that the encode side never applied, so every
+  DCP built from a Rec.709 or P3-D65 master previewed desaturated and faintly
+  magenta. A DCDM stores absolute XYZ and does not record what its neutral is,
+  and the encode leaves such a master's neutral at D65, as libdcp and
+  DCP-o-matic do. The preview now renders that XYZ as measured, so it inverts
+  the encode: Rec.709 in comes back as Rec.709 out within a code or two. A
+  picture graded against DCI white renders green, which is what it measures.
+  `XyzToIcc` adapts D65 to the D50 PCS for the same reason. Measured against the
+  source frame of a 2K DCP, the preview went from 26.74 dB to 29.62 dB, ahead of
+  ffmpeg's conversion on every channel where it had been behind on every one.
+- `render_dcp_frame` writes a binary PPM itself rather than spawning ffmpeg for
+  it, since a P6 file is the frame's own rgb24 bytes behind a short header. Every
+  other format still goes through ffmpeg. The preview tests now need no external
+  tool, which is what their docstring already claimed and what the CI runners,
+  which carry no ffmpeg, required.
 - **The DCP-native preview decodes with grok, not ffmpeg**: `render_dcp_frame`
   and `play_dcp` no longer pipe each codestream to an ffmpeg process. The frame's
   size comes from the decoder rather than from a second parse of the codestream
@@ -25,6 +53,9 @@
 
 ### Added
 
+- `j2k::is_dci_cinema_profile(rsiz)`, whether an Rsiz value is one of the DCI
+  cinema profiles and so carries X'Y'Z' samples rather than the RGB or YCbCr an
+  IMF or broadcast codestream holds. `extract_frame` routes on it.
 - `grok_decoder`: in-process JPEG 2000 decoding through the grok FFI. Bytes in,
   planar samples out, so nothing is written to disk and no process is spawned.
   `decode(codestream, reduce)` discards `reduce` highest resolution levels and

@@ -1,5 +1,19 @@
 # Planned
 
+- `extract_frame` takes no content key, so a frame of encrypted DCP essence
+  cannot be extracted. It refuses by name rather than handing the ciphertext to
+  ffmpeg, which renders it as a picture. `render_dcp_frame` already takes a key,
+  so closing this is a `--key` / `--keys-json` flag on both wizards'
+  `frame-extract` and passing it through. Same entry in dcpwizard's DESIGN_TODO.
+- IMF App 2E picture still decodes with ffmpeg. `extract_frame` routes only
+  codestreams declaring a DCI cinema profile to grok, because App 2E samples are
+  RGB or YCbCr in Rec.709 or Rec.2020, not X'Y'Z', and the DCDM inverse in
+  `XyzToSrgb` does not apply to them. grok decodes them either way, so what is
+  missing is the display transform for those spaces:
+  `DcdmTransform::to_xyz(Rec709)` into `XyzToSrgb` would chain two transforms
+  that already exist, and 4:2:2 essence would still need chroma upsampling, which
+  `grok_decoder` refuses by name today. Needs a real App 2E track file to verify
+  against. Same entry in imfwizard's DESIGN_TODO.
 - Verify the non-blocking render live (2026-08-17). `render_opengl` now passes
   `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0` with `video-timing-offset` 0,
   because the default wait parked the app's main thread for most of each frame
