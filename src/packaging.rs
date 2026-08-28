@@ -677,10 +677,10 @@ mod tests {
   <system systemId="http://www.digicine.com/PROTO-ASDCP-CPL-20040511.xsd" uri="{interop_cpl}"/>
   <public publicId="http://www.digicine.com/PROTO-ASDCP-CPL-20040511#" uri="{interop_cpl}"/>
 </catalog>"#,
-                dsig = dsig.display(),
-                xml_xsd = xml_xsd.display(),
-                stereo = stereo.display(),
-                interop_cpl = interop_cpl.display(),
+                dsig = crate::file_uri::file_uri(&dsig),
+                xml_xsd = crate::file_uri::file_uri(&xml_xsd),
+                stereo = crate::file_uri::file_uri(&stereo),
+                interop_cpl = crate::file_uri::file_uri(&interop_cpl),
             ),
         )
         .unwrap();
@@ -824,7 +824,7 @@ mod tests {
                 .args(["--nonet", "--noout", "--schema"])
                 .arg(xsd.join(schema))
                 .arg(&path)
-                .env("XML_CATALOG_FILES", &catalog)
+                .env("XML_CATALOG_FILES", crate::file_uri::file_uri(&catalog))
                 .output()
                 .expect("run xmllint");
             assert!(
@@ -1458,7 +1458,7 @@ mod tests {
             Some(p) => format!(
                 "\n  <xs:import namespace=\"{}\" schemaLocation=\"{}\"/>",
                 ns::APP2E,
-                p.display()
+                crate::file_uri::file_uri(&p)
             ),
             None => String::new(),
         };
@@ -1471,8 +1471,8 @@ mod tests {
   <xs:import namespace="http://www.smpte-ra.org/schemas/2067-3/2016" schemaLocation="{cpl}"/>
   <xs:import namespace="http://www.w3.org/2000/09/xmldsig#" schemaLocation="{dsig}"/>{app2e_import}
 </xs:schema>"#,
-                cpl = cpl_xsd.display(),
-                dsig = dsig_xsd.display(),
+                cpl = crate::file_uri::file_uri(&cpl_xsd),
+                dsig = crate::file_uri::file_uri(&dsig_xsd),
             ),
         )
         .unwrap();

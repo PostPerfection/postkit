@@ -220,7 +220,13 @@ mod tests {
     /// A directory name carrying every character that ends a filter or a filter
     /// argument.
     fn awkward_dir(root: &Path) -> PathBuf {
-        let dir = root.join("re:el 1, take 'two' [a]");
+        // windows forbids a colon in a file name, the drive letter supplies one
+        let name = if cfg!(windows) {
+            "reel 1, take 'two' [a]"
+        } else {
+            "re:el 1, take 'two' [a]"
+        };
+        let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

@@ -14,6 +14,7 @@ pub mod dcdm;
 pub mod dolby_vision;
 pub mod edl_import;
 pub mod encode;
+pub mod file_uri;
 pub mod font_subset;
 pub mod frame_compare;
 pub mod free_space;
