@@ -26,6 +26,9 @@ pub struct WatermarkResult {
 /// Burn a visible text mark (first 8 hex chars of the operator/session hash plus
 /// the session id) into each frame with ffmpeg drawtext. Plainly visible, not
 /// forensic.
+/// The concat list needs a rate and the output is stills, so any rate does.
+const FRAME_LIST_FPS: u32 = 24;
+
 pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
     if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
         return WatermarkResult {
@@ -42,7 +45,7 @@ pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
     hasher.update(opts.session_id.as_bytes());
     let payload_hash = hex::encode(hasher.finalize());
 
-    let frames: Vec<PathBuf> = std::fs::read_dir(&opts.input_dir)
+    let mut frames: Vec<PathBuf> = std::fs::read_dir(&opts.input_dir)
         .into_iter()
         .flatten()
         .flatten()
@@ -54,6 +57,7 @@ pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
                     .is_some_and(|e| matches!(e, "tif" | "tiff" | "dpx" | "exr" | "png" | "jpg"))
         })
         .collect();
+    frames.sort();
 
     if frames.is_empty() {
         return WatermarkResult {
@@ -75,7 +79,28 @@ pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
         .and_then(|e| e.to_str())
         .unwrap_or("tif");
 
-    let input_pattern = opts.input_dir.join(format!("*.{ext}"));
+    let list_dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            return WatermarkResult {
+                success: false,
+                error: format!("Failed to create a working directory: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+    let frame_list = list_dir.path().join("frames.ffconcat");
+    if let Err(e) = crate::encode::write_image_concat_list(
+        &frames,
+        crate::encode::FrameRate::whole(FRAME_LIST_FPS),
+        &frame_list,
+    ) {
+        return WatermarkResult {
+            success: false,
+            error: e,
+            ..Default::default()
+        };
+    }
     let output_pattern = opts.output_dir.join(format!("%06d.{ext}"));
 
     // Keep the mark to characters drawtext handles without filtergraph escaping
@@ -92,11 +117,8 @@ pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
     );
 
     let output = std::process::Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-pattern_type")
-        .arg("glob")
-        .arg("-i")
-        .arg(input_pattern.to_string_lossy().as_ref())
+        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&frame_list)
         .arg("-vf")
         .arg(&filter)
         .arg(&output_pattern)

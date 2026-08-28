@@ -127,7 +127,7 @@ jobs:
         run: cargo build --features "async tms"
 
       - name: Test
-        run: cargo test --features "async tms"
+        run: cargo test --no-fail-fast --features "async tms"
 
       - name: Clippy
         run: cargo clippy --all-targets --features "async tms" -- -D warnings
@@ -136,7 +136,7 @@ jobs:
         run: cargo build --features "${{ matrix.grok-features }}"
 
       - name: Test (grok-ffi)
-        run: cargo test --features "${{ matrix.grok-features }}"
+        run: cargo test --no-fail-fast --features "${{ matrix.grok-features }}"
 
       - name: Clippy (grok-ffi)
         run: cargo clippy --all-targets --features "${{ matrix.grok-features }}" -- -D warnings

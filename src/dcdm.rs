@@ -133,17 +133,34 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
         }
     };
 
-    let first = &frames[0];
-    let parent = first.parent().unwrap_or(Path::new("."));
-    let ext = first.extension().and_then(|e| e.to_str()).unwrap_or("dpx");
-    let input_pattern = parent.join(format!("*.{ext}"));
+    let list_dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            return DcdmResult {
+                success: false,
+                error: format!("Failed to create a working directory: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+    let frame_list = list_dir.path().join("frames.ffconcat");
+    if let Err(e) = crate::encode::write_image_concat_list(
+        &frames,
+        crate::encode::FrameRate::new(opts.fps_num, opts.fps_den),
+        &frame_list,
+    ) {
+        return DcdmResult {
+            success: false,
+            error: e,
+            ..Default::default()
+        };
+    }
 
     let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.arg("-y")
-        .arg("-pattern_type")
-        .arg("glob")
-        .arg("-i")
-        .arg(input_pattern.to_string_lossy().as_ref());
+    cmd.args([
+        "-y", "-v", "error", "-nostats", "-f", "concat", "-safe", "0", "-i",
+    ])
+    .arg(&frame_list);
 
     if !opts.lut_path.as_os_str().is_empty() && opts.lut_path.exists() {
         cmd.arg("-vf")
@@ -159,7 +176,7 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
         .arg("-an")
         .arg("pipe:1")
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
 
     let mut ffmpeg = match cmd.spawn() {
         Ok(c) => c,
@@ -221,12 +238,16 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
         frames_written += 1;
     }
 
+    let mut stderr_text = String::new();
+    if let Some(mut stderr) = ffmpeg.stderr.take() {
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut stderr_text);
+    }
     match ffmpeg.wait() {
         Ok(s) if s.success() => {}
         Ok(s) => {
             return DcdmResult {
                 success: false,
-                error: format!("ffmpeg exited with {s}"),
+                error: format!("ffmpeg exited with {s}: {}", stderr_text.trim()),
                 frames_written,
                 output_dir: opts.output_dir.clone(),
             };
@@ -392,6 +413,9 @@ fn write_xyz_tiff(
     Ok(())
 }
 
+/// Rate of the review movie: `export_dcdm` takes no rate and cinema material is 24.
+const DCDM_REVIEW_FPS: u32 = 24;
+
 /// Convert DCDM back to viewable format (e.g. Rec.709 ProRes for review).
 pub fn export_dcdm(
     dcdm_dir: &Path,
@@ -406,7 +430,41 @@ pub fn export_dcdm(
         };
     }
 
-    let input_pattern = dcdm_dir.join("*.tif");
+    let frames: Vec<PathBuf> = match crate::encode::find_source_frames(dcdm_dir) {
+        Ok(f) => f
+            .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "tif"))
+            .collect(),
+        Err(e) => {
+            return DcdmResult {
+                success: false,
+                error: format!("Failed to list {}: {e}", dcdm_dir.display()),
+                ..Default::default()
+            };
+        }
+    };
+    let list_dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => {
+            return DcdmResult {
+                success: false,
+                error: format!("Failed to create a working directory: {e}"),
+                ..Default::default()
+            };
+        }
+    };
+    let frame_list = list_dir.path().join("frames.ffconcat");
+    if let Err(e) = crate::encode::write_image_concat_list(
+        &frames,
+        crate::encode::FrameRate::whole(DCDM_REVIEW_FPS),
+        &frame_list,
+    ) {
+        return DcdmResult {
+            success: false,
+            error: e,
+            ..Default::default()
+        };
+    }
     let output_file = output_dir.join("review.mov");
 
     let colour_filter = match target_colour_space {
@@ -416,11 +474,8 @@ pub fn export_dcdm(
     };
 
     let output = std::process::Command::new("ffmpeg")
-        .arg("-y")
-        .arg("-pattern_type")
-        .arg("glob")
-        .arg("-i")
-        .arg(input_pattern.to_string_lossy().as_ref())
+        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(&frame_list)
         .arg("-vf")
         .arg(colour_filter)
         .arg("-c:v")
