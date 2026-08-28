@@ -2876,15 +2876,61 @@ mod tests {
         assert_eq!(&buf[..n], &frame_data[..], "decrypted Atmos frame");
     }
 
+    /// Where cargo puts build output, which CARGO_TARGET_DIR moves.
+    fn cargo_target_dir() -> std::path::PathBuf {
+        match std::env::var_os("CARGO_TARGET_DIR") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+        }
+    }
+
+    /// asdcplib's own asdcp-info. POSTKIT_ASDCP_INFO names one, otherwise the
+    /// copy asdcplib-sys built into its cargo output directory.
+    fn asdcp_info_tool() -> std::path::PathBuf {
+        if let Some(path) = std::env::var_os("POSTKIT_ASDCP_INFO") {
+            return std::path::PathBuf::from(path);
+        }
+        let name = format!("asdcp-info{}", std::env::consts::EXE_SUFFIX);
+        let mut searched = Vec::new();
+        for profile in ["debug", "release"] {
+            let build = cargo_target_dir().join(profile).join("build");
+            searched.push(build.join("asdcplib-sys-*").join("out/bin").join(&name));
+            let Ok(entries) = std::fs::read_dir(&build) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("asdcplib-sys-")
+                {
+                    continue;
+                }
+                let tool = entry.path().join("out").join("bin").join(&name);
+                if tool.is_file() {
+                    return tool;
+                }
+            }
+        }
+        panic!(
+            "no asdcp-info found. set POSTKIT_ASDCP_INFO, or build one where these look: {}",
+            searched
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     /// Read the AssetUUID an MXF actually carries, using an independent
     /// asdcp-info binary rather than this crate's own reader. Returns None when
     /// the tool reports no AssetUUID (it refuses AS-02 files).
-    fn asdcp_info_asset_uuid(tool: &str, path: &std::path::Path) -> Option<String> {
+    fn asdcp_info_asset_uuid(tool: &std::path::Path, path: &std::path::Path) -> Option<String> {
         let out = std::process::Command::new(tool)
             .arg("-i")
             .arg(path)
             .output()
-            .expect("run asdcp-info");
+            .unwrap_or_else(|error| panic!("could not run {}: {error}", tool.display()));
         String::from_utf8_lossy(&out.stdout)
             .lines()
             .find_map(|l| l.trim().strip_prefix("AssetUUID:"))
@@ -2894,13 +2940,10 @@ mod tests {
     /// The one id an asset is known by: the AssetUUID inside the MXF, the uuid in
     /// the file name, and the id postkit reports for the CPL/PKL/ASSETMAP must all
     /// be the same. The MXF side is read back with an external asdcp-info binary,
-    /// so postkit cannot agree with itself and pass. Gated on POSTKIT_ASDCP_INFO.
+    /// so postkit cannot agree with itself and pass.
     #[test]
     fn every_wrap_path_writes_the_caller_supplied_asset_uuid() {
-        let Ok(tool) = std::env::var("POSTKIT_ASDCP_INFO") else {
-            eprintln!("skipping: set POSTKIT_ASDCP_INFO to an asdcp-info binary");
-            return;
-        };
+        let tool = asdcp_info_tool();
         let dir = tempfile::tempdir().unwrap();
 
         let frame = dir.path().join("0001.j2c");
@@ -2976,13 +3019,10 @@ mod tests {
 
     /// Without a caller-supplied id the wrap mints one, and the id it reports must
     /// still be the id the MXF carries. Read back with the external asdcp-info, so
-    /// this asserts nothing the test itself chose. Gated on POSTKIT_ASDCP_INFO.
+    /// this asserts nothing the test itself chose.
     #[test]
     fn a_minted_asset_uuid_is_reported_as_the_mxf_carries_it() {
-        let Ok(tool) = std::env::var("POSTKIT_ASDCP_INFO") else {
-            eprintln!("skipping: set POSTKIT_ASDCP_INFO to an asdcp-info binary");
-            return;
-        };
+        let tool = asdcp_info_tool();
         let dir = tempfile::tempdir().unwrap();
         let frame = dir.path().join("0001.j2c");
         std::fs::write(&frame, synthetic_j2k()).unwrap();

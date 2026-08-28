@@ -3018,14 +3018,6 @@ mod tests {
         }
     }
 
-    fn xmlsec1_available() -> bool {
-        std::process::Command::new("xmlsec1")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
     /// Run `xmlsec1 --verify` against a signed KDM, returning whether it passed.
     fn xmlsec1_verify(kdm: &Path, trusted_pem: &Path) -> bool {
         std::process::Command::new("xmlsec1")
@@ -3036,17 +3028,9 @@ mod tests {
             .args(["--id-attr:Id", "AuthenticatedPrivate"])
             .arg(kdm)
             .output()
-            .expect("run xmlsec1")
+            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"))
             .status
             .success()
-    }
-
-    fn xmllint_available() -> bool {
-        std::process::Command::new("xmllint")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
     }
 
     /// Reference inclusive c14n via libxml2, the same engine xmlsec1 uses.
@@ -3073,7 +3057,13 @@ mod tests {
             "xmllint --c14n failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        // windows xmllint writes stdout in text mode, so every LF arrives as CRLF.
+        // canonical XML escapes a real carriage return as &#xD;, so dropping every
+        // raw one leaves the canonical bytes.
         out.stdout
+            .into_iter()
+            .filter(|byte| *byte != b'\r')
+            .collect()
     }
 
     /// The pure-Rust c14n must equal libxml2 byte-for-byte for each fragment
@@ -3084,18 +3074,6 @@ mod tests {
     /// title). If this drifts from libxml2 the signature stops verifying.
     #[test]
     fn c14n_matches_xmllint_for_each_fragment_shape() {
-        // Windows xmllint writes stdout in text mode (LF -> CRLF), so a raw byte
-        // comparison against its output is meaningless there. The xmlsec1 tests
-        // prove byte-exact correctness on Windows instead.
-        if cfg!(windows) {
-            eprintln!("skipping on windows: xmllint stdout is crlf-translated");
-            return;
-        }
-        if !xmllint_available() {
-            eprintln!("skipping: xmllint not installed");
-            return;
-        }
-
         let public = format!(
             r#"<AuthenticatedPublic xmlns="{ETM_NS}" xmlns:ds="{DSIG_NS}" Id="{AUTH_PUBLIC_ID}">
     <MessageId>urn:uuid:11111111-2222-3333-4444-555555555555</MessageId>
@@ -3301,10 +3279,6 @@ mod tests {
 
     #[test]
     fn interop_kdm_signature_verifies_with_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("interop.kdm.xml");
@@ -3719,10 +3693,6 @@ mod tests {
 
     #[test]
     fn kdm_signature_verifies_with_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("signed.kdm.xml");
@@ -3738,10 +3708,6 @@ mod tests {
     /// signature has to still verify with it there.
     #[test]
     fn a_kdm_carrying_a_content_authenticator_verifies_with_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         for formulation in [KdmFormulation::DciAny, KdmFormulation::DciSpecific] {
@@ -3770,10 +3736,6 @@ mod tests {
 
     #[test]
     fn tampered_authenticated_public_fails_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("signed.kdm.xml");
@@ -3794,10 +3756,6 @@ mod tests {
     #[test]
     fn self_signed_signer_verifies_with_xmlsec1() {
         // The default test_config signs with the self-signed root.
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("signed.kdm.xml");
@@ -4073,10 +4031,6 @@ mod tests {
 
     #[test]
     fn rewrapped_kdm_verifies_with_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let f = fixtures();
         let src_keys = vec![
             KdmKey {
@@ -4295,15 +4249,21 @@ mod tests {
     /// The KDMRequiredExtensions element on its own, as a standalone document
     /// the ST 430-1 schema can be pointed at directly.
     fn required_extensions_fragment(kdm_xml: &str) -> String {
+        const START_TAG: &str = "<KDMRequiredExtensions";
         const END_TAG: &str = "</KDMRequiredExtensions>";
         let start = kdm_xml
-            .find("<KDMRequiredExtensions")
+            .find(START_TAG)
             .expect("KDMRequiredExtensions start");
         let end = kdm_xml.find(END_TAG).expect("KDMRequiredExtensions end") + END_TAG.len();
-        format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}\n",
-            &kdm_xml[start..end]
-        )
+        let mut element = kdm_xml[start..end].to_string();
+        // libdcp declares xmlns:ds on the document root, so the element on its own
+        // uses a ds: prefix it never bound
+        if !element[..element.find('>').expect("KDMRequiredExtensions start tag")]
+            .contains("xmlns:ds=")
+        {
+            element.insert_str(START_TAG.len(), &format!(" xmlns:ds=\"{DSIG_NS}\""));
+        }
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{element}\n")
     }
 
     /// Text of every occurrence of one element, in document order.
@@ -5041,11 +5001,6 @@ mod tests {
     /// ContentAuthenticator forms are covered.
     #[test]
     fn kdm_required_extensions_pass_the_st_430_1_xsd() {
-        if !xmllint_available() {
-            eprintln!("skipping: xmllint not installed");
-            return;
-        }
-
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         for formulation in KdmFormulation::ALL {
@@ -5068,11 +5023,6 @@ mod tests {
     /// dcpdoctor validates a KDM this way.
     #[test]
     fn a_whole_kdm_passes_the_st_430_1_xsd() {
-        if !xmllint_available() {
-            eprintln!("skipping: xmllint not installed");
-            return;
-        }
-
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         for formulation in KdmFormulation::ALL {
@@ -5174,11 +5124,6 @@ mod tests {
     /// the element's position after KeyIdList is checked and not assumed.
     #[test]
     fn every_forensic_marking_state_passes_the_st_430_1_xsd() {
-        if !xmllint_available() {
-            eprintln!("skipping: xmllint not installed");
-            return;
-        }
-
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         for (label, picture, audio, _) in forensic_marking_states() {
@@ -5241,23 +5186,21 @@ mod tests {
         );
     }
 
-    /// Real Doremi-signed KDMs through the same extraction and schema, which is
-    /// what proves the schema handling is not merely self-consistent. Gated on
-    /// POSTKIT_SAMPLE_KDMS, a directory of .xml KDMs.
+    /// KDMs another implementation wrote, through the same extraction and schema,
+    /// which is what proves the schema handling is not merely self-consistent.
+    /// Reads the DCP-o-matic fixtures unless POSTKIT_SAMPLE_KDMS names another
+    /// directory of .xml KDMs, Doremi-signed ones included.
     #[test]
     fn real_kdms_pass_the_same_schema() {
-        let Ok(sample_dir) = std::env::var("POSTKIT_SAMPLE_KDMS") else {
-            eprintln!("skipping: set POSTKIT_SAMPLE_KDMS to a directory of real KDMs");
-            return;
-        };
-        if !xmllint_available() {
-            eprintln!("skipping: xmllint not installed");
-            return;
-        }
+        let sample_dir = std::env::var("POSTKIT_SAMPLE_KDMS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| dcp_o_matic_dir());
 
         let dir = tempfile::tempdir().unwrap();
         let mut checked = 0;
-        for entry in std::fs::read_dir(&sample_dir).expect("read sample dir") {
+        for entry in std::fs::read_dir(&sample_dir)
+            .unwrap_or_else(|error| panic!("read {}: {error}", sample_dir.display()))
+        {
             let source = entry.expect("dir entry").path();
             if source.extension().is_none_or(|e| e != "xml") {
                 continue;
@@ -5278,7 +5221,7 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked > 0, "POSTKIT_SAMPLE_KDMS held no KDM to check");
+        assert!(checked > 0, "{} held no KDM to check", sample_dir.display());
     }
 
     #[test]

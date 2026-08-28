@@ -637,24 +637,24 @@ impl ImfCpl {
 mod tests {
     use super::*;
 
-    // Validate the generated SMPTE DCP docs against the official XSDs. Gated on
-    // POSTKIT_DCP_XSD_DIR (a dir holding the SMPTE 429-7/8/9 schemas plus a local
-    // xmldsig-core-schema.xsd and xml.xsd) and xmllint; skips when absent.
+    /// XSDs the generated documents are validated against, copied into the repo.
+    fn xsd_fixture_dir(kind: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("xsd")
+            .join(kind)
+    }
+
+    // Validate the generated SMPTE DCP docs against the official XSDs. Reads the
+    // fixture copies unless POSTKIT_DCP_XSD_DIR names another directory holding
+    // the SMPTE 429-7/8/9 schemas plus xmldsig-core-schema.xsd and xml.xsd.
     #[test]
     fn generated_dcp_docs_pass_xmllint_schema() {
-        let Ok(xsd_dir) = std::env::var("POSTKIT_DCP_XSD_DIR") else {
-            eprintln!("skipping: set POSTKIT_DCP_XSD_DIR to the SMPTE XSD directory");
-            return;
-        };
-        if std::process::Command::new("xmllint")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping: xmllint not installed");
-            return;
-        }
-        let xsd = std::path::Path::new(&xsd_dir);
+        let xsd = std::env::var("POSTKIT_DCP_XSD_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| xsd_fixture_dir("dcp"));
+        let xsd = xsd.as_path();
         let dir = tempfile::tempdir().unwrap();
 
         // xmllint resolves the CPLs' ds:Signature, xml.xsd, and (Interop only)
@@ -908,27 +908,23 @@ mod tests {
         }
     }
 
-    /// The IMF PKL against the vendored ST 2067-2 packing-list schema. Gated on
-    /// POSTKIT_IMF_PKL_XSD (the path to packingList_schema.xsd) and xmllint.
+    /// The IMF PKL against the ST 2067-2 packing-list schema. Reads the fixture
+    /// copy unless POSTKIT_IMF_PKL_XSD names another packingList_schema.xsd.
     #[test]
     fn generated_imf_pkl_passes_xmllint_schema() {
-        let Ok(schema) = std::env::var("POSTKIT_IMF_PKL_XSD") else {
-            eprintln!("skipping: set POSTKIT_IMF_PKL_XSD to the ST 2067-2 PKL schema");
-            return;
-        };
-        if std::process::Command::new("xmllint")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping: xmllint not installed");
-            return;
-        }
+        let schema = std::env::var("POSTKIT_IMF_PKL_XSD")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                xsd_fixture_dir("imf")
+                    .join("org/smpte_ra/schemas/st2067_2_2016/PKL/packingList_schema.xsd")
+            });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("IMF_PKL.xml");
         std::fs::write(&path, pkl_in(ns::PKL_IMF).to_xml()).unwrap();
         let out = std::process::Command::new("xmllint")
-            .args(["--nonet", "--noout", "--schema", &schema])
+            .args(["--nonet", "--noout"])
+            .arg("--schema")
+            .arg(&schema)
             .arg(&path)
             .output()
             .expect("run xmllint");
@@ -1395,23 +1391,14 @@ mod tests {
 
     /// Validate an IMF CPL carrying a LocaleList and an audio EssenceDescriptor
     /// (with MCA soundfield + RFC 5646 language) against the official ST
-    /// 2067-3:2016 XSD. Gated on IMFWIZARD_IMF_XSD_DIR (a dir holding
-    /// imf-cpl-20160411.xsd and xmldsig-core-schema.xsd anywhere below it) plus
-    /// xmllint; skips when absent.
+    /// 2067-3:2016 XSD. Reads the fixture copies unless IMFWIZARD_IMF_XSD_DIR
+    /// names another directory holding imf-cpl-20160411.xsd and
+    /// xmldsig-core-schema.xsd anywhere below it.
     #[test]
     fn imf_cpl_passes_st2067_3_xsd() {
-        let Ok(xsd_dir) = std::env::var("IMFWIZARD_IMF_XSD_DIR") else {
-            eprintln!("skipping: set IMFWIZARD_IMF_XSD_DIR to the ST 2067-3 XSD directory");
-            return;
-        };
-        if std::process::Command::new("xmllint")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping: xmllint not installed");
-            return;
-        }
+        let xsd_dir = std::env::var("IMFWIZARD_IMF_XSD_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| xsd_fixture_dir("imf"));
         fn walk(dir: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
             for e in std::fs::read_dir(dir).ok()?.flatten() {
                 let p = e.path();
@@ -1425,13 +1412,14 @@ mod tests {
             }
             None
         }
-        let root = std::path::Path::new(&xsd_dir);
+        let root = xsd_dir.as_path();
         let (Some(cpl_xsd), Some(dsig_xsd)) = (
             walk(root, "imf-cpl-20160411.xsd"),
             walk(root, "xmldsig-core-schema.xsd"),
         ) else {
             panic!(
-                "could not locate imf-cpl-20160411.xsd and xmldsig-core-schema.xsd under {xsd_dir}"
+                "could not locate imf-cpl-20160411.xsd and xmldsig-core-schema.xsd under {}",
+                xsd_dir.display()
             );
         };
 

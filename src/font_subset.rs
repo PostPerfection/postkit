@@ -82,8 +82,22 @@ mod tests {
         font.table_data(Tag::new(b"loca")).is_some() && font.charmap().map('A').is_some()
     }
 
+    /// Where each platform keeps the system fonts this test subsets.
+    const SYSTEM_FONT_DIRECTORIES: &[&str] = if cfg!(target_os = "macos") {
+        &["/System/Library/Fonts", "/Library/Fonts"]
+    } else if cfg!(target_os = "windows") {
+        &["C:\\Windows\\Fonts"]
+    } else {
+        &["/usr/share/fonts", "/usr/local/share/fonts"]
+    };
+
+    /// A system .ttf with glyf outlines and a latin cmap.
+    fn system_ttf() -> PathBuf {
+        find_ttf().unwrap_or_else(|| panic!("no usable .ttf under {SYSTEM_FONT_DIRECTORIES:?}"))
+    }
+
     fn find_ttf() -> Option<PathBuf> {
-        let mut stack = vec![PathBuf::from("/usr/share/fonts")];
+        let mut stack: Vec<PathBuf> = SYSTEM_FONT_DIRECTORIES.iter().map(PathBuf::from).collect();
         while let Some(dir) = stack.pop() {
             let Ok(rd) = std::fs::read_dir(&dir) else {
                 continue;
@@ -103,10 +117,7 @@ mod tests {
 
     #[test]
     fn subset_keeps_requested_chars_and_shrinks() {
-        let Some(path) = find_ttf() else {
-            eprintln!("skipping subset test: no .ttf under /usr/share/fonts");
-            return;
-        };
+        let path = system_ttf();
         let bytes = std::fs::read(&path).unwrap();
         let chars = ['A', 'b', 'C', '1', ' '];
         let out = subset_font(&bytes, chars).unwrap();
@@ -126,10 +137,7 @@ mod tests {
 
     #[test]
     fn subset_errors_when_no_chars_present() {
-        let Some(path) = find_ttf() else {
-            eprintln!("skipping subset test: no .ttf under /usr/share/fonts");
-            return;
-        };
+        let path = system_ttf();
         let bytes = std::fs::read(&path).unwrap();
         // a code point no Latin font will contain
         assert!(matches!(

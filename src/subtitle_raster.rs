@@ -1287,16 +1287,10 @@ mod tests {
     use super::*;
     use crate::subtitle_formats::StyledRun;
 
-    /// A rasterizer with a font, or `None` when this machine has none and the
-    /// test should be skipped rather than failing on the environment.
-    fn rasterizer() -> Option<SubtitleRasterizer> {
+    fn rasterizer() -> SubtitleRasterizer {
         let raster = SubtitleRasterizer::new(None).expect("font discovery");
-        if raster.has_font() {
-            Some(raster)
-        } else {
-            eprintln!("skipping: fontdb found no system font on this machine");
-            None
-        }
+        assert!(raster.has_font(), "this machine has no system font");
+        raster
     }
 
     fn cue(text: &str) -> StyledCue {
@@ -1308,10 +1302,7 @@ mod tests {
     /// face fontdb only holds in memory.
     #[test]
     fn the_fallback_sans_font_is_a_readable_font_file() {
-        let Some(path) = find_system_sans_font() else {
-            eprintln!("skipping: fontdb found no sans-serif font on this machine");
-            return;
-        };
+        let path = find_system_sans_font().expect("this machine has no sans-serif font");
         let bytes = std::fs::read(&path).expect("the discovered font file is readable");
         assert!(
             crate::font_subset::subset_font(&bytes, "Hi".chars()).is_ok(),
@@ -1344,9 +1335,7 @@ mod tests {
 
     #[test]
     fn a_text_cue_draws_pixels_only_while_it_is_on_screen() {
-        let Some(mut raster) = rasterizer() else {
-            return;
-        };
+        let mut raster = rasterizer();
         let cues = [cue("Hello")];
         let style = BurnStyle::default();
         let before = raster.render(&cues, 0, WIDTH, HEIGHT, &style).unwrap();
@@ -1358,9 +1347,7 @@ mod tests {
 
     #[test]
     fn alignment_moves_the_block_to_the_named_corner() {
-        let Some(mut raster) = rasterizer() else {
-            return;
-        };
+        let mut raster = rasterizer();
         let style = BurnStyle::default();
         let mut placed = Vec::new();
         for (halign, valign) in [
@@ -1404,9 +1391,7 @@ mod tests {
 
     #[test]
     fn vposition_measures_from_the_anchored_edge() {
-        let Some(mut raster) = rasterizer() else {
-            return;
-        };
+        let mut raster = rasterizer();
         let style = BurnStyle::default();
         let mut top = cue("Hello");
         top.valign = Some(VAlign::Top);
@@ -1432,9 +1417,7 @@ mod tests {
 
     #[test]
     fn bold_and_italic_change_what_is_drawn() {
-        let Some(mut raster) = rasterizer() else {
-            return;
-        };
+        let mut raster = rasterizer();
         let style = BurnStyle::default();
         let plain = raster
             .render(&[cue("Hamburgefonstiv")], 0, WIDTH, HEIGHT, &style)
@@ -1461,9 +1444,7 @@ mod tests {
 
     #[test]
     fn a_run_colour_overrides_the_default_colour() {
-        let Some(mut raster) = rasterizer() else {
-            return;
-        };
+        let mut raster = rasterizer();
         let red = StyledRun {
             text: "Hello".into(),
             color: Some(Rgba {
@@ -1503,9 +1484,7 @@ mod tests {
 
     #[test]
     fn underline_adds_coverage_below_the_text() {
-        let Some(mut raster) = rasterizer() else {
-            return;
-        };
+        let mut raster = rasterizer();
         let style = BurnStyle::default();
         let plain = raster
             .render(&[cue("Hello")], 0, WIDTH, HEIGHT, &style)
@@ -1713,9 +1692,7 @@ mod tests {
 
     #[test]
     fn the_scales_stretch_the_text_in_one_axis_each() {
-        let Some(mut raster) = rasterizer() else {
-            return;
-        };
+        let mut raster = rasterizer();
         let base = raster
             .render(&[cue("Hello")], 0, WIDTH, HEIGHT, &plain_style())
             .unwrap();
@@ -1763,9 +1740,7 @@ mod tests {
 
     #[test]
     fn an_effect_draws_effect_colour_pixels_the_plain_style_does_not() {
-        let Some(mut raster) = rasterizer() else {
-            return;
-        };
+        let mut raster = rasterizer();
         let green = Rgba {
             r: 0,
             g: 255,

@@ -26,12 +26,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libssl-dev libxerces-c-dev xmlsec1 libxml2-utils libmpv-dev
+          sudo apt-get install -y cmake libssl-dev libxerces-c-dev xmlsec1 libxml2-utils libmpv-dev fonts-dejavu-core
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake openssl xerces-c ffmpeg
+          brew install cmake openssl xerces-c ffmpeg xmlsec1
           echo "OPENSSL_DIR=$(brew --prefix openssl)" >> $GITHUB_ENV
           echo "CMAKE_PREFIX_PATH=$(brew --prefix xerces-c):$(brew --prefix openssl)" >> $GITHUB_ENV
 
@@ -57,7 +57,7 @@ jobs:
           # vcpkg reads curl 56 and 503 off github's archive host as permanent and
           # refuses to retry the source download, so retry the whole install
           for ($attempt = 1; $attempt -le 5; $attempt++) {
-            vcpkg install xerces-c:x64-windows openssl:x64-windows
+            vcpkg install xerces-c:x64-windows openssl:x64-windows 'libxml2[tools]:x64-windows' 'xmlsec[tools]:x64-windows'
             if ($LASTEXITCODE -eq 0) { break }
             if ($attempt -eq 5) { throw "vcpkg install failed after $attempt attempts" }
             Start-Sleep -Seconds (30 * $attempt)
@@ -69,6 +69,10 @@ jobs:
         run: |
           echo "VCPKG_ROOT=C:\vcpkg" >> $env:GITHUB_ENV
           echo "CMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
+          $installed = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
+          echo "$installed\tools\libxml2" >> $env:GITHUB_PATH
+          echo "$installed\tools\xmlsec" >> $env:GITHUB_PATH
+          echo "$installed\bin" >> $env:GITHUB_PATH
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -85,10 +89,8 @@ jobs:
           ffprobe -version | head -n 1
           grk_compress -h > /dev/null
           grk_decompress -h > /dev/null
-          # no xmllint on the windows runner and no test reaches it there
-          if [ "$RUNNER_OS" != Windows ]; then
-            xmllint --version
-          fi
+          xmllint --version
+          xmlsec1 --version
           if [ "$RUNNER_OS" = Linux ]; then
             pkg-config --modversion mpv
           fi

@@ -1518,14 +1518,6 @@ mod tests {
         .to_string()
     }
 
-    fn xmlsec1_available() -> bool {
-        std::process::Command::new("xmlsec1")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
     fn xmlsec1_verify(doc: &Path, trusted_pem: &Path) -> std::process::Output {
         std::process::Command::new("xmlsec1")
             .arg("--verify")
@@ -1535,7 +1527,7 @@ mod tests {
             .args(["--id-attr:Id", "ReelList"])
             .arg(doc)
             .output()
-            .expect("run xmlsec1")
+            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"))
     }
 
     // Standard enveloped profile: verify with no --id-attr hints at all.
@@ -1546,15 +1538,11 @@ mod tests {
             .arg(trusted_pem)
             .arg(doc)
             .output()
-            .expect("run xmlsec1")
+            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"))
     }
 
     #[test]
     fn generic_doc_signature_verifies_with_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let signed = sign_enveloped(
             &cpl_doc(),
@@ -1584,10 +1572,6 @@ mod tests {
 
     #[test]
     fn generic_doc_tamper_fails_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let signed = sign_enveloped(
             &cpl_doc(),
@@ -1642,10 +1626,6 @@ mod tests {
 
     #[test]
     fn document_enveloped_signature_verifies_with_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let signed = sign_document_enveloped(&cpl_doc(), &leaf_signer(c))
             .expect("sign document (enveloped)");
@@ -1670,10 +1650,6 @@ mod tests {
 
     #[test]
     fn document_enveloped_tamper_fails_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let signed = sign_document_enveloped(&cpl_doc(), &leaf_signer(c))
             .expect("sign document (enveloped)");
@@ -1776,10 +1752,6 @@ mod tests {
 
     #[test]
     fn the_rsa_sha1_profile_verifies_with_xmlsec1() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let signed =
             sign_document_enveloped_as(&cpl_doc(), &leaf_signer(c), SignatureProfile::RsaSha1)
@@ -1884,10 +1856,6 @@ mod tests {
         verify_document_enveloped(&injected, None)
             .expect("a comment is not part of what URI=\"\" digests");
 
-        if !xmlsec1_available() {
-            eprintln!("skipping the xmlsec1 half: xmlsec1 not installed");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         for (name, document) in [("intact", &signed), ("commented", &injected)] {
             let out = dir.path().join(format!("cpl-comment-{name}.xml"));
@@ -1918,17 +1886,15 @@ mod tests {
         .expect("sign by-id with a comment in a referenced element");
         verify_enveloped(&signed, "Id", None).expect("a comment must not break verification");
 
-        if xmlsec1_available() {
-            let dir = tempfile::tempdir().unwrap();
-            let out = dir.path().join("cpl-byid-comment.xml");
-            std::fs::write(&out, &signed).unwrap();
-            let result = xmlsec1_verify(&out, &c.root);
-            assert!(
-                result.status.success(),
-                "xmlsec1 must verify it too: {}",
-                String::from_utf8_lossy(&result.stderr).trim()
-            );
-        }
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("cpl-byid-comment.xml");
+        std::fs::write(&out, &signed).unwrap();
+        let result = xmlsec1_verify(&out, &c.root);
+        assert!(
+            result.status.success(),
+            "xmlsec1 must verify it too: {}",
+            String::from_utf8_lossy(&result.stderr).trim()
+        );
     }
 
     /// Sign a template with xmlsec1, which fills in DigestValue, SignatureValue
@@ -1944,7 +1910,7 @@ mod tests {
             .arg(out)
             .arg(out.with_extension("tpl"))
             .output()
-            .expect("run xmlsec1 --sign");
+            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"));
         assert!(
             result.status.success(),
             "xmlsec1 --sign failed: {}",
@@ -1988,10 +1954,6 @@ mod tests {
     // valid signature look like tampering.
     #[test]
     fn a_plain_c14n_document_with_a_comment_verifies() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let template = plain_c14n_template(&cpl_doc_with_comment());
 
@@ -2037,10 +1999,6 @@ mod tests {
     // comment, and xmlsec1 signs and verifies these documents that way.
     #[test]
     fn comments_outside_the_root_are_not_part_of_the_document_digest() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let signed =
             sign_document_enveloped(&cpl_doc_with_comments_outside_the_root(), &leaf_signer(c))
@@ -2065,10 +2023,6 @@ mod tests {
     // The plain-c14n twin of the same edit, on a document xmlsec1 signed.
     #[test]
     fn editing_a_comment_outside_the_root_leaves_a_plain_c14n_signature_valid() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let dir = tempfile::tempdir().unwrap();
         let signed = xmlsec1_sign(
@@ -2097,10 +2051,6 @@ mod tests {
 
     #[test]
     fn a_processing_instruction_outside_the_root_is_part_of_the_document_digest() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let signed =
             sign_document_enveloped(&cpl_doc_with_a_processing_instruction(), &leaf_signer(c))
@@ -2123,10 +2073,6 @@ mod tests {
     // The plain-c14n twin: a processing instruction is digested there too.
     #[test]
     fn editing_a_processing_instruction_outside_the_root_fails_plain_c14n() {
-        if !xmlsec1_available() {
-            eprintln!("skipping: xmlsec1 not installed");
-            return;
-        }
         let c = chain();
         let dir = tempfile::tempdir().unwrap();
         let signed = xmlsec1_sign(

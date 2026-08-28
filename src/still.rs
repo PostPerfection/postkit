@@ -237,10 +237,8 @@ mod tests {
         // one cue over frames 24..48 at 24 fps: the picture changes when it
         // arrives and again when it leaves
         let cue = StyledCue::text(1000, 2000, vec![StyledRun::plain("hello")]);
-        let Ok(burn) = SubtitleBurn::new(vec![cue], None, BurnStyle::default(), 24.0) else {
-            eprintln!("skipping: no font available to build a burn");
-            return;
-        };
+        let burn =
+            SubtitleBurn::new(vec![cue], None, BurnStyle::default(), 24.0).expect("build a burn");
         assert_eq!(distinct_frames(Some(&burn), 100), vec![0, 24, 48]);
     }
 

@@ -103,6 +103,23 @@
   the new `find_grk_decompress` scan PATH themselves rather than spawning
   `which`, which the Windows runner has no usable copy of.
 
+- **No test skips over a missing tool or fixture**: `Check test tools` also
+  demands xmllint and xmlsec1 on all three runners, which the Windows job gets
+  from vcpkg's `libxml2[tools]` and `xmlsec[tools]` and macOS from brew, and
+  the Linux job installs `fonts-dejavu-core`. The schemas the packaging tests
+  validate against live in `tests/fixtures/xsd` now, so `POSTKIT_DCP_XSD_DIR`,
+  `POSTKIT_IMF_PKL_XSD` and `IMFWIZARD_IMF_XSD_DIR` only redirect a test that
+  already runs. The KDM schema test reads the DCP-o-matic fixtures unless
+  `POSTKIT_SAMPLE_KDMS` names another directory, and the AssetUUID tests find
+  asdcp-info in asdcplib-sys's own build output unless `POSTKIT_ASDCP_INFO`
+  names one. The c14n cross-check against xmllint drops the carriage returns
+  Windows adds instead of skipping there, and
+  `required_extensions_fragment` binds the `ds` prefix that libdcp declares on
+  the document root, which the extracted element otherwise used unbound. The
+  font tests search each platform's font directories rather than
+  `/usr/share/fonts` alone. Two early returns are left: an OpenSSL build that
+  refuses RSA over SHA-1, and `POSTKIT_CLAIRMETA_DATA`.
+
 - **A picture wrap refuses a codestream the standard cannot carry**: `mxf_wrap`
   took any codestream for either standard, and the picture descriptor it opened
   asdcplib with left the JPEG2000 sub-descriptor zeroed, so a DCP's X'Y'Z'

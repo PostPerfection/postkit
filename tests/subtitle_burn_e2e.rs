@@ -334,19 +334,11 @@ fn text_style(effect: BurnEffect) -> BurnStyle {
     }
 }
 
-/// A burn of one centred text cue, or `None` when this machine has no font and
-/// the test should be skipped rather than fail on the environment.
-fn text_burn(start_ms: u64, end_ms: u64, style: BurnStyle) -> Option<SubtitleBurn> {
+/// A burn of one centred text cue.
+fn text_burn(start_ms: u64, end_ms: u64, style: BurnStyle) -> SubtitleBurn {
     let mut cue = StyledCue::text(start_ms, end_ms, vec![StyledRun::plain("Hello")]);
     cue.valign = Some(VAlign::Middle);
-    match SubtitleBurn::new(vec![cue], None, style, TEXT_FPS as f64) {
-        Ok(burn) => Some(burn),
-        Err(error) if error.to_string().contains("no font found") => {
-            eprintln!("skipping: fontdb found no system font on this machine");
-            None
-        }
-        Err(error) => panic!("burn: {error}"),
-    }
+    SubtitleBurn::new(vec![cue], None, style, TEXT_FPS as f64).expect("burn")
 }
 
 /// Burn one frame over the flat background and return its 16-bit samples.
@@ -414,10 +406,8 @@ fn deviation(frame: &[u16]) -> u32 {
 
 #[test]
 fn an_outline_draws_effect_colour_around_the_text() {
-    let Some(plain) = text_burn(0, 1000, text_style(BurnEffect::None)) else {
-        return;
-    };
-    let outlined = text_burn(0, 1000, text_style(BurnEffect::Outline)).expect("outline burn");
+    let plain = text_burn(0, 1000, text_style(BurnEffect::None));
+    let outlined = text_burn(0, 1000, text_style(BurnEffect::Outline));
     let plain = burnt_frame(&plain, 0);
     let outlined = burnt_frame(&outlined, 0);
 
@@ -455,9 +445,7 @@ fn an_outline_draws_effect_colour_around_the_text() {
 
 #[test]
 fn a_shadow_falls_below_and_right_of_the_text() {
-    let Some(burn) = text_burn(0, 1000, text_style(BurnEffect::Shadow)) else {
-        return;
-    };
+    let burn = text_burn(0, 1000, text_style(BurnEffect::Shadow));
     let frame = burnt_frame(&burn, 0);
     let text = pixels_matching(&frame, is_bright);
     let shadow = pixels_matching(&frame, is_dark);
@@ -490,9 +478,7 @@ fn a_fade_ramps_the_cue_up_and_leaves_the_frames_around_it_alone() {
         ..text_style(BurnEffect::None)
     };
     // The cue runs 0..1000ms at 8fps, so the ramp covers frames 0 to 4.
-    let Some(burn) = text_burn(0, 1000, style) else {
-        return;
-    };
+    let burn = text_burn(0, 1000, style);
     let at_start = burnt_frame(&burn, 0);
     let ramping = burnt_frame(&burn, 1);
     let full = burnt_frame(&burn, 4);
@@ -518,9 +504,7 @@ fn a_fade_ramps_the_cue_up_and_leaves_the_frames_around_it_alone() {
 
 #[test]
 fn x_scale_stretches_the_text_horizontally_only() {
-    let Some(plain) = text_burn(0, 1000, text_style(BurnEffect::None)) else {
-        return;
-    };
+    let plain = text_burn(0, 1000, text_style(BurnEffect::None));
     let stretched = text_burn(
         0,
         1000,
@@ -528,8 +512,7 @@ fn x_scale_stretches_the_text_horizontally_only() {
             x_scale: 2.0,
             ..text_style(BurnEffect::None)
         },
-    )
-    .expect("stretched burn");
+    );
     let plain = pixels_matching(&burnt_frame(&plain, 0), is_bright);
     let stretched = pixels_matching(&burnt_frame(&stretched, 0), is_bright);
 
@@ -552,9 +535,7 @@ fn x_scale_stretches_the_text_horizontally_only() {
 
 #[test]
 fn frames_inside_one_cue_burn_identically_unless_a_fade_is_running() {
-    let Some(steady) = text_burn(0, 1000, text_style(BurnEffect::Shadow)) else {
-        return;
-    };
+    let steady = text_burn(0, 1000, text_style(BurnEffect::Shadow));
     assert_eq!(
         burnt_frame(&steady, 1),
         burnt_frame(&steady, 2),
@@ -568,8 +549,7 @@ fn frames_inside_one_cue_burn_identically_unless_a_fade_is_running() {
             fade_down_ms: 1000,
             ..text_style(BurnEffect::Shadow)
         },
-    )
-    .expect("fading burn");
+    );
     assert_ne!(
         burnt_frame(&fading, 1),
         burnt_frame(&fading, 2),
@@ -589,9 +569,7 @@ fn an_effect_is_drawn_in_the_colour_it_names() {
         },
         ..text_style(BurnEffect::Outline)
     };
-    let Some(burn) = text_burn(0, 1000, style) else {
-        return;
-    };
+    let burn = text_burn(0, 1000, style);
     let frame = burnt_frame(&burn, 0);
     let blue = (0..TEXT_HEIGHT as usize)
         .flat_map(|row| (0..TEXT_WIDTH as usize).map(move |column| (row, column)))
