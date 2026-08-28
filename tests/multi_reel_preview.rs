@@ -2,8 +2,7 @@
 //!
 //! The package is written by postkit's own ASSETMAP and CPL writers around
 //! three short clips, then loaded through the libmpv render player: the same
-//! `load_package_dir` the wizards call. Needs ffmpeg for the clips, and skips
-//! when it is absent.
+//! `load_package_dir` the wizards call. Needs ffmpeg for the clips.
 
 #![cfg(all(target_os = "linux", feature = "libmpv"))]
 
@@ -30,14 +29,6 @@ const TRIMMED_REEL: usize = 1;
 const TRIMMED_REEL_SECONDS: u32 = 1;
 const DURATION_TOLERANCE_SECONDS: f64 = 0.2;
 const DURATION_TIMEOUT: Duration = Duration::from_secs(20);
-
-fn have_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-}
 
 fn write_clip(path: &Path, seconds: u32) {
     let out = std::process::Command::new("ffmpeg")
@@ -143,10 +134,6 @@ fn duration_when_ready(player: &MpvRenderPlayer) -> f64 {
 
 #[test]
 fn a_three_reel_package_plays_as_one_timeline() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     write_package(dir.path(), |cpl| cpl);
 
@@ -179,10 +166,6 @@ fn a_three_reel_package_plays_as_one_timeline() {
 
 #[test]
 fn a_trimmed_reel_plays_only_the_span_the_cpl_states() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     write_package(dir.path(), trim_one_reel);
 

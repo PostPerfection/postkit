@@ -111,20 +111,8 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn have(bin: &str) -> bool {
-        Command::new(bin)
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
     #[test]
     fn mks_extracts_and_parses_srt_stream() {
-        if !have("ffmpeg") || !have("ffprobe") {
-            eprintln!("skipping mks test: ffmpeg/ffprobe not found");
-            return;
-        }
         let dir = TempDir::new().unwrap();
         let srt = dir.path().join("in.srt");
         std::fs::write(&srt, "1\n00:00:01,000 --> 00:00:03,000\nHello mks\n").unwrap();
@@ -151,10 +139,6 @@ mod tests {
 
     #[test]
     fn mks_fails_loud_without_subtitle_stream() {
-        if !have("ffmpeg") || !have("ffprobe") {
-            eprintln!("skipping mks test: ffmpeg/ffprobe not found");
-            return;
-        }
         let dir = TempDir::new().unwrap();
         let mkv = dir.path().join("audio.mkv");
         let make = Command::new("ffmpeg")

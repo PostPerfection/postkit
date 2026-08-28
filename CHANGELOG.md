@@ -94,6 +94,15 @@
 
 ### Changed
 
+- **CI runs every test**: the ffmpeg 8.1 static build is installed on all three
+  runners, grok is built on Windows as well, and the Linux runner adds
+  `libmpv-dev` so the `libmpv` tests compile and run. A `Check test tools` step
+  fails the job when ffmpeg, ffprobe, grk_compress or grk_decompress is missing.
+  The tests no longer return early when one of those is absent, so a missing
+  tool is a failure instead of a pass. `postkit::grok::find_grk_compress` and
+  the new `find_grk_decompress` scan PATH themselves rather than spawning
+  `which`, which the Windows runner has no usable copy of.
+
 - **A picture wrap refuses a codestream the standard cannot carry**: `mxf_wrap`
   took any codestream for either standard, and the picture descriptor it opened
   asdcplib with left the JPEG2000 sub-descriptor zeroed, so a DCP's X'Y'Z'

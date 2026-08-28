@@ -27,30 +27,6 @@ const HEIGHT: u32 = 128;
 const CUE_WIDTH: u32 = 64;
 const CUE_HEIGHT: u32 = 32;
 
-fn have_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_grk_decompress() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(home).join("bin/grok/bin/grk_decompress");
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    std::process::Command::new("which")
-        .arg("grk_decompress")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| PathBuf::from(s.trim()))
-}
-
 fn make_clip(video: &Path) {
     let output = std::process::Command::new("ffmpeg")
         .args([
@@ -168,14 +144,8 @@ fn decode_frame(grk_decompress: &Path, codestream: &Path, out: &Path) -> Vec<u16
 
 #[test]
 fn a_burnt_cue_changes_its_own_region_and_nothing_else() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let Some(grk_decompress) = find_grk_decompress() else {
-        eprintln!("skipping: grk_decompress not found");
-        return;
-    };
+    let grk_decompress =
+        postkit::grok::find_grk_decompress().expect("grk_decompress is required for this test");
 
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
@@ -280,14 +250,8 @@ fn spread(frame: &[u16], left: usize, right: usize) -> u32 {
 /// demuxer instead, so this proves the cue actually lands on those frames.
 #[test]
 fn an_image_sequence_burns_through_the_concat_demuxer() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let Some(grk_decompress) = find_grk_decompress() else {
-        eprintln!("skipping: grk_decompress not found");
-        return;
-    };
+    let grk_decompress =
+        postkit::grok::find_grk_decompress().expect("grk_decompress is required for this test");
 
     let dir = tempfile::tempdir().unwrap();
     let frames_dir = dir.path().join("frames");

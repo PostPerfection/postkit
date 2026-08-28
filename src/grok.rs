@@ -162,23 +162,32 @@ pub fn load_tiff(path: &Path) -> Result<TiffFrame, String> {
     })
 }
 
-/// Find the grk_compress binary.
-/// Searches: 1) $HOME/bin/grok/bin/ 2) PATH via `which`
-pub fn find_grk_compress() -> Option<PathBuf> {
+/// The directory a source build of grok installs its command line tools into.
+const HOME_GROK_BIN: &str = "bin/grok/bin";
+
+/// Find one of grok's command line tools under `$HOME/bin/grok/bin`, then on PATH.
+fn find_grok_tool(stem: &str) -> Option<PathBuf> {
+    let name = format!("{stem}{}", std::env::consts::EXE_SUFFIX);
     if let Ok(home) = std::env::var("HOME") {
-        let p = PathBuf::from(home).join("bin/grok/bin/grk_compress");
-        if p.exists() {
-            return Some(p);
+        let path = PathBuf::from(home).join(HOME_GROK_BIN).join(&name);
+        if path.is_file() {
+            return Some(path);
         }
     }
-    // Check PATH
-    std::process::Command::new("which")
-        .arg("grk_compress")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| PathBuf::from(s.trim()))
+    let path_variable = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_variable)
+        .map(|directory| directory.join(&name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Find the grk_compress binary.
+pub fn find_grk_compress() -> Option<PathBuf> {
+    find_grok_tool("grk_compress")
+}
+
+/// Find the grk_decompress binary.
+pub fn find_grk_decompress() -> Option<PathBuf> {
+    find_grok_tool("grk_decompress")
 }
 
 /// Compress a single TIFF to J2C by spawning a `grk_compress` subprocess.

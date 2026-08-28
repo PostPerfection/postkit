@@ -217,14 +217,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn have_ffmpeg() -> bool {
-        std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
     /// A directory name carrying every character that ends a filter or a filter
     /// argument.
     fn awkward_dir(root: &Path) -> PathBuf {
@@ -414,10 +406,6 @@ mod tests {
 
     #[test]
     fn ffmpeg_burns_in_subtitles_losslessly_when_asked() {
-        if !have_ffmpeg() {
-            eprintln!("skipping burn-in test: ffmpeg not found");
-            return;
-        }
         let root = TempDir::new().unwrap();
         let opts = BurninOptions {
             input: one_frame_video(root.path()),
@@ -433,10 +421,6 @@ mod tests {
 
     #[test]
     fn ffmpeg_burns_in_subtitles_from_an_awkward_path() {
-        if !have_ffmpeg() {
-            eprintln!("skipping burn-in test: ffmpeg not found");
-            return;
-        }
         let root = TempDir::new().unwrap();
         let dir = awkward_dir(root.path());
         let opts = BurninOptions {
@@ -454,10 +438,6 @@ mod tests {
 
     #[test]
     fn ffmpeg_burns_in_text_holding_filter_separators() {
-        if !have_ffmpeg() {
-            eprintln!("skipping burn-in test: ffmpeg not found");
-            return;
-        }
         let root = TempDir::new().unwrap();
         let opts = BurninOptions {
             input: one_frame_video(root.path()),

@@ -12,7 +12,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            grok-features: async grok-ffi libmpv
+          - os: macos-latest
+            grok-features: async grok-ffi
+          - os: windows-latest
+            grok-features: async grok-ffi
     steps:
       - uses: actions/checkout@v4
 
@@ -20,14 +26,29 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libssl-dev libxerces-c-dev xmlsec1 libxml2-utils ffmpeg
+          sudo apt-get install -y cmake libssl-dev libxerces-c-dev xmlsec1 libxml2-utils libmpv-dev
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake openssl xerces-c
+          brew install cmake openssl xerces-c ffmpeg
           echo "OPENSSL_DIR=$(brew --prefix openssl)" >> $GITHUB_ENV
           echo "CMAKE_PREFIX_PATH=$(brew --prefix xerces-c):$(brew --prefix openssl)" >> $GITHUB_ENV
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          curl -sSL -o ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-27-16-45/ffmpeg-n8.1.2-47-g156bb4d299-linux64-gpl-8.1.tar.xz
+          tar -xJf ffmpeg.tar.xz
+          echo "$PWD/ffmpeg-n8.1.2-47-g156bb4d299-linux64-gpl-8.1/bin" >> "$GITHUB_PATH"
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -sSL -o ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-27-16-45/ffmpeg-n8.1.2-47-g156bb4d299-win64-gpl-8.1.zip
+          unzip -q ffmpeg.zip
+          echo "$(cygpath -w "$PWD/ffmpeg-n8.1.2-47-g156bb4d299-win64-gpl-8.1/bin")" >> "$GITHUB_PATH"
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
@@ -51,6 +72,27 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup grok
+        uses: PostPerfection/setup-grok@v1
+        with:
+          grok-ref: v20.4.0
+
+      - name: Check test tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+          grk_compress -h > /dev/null
+          grk_decompress -h > /dev/null
+          # no xmllint on the windows runner and no test reaches it there
+          if [ "$RUNNER_OS" != Windows ]; then
+            xmllint --version
+          fi
+          if [ "$RUNNER_OS" = Linux ]; then
+            pkg-config --modversion mpv
+          fi
+
       - name: Build
         run: cargo build --features "async tms"
 
@@ -60,25 +102,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --features "async tms" -- -D warnings
 
-      - name: Setup grok
-        if: runner.os != 'Windows'
-        uses: PostPerfection/setup-grok@v1
-        with:
-          grok-ref: v20.4.0
-
-      # grok-ffi links libgrokj2k (built above); skipped on windows where the
-      # source build is not wired up.
       - name: Build (grok-ffi)
-        if: runner.os != 'Windows'
-        run: cargo build --features "async grok-ffi"
+        run: cargo build --features "${{ matrix.grok-features }}"
 
       - name: Test (grok-ffi)
-        if: runner.os != 'Windows'
-        run: cargo test --features "async grok-ffi"
+        run: cargo test --features "${{ matrix.grok-features }}"
 
       - name: Clippy (grok-ffi)
-        if: runner.os != 'Windows'
-        run: cargo clippy --all-targets --features "async grok-ffi" -- -D warnings
+        run: cargo clippy --all-targets --features "${{ matrix.grok-features }}" -- -D warnings
 
       - name: Format check
         run: cargo fmt -- --check

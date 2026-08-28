@@ -14,21 +14,8 @@ const FRAME_COUNT: u64 = 4;
 const WIDTH: u32 = 128;
 const HEIGHT: u32 = 128;
 
-fn have_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 #[test]
 fn a_video_source_encodes_to_one_codestream_per_frame() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
     let status = std::process::Command::new("ffmpeg")
@@ -99,11 +86,6 @@ fn a_video_source_encodes_to_one_codestream_per_frame() {
 /// so a wrong-by-a-frame composition shows up as a codestream count.
 #[test]
 fn a_23_976_clip_encodes_500_codestreams_where_an_integer_24_would_make_501() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     const NTSC_FRAME_COUNT: u64 = 500;
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("ntsc.mp4");
@@ -157,11 +139,6 @@ fn a_23_976_clip_encodes_500_codestreams_where_an_integer_24_would_make_501() {
 /// `fps=24` filter duplicates one and the composition runs a frame long.
 #[test]
 fn reading_a_23_976_clip_at_24_encodes_every_frame_once_and_not_reading_it_duplicates_one() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     const NTSC_FRAME_COUNT: u64 = 500;
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("ntsc.mp4");
@@ -224,11 +201,6 @@ fn reading_a_23_976_clip_at_24_encodes_every_frame_once_and_not_reading_it_dupli
 /// real encode, so this runs one and reads the last progress update.
 #[test]
 fn a_video_encode_reports_where_the_time_went() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
     let status = std::process::Command::new("ffmpeg")
@@ -326,11 +298,6 @@ fn an_image_sequence_refuses_a_source_read_rate() {
 /// directory encoded the whole clip first.
 #[test]
 fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     const CAPPED_FRAME_COUNT: u64 = 48;
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
@@ -418,11 +385,6 @@ fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
 /// and then throw the codestreams away.
 #[test]
 fn a_frame_range_encodes_only_its_window_and_the_frames_a_full_encode_wrote_there() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     const SOURCE_FRAMES: u64 = 48;
     const FIRST_FRAME: u64 = 10;
     const WINDOW_FRAMES: u64 = 5;
@@ -525,11 +487,6 @@ fn a_frame_range_encodes_only_its_window_and_the_frames_a_full_encode_wrote_ther
 
 #[test]
 fn a_frame_range_past_the_end_of_the_source_fails_before_anything_is_encoded() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     const SOURCE_FRAMES: u64 = 48;
 
     let dir = tempfile::tempdir().unwrap();
@@ -588,11 +545,6 @@ fn a_frame_range_past_the_end_of_the_source_fails_before_anything_is_encoded() {
 /// included.
 #[test]
 fn the_resumable_pipeline_encodes_a_window_and_resumes_inside_it() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     use postkit::grok_encoder::{
         CompressParams, EncodeProgress, contiguous_encoded_frames, encode_video_pipeline_resumable,
     };
@@ -786,11 +738,6 @@ fn write_detection_clip(path: &std::path::Path) {
 
 #[test]
 fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mkv");
     write_detection_clip(&video);
@@ -912,11 +859,6 @@ fn encode_codestream_sizes(
 
 #[test]
 fn a_higher_psnr_target_makes_larger_codestreams() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mkv");
     write_lavfi_clip(
@@ -940,11 +882,6 @@ fn a_higher_psnr_target_makes_larger_codestreams() {
 
 #[test]
 fn a_byte_cap_holds_where_the_psnr_target_cannot() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("noise.mkv");
     write_lavfi_clip(
@@ -977,11 +914,6 @@ fn a_byte_cap_holds_where_the_psnr_target_cannot() {
 /// which runs its own ffmpeg, so the findings have to come back from there too.
 #[test]
 fn the_resumable_pipeline_reports_its_own_findings() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     use postkit::grok_encoder::{CompressParams, EncodeProgress, encode_video_pipeline_resumable};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1082,11 +1014,6 @@ fn write_ntsc_detection_clip(path: &std::path::Path) {
 /// frame of the testsrc.
 #[test]
 fn the_resumable_pipeline_converts_findings_at_the_exact_rate() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     use postkit::grok_encoder::{CompressParams, EncodeProgress, encode_video_pipeline_resumable};
 
     let dir = tempfile::tempdir().unwrap();

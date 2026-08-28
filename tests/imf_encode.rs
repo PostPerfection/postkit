@@ -191,31 +191,12 @@ fn red_sequence(dir: &Path) -> std::path::PathBuf {
     frames
 }
 
-fn have_grk_compress() -> bool {
-    if postkit::grok::find_grk_compress().is_some() {
-        return true;
-    }
-    eprintln!("skipping: grk_compress not available");
-    false
-}
-
-fn have_ffmpeg() -> bool {
-    let found = std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !found {
-        eprintln!("skipping: ffmpeg not available");
-    }
-    found
-}
-
 #[test]
 fn the_pipeline_encodes_an_image_sequence_under_the_imf_rsiz() {
-    if !have_grk_compress() {
-        return;
-    }
+    assert!(
+        postkit::grok::find_grk_compress().is_some(),
+        "grk_compress is required for this test"
+    );
     let rsiz = test_rsiz();
     let dir = tempfile::tempdir().unwrap();
     let frames = red_sequence(dir.path());
@@ -241,9 +222,10 @@ fn the_pipeline_encodes_an_image_sequence_under_the_imf_rsiz() {
 
 #[test]
 fn the_parallel_encoder_writes_the_imf_rsiz_it_is_given() {
-    if !have_grk_compress() {
-        return;
-    }
+    assert!(
+        postkit::grok::find_grk_compress().is_some(),
+        "grk_compress is required for this test"
+    );
     let rsiz = test_rsiz();
     let dir = tempfile::tempdir().unwrap();
     let frames = postkit::encode::find_source_frames(&red_sequence(dir.path())).unwrap();
@@ -296,9 +278,6 @@ fn the_parallel_encoder_refuses_the_xyz_transform_under_an_imf_rsiz() {
 
 #[test]
 fn a_held_still_is_encoded_under_the_imf_rsiz() {
-    if !have_ffmpeg() {
-        return;
-    }
     let rsiz = test_rsiz();
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("card.png");

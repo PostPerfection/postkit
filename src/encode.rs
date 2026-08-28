@@ -219,8 +219,7 @@ pub fn find_source_frames(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// For GPU-accelerated encoding, set `opts.gpu_device` to the device index.
 pub fn encode(opts: &EncodeOptions) -> EncodeResult {
     let compressor = if opts.compressor_path.as_os_str().is_empty() {
-        // Try to find grk_compress in PATH
-        which_compressor()
+        crate::grok::find_grk_compress()
     } else {
         Some(opts.compressor_path.clone())
     };
@@ -320,23 +319,6 @@ pub fn encode(opts: &EncodeOptions) -> EncodeResult {
         output_dir: opts.output_dir.clone(),
         ..Default::default()
     }
-}
-
-/// Try to find `grk_compress` in PATH.
-fn which_compressor() -> Option<PathBuf> {
-    std::process::Command::new("which")
-        .arg("grk_compress")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(s))
-            }
-        })
 }
 
 // ─── Streaming encode (ffmpeg → raw pipe → grk_compress) ──────────────────
@@ -715,9 +697,8 @@ pub fn find_compressor() -> Option<(PathBuf, Option<PathBuf>)> {
             return Some((grk, Some(lib_dir)));
         }
     }
-    // Check PATH
-    if let Some(p) = which_compressor() {
-        return Some((p, None));
+    if let Some(path) = crate::grok::find_grk_compress() {
+        return Some((path, None));
     }
     None
 }
@@ -1625,10 +1606,6 @@ mod tests {
 
     #[test]
     fn parallel_encode_honours_the_ratio_and_the_cap() {
-        if crate::grok::find_grk_compress().is_none() {
-            eprintln!("skipping: grk_compress not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in");
         std::fs::create_dir(&input).unwrap();
@@ -1724,10 +1701,6 @@ mod tests {
 
     #[test]
     fn parallel_encode_compresses_only_the_frames_it_is_given() {
-        if crate::grok::find_grk_compress().is_none() {
-            eprintln!("skipping: grk_compress not available");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in");
         std::fs::create_dir(&input).unwrap();

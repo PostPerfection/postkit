@@ -1,21 +1,8 @@
 use postkit::colour::{ColourSpace, DcdmTransform};
 use postkit::dcdm::*;
 
-fn have_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 #[test]
 fn dcdm_end_to_end_writes_xyz_tiffs() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -74,10 +61,6 @@ fn dcdm_end_to_end_writes_xyz_tiffs() {
 /// writes, so the encoder and `create_dcdm` cannot drift apart.
 #[test]
 fn the_public_transform_reproduces_a_written_dcdm_frame() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
     const SIZE: u32 = 32;
 
     let dir = tempfile::tempdir().unwrap();

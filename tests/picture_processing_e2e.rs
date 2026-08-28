@@ -35,30 +35,6 @@ const CONTENT_FLOOR_DIVISOR: u16 = 2;
 const SEQUENCE_SIZE: u32 = 128;
 const SEQUENCE_CROP: u32 = 16;
 
-fn have_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_grk_decompress() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(home).join("bin/grok/bin/grk_decompress");
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    std::process::Command::new("which")
-        .arg("grk_decompress")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| PathBuf::from(s.trim()))
-}
-
 /// A testsrc clip, optionally run through an extra filter chain.
 fn make_clip(video: &Path, width: u32, height: u32, filters: Option<&str>) {
     let mut command = std::process::Command::new("ffmpeg");
@@ -175,14 +151,8 @@ fn decode_frame(grk_decompress: &Path, codestream: &Path, out: &Path) -> Decoded
 
 #[test]
 fn a_cropped_source_lands_centred_on_the_target_raster() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let Some(grk_decompress) = find_grk_decompress() else {
-        eprintln!("skipping: grk_decompress not found");
-        return;
-    };
+    let grk_decompress =
+        postkit::grok::find_grk_decompress().expect("grk_decompress is required for this test");
 
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
@@ -261,11 +231,6 @@ fn a_cropped_source_lands_centred_on_the_target_raster() {
 
 #[test]
 fn black_bars_are_detected_from_a_few_sampled_frames() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("barred.mp4");
     let content_height = SOURCE_HEIGHT - 2 * BAR_HEIGHT;
@@ -309,11 +274,6 @@ fn black_bars_are_detected_from_a_few_sampled_frames() {
 
 #[test]
 fn an_image_sequence_with_a_crop_encodes_at_the_cropped_size() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let frames_dir = dir.path().join("frames");
     std::fs::create_dir_all(&frames_dir).unwrap();

@@ -5,36 +5,12 @@
 //! demuxer and that the codestreams come back at the source raster.
 
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_with_options};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 const FRAME_COUNT: u64 = 3;
 const FRAME_SIZE: u32 = 128;
-
-fn have_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-fn find_grk_decompress() -> Option<PathBuf> {
-    if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(home).join("bin/grok/bin/grk_decompress");
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    std::process::Command::new("which")
-        .arg("grk_decompress")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| PathBuf::from(s.trim()))
-}
 
 /// Raster of a codestream decoded to a 16-bit-per-channel PPM.
 fn decoded_raster(grk_decompress: &Path, codestream: &Path, out: &Path) -> (u32, u32) {
@@ -78,14 +54,8 @@ fn decoded_raster(grk_decompress: &Path, codestream: &Path, out: &Path) -> (u32,
 
 #[test]
 fn a_jpeg_sequence_encodes_to_one_codestream_per_frame() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-    let Some(grk_decompress) = find_grk_decompress() else {
-        eprintln!("skipping: grk_decompress not found");
-        return;
-    };
+    let grk_decompress =
+        postkit::grok::find_grk_decompress().expect("grk_decompress is required for this test");
 
     let dir = tempfile::tempdir().unwrap();
     let frames_dir = dir.path().join("frames");

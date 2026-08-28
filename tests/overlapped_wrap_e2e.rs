@@ -23,14 +23,6 @@ const FRAME_COUNT: u64 = 12;
 /// arrives, so the cancel lands mid-encode.
 const CANCEL_FRAME_COUNT: u64 = 600;
 
-fn have_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 fn make_clip(path: &Path, frames: u64) {
     let output = std::process::Command::new("ffmpeg")
         .args([
@@ -101,11 +93,6 @@ fn essence(path: &Path) -> Vec<Vec<u8>> {
 /// not match the sequential wrap's.
 #[test]
 fn wrapping_during_the_encode_writes_the_essence_wrapping_afterwards_does() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
     make_clip(&video, FRAME_COUNT);
@@ -211,11 +198,6 @@ fn wrapping_during_the_encode_writes_the_essence_wrapping_afterwards_does() {
 /// codestreams that finished stay put, as they do for an encode on its own.
 #[test]
 fn a_cancelled_overlapped_wrap_leaves_the_codestreams_and_no_mxf() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
     make_clip(&video, CANCEL_FRAME_COUNT);
@@ -269,11 +251,6 @@ fn a_cancelled_overlapped_wrap_leaves_the_codestreams_and_no_mxf() {
 /// wrap's own, or nobody can tell what went wrong.
 #[test]
 fn a_wrap_that_cannot_open_its_mxf_reports_why_rather_than_that_it_stopped() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
     make_clip(&video, FRAME_COUNT);

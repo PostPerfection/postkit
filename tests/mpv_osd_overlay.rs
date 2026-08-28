@@ -1,7 +1,7 @@
 //! The ASS overlay the render player installs, drawn by a real libmpv.
 //!
 //! A black clip is rendered through the software renderer, so the only pixels
-//! that can be light are the overlay's own. Skips when ffmpeg is absent.
+//! that can be light are the overlay's own.
 #![cfg(all(target_os = "linux", feature = "libmpv"))]
 
 use std::path::Path;
@@ -30,14 +30,6 @@ const FRAME_TIMEOUT: Duration = Duration::from_secs(20);
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 /// How light a pixel counts as drawn on, out of 255.
 const DRAWN_ON: u8 = 200;
-
-fn have_ffmpeg() -> bool {
-    std::process::Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
-}
 
 fn write_black_clip(path: &Path) {
     let out = std::process::Command::new("ffmpeg")
@@ -132,10 +124,6 @@ fn overlay(events: &str) -> OsdAssOverlay<'_> {
 
 #[test]
 fn an_ass_overlay_is_drawn_and_taken_away_again() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
     let directory = tempfile::tempdir().unwrap();
     let clip = directory.path().join("black.mp4");
     write_black_clip(&clip);
@@ -192,10 +180,6 @@ fn an_ass_overlay_is_drawn_and_taken_away_again() {
 /// overlay hold drawings of different colours.
 #[test]
 fn each_line_of_the_events_is_drawn() {
-    if !have_ffmpeg() {
-        eprintln!("skipping: ffmpeg not available");
-        return;
-    }
     let directory = tempfile::tempdir().unwrap();
     let clip = directory.path().join("black.mp4");
     write_black_clip(&clip);

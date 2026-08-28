@@ -250,20 +250,8 @@ mod tests {
         text.iter().map(|line| line.to_string()).collect()
     }
 
-    fn have_ffmpeg() -> bool {
-        std::process::Command::new("ffmpeg")
-            .arg("-version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    }
-
     #[test]
     fn a_black_clip_reports_black_and_frozen_over_finished_essence() {
-        if !have_ffmpeg() {
-            eprintln!("skipping essence detection test: ffmpeg not found");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let clip = dir.path().join("black.mp4");
         let made = std::process::Command::new("ffmpeg")
@@ -291,10 +279,6 @@ mod tests {
 
     #[test]
     fn essence_ffmpeg_cannot_read_fails_loud() {
-        if !have_ffmpeg() {
-            eprintln!("skipping essence detection test: ffmpeg not found");
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let not_video = dir.path().join("notes.txt");
         std::fs::write(&not_video, "this is not picture essence").unwrap();
