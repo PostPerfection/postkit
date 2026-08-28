@@ -1,10 +1,5 @@
 # Planned
 
-- Nothing selects an IMF profile yet. Every postkit entry point now carries the
-  Rsiz and the source colour, but imfwizard's `create` leaves
-  `EncodeRunOptions` at its cinema defaults, so it hands the AS-02 wrap X'Y'Z'
-  cinema picture and the wrap refuses it. IMP creation stays broken until that
-  caller passes an IMF Rsiz, `KeepRgb` and the picture's colour ULs.
 - The preview shows only Rec.709 App 2E picture. `render_imf_frame` refuses
   ST 2084, HLG, BT.2020 and P3-D65 by name, which is most of what a real IMP
   carries: the display transform for them is a tone map plus a gamut conversion
