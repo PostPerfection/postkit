@@ -506,7 +506,11 @@ fn a_frame_range_past_the_end_of_the_source_fails_before_anything_is_encoded() {
         .arg(&video)
         .output()
         .expect("ffmpeg");
-    assert!(ffmpeg.status.success());
+    assert!(
+        ffmpeg.status.success(),
+        "ffmpeg failed: {}",
+        String::from_utf8_lossy(&ffmpeg.stderr)
+    );
 
     let output = dir.path().join("out");
     let outcome = run_encode_with_options(

@@ -16,9 +16,9 @@ jobs:
           - os: ubuntu-latest
             grok-features: async grok-ffi libmpv
           - os: macos-latest
-            grok-features: async grok-ffi
+            grok-features: async grok-ffi libmpv
           - os: windows-latest
-            grok-features: async grok-ffi
+            grok-features: async grok-ffi libmpv
     steps:
       - uses: actions/checkout@v4
 
@@ -26,14 +26,27 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake libssl-dev libxerces-c-dev xmlsec1 libxml2-utils libmpv-dev fonts-dejavu-core
+          sudo apt-get install -y cmake libssl-dev libxerces-c-dev xmlsec1 libxml2-utils fonts-dejavu-core
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake openssl xerces-c ffmpeg xmlsec1
+          brew install cmake openssl xerces-c xmlsec1
           echo "OPENSSL_DIR=$(brew --prefix openssl)" >> $GITHUB_ENV
           echo "CMAKE_PREFIX_PATH=$(brew --prefix xerces-c):$(brew --prefix openssl)" >> $GITHUB_ENV
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        uses: mamba-org/setup-micromamba@v3
+        with:
+          environment-name: ffmpeg
+          create-args: ffmpeg=8.1.1=gpl_h4b93310_102
+          init-shell: none
+
+      - name: Put ffmpeg on PATH (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: echo "$(dirname "$("${MAMBA_EXE:-micromamba}" run -n ffmpeg which ffmpeg)")" >> "$GITHUB_PATH"
 
       - name: Install ffmpeg (Linux)
         if: runner.os == 'Linux'
@@ -50,6 +63,13 @@ jobs:
           unzip -q ffmpeg.zip
           echo "$(cygpath -w "$PWD/ffmpeg-n8.1.2-47-g156bb4d299-win64-gpl-8.1/bin")" >> "$GITHUB_PATH"
 
+      - name: Install xmlsec1 (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          /c/msys64/usr/bin/pacman.exe -Sy --noconfirm --needed mingw-w64-x86_64-xmlsec
+          echo "C:\msys64\mingw64\bin" >> "$GITHUB_PATH"
+
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: |
@@ -57,7 +77,7 @@ jobs:
           # vcpkg reads curl 56 and 503 off github's archive host as permanent and
           # refuses to retry the source download, so retry the whole install
           for ($attempt = 1; $attempt -le 5; $attempt++) {
-            vcpkg install xerces-c:x64-windows openssl:x64-windows 'libxml2[tools]:x64-windows' 'xmlsec[tools]:x64-windows'
+            vcpkg install xerces-c:x64-windows openssl:x64-windows 'libxml2[tools]:x64-windows'
             if ($LASTEXITCODE -eq 0) { break }
             if ($attempt -eq 5) { throw "vcpkg install failed after $attempt attempts" }
             Start-Sleep -Seconds (30 * $attempt)
@@ -71,7 +91,6 @@ jobs:
           echo "CMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake" >> $env:GITHUB_ENV
           $installed = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
           echo "$installed\tools\libxml2" >> $env:GITHUB_PATH
-          echo "$installed\tools\xmlsec" >> $env:GITHUB_PATH
           echo "$installed\bin" >> $env:GITHUB_PATH
 
       - uses: dtolnay/rust-toolchain@stable
@@ -80,6 +99,12 @@ jobs:
         uses: PostPerfection/setup-grok@v1
         with:
           grok-ref: v20.4.0
+
+      - name: Setup libmpv
+        uses: PostPerfection/setup-libmpv@v1
+        with:
+          mpv-release: 20260828
+          mpv-archive: mpv-dev-x86_64-20260828-git-182fa6ca49.7z
 
       - name: Check test tools
         shell: bash
@@ -91,7 +116,10 @@ jobs:
           grk_decompress -h > /dev/null
           xmllint --version
           xmlsec1 --version
-          if [ "$RUNNER_OS" = Linux ]; then
+          if [ "$RUNNER_OS" = Windows ]; then
+            # no pkg-config for mpv there, build.rs reads this instead
+            test -n "${MPV_LIB_DIR:-}"
+          else
             pkg-config --modversion mpv
           fi
 

@@ -1462,6 +1462,97 @@ fn cert_rsa_public_key(cert_path: &Path) -> Result<rsa::RsaPublicKey, String> {
     })
 }
 
+/// Driving the xmlsec1 command line tool from tests, on both the 1.2 and 1.3
+/// series. 1.3 made the key search strict, so a key handed over on the command
+/// line no longer matches a document whose KeyInfo names a certificate, and it
+/// will not build a certificate chain out of the sibling X509Data elements a
+/// DCP signature puts the intermediate in. Callers pass the intermediate, and
+/// this adds the 1.3-only options where the tool has them.
+#[cfg(test)]
+pub(crate) mod xmlsec1_cli {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::process::{Command, Output};
+    use std::sync::OnceLock;
+
+    /// Matches a key the document names by certificate rather than by name.
+    const LAX_KEY_SEARCH: &str = "--lax-key-search";
+    /// 1.3 prints only "Failure reason: SIGNATURE" without this.
+    const VERBOSE: &str = "--verbose";
+
+    /// `--help` lists only the commands, so the options are behind `--help-all`.
+    fn help_all() -> &'static str {
+        static HELP: OnceLock<String> = OnceLock::new();
+        HELP.get_or_init(|| {
+            let help = output(Command::new("xmlsec1").arg("--help-all"));
+            String::from_utf8_lossy(&help.stdout).into_owned()
+        })
+    }
+
+    fn output(command: &mut Command) -> Output {
+        command
+            .output()
+            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"))
+    }
+
+    fn command(mode: &str) -> Command {
+        let mut command = Command::new("xmlsec1");
+        command.arg(mode);
+        for option in [LAX_KEY_SEARCH, VERBOSE] {
+            if help_all().contains(option) {
+                command.arg(option);
+            }
+        }
+        command
+    }
+
+    /// Fill in a signature template with an independent signer.
+    pub(crate) fn sign(template: &Path, key: &Path, cert: &Path, out: &Path) -> Output {
+        let mut key_and_cert = OsString::from(key);
+        key_and_cert.push(",");
+        key_and_cert.push(cert);
+        output(
+            command("--sign")
+                .arg("--privkey-pem")
+                .arg(key_and_cert)
+                .arg("--output")
+                .arg(out)
+                .arg(template),
+        )
+    }
+
+    /// Verify `doc` up to `trusted`, with `untrusted` filling in the chain
+    /// between them, and `id_attributes` naming the Id-bearing elements. Pass
+    /// only the certificates that really are in the document's chain: 1.3 gives
+    /// up its key search over one that is not.
+    pub(crate) fn verify(
+        doc: &Path,
+        trusted: &Path,
+        untrusted: &[&Path],
+        id_attributes: &[&str],
+    ) -> Output {
+        let mut command = command("--verify");
+        command.arg("--trusted-pem").arg(trusted);
+        for certificate in untrusted {
+            command.arg("--untrusted-pem").arg(certificate);
+        }
+        for name in id_attributes {
+            command.args(["--id-attr:Id", name]);
+        }
+        output(command.arg(doc))
+    }
+
+    /// Everything xmlsec1 said, so a failed assertion names the reason.
+    pub(crate) fn report(output: &Output) -> String {
+        format!(
+            "status: {}\n  stdout: {}\n  stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1518,27 +1609,22 @@ mod tests {
         .to_string()
     }
 
+    /// The Id-bearing elements of the by-id profile, which xmlsec1 will not find
+    /// on its own.
+    const CPL_ID_ATTRIBUTES: &[&str] = &["ContentTitleText", "ReelList"];
+
     fn xmlsec1_verify(doc: &Path, trusted_pem: &Path) -> std::process::Output {
-        std::process::Command::new("xmlsec1")
-            .arg("--verify")
-            .arg("--trusted-pem")
-            .arg(trusted_pem)
-            .args(["--id-attr:Id", "ContentTitleText"])
-            .args(["--id-attr:Id", "ReelList"])
-            .arg(doc)
-            .output()
-            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"))
+        xmlsec1_cli::verify(
+            doc,
+            trusted_pem,
+            &[&chain().intermediate],
+            CPL_ID_ATTRIBUTES,
+        )
     }
 
     // Standard enveloped profile: verify with no --id-attr hints at all.
     fn xmlsec1_verify_no_id(doc: &Path, trusted_pem: &Path) -> std::process::Output {
-        std::process::Command::new("xmlsec1")
-            .arg("--verify")
-            .arg("--trusted-pem")
-            .arg(trusted_pem)
-            .arg(doc)
-            .output()
-            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"))
+        xmlsec1_cli::verify(doc, trusted_pem, &[&chain().intermediate], &[])
     }
 
     #[test]
@@ -1558,15 +1644,10 @@ mod tests {
         std::fs::write(&out, &signed).unwrap();
 
         let result = xmlsec1_verify(&out, &c.root);
-        eprintln!(
-            "xmlsec1 --verify (generic doc):\n  status: {}\n  stdout: {}\n  stderr: {}",
-            result.status,
-            String::from_utf8_lossy(&result.stdout).trim(),
-            String::from_utf8_lossy(&result.stderr).trim(),
-        );
         assert!(
             result.status.success(),
-            "xmlsec1 must verify the signed generic document against the trusted root"
+            "xmlsec1 must verify the signed generic document against the trusted root\n  {}",
+            xmlsec1_cli::report(&result)
         );
     }
 
@@ -1588,9 +1669,11 @@ mod tests {
         let out = dir.path().join("cpl-tampered.xml");
         std::fs::write(&out, &tampered).unwrap();
 
+        let result = xmlsec1_verify(&out, &c.root);
         assert!(
-            !xmlsec1_verify(&out, &c.root).status.success(),
-            "xmlsec1 must reject a tampered referenced element"
+            !result.status.success(),
+            "xmlsec1 must reject a tampered referenced element\n  {}",
+            xmlsec1_cli::report(&result)
         );
     }
 
@@ -1636,15 +1719,10 @@ mod tests {
 
         // The whole point of the standard profile: NO --id-attr hints needed.
         let result = xmlsec1_verify_no_id(&out, &c.root);
-        eprintln!(
-            "xmlsec1 --verify (enveloped, no --id-attr):\n  status: {}\n  stdout: {}\n  stderr: {}",
-            result.status,
-            String::from_utf8_lossy(&result.stdout).trim(),
-            String::from_utf8_lossy(&result.stderr).trim(),
-        );
         assert!(
             result.status.success(),
-            "xmlsec1 must verify the enveloped document with no --id-attr hints"
+            "xmlsec1 must verify the enveloped document with no --id-attr hints\n  {}",
+            xmlsec1_cli::report(&result)
         );
     }
 
@@ -1660,9 +1738,11 @@ mod tests {
         let out = dir.path().join("cpl-enveloped-tampered.xml");
         std::fs::write(&out, &tampered).unwrap();
 
+        let result = xmlsec1_verify_no_id(&out, &c.root);
         assert!(
-            !xmlsec1_verify_no_id(&out, &c.root).status.success(),
-            "xmlsec1 must reject a tampered enveloped document"
+            !result.status.success(),
+            "xmlsec1 must reject a tampered enveloped document\n  {}",
+            xmlsec1_cli::report(&result)
         );
     }
 
@@ -1762,11 +1842,6 @@ mod tests {
 
         let result = xmlsec1_verify_no_id(&out, &c.root);
         let stderr = String::from_utf8_lossy(&result.stderr).into_owned();
-        eprintln!(
-            "xmlsec1 --verify (rsa-sha1):\n  status: {}\n  stderr: {}",
-            result.status,
-            stderr.trim(),
-        );
         // OpenSSL 3 under a default crypto policy refuses RSA over SHA-1
         // outright, so the tool cannot judge this document either way.
         if stderr.contains("invalid digest") {
@@ -1775,14 +1850,17 @@ mod tests {
         }
         assert!(
             result.status.success(),
-            "xmlsec1 must verify an rsa-sha1 enveloped document"
+            "xmlsec1 must verify an rsa-sha1 enveloped document\n  {}",
+            xmlsec1_cli::report(&result)
         );
 
         let tampered = signed.replacen("Example &amp; Co", "Tampered &amp; Co", 1);
         std::fs::write(&out, &tampered).unwrap();
+        let result = xmlsec1_verify_no_id(&out, &c.root);
         assert!(
-            !xmlsec1_verify_no_id(&out, &c.root).status.success(),
-            "xmlsec1 must reject a tampered rsa-sha1 document"
+            !result.status.success(),
+            "xmlsec1 must reject a tampered rsa-sha1 document\n  {}",
+            xmlsec1_cli::report(&result)
         );
     }
 
@@ -1861,14 +1939,10 @@ mod tests {
             let out = dir.path().join(format!("cpl-comment-{name}.xml"));
             std::fs::write(&out, document).unwrap();
             let result = xmlsec1_verify_no_id(&out, &c.root);
-            eprintln!(
-                "xmlsec1 --verify (comment inside the root, {name}):\n  status: {}\n  stderr: {}",
-                result.status,
-                String::from_utf8_lossy(&result.stderr).trim(),
-            );
             assert!(
                 result.status.success(),
-                "xmlsec1 must accept the {name} document"
+                "xmlsec1 must accept the {name} document\n  {}",
+                xmlsec1_cli::report(&result)
             );
         }
     }
@@ -1892,8 +1966,8 @@ mod tests {
         let result = xmlsec1_verify(&out, &c.root);
         assert!(
             result.status.success(),
-            "xmlsec1 must verify it too: {}",
-            String::from_utf8_lossy(&result.stderr).trim()
+            "xmlsec1 must verify it too\n  {}",
+            xmlsec1_cli::report(&result)
         );
     }
 
@@ -1901,20 +1975,13 @@ mod tests {
     /// and the X509Certificate. An independent signer is the only way to produce
     /// a document declaring a canonicalization postkit does not sign with.
     fn xmlsec1_sign(template: &str, key: &Path, cert: &Path, out: &Path) -> String {
-        std::fs::write(out.with_extension("tpl"), template).unwrap();
-        let result = std::process::Command::new("xmlsec1")
-            .arg("--sign")
-            .arg("--privkey-pem")
-            .arg(format!("{},{}", key.display(), cert.display()))
-            .arg("--output")
-            .arg(out)
-            .arg(out.with_extension("tpl"))
-            .output()
-            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"));
+        let tpl = out.with_extension("tpl");
+        std::fs::write(&tpl, template).unwrap();
+        let result = xmlsec1_cli::sign(&tpl, key, cert, out);
         assert!(
             result.status.success(),
-            "xmlsec1 --sign failed: {}",
-            String::from_utf8_lossy(&result.stderr).trim()
+            "xmlsec1 --sign failed:\n  {}",
+            xmlsec1_cli::report(&result)
         );
         std::fs::read_to_string(out).unwrap()
     }
@@ -1985,12 +2052,7 @@ mod tests {
         let out = dir.path().join(format!("{name}.xml"));
         std::fs::write(&out, document).unwrap();
         let result = xmlsec1_verify_no_id(&out, root_pem);
-        eprintln!(
-            "xmlsec1 --verify ({name}):\n  status: {}\n  stdout: {}\n  stderr: {}",
-            result.status,
-            String::from_utf8_lossy(&result.stdout).trim(),
-            String::from_utf8_lossy(&result.stderr).trim(),
-        );
+        eprintln!("xmlsec1 ({name}): {}", xmlsec1_cli::report(&result));
         (ours.is_ok(), result.status.success())
     }
 

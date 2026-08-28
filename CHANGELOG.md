@@ -94,14 +94,30 @@
 
 ### Changed
 
-- **CI runs every test**: the ffmpeg 8.1 static build is installed on all three
-  runners, grok is built on Windows as well, and the Linux runner adds
-  `libmpv-dev` so the `libmpv` tests compile and run. A `Check test tools` step
-  fails the job when ffmpeg, ffprobe, grk_compress or grk_decompress is missing.
+- **CI runs every test**: ffmpeg 8.1 is installed on all three runners, from
+  the BtbN static build on Linux and Windows and from conda-forge on macOS,
+  where Homebrew's is built without libass or freetype and the burn-in tests
+  need both. grok is built on Windows as well, and `setup-libmpv` puts libmpv
+  on every runner so the `libmpv` feature builds everywhere and its tests run
+  on Linux. A `Check test tools` step fails the job when ffmpeg, ffprobe,
+  grk_compress or grk_decompress is missing.
   The tests no longer return early when one of those is absent, so a missing
   tool is a failure instead of a pass. `postkit::grok::find_grk_compress` and
   the new `find_grk_decompress` scan PATH themselves rather than spawning
   `which`, which the Windows runner has no usable copy of.
+
+- **The xmlsec1 tests run on the 1.2 and 1.3 series alike**: xmlsec 1.3 made
+  the key search strict, so `--sign` stopped matching a `--privkey-pem` key
+  against a template whose KeyInfo names a certificate, and `--verify` stopped
+  building a chain out of the sibling X509Data elements a DCP signature puts
+  the intermediate in. Every xmlsec1 call now goes through one
+  `xmldsig::xmlsec1_cli`, which reads `xmlsec1 --help-all` once and adds
+  `--lax-key-search` and `--verbose` where the tool has them, and takes the
+  chain between the document's signer and the trusted root as an explicit
+  `--untrusted-pem` list. Handing 1.3 a certificate that is not in the
+  document's chain makes its key search give up, so the self-signed case passes
+  none. Every assertion on an xmlsec1 or ffmpeg exit status now carries that
+  run's stdout and stderr, which is what `--verbose` restores on 1.3.
 
 - **No test skips over a missing tool or fixture**: `Check test tools` also
   demands xmllint and xmlsec1 on all three runners, which the Windows job gets

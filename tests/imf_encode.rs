@@ -288,7 +288,11 @@ fn a_held_still_is_encoded_under_the_imf_rsiz() {
         .arg(&image)
         .output()
         .expect("ffmpeg");
-    assert!(made.status.success(), "could not write the still");
+    assert!(
+        made.status.success(),
+        "could not write the still: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
 
     let held = dir.path().join("held");
     let hold = |apply_xyz_transform| StillHold {

@@ -117,7 +117,11 @@ fn the_public_transform_reproduces_a_written_dcdm_frame() {
             .stderr(std::process::Stdio::null())
             .output()
             .expect("ffmpeg");
-        assert!(raw.status.success());
+        assert!(
+            raw.status.success(),
+            "ffmpeg failed: {}",
+            String::from_utf8_lossy(&raw.stderr)
+        );
 
         let mut expected = vec![0u16; written.len()];
         DcdmTransform::to_xyz(space)

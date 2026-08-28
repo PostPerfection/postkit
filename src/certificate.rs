@@ -3018,19 +3018,14 @@ mod tests {
         }
     }
 
-    /// Run `xmlsec1 --verify` against a signed KDM, returning whether it passed.
-    fn xmlsec1_verify(kdm: &Path, trusted_pem: &Path) -> bool {
-        std::process::Command::new("xmlsec1")
-            .arg("--verify")
-            .arg("--trusted-pem")
-            .arg(trusted_pem)
-            .args(["--id-attr:Id", "AuthenticatedPublic"])
-            .args(["--id-attr:Id", "AuthenticatedPrivate"])
-            .arg(kdm)
-            .output()
-            .unwrap_or_else(|error| panic!("could not run xmlsec1: {error}"))
-            .status
-            .success()
+    /// The Id-bearing elements of a KDM, which xmlsec1 will not find on its own.
+    const KDM_ID_ATTRIBUTES: &[&str] = &["AuthenticatedPublic", "AuthenticatedPrivate"];
+
+    /// Run `xmlsec1 --verify` against a signed KDM. `untrusted` carries the
+    /// certificates between the KDM's signer and `trusted_pem`, which is empty
+    /// when the signer is the self-signed root.
+    fn xmlsec1_verify(kdm: &Path, trusted_pem: &Path, untrusted: &[&Path]) -> std::process::Output {
+        crate::xmldsig::xmlsec1_cli::verify(kdm, trusted_pem, untrusted, KDM_ID_ATTRIBUTES)
     }
 
     /// Reference inclusive c14n via libxml2, the same engine xmlsec1 uses.
@@ -3285,9 +3280,11 @@ mod tests {
         let mut config = chain_signed_config(f, out.clone());
         config.format = KdmFormat::Interop;
         generate_kdm(&config).expect("generate interop kdm");
+        let result = xmlsec1_verify(&out, &f.root, &[&f.intermediate]);
         assert!(
-            xmlsec1_verify(&out, &f.root),
-            "interop KDM signature must verify"
+            result.status.success(),
+            "interop KDM signature must verify\n  {}",
+            crate::xmldsig::xmlsec1_cli::report(&result)
         );
     }
 
@@ -3698,9 +3695,11 @@ mod tests {
         let out = dir.path().join("signed.kdm.xml");
         generate_kdm(&chain_signed_config(f, out.clone())).expect("generate signed kdm");
 
+        let result = xmlsec1_verify(&out, &f.root, &[&f.intermediate]);
         assert!(
-            xmlsec1_verify(&out, &f.root),
-            "xmlsec1 must verify the signed KDM against the trusted root"
+            result.status.success(),
+            "xmlsec1 must verify the signed KDM against the trusted root\n  {}",
+            crate::xmldsig::xmlsec1_cli::report(&result)
         );
     }
 
@@ -3727,9 +3726,11 @@ mod tests {
                 vec![expected_thumbprint(&config.signer_cert_file)],
                 "{formulation} must authenticate with the signer leaf's thumbprint"
             );
+            let result = xmlsec1_verify(&out, &f.root, &[&f.intermediate]);
             assert!(
-                xmlsec1_verify(&out, &f.root),
-                "{formulation} must still verify against the trusted root"
+                result.status.success(),
+                "{formulation} must still verify against the trusted root\n  {}",
+                crate::xmldsig::xmlsec1_cli::report(&result)
             );
         }
     }
@@ -3747,9 +3748,11 @@ mod tests {
         assert_ne!(xml, tampered, "tamper must actually change the file");
         std::fs::write(&out, tampered).unwrap();
 
+        let result = xmlsec1_verify(&out, &f.root, &[&f.intermediate]);
         assert!(
-            !xmlsec1_verify(&out, &f.root),
-            "xmlsec1 must reject a KDM whose AuthenticatedPublic was altered"
+            !result.status.success(),
+            "xmlsec1 must reject a KDM whose AuthenticatedPublic was altered\n  {}",
+            crate::xmldsig::xmlsec1_cli::report(&result)
         );
     }
 
@@ -3760,7 +3763,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("signed.kdm.xml");
         generate_kdm(&test_config(f, out.clone())).expect("generate signed kdm");
-        assert!(xmlsec1_verify(&out, &f.root), "self-signed KDM must verify");
+        // the root signed it, so there is nothing between the two
+        let result = xmlsec1_verify(&out, &f.root, &[]);
+        assert!(
+            result.status.success(),
+            "self-signed KDM must verify\n  {}",
+            crate::xmldsig::xmlsec1_cli::report(&result)
+        );
     }
 
     #[test]
@@ -4068,9 +4077,11 @@ mod tests {
             audio_forensic_marking: AudioForensicMarking::default(),
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
+        let result = xmlsec1_verify(&out, &f.root, &[&f.intermediate]);
         assert!(
-            xmlsec1_verify(&out, &f.root),
-            "xmlsec1 must verify the re-wrapped KDM against the trusted root"
+            result.status.success(),
+            "xmlsec1 must verify the re-wrapped KDM against the trusted root\n  {}",
+            crate::xmldsig::xmlsec1_cli::report(&result)
         );
     }
 
