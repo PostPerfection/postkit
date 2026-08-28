@@ -1498,6 +1498,10 @@ pub(crate) mod xmlsec1_cli {
     fn command(mode: &str) -> Command {
         let mut command = Command::new("xmlsec1");
         command.arg(mode);
+        // the msys2 build defaults to mscrypto, which cannot load a pem cert
+        if cfg!(windows) {
+            command.args(["--crypto", "openssl"]);
+        }
         for option in [LAX_KEY_SEARCH, VERBOSE] {
             if help_all().contains(option) {
                 command.arg(option);
