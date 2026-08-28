@@ -117,8 +117,11 @@
   `required_extensions_fragment` binds the `ds` prefix that libdcp declares on
   the document root, which the extracted element otherwise used unbound. The
   font tests search each platform's font directories rather than
-  `/usr/share/fonts` alone. Two early returns are left: an OpenSSL build that
-  refuses RSA over SHA-1, and `POSTKIT_CLAIRMETA_DATA`.
+  `/usr/share/fonts` alone. `real_ecl_dcps_verify` reads the ECL set's signed
+  CPLs and PKLs from `tests/fixtures/clairmeta-ecl`, so `POSTKIT_CLAIRMETA_DATA`
+  only redirects it at a full ClairMeta_Data clone. One early return is left:
+  an OpenSSL build that refuses RSA over SHA-1 cannot judge that document
+  either way.
 
 - **A picture wrap refuses a codestream the standard cannot carry**: `mxf_wrap`
   took any codestream for either standard, and the picture descriptor it opened

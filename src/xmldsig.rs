@@ -2105,18 +2105,23 @@ mod tests {
         assert!(err.contains("xml-exc-c14n"), "got: {err}");
     }
 
-    // Cross-check against real published DCPs: point POSTKIT_CLAIRMETA_DATA at a
-    // clone of ClairMeta_Data. The ECL set is SHA-1 signed, so before the
-    // algorithm dispatch these all falsely failed with a signature error.
+    // Cross-check against real published DCPs. Reads the vendored ECL documents
+    // unless POSTKIT_CLAIRMETA_DATA points at a full ClairMeta_Data clone. The
+    // ECL set is SHA-1 signed, so before the algorithm dispatch these all
+    // falsely failed with a signature error.
     #[test]
     fn real_ecl_dcps_verify() {
-        let Ok(root) = std::env::var("POSTKIT_CLAIRMETA_DATA") else {
-            eprintln!("skipping: set POSTKIT_CLAIRMETA_DATA to a ClairMeta_Data clone");
-            return;
-        };
-        let ecl = std::path::Path::new(&root).join("DCP/ECL-SET");
+        let root = std::env::var("POSTKIT_CLAIRMETA_DATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/clairmeta-ecl")
+            });
+        let ecl = root.join("DCP/ECL-SET");
         let mut checked = 0;
-        for entry in std::fs::read_dir(&ecl).expect("read ECL-SET") {
+        for entry in std::fs::read_dir(&ecl)
+            .unwrap_or_else(|error| panic!("read {}: {error}", ecl.display()))
+        {
             let dir = entry.unwrap().path();
             if !dir.is_dir() {
                 continue;
