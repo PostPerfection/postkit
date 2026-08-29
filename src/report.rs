@@ -32,6 +32,16 @@ pub struct Report {
 }
 
 impl Report {
+    pub fn add_entry(&mut self, entry: ReportEntry) {
+        match entry.severity.to_ascii_lowercase().as_str() {
+            "pass" => self.pass_count += 1,
+            "warning" => self.warning_count += 1,
+            "error" => self.error_count += 1,
+            _ => {}
+        }
+        self.entries.push(entry);
+    }
+
     /// Render the report to a string in the specified format.
     pub fn render(&self, format: ReportFormat) -> String {
         match format {
@@ -105,5 +115,33 @@ impl Report {
         }
         out.push_str("</table></body></html>");
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(severity: &str) -> ReportEntry {
+        ReportEntry {
+            severity: severity.into(),
+            category: "picture".into(),
+            message: "finding".into(),
+            details: String::new(),
+        }
+    }
+
+    #[test]
+    fn adding_an_entry_updates_its_counter() {
+        let mut report = Report::default();
+        report.add_entry(entry("pass"));
+        report.add_entry(entry("warning"));
+        report.add_entry(entry("error"));
+        report.add_entry(entry("info"));
+
+        assert_eq!(report.pass_count, 1);
+        assert_eq!(report.warning_count, 1);
+        assert_eq!(report.error_count, 1);
+        assert_eq!(report.entries.len(), 4);
     }
 }
