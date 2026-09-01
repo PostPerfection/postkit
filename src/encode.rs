@@ -492,7 +492,8 @@ pub struct StreamEncodeOptions {
     pub codestream_byte_cap: Option<u64>,
 }
 
-/// Cinema 2K, the profile a DCP picture declares.
+/// The cinema profile a DCP picture declares, written as 2K or 4K by each
+/// frame's raster.
 pub fn default_rsiz() -> u16 {
     crate::grok_encoder::CompressParams::default().profile
 }

@@ -261,14 +261,47 @@ pub fn imf_rsiz(profile: ImfProfile, levels: ImfLevels) -> u16 {
     profile.rsiz_base() | ((levels.sub_level as u16) << 4) | levels.main_level as u16
 }
 
+pub const CINEMA_2K_RSIZ: u16 = 0x0003;
+pub const CINEMA_4K_RSIZ: u16 = 0x0004;
+/// The largest frame the 2K cinema profile holds.
+pub const CINEMA_2K_MAX_RASTER: (u32, u32) = (2048, 1080);
+/// DCI 4K carries six decomposition levels, one more than 2K, so the 2K
+/// sub-image is the next resolution down. The POC marker is written from it.
+pub const CINEMA_4K_RESOLUTIONS: u8 = 7;
+/// The largest frame the 4K cinema profile holds.
+pub const CINEMA_4K_MAX_RASTER: (u32, u32) = (4096, 2160);
+
+/// The Rsiz a `width` x `height` frame is compressed under. A plain cinema
+/// profile is 2K up to 2048x1080 and 4K up to 4096x2160, whichever was asked
+/// for, since grok refuses a frame past its profile's raster. Every other
+/// profile passes through as given.
+pub fn rsiz_for_raster(requested: u16, width: u32, height: u32) -> Result<u16, String> {
+    if !matches!(
+        J2kProfile::from(requested),
+        J2kProfile::Cinema2k | J2kProfile::Cinema4k
+    ) {
+        return Ok(requested);
+    }
+    if width <= CINEMA_2K_MAX_RASTER.0 && height <= CINEMA_2K_MAX_RASTER.1 {
+        return Ok(CINEMA_2K_RSIZ);
+    }
+    if width <= CINEMA_4K_MAX_RASTER.0 && height <= CINEMA_4K_MAX_RASTER.1 {
+        return Ok(CINEMA_4K_RSIZ);
+    }
+    Err(format!(
+        "{width}x{height} is past the {}x{} the 4K cinema profile allows",
+        CINEMA_4K_MAX_RASTER.0, CINEMA_4K_MAX_RASTER.1
+    ))
+}
+
 /// Check the header fields DCP picture wrapping requires.
 pub fn validate_dci_header(header: &J2kHeader) -> Result<(), String> {
     // a DCP carries the plain 2K or 4K cinema profile; the scalable and
     // long-term-storage ones are cinema too but SMPTE 429-4 does not wrap them
     let profile = J2kProfile::from(header.profile);
     let max_dimensions = match profile {
-        J2kProfile::Cinema2k => (2048, 1080),
-        J2kProfile::Cinema4k => (4096, 2160),
+        J2kProfile::Cinema2k => CINEMA_2K_MAX_RASTER,
+        J2kProfile::Cinema4k => CINEMA_4K_MAX_RASTER,
         _ => {
             return Err(format!(
                 "RSIZ {:#06x} is not a DCI JPEG 2000 profile",
@@ -607,6 +640,39 @@ mod tests {
         assert_eq!(J2kProfile::from(0x0000), J2kProfile::None);
         assert_eq!(J2kProfile::from(0x0003), J2kProfile::Cinema2k);
         assert_eq!(J2kProfile::from(0x0004), J2kProfile::Cinema4k);
+    }
+
+    #[test]
+    fn a_cinema_profile_is_2k_or_4k_by_the_raster() {
+        assert_eq!(
+            rsiz_for_raster(CINEMA_2K_RSIZ, 2048, 1080),
+            Ok(CINEMA_2K_RSIZ)
+        );
+        assert_eq!(
+            rsiz_for_raster(CINEMA_2K_RSIZ, 1998, 1080),
+            Ok(CINEMA_2K_RSIZ)
+        );
+        assert_eq!(
+            rsiz_for_raster(CINEMA_2K_RSIZ, 4096, 2160),
+            Ok(CINEMA_4K_RSIZ)
+        );
+        assert_eq!(
+            rsiz_for_raster(CINEMA_2K_RSIZ, 2049, 1080),
+            Ok(CINEMA_4K_RSIZ)
+        );
+        assert_eq!(
+            rsiz_for_raster(CINEMA_4K_RSIZ, 2048, 1080),
+            Ok(CINEMA_2K_RSIZ)
+        );
+        assert!(rsiz_for_raster(CINEMA_2K_RSIZ, 4097, 2160).is_err());
+        let imf = imf_rsiz(
+            ImfProfile::Imf2k,
+            ImfLevels {
+                main_level: 1,
+                sub_level: 1,
+            },
+        );
+        assert_eq!(rsiz_for_raster(imf, 4096, 2160), Ok(imf));
         assert_eq!(J2kProfile::from(0x0005), J2kProfile::CinemaScalable2k);
         assert_eq!(J2kProfile::from(0x0006), J2kProfile::CinemaScalable4k);
         assert_eq!(J2kProfile::from(0x0007), J2kProfile::CinemaLongTermStorage);

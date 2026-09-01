@@ -45,6 +45,14 @@
 
 ### Fixed
 
+- **No 4K frame could be compressed**: every DCP encode asked grok for the
+  Cinema 2K profile whatever the raster, and grok refuses a frame past
+  2048x1080 under it, so a 4K encode died at "Failed to initialize Grok
+  compressor" and a 4K DCP was never buildable. A plain cinema profile now
+  resolves to 2K or 4K by each frame's raster through `j2k::rsiz_for_raster`,
+  and a frame past 4096x2160 is refused naming the raster. The wrap check that
+  a 2K codestream fits 2048x1080 was already there, so nothing wrong could have
+  shipped, nothing 4K could ship at all.
 - **The DCDM review movie played at whatever rate ffmpeg picked**:
   `export_dcdm` now takes a `FrameRate` and passes it as an input option, so
   the movie plays at the rate the caller asks for. The concat list's frame

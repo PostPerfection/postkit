@@ -87,7 +87,8 @@ pub struct CompressParams {
     pub progression: ProgressionOrder,
     /// Number of quality layers
     pub num_layers: u16,
-    /// RSIZ profile (0x0003 = Cinema 2K, 0x0004 = Cinema 4K)
+    /// RSIZ profile. A plain cinema profile (0x0003 or 0x0004) is written as
+    /// 2K or 4K by each frame's raster, see [`crate::j2k::rsiz_for_raster`].
     pub profile: u16,
     /// Guard bits
     pub num_guard_bits: u8,
@@ -796,6 +797,7 @@ fn compress_frame_once(
 
     let width = frame.width();
     let height = frame.height();
+    let rsiz = crate::j2k::rsiz_for_raster(params.profile, width, height)?;
     // grok reduces deeper samples to the 12 bits cinema profiles require,
     // fused with its X'Y'Z' transform, so frames pass through at full precision
     let mut precision = frame.precision();
@@ -925,12 +927,16 @@ fn compress_frame_once(
                 cparams.layer_distortion[0] = psnr;
             }
         }
-        cparams.numresolution = params.num_resolutions;
+        cparams.numresolution = if rsiz == crate::j2k::CINEMA_4K_RSIZ {
+            crate::j2k::CINEMA_4K_RESOLUTIONS
+        } else {
+            params.num_resolutions
+        };
         cparams.cblockw_init = params.codeblock_size;
         cparams.cblockh_init = params.codeblock_size;
         cparams.irreversible = params.irreversible;
         cparams.mct = if params.mct { 1 } else { 0 };
-        cparams.rsiz = params.profile;
+        cparams.rsiz = rsiz;
         cparams.numgbits = params.num_guard_bits;
         cparams.framerate = params.grok_frame_rate();
         cparams.num_threads = params.threads_per_codec;
@@ -1537,6 +1543,58 @@ mod tests {
         assert_eq!(&bytes[..4], &[0xff, 0x4f, 0xff, 0x51]);
         let rsiz = u16::from_be_bytes([bytes[6], bytes[7]]);
         assert_eq!(rsiz, 0x0003, "cinema 2k profile was stripped");
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    fn grey_frame(width: u32, height: u32) -> RawFrame {
+        RawFrame::Packed {
+            data: vec![0x80u8; (width * height * 6) as usize],
+            width,
+            height,
+            precision: 16,
+            index: 0,
+        }
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_4k_frame_is_written_under_the_cinema_4k_profile() {
+        // grok refuses a 4K frame under the 2K profile
+        initialize(0);
+        let mut buf = Vec::new();
+        let bytes = compress_frame_grok(
+            &grey_frame(4096, 2160),
+            &CompressParams::default(),
+            &mut buf,
+        )
+        .expect("a 4K frame compresses under the default profile");
+        let rsiz = u16::from_be_bytes([bytes[6], bytes[7]]);
+        assert_eq!(rsiz, crate::j2k::CINEMA_4K_RSIZ);
+        // the decomposition level count is 9 bytes past the COD marker
+        let cod = bytes
+            .windows(2)
+            .position(|w| w == [0xff, 0x52])
+            .expect("COD marker");
+        let decomposition_levels = bytes[cod + 9];
+        assert_eq!(
+            decomposition_levels,
+            crate::j2k::CINEMA_4K_RESOLUTIONS - 1,
+            "DCI 4K carries six decomposition levels"
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_frame_past_4k_is_refused_by_name() {
+        initialize(0);
+        let mut buf = Vec::new();
+        let error = compress_frame_grok(
+            &grey_frame(4097, 2160),
+            &CompressParams::default(),
+            &mut buf,
+        )
+        .expect_err("no cinema profile holds a frame wider than 4096");
+        assert!(error.contains("4097x2160"), "{error}");
     }
 
     #[cfg(feature = "grok-ffi")]
