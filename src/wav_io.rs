@@ -28,6 +28,13 @@ impl Samples {
     }
 }
 
+/// How many channels a WAV carries, without reading its samples.
+pub fn channel_count(path: &Path) -> Result<usize, String> {
+    let reader = WavReader::open(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    Ok(reader.spec().channels as usize)
+}
+
 /// Read a WAV into (spec, interleaved samples of the file's own type). Every
 /// sample survives, so writing the result back reproduces the file byte for
 /// byte. Use this for anything that moves samples around rather than doing

@@ -4,6 +4,28 @@
 
 ### Added
 
+- **`hints`**: the advisory rules a job raises before an encode, which both
+  wizards carried a copy of. `audio_level_hint`, `audio_language_hint` and
+  `subtitle_hints` (a first cue before 4 seconds, a cue under 15 frames, a gap
+  under 2 frames or an overlap, more than 3 lines, and a line over 52
+  characters, replaced by the stronger hint at 79), over `Hint`, `AudioLevel`,
+  `SubtitleCues` and `HintCue`. A format's own rule is a `CueRule` read over the
+  same cue walk by `first_offence`, which is how dcpwizard's caption rules run.
+  Rates are `f64`, so a composition at 23.976 counts frames at the rate it
+  runs at.
+- **`preflight`**: `check_burn_supported`, the four refusals both wizards made
+  before drawing a burnt-in subtitle: the file is not there, it is also a
+  timed-text track, the picture is a J2K directory, or the frames reach the
+  encoder as X'Y'Z' already. `BurnTarget.frames_already_xyz` names the caller's
+  own flags, which is all the two copies disagreed on.
+- **`wav_io::channel_count`**: how many channels a WAV carries, without reading
+  its samples. dcpwizard's `probe_channel_count` and imfwizard's
+  `input_channels` were the same four lines and the same error.
+- **`colour::parse_colour_space`**: the colour space a name written on a command
+  line means, or None. It takes every spelling either wizard's own parser took,
+  so `bt709`, `dcip3`, `dci-p3`, `ciexyz`, `2020`, `bt2020`, `ap0`, `ap1`,
+  `alexa` and `arrilogc` all land where they look like they should, and the
+  caller decides what an unknown name does.
 - **TIFF sequences encode in process**: `encode::encode_tiff_sequence_inprocess`
   reads a sequence of 8, 12 or 16-bit TIFF stills on a small pool of loader
   threads (a quarter of the cores, at most four) into packed 16-bit frames and

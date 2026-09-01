@@ -20,6 +20,22 @@ pub enum ColourSpace {
     LogC,
 }
 
+/// The colour space a name written on a command line means, or None when it
+/// names none of them. Every spelling either wizard has ever taken is here, so
+/// a name accepted by one is accepted by both.
+pub fn parse_colour_space(name: &str) -> Option<ColourSpace> {
+    match name.trim().to_lowercase().as_str() {
+        "rec709" | "bt709" => Some(ColourSpace::Rec709),
+        "p3" | "dcip3" | "dci-p3" => Some(ColourSpace::P3),
+        "xyz" | "ciexyz" => Some(ColourSpace::Xyz),
+        "rec2020" | "bt2020" | "2020" => Some(ColourSpace::Rec2020),
+        "aces" | "ap0" => Some(ColourSpace::Aces),
+        "acescg" | "ap1" => Some(ColourSpace::AcesCg),
+        "logc" | "arrilogc" | "alexa" => Some(ColourSpace::LogC),
+        _ => None,
+    }
+}
+
 /// Colour conversion options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColourConvertOptions {
@@ -93,6 +109,29 @@ fn ffmpeg_color_params(cs: ColourSpace) -> Option<(&'static str, &'static str, &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every spelling either front end takes lands on the same space, whichever
+    /// front end it was written for.
+    #[test]
+    fn every_name_a_front_end_takes_parses() {
+        for (name, space) in [
+            ("rec709", ColourSpace::Rec709),
+            ("BT709", ColourSpace::Rec709),
+            ("dcip3", ColourSpace::P3),
+            ("dci-p3", ColourSpace::P3),
+            ("ciexyz", ColourSpace::Xyz),
+            ("2020", ColourSpace::Rec2020),
+            ("bt2020", ColourSpace::Rec2020),
+            ("ap0", ColourSpace::Aces),
+            ("ap1", ColourSpace::AcesCg),
+            ("alexa", ColourSpace::LogC),
+            (" arrilogc ", ColourSpace::LogC),
+        ] {
+            assert_eq!(parse_colour_space(name), Some(space), "{name}");
+        }
+        assert_eq!(parse_colour_space("srgb"), None);
+        assert_eq!(parse_colour_space(""), None);
+    }
 
     #[test]
     fn test_ffmpeg_color_params() {
