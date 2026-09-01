@@ -130,3 +130,61 @@ fn the_public_transform_reproduces_a_written_dcdm_frame() {
         assert_eq!(expected, written, "{name} frame differs from create_dcdm");
     }
 }
+
+/// The review movie plays at the rate the caller passes, not a fixed 24.
+#[test]
+fn export_dcdm_writes_the_review_movie_at_the_given_rate() {
+    const REVIEW_RATE: u32 = 48;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+
+    let st = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=64x64:r=5",
+            "-frames:v",
+            "10",
+        ])
+        .arg(src.join("f_%03d.png"))
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        st.status.success(),
+        "{}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+
+    let dcdm = dir.path().join("dcdm");
+    let created = create_dcdm(&DcdmOptions {
+        input_dir: src,
+        output_dir: dcdm.clone(),
+        width: 0,
+        height: 0,
+        colour_space: "rec709".into(),
+        ..Default::default()
+    });
+    assert!(created.success, "{}", created.error);
+
+    let review = dir.path().join("review");
+    let exported = export_dcdm(
+        &dcdm,
+        &review,
+        postkit::encode::FrameRate::whole(REVIEW_RATE),
+        Some("rec709"),
+    );
+    assert!(exported.success, "{}", exported.error);
+
+    let info = postkit::probe::probe_video(&review.join("review.mov"))
+        .expect("ffprobe could not read the review movie");
+    assert_eq!(
+        (info.fps_num, info.fps_den),
+        (REVIEW_RATE, 1),
+        "review movie rate"
+    );
+    assert_eq!(info.total_frames, 10, "review movie frame count");
+}

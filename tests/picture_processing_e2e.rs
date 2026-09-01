@@ -83,7 +83,7 @@ fn encode(input: &Path, output: &Path, picture: PictureProcessing) -> PathBuf {
 }
 
 /// A decoded frame: its raster, its full-scale value (the codestreams are
-/// 12-bit DCI, so the samples in a 16-bit PPM top out at 4095), and its samples.
+/// 12-bit DCI, so the samples top out at 4095), and its samples.
 struct DecodedFrame {
     width: u32,
     height: u32,
@@ -100,60 +100,21 @@ impl DecodedFrame {
     }
 }
 
-/// Decode one codestream to a 16-bit-per-channel PPM and read it back.
-fn decode_frame(grk_decompress: &Path, codestream: &Path, out: &Path) -> DecodedFrame {
-    let output = std::process::Command::new(grk_decompress)
-        .env("LD_LIBRARY_PATH", postkit::grok::grok_lib_path())
-        .args(["-i", &codestream.to_string_lossy()])
-        .args(["-o", &out.to_string_lossy()])
-        .output()
-        .expect("grk_decompress");
-    assert!(
-        output.status.success(),
-        "grk_decompress failed on {}: {}",
-        codestream.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let bytes = std::fs::read(out).expect("decoded ppm");
-    // P6 header: magic, width, height, maxval, each whitespace-separated, then
-    // one whitespace byte before the raster.
-    let mut at = 0usize;
-    let mut fields: Vec<String> = Vec::new();
-    while fields.len() < 4 {
-        while bytes[at].is_ascii_whitespace() {
-            at += 1;
-        }
-        if bytes[at] == b'#' {
-            while bytes[at] != b'\n' {
-                at += 1;
-            }
-            continue;
-        }
-        let start = at;
-        while !bytes[at].is_ascii_whitespace() {
-            at += 1;
-        }
-        fields.push(String::from_utf8_lossy(&bytes[start..at]).to_string());
-    }
-    at += 1;
+/// Decode one codestream in memory.
+fn decode_frame(codestream: &Path) -> DecodedFrame {
+    let data = std::fs::read(codestream).expect("codestream");
+    let frame = postkit::grok_decoder::decode(data, 0)
+        .unwrap_or_else(|e| panic!("cannot decode {}: {e}", codestream.display()));
     DecodedFrame {
-        width: fields[1].parse().expect("ppm width"),
-        height: fields[2].parse().expect("ppm height"),
-        full_scale: fields[3].parse().expect("ppm maxval"),
-        samples: bytes[at..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|s| u16::from_be_bytes(*s))
-            .collect(),
+        width: frame.width,
+        height: frame.height,
+        full_scale: ((1u32 << frame.precision) - 1) as u16,
+        samples: frame.interleaved_samples().expect("three components"),
     }
 }
 
 #[test]
 fn a_cropped_source_lands_centred_on_the_target_raster() {
-    let grk_decompress =
-        postkit::grok::find_grk_decompress().expect("grk_decompress is required for this test");
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
     make_clip(&video, SOURCE_WIDTH, SOURCE_HEIGHT, None);
@@ -194,7 +155,7 @@ fn a_cropped_source_lands_centred_on_the_target_raster() {
         "the codestream has to declare the fitted raster, not the source"
     );
 
-    let frame = decode_frame(&grk_decompress, &first, &dir.path().join("frame.ppm"));
+    let frame = decode_frame(&first);
     assert_eq!((frame.width, frame.height), (RASTER_WIDTH, RASTER_HEIGHT));
     assert_eq!(
         frame.samples.len(),

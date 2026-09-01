@@ -413,13 +413,14 @@ fn write_xyz_tiff(
     Ok(())
 }
 
-/// Rate of the review movie: `export_dcdm` takes no rate and cinema material is 24.
-const DCDM_REVIEW_FPS: u32 = 24;
-
 /// Convert DCDM back to viewable format (e.g. Rec.709 ProRes for review).
+///
+/// A DCDM is a still sequence and carries no rate, so `rate` is the rate the
+/// review movie plays at.
 pub fn export_dcdm(
     dcdm_dir: &Path,
     output_dir: &Path,
+    rate: crate::encode::FrameRate,
     target_colour_space: Option<&str>,
 ) -> DcdmResult {
     if let Err(e) = std::fs::create_dir_all(output_dir) {
@@ -454,11 +455,7 @@ pub fn export_dcdm(
         }
     };
     let frame_list = list_dir.path().join("frames.ffconcat");
-    if let Err(e) = crate::encode::write_image_concat_list(
-        &frames,
-        crate::encode::FrameRate::whole(DCDM_REVIEW_FPS),
-        &frame_list,
-    ) {
+    if let Err(e) = crate::encode::write_image_concat_list(&frames, rate, &frame_list) {
         return DcdmResult {
             success: false,
             error: e,
@@ -474,7 +471,12 @@ pub fn export_dcdm(
     };
 
     let output = std::process::Command::new("ffmpeg")
-        .args(["-y", "-f", "concat", "-safe", "0", "-i"])
+        .args(["-y", "-f", "concat", "-safe", "0"])
+        // the concat demuxer reports its own default rate, so the stills only
+        // become `rate` if the input timestamps are regenerated at it
+        .arg("-r")
+        .arg(rate.ffmpeg_filter_value())
+        .arg("-i")
         .arg(&frame_list)
         .arg("-vf")
         .arg(colour_filter)

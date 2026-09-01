@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use crate::encode::FrameRange;
 use crate::encode::{
-    FrameRate, ImageFormat, InputType, ParallelProgress, SourceColour, StreamEncodeOptions,
-    StreamProgress, check_codestream_size, encode_parallel, stream_encode_inprocess_with_mxf_feed,
+    FrameRate, ImageFormat, InputType, SourceColour, StreamEncodeOptions, StreamProgress,
+    check_codestream_size, encode_tiff_sequence_inprocess, stream_encode_inprocess_with_mxf_feed,
 };
 use crate::picture_processing::PictureProcessing;
 
@@ -18,7 +18,7 @@ use crate::picture_processing::PictureProcessing;
 ///
 /// The four phase clocks carry [`StreamProgress`]'s breakdown of the time
 /// inside the encode. They are zero for a stage that measures nothing, such as
-/// an image sequence handed straight to grk_compress.
+/// a J2K sequence that is never encoded.
 #[derive(Clone, Debug)]
 pub struct PipelineProgress {
     pub stage: String,
@@ -76,8 +76,8 @@ pub struct EncodeResult {
     /// Total elapsed time in seconds.
     pub elapsed_secs: f64,
     /// Black and frozen runs seen while the source decoded. Empty for a J2K
-    /// sequence and for an image sequence grk_compress read for itself, since
-    /// neither goes through ffmpeg.
+    /// sequence and for a TIFF sequence postkit read itself, since neither
+    /// goes through ffmpeg.
     pub picture_findings: crate::picture_findings::PictureFindings,
 }
 
@@ -230,13 +230,11 @@ pub fn run_encode_with_options(
 /// left behind. A cancel or a failure of either side deletes the part-written MXF
 /// and leaves the codestreams that finished, as an encode on its own does.
 ///
-/// Only a source that decodes through ffmpeg can overlap: that is the path where
-/// postkit holds each codestream in memory. A J2K sequence, or an image sequence
-/// grk_compress reads for itself, is refused here and wraps with
-/// [`crate::mxf_wrap::mxf_wrap`] once the encode is done. This is the 2D picture
-/// path only: a stereoscopic wrap interleaves two eyes per frame and stays with
-/// [`crate::mxf_wrap::wrap_stereoscopic`], and sound and Atmos never come through
-/// here at all.
+/// A J2K sequence is never encoded here, so it hands postkit no codestream to
+/// feed the wrap: it is refused here and wraps with [`crate::mxf_wrap::mxf_wrap`]
+/// instead. This is the 2D picture path only: a stereoscopic wrap interleaves
+/// two eyes per frame and stays with [`crate::mxf_wrap::wrap_stereoscopic`],
+/// and sound and Atmos never come through here at all.
 #[allow(clippy::too_many_arguments)]
 pub fn run_encode_and_wrap_picture(
     video: &Path,
@@ -289,16 +287,9 @@ fn run_encode_and_maybe_wrap(
         InputType::ImageSequence => Some(first_frame_format(video)?),
         _ => None,
     };
-    // an image sequence only reaches ffmpeg when something has to happen to each
-    // frame, and the branch it takes decides which colour paths are open. jpeg
-    // and png frames always go that way, because grk_compress reads them only if
-    // grok was built with those loaders and ffmpeg always does
-    let sequence_needs_ffmpeg = options.subtitle_burn.is_some()
-        || !options.picture.is_identity()
-        || matches!(
-            sequence_frame_format,
-            Some(ImageFormat::Jpeg | ImageFormat::Png)
-        );
+    // tiff stills only reach ffmpeg for a picture change
+    let sequence_needs_ffmpeg =
+        !options.picture.is_identity() || sequence_frame_format != Some(ImageFormat::Tiff);
     let decodes_through_ffmpeg = match input_type {
         InputType::Video => true,
         InputType::ImageSequence => sequence_needs_ffmpeg,
@@ -322,10 +313,10 @@ fn run_encode_and_maybe_wrap(
     }
 
     let mut overlapped_wrap = match wrap {
-        Some(wrap) if !decodes_through_ffmpeg => {
+        Some(wrap) if input_type == InputType::J2kSequence => {
             return Err(format!(
-                "a {input_type:?} input never hands postkit a codestream, so its MXF cannot be \
-                 wrapped while it encodes: wrap {} once the encode is done",
+                "a J2K sequence is never encoded here, so it hands postkit no codestream to \
+                 wrap while it encodes: wrap {} from the sequence instead",
                 wrap.output.display()
             ));
         }
@@ -337,13 +328,8 @@ fn run_encode_and_maybe_wrap(
     let mut frames_encoded = 0u64;
     let mut picture_findings = crate::picture_findings::PictureFindings::default();
 
-    // Everything ffmpeg decodes goes through one code path, so a subtitle burn
-    // has a single place to hook into. `run_stream` is that path; the arms below
-    // only decide what ffmpeg opens.
-    let mut run_stream = |opts: &StreamEncodeOptions| -> Result<
-        (u64, crate::picture_findings::PictureFindings),
-        String,
-    > {
+    // every in-process encode reports through these two
+    let report_start = || {
         on_progress(&PipelineProgress {
             stage: "encode".to_string(),
             message: "Starting...".to_string(),
@@ -357,37 +343,36 @@ fn run_encode_and_maybe_wrap(
             encode_secs: 0.0,
             write_secs: 0.0,
         });
-        let mxf_feed = overlapped_wrap.as_ref().map(|wrap| wrap.sender());
-        let result = stream_encode_inprocess_with_mxf_feed(
-            opts,
-            cancel,
-            pause,
-            mxf_feed,
-            |p: StreamProgress| {
-                let percent = if p.total_frames > 0 {
-                    (p.frame as f64 / p.total_frames as f64) * 100.0
-                } else {
-                    0.0
-                };
-                on_progress(&PipelineProgress {
-                    stage: "encode".to_string(),
-                    message: format!("Frame {}/{}", p.frame, p.total_frames),
-                    frame: p.frame,
-                    total_frames: p.total_frames,
-                    fps: p.fps,
-                    elapsed_secs: p.elapsed_secs,
-                    percent: percent.min(99.0),
-                    decode_wait_secs: p.decode_wait_secs,
-                    prepare_secs: p.prepare_secs,
-                    encode_secs: p.encode_secs,
-                    write_secs: p.write_secs,
-                });
-                on_log(&format!(
-                    "[ENCODE] frame={}/{} fps={:.1}",
-                    p.frame, p.total_frames, p.fps
-                ));
-            },
-        );
+    };
+    let report_frame = |p: StreamProgress| {
+        let percent = if p.total_frames > 0 {
+            (p.frame as f64 / p.total_frames as f64) * 100.0
+        } else {
+            0.0
+        };
+        on_progress(&PipelineProgress {
+            stage: "encode".to_string(),
+            message: format!("Frame {}/{}", p.frame, p.total_frames),
+            frame: p.frame,
+            total_frames: p.total_frames,
+            fps: p.fps,
+            elapsed_secs: p.elapsed_secs,
+            percent: percent.min(99.0),
+            decode_wait_secs: p.decode_wait_secs,
+            prepare_secs: p.prepare_secs,
+            encode_secs: p.encode_secs,
+            write_secs: p.write_secs,
+        });
+        on_log(&format!(
+            "[ENCODE] frame={}/{} fps={:.1}",
+            p.frame, p.total_frames, p.fps
+        ));
+    };
+    let mxf_feed = overlapped_wrap.as_ref().map(|wrap| wrap.sender());
+    let mut finish = |result: crate::encode::EncodeResult| -> Result<
+        (u64, crate::picture_findings::PictureFindings),
+        String,
+    > {
         if !result.success {
             // the encoder only sees that the wrap stopped taking frames, so the
             // wrap's own error is the one worth reporting
@@ -400,27 +385,35 @@ fn run_encode_and_maybe_wrap(
         }
         Ok((result.frames_encoded, result.picture_findings))
     };
+    // a cloned feed would keep the wrap waiting after the encoder returns
+    let run_stream = |opts: &StreamEncodeOptions, mxf_feed| {
+        report_start();
+        stream_encode_inprocess_with_mxf_feed(opts, cancel, pause, mxf_feed, report_frame)
+    };
 
     match input_type {
         InputType::Video => {
-            (frames_encoded, picture_findings) = run_stream(&StreamEncodeOptions {
-                input: video.to_path_buf(),
-                output_dir: j2k_dir.clone(),
-                compression_ratio,
-                quality_psnr,
-                num_resolutions: 6,
-                codeblock_size: 32,
-                progression: "CPRL".to_string(),
-                fps,
-                read_source_at: options.read_source_at,
-                frame_range: options.frame_range,
-                source_colour: options.source_colour.clone(),
-                rsiz: options.rsiz,
-                subtitle_burn: options.subtitle_burn.clone(),
-                picture: options.picture.clone(),
-                codestream_byte_cap: options.codestream_byte_cap,
-                ..StreamEncodeOptions::default()
-            })?;
+            (frames_encoded, picture_findings) = finish(run_stream(
+                &StreamEncodeOptions {
+                    input: video.to_path_buf(),
+                    output_dir: j2k_dir.clone(),
+                    compression_ratio,
+                    quality_psnr,
+                    num_resolutions: 6,
+                    codeblock_size: 32,
+                    progression: "CPRL".to_string(),
+                    fps,
+                    read_source_at: options.read_source_at,
+                    frame_range: options.frame_range,
+                    source_colour: options.source_colour.clone(),
+                    rsiz: options.rsiz,
+                    subtitle_burn: options.subtitle_burn.clone(),
+                    picture: options.picture.clone(),
+                    codestream_byte_cap: options.codestream_byte_cap,
+                    ..StreamEncodeOptions::default()
+                },
+                mxf_feed,
+            ))?;
             on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
         }
         InputType::ImageSequence => {
@@ -435,90 +428,51 @@ fn run_encode_and_maybe_wrap(
                 None => frames,
             };
 
+            let compress = StreamEncodeOptions {
+                output_dir: j2k_dir.clone(),
+                compression_ratio,
+                quality_psnr,
+                num_resolutions: 6,
+                codeblock_size: 32,
+                progression: "CPRL".to_string(),
+                fps,
+                source_colour: options.source_colour.clone(),
+                rsiz: options.rsiz,
+                subtitle_burn: options.subtitle_burn.clone(),
+                picture: options.picture.clone(),
+                codestream_byte_cap: options.codestream_byte_cap,
+                ..StreamEncodeOptions::default()
+            };
             if sequence_needs_ffmpeg {
-                // grk_compress reads the stills itself and never shows postkit a
-                // frame buffer, so a burn or a picture change takes the sequence
-                // through ffmpeg instead: a concat list holding each still for
-                // one frame period decodes to the same rgb48be stream a video
-                // does.
+                // a concat list holding each still for one frame period decodes
+                // to the same rgb48be stream a video does
                 let list = output_dir.join("frames.ffconcat");
                 crate::encode::write_image_concat_list(&frames, fps, &list)?;
                 on_log(&format!(
                     "[ENCODE] Taking {} images through ffmpeg",
                     frames.len()
                 ));
-                (frames_encoded, picture_findings) = run_stream(&StreamEncodeOptions {
-                    input: list,
-                    output_dir: j2k_dir.clone(),
-                    compression_ratio,
-                    quality_psnr,
-                    num_resolutions: 6,
-                    codeblock_size: 32,
-                    progression: "CPRL".to_string(),
-                    fps,
-                    source_colour: options.source_colour.clone(),
-                    rsiz: options.rsiz,
-                    subtitle_burn: options.subtitle_burn.clone(),
-                    picture: options.picture.clone(),
-                    codestream_byte_cap: options.codestream_byte_cap,
-                    decode_source: crate::encode::DecodeSource::ImageList,
-                    ..StreamEncodeOptions::default()
-                })?;
-                on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
+                (frames_encoded, picture_findings) = finish(run_stream(
+                    &StreamEncodeOptions {
+                        input: list,
+                        decode_source: crate::encode::DecodeSource::ImageList,
+                        ..compress
+                    },
+                    mxf_feed,
+                ))?;
             } else {
-                on_progress(&PipelineProgress {
-                    stage: "encode".to_string(),
-                    message: "Encoding images...".to_string(),
-                    frame: 0,
-                    total_frames: 0,
-                    fps: 0.0,
-                    elapsed_secs: 0.0,
-                    percent: 0.0,
-                    decode_wait_secs: 0.0,
-                    prepare_secs: 0.0,
-                    encode_secs: 0.0,
-                    write_secs: 0.0,
-                });
-
-                let result = encode_parallel(
+                on_log(&format!("[ENCODE] Reading {} tiff stills", frames.len()));
+                report_start();
+                (frames_encoded, picture_findings) = finish(encode_tiff_sequence_inprocess(
                     &frames,
-                    &j2k_dir,
-                    compression_ratio,
-                    quality_psnr,
-                    options.codestream_byte_cap,
-                    options.rsiz,
-                    fps,
-                    &options.source_colour,
+                    &compress,
                     cancel,
                     pause,
-                    |p: ParallelProgress| {
-                        let percent = if p.total > 0 {
-                            (p.done as f64 / p.total as f64) * 100.0
-                        } else {
-                            0.0
-                        };
-                        on_progress(&PipelineProgress {
-                            stage: "encode".to_string(),
-                            message: format!("Frame {}/{}", p.done, p.total),
-                            frame: p.done,
-                            total_frames: p.total,
-                            fps: p.fps,
-                            elapsed_secs: p.elapsed_secs,
-                            percent: percent.min(99.0),
-                            decode_wait_secs: 0.0,
-                            prepare_secs: 0.0,
-                            encode_secs: 0.0,
-                            write_secs: 0.0,
-                        });
-                    },
-                );
-
-                if !result.success {
-                    return Err(result.error);
-                }
-                frames_encoded = result.frames_encoded;
-                on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
+                    mxf_feed,
+                    report_frame,
+                ))?;
             }
+            on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
         }
         InputType::J2kSequence => {
             on_log("Input is already J2K, skipping encode");
@@ -538,10 +492,10 @@ fn run_encode_and_maybe_wrap(
         _ => j2k_dir,
     };
 
-    // the in-process encoder already refused anything over the cap frame by
-    // frame, but a J2K sequence was never encoded here and grk_compress writes
-    // an image sequence's codestreams itself, so those only get checked here
-    if let Some(cap) = options.codestream_byte_cap {
+    // only a J2K sequence is unchecked by the encoder
+    if let Some(cap) = options.codestream_byte_cap
+        && input_type == InputType::J2kSequence
+    {
         check_codestream_dir(&final_j2k_dir, cap)?;
     }
 
@@ -582,47 +536,31 @@ fn sequence_directory(input: &Path) -> PathBuf {
     }
 }
 
-/// Format of the first frame of an image sequence, which decides whether the
-/// frames can be handed to grk_compress as they are.
+/// Format of the first frame of an image sequence, which decides whether
+/// postkit reads the stills itself or ffmpeg decodes them.
 fn first_frame_format(input: &Path) -> Result<ImageFormat, String> {
-    let directory = sequence_directory(input);
-    let frames = crate::encode::find_source_frames(&directory)
-        .map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
-    let first = frames
-        .first()
-        .ok_or_else(|| format!("no images in {}", directory.display()))?;
-    Ok(crate::encode::detect_image_format(first))
+    let first = crate::encode::first_source_frame(&sequence_directory(input))?;
+    Ok(crate::encode::detect_image_format(&first))
 }
 
-/// Refuse a source colour the chosen input branch cannot honour: the image
-/// sequence encoder hands each file to grk_compress, which only converts
-/// Rec.709, and nothing can be converted once the frames are compressed.
+/// Refuse a source colour the chosen input branch cannot honour: the HDR-to-DCI
+/// LUT runs inside ffmpeg's decode, so a TIFF sequence postkit reads itself
+/// cannot take it, and nothing can be converted once the frames are compressed.
 ///
-/// `decodes_through_ffmpeg` is what the sequence limits hang on rather than the
-/// input type: a sequence that a burn or a picture change routes through ffmpeg
-/// reaches the same per-frame hooks a video does, so those limits fall away.
+/// `decodes_through_ffmpeg` is what the sequence limit hangs on rather than the
+/// input type: a sequence that a picture change routes through ffmpeg reaches
+/// the LUT the way a video does.
 fn reject_unsupported_colour_path(
     input_type: InputType,
     source_colour: &SourceColour,
     decodes_through_ffmpeg: bool,
 ) -> Result<(), String> {
     match (input_type, source_colour) {
-        (InputType::ImageSequence, SourceColour::DisplayRgbIn(space))
-            if !decodes_through_ffmpeg =>
-        {
+        (InputType::ImageSequence, SourceColour::DciLut(lut)) if !decodes_through_ffmpeg => {
             Err(format!(
-                "image sequences are compressed straight from file by grk_compress, which only \
-                 converts Rec.709: convert a {space:?} sequence to X'Y'Z' first, or encode from \
-                 a video"
-            ))
-        }
-        (InputType::ImageSequence, colour)
-            if !decodes_through_ffmpeg
-                && !matches!(colour, SourceColour::DisplayRgb | SourceColour::KeepRgb) =>
-        {
-            Err(format!(
-                "grk_compress either runs the DCDM X'Y'Z' transform over an image sequence or \
-                 compresses it as it is, so {colour:?} would be mislabelled"
+                "the HDR-to-DCI LUT {} runs inside ffmpeg's decode, and TIFF stills are read by \
+                 postkit itself: encode from a video instead",
+                lut.display()
             ))
         }
         (InputType::J2kSequence, SourceColour::DciLut(lut)) => Err(format!(
@@ -638,8 +576,8 @@ fn reject_unsupported_colour_path(
 }
 
 /// Refuse a burn the encode cannot honour: subtitle bitmaps are display RGB, so
-/// they only make sense on frames that have not been converted yet, and only
-/// the video path decodes frames postkit can composite onto at all.
+/// they only make sense on frames that have not been converted yet, and a J2K
+/// sequence has no frames to composite onto at all.
 fn reject_unsupported_burn(
     input_type: InputType,
     source_colour: &SourceColour,
@@ -743,7 +681,7 @@ mod tests {
         );
         assert!(
             reject_unsupported_burn(InputType::ImageSequence, &SourceColour::DisplayRgb).is_ok(),
-            "an image sequence burns through the concat demuxer"
+            "an image sequence burns on the frames postkit reads or ffmpeg decodes"
         );
         for (input, colour, expected) in [
             (
@@ -766,73 +704,39 @@ mod tests {
 
     /// The branch an input takes, as `reject_unsupported_colour_path` sees it.
     const THROUGH_FFMPEG: bool = true;
-    const STRAIGHT_FROM_FILE: bool = false;
+    const READ_BY_POSTKIT: bool = false;
 
     #[test]
-    fn image_sequences_refuse_a_source_grk_compress_cannot_convert() {
+    fn a_tiff_sequence_takes_every_colour_but_the_lut() {
+        for colour in [
+            SourceColour::DisplayRgb,
+            SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3),
+            SourceColour::AlreadyPq,
+            SourceColour::KeepRgb,
+        ] {
+            assert!(
+                reject_unsupported_colour_path(InputType::ImageSequence, &colour, READ_BY_POSTKIT)
+                    .is_ok(),
+                "{colour:?} is applied on the frames postkit reads"
+            );
+        }
+        let lut = SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube"));
+        let refused =
+            reject_unsupported_colour_path(InputType::ImageSequence, &lut, READ_BY_POSTKIT)
+                .unwrap_err();
+        assert!(refused.contains("hdr_to_dci.cube"), "{refused}");
         assert!(
-            reject_unsupported_colour_path(
-                InputType::ImageSequence,
-                &SourceColour::DisplayRgb,
-                STRAIGHT_FROM_FILE
-            )
-            .is_ok()
-        );
-        assert!(
-            reject_unsupported_colour_path(
-                InputType::ImageSequence,
-                &SourceColour::KeepRgb,
-                STRAIGHT_FROM_FILE
-            )
-            .is_ok(),
-            "IMF picture is compressed straight from file with no transform"
-        );
-        assert!(
-            reject_unsupported_colour_path(
-                InputType::ImageSequence,
-                &SourceColour::AlreadyPq,
-                STRAIGHT_FROM_FILE
-            )
-            .is_err()
-        );
-        assert!(
-            reject_unsupported_colour_path(
-                InputType::ImageSequence,
-                &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
-                STRAIGHT_FROM_FILE
-            )
-            .is_err()
+            reject_unsupported_colour_path(InputType::ImageSequence, &lut, THROUGH_FFMPEG).is_ok(),
+            "a picture change decodes the sequence through ffmpeg, where the LUT runs"
         );
     }
 
     #[test]
-    fn a_streamed_image_sequence_takes_the_colours_a_video_does() {
-        let p3 = SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3);
-        assert!(
-            reject_unsupported_colour_path(InputType::ImageSequence, &p3, THROUGH_FFMPEG).is_ok(),
-            "a burn or a picture change decodes the sequence through ffmpeg, where the frame \
-             transform runs"
-        );
-        assert!(
-            reject_unsupported_colour_path(
-                InputType::ImageSequence,
-                &SourceColour::AlreadyPq,
-                THROUGH_FFMPEG
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn a_wide_gamut_source_encodes_from_video_only() {
+    fn compressed_input_refuses_a_wide_gamut_source() {
         let p3 = SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3);
         assert!(reject_unsupported_colour_path(InputType::Video, &p3, THROUGH_FFMPEG).is_ok());
-        let images =
-            reject_unsupported_colour_path(InputType::ImageSequence, &p3, STRAIGHT_FROM_FILE)
-                .unwrap_err();
-        assert!(images.contains("P3"), "{images}");
         let compressed =
-            reject_unsupported_colour_path(InputType::J2kSequence, &p3, STRAIGHT_FROM_FILE)
+            reject_unsupported_colour_path(InputType::J2kSequence, &p3, READ_BY_POSTKIT)
                 .unwrap_err();
         assert!(compressed.contains("already compressed"), "{compressed}");
     }
@@ -843,7 +747,7 @@ mod tests {
             reject_unsupported_colour_path(
                 InputType::J2kSequence,
                 &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
-                STRAIGHT_FROM_FILE
+                READ_BY_POSTKIT
             )
             .is_err()
         );
@@ -851,7 +755,7 @@ mod tests {
             reject_unsupported_colour_path(
                 InputType::J2kSequence,
                 &SourceColour::AlreadyPq,
-                STRAIGHT_FROM_FILE
+                READ_BY_POSTKIT
             )
             .is_ok()
         );

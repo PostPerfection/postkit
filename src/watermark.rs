@@ -143,3 +143,87 @@ pub fn embed_watermark(opts: &WatermarkOptions) -> WatermarkResult {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    const FRAME_WIDTH: usize = 160;
+    const FRAME_HEIGHT: usize = 64;
+    const FRAME_COUNT: usize = 3;
+    /// The mark sits at y = h - 20 in a 10 pixel font, so nothing above this row
+    /// is drawn on.
+    const FIRST_MARKED_ROW: usize = FRAME_HEIGHT - 22;
+
+    fn read_png_rgb(path: &Path) -> (usize, usize, Vec<u8>) {
+        let file = std::fs::File::open(path).expect("open output frame");
+        let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+        decoder.set_transformations(png::Transformations::EXPAND);
+        let mut reader = decoder.read_info().expect("png header");
+        let mut buffer = vec![0u8; reader.output_buffer_size().unwrap_or(0)];
+        let info = reader.next_frame(&mut buffer).expect("png pixels");
+        assert_eq!(info.color_type, png::ColorType::Rgb);
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        buffer.truncate(info.buffer_size());
+        (info.width as usize, info.height as usize, buffer)
+    }
+
+    #[test]
+    fn embed_watermark_draws_the_mark_and_leaves_the_rest_of_the_frame_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let input_dir = dir.path().join("in");
+        std::fs::create_dir_all(&input_dir).unwrap();
+
+        let ffmpeg = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=c=red:s={FRAME_WIDTH}x{FRAME_HEIGHT}:r=1"),
+                "-frames:v",
+                &FRAME_COUNT.to_string(),
+            ])
+            .arg(input_dir.join("f_%03d.png"))
+            .output()
+            .expect("ffmpeg");
+        assert!(
+            ffmpeg.status.success(),
+            "{}",
+            String::from_utf8_lossy(&ffmpeg.stderr)
+        );
+
+        let output_dir = dir.path().join("out");
+        let result = embed_watermark(&WatermarkOptions {
+            operator_id: "operator-7".into(),
+            session_id: "session-42".into(),
+            strength: 0.9,
+            input_dir: input_dir.clone(),
+            output_dir: output_dir.clone(),
+        });
+        assert!(result.success, "{}", result.error);
+        assert_eq!(result.frames_processed, FRAME_COUNT as u64);
+        assert_eq!(result.payload_hash.len(), 64);
+
+        let (_, _, source) = read_png_rgb(&input_dir.join("f_001.png"));
+        let (width, height, marked) = read_png_rgb(&output_dir.join("000001.png"));
+        assert_eq!((width, height), (FRAME_WIDTH, FRAME_HEIGHT));
+
+        let untouched = FIRST_MARKED_ROW * FRAME_WIDTH * 3;
+        assert_eq!(
+            marked[..untouched],
+            source[..untouched],
+            "picture above the mark changed"
+        );
+
+        let drawn = marked[untouched..]
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(source[untouched..].as_chunks::<3>().0)
+            .filter(|(after, before)| after != before)
+            .count();
+        assert!(drawn > 20, "only {drawn} pixels carry the mark");
+    }
+}

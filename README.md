@@ -24,7 +24,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `dcdm` | Digital Cinema Distribution Master creation and export; XYZ or P3-D65 mastering target |
 | `dolby_vision` | Dolby Vision RPU, HDR10, HLG metadata handling |
 | `edl_import` | EDL/FCP XML timeline parsing and import |
-| `encode` | JPEG 2000 encoding pipeline (stream subprocess via grok) |
+| `encode` | JPEG 2000 encoding pipeline (ffmpeg stream and TIFF sequence, through the linked grok) |
 | `font_subset` | Subtitle font subsetting to a code-point set (640 KB embed limit) |
 | `frame_compare` | Per-frame PSNR/SSIM and pooled VMAF via ffmpeg |
 | `grok` | Grok codec detection and configuration |

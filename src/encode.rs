@@ -56,61 +56,6 @@ impl Default for FrameRate {
     }
 }
 
-/// JPEG 2000 encoding options.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EncodeOptions {
-    /// Source image sequence directory (DPX/TIFF/EXR/PNG/BMP)
-    pub input_dir: PathBuf,
-    /// Output J2K codestream directory
-    pub output_dir: PathBuf,
-    /// Target bitrate in Mbps (e.g. 250.0 for DCI 2K)
-    pub bitrate_mbps: f64,
-    /// Resolution: "2K" or "4K"
-    pub resolution: String,
-    /// Frame rate numerator
-    pub fps_num: u32,
-    /// Frame rate denominator
-    pub fps_den: u32,
-    /// Number of quality layers
-    pub num_layers: u32,
-    /// Progression order: "CPRL", "LRCP", "RLCP"
-    pub progression: String,
-    /// Number of decomposition levels
-    pub num_resolutions: u32,
-    /// Code block size (usually 32 or 64)
-    pub codeblock_size: u32,
-    /// Path to external grok compressor binary (grk_compress)
-    pub compressor_path: PathBuf,
-    /// GPU device index (-1 for CPU)
-    pub gpu_device: i32,
-    /// Number of parallel encoding threads
-    pub num_threads: u32,
-    /// Library directory for LD_LIBRARY_PATH (if needed)
-    #[serde(default)]
-    pub lib_dir: Option<PathBuf>,
-}
-
-impl Default for EncodeOptions {
-    fn default() -> Self {
-        Self {
-            input_dir: PathBuf::new(),
-            output_dir: PathBuf::new(),
-            bitrate_mbps: 250.0,
-            resolution: "2K".to_string(),
-            fps_num: 24,
-            fps_den: 1,
-            num_layers: 1,
-            progression: "CPRL".to_string(),
-            num_resolutions: 6,
-            codeblock_size: 32,
-            compressor_path: PathBuf::new(),
-            gpu_device: -1,
-            num_threads: 0, // auto-detect
-            lib_dir: None,
-        }
-    }
-}
-
 /// Result of encoding operation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EncodeResult {
@@ -119,7 +64,7 @@ pub struct EncodeResult {
     pub frames_encoded: u64,
     pub output_dir: PathBuf,
     /// Black and frozen runs blackdetect and freezedetect saw during the
-    /// decode. Empty where grk_compress read the source files itself, since
+    /// decode. Empty for a TIFF sequence, which postkit reads itself, since
     /// nothing decoded through ffmpeg there.
     #[serde(default)]
     pub picture_findings: crate::picture_findings::PictureFindings,
@@ -213,118 +158,38 @@ pub fn find_source_frames(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(frames)
 }
 
-/// Encode a sequence of images to JPEG 2000 using an external compressor.
-///
-/// This spawns the compressor binary (e.g. `grk_compress`) for each frame.
-/// For GPU-accelerated encoding, set `opts.gpu_device` to the device index.
-pub fn encode(opts: &EncodeOptions) -> EncodeResult {
-    let compressor = if opts.compressor_path.as_os_str().is_empty() {
-        crate::grok::find_grk_compress()
-    } else {
-        Some(opts.compressor_path.clone())
-    };
-
-    let Some(compressor) = compressor else {
-        return EncodeResult {
-            success: false,
-            error: "grk_compress not found in PATH and no compressor_path specified".to_string(),
-            ..Default::default()
-        };
-    };
-
-    let frames = match find_source_frames(&opts.input_dir) {
-        Ok(f) => f,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: format!("Failed to read input directory: {e}"),
-                ..Default::default()
-            };
-        }
-    };
-
-    if frames.is_empty() {
-        return EncodeResult {
-            success: false,
-            error: "No source image files found in input directory".to_string(),
-            ..Default::default()
-        };
-    }
-
-    if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
-        return EncodeResult {
-            success: false,
-            error: format!("Failed to create output directory: {e}"),
-            ..Default::default()
-        };
-    }
-
-    let mut encoded = 0u64;
-    for frame in &frames {
-        let stem = frame.file_stem().unwrap_or_default();
-        let output = opts
-            .output_dir
-            .join(format!("{}.j2c", stem.to_string_lossy()));
-
-        let mut cmd = std::process::Command::new(&compressor);
-        if let Some(ref ld) = opts.lib_dir {
-            cmd.env("LD_LIBRARY_PATH", ld);
-        }
-        cmd.arg("-i")
-            .arg(frame)
-            .arg("-o")
-            .arg(&output)
-            .arg("-r")
-            .arg(format!("{}", opts.bitrate_mbps))
-            .arg("-X");
-
-        if opts.gpu_device >= 0 {
-            cmd.arg("-G").arg(format!("{}", opts.gpu_device));
-        }
-        if opts.num_threads > 0 {
-            cmd.arg("-t").arg(format!("{}", opts.num_threads));
-        }
-
-        match cmd.output() {
-            Ok(out) if out.status.success() => {
-                encoded += 1;
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::error!("Encode failed for {:?}: {}", frame, stderr);
-                return EncodeResult {
-                    success: false,
-                    error: format!("Encode failed at frame {}: {}", encoded, stderr),
-                    frames_encoded: encoded,
-                    output_dir: opts.output_dir.clone(),
-                    ..Default::default()
-                };
-            }
-            Err(e) => {
-                return EncodeResult {
-                    success: false,
-                    error: format!("Failed to spawn compressor: {e}"),
-                    frames_encoded: encoded,
-                    output_dir: opts.output_dir.clone(),
-                    ..Default::default()
-                };
-            }
-        }
-    }
-
-    EncodeResult {
-        success: true,
-        error: String::new(),
-        frames_encoded: encoded,
-        output_dir: opts.output_dir.clone(),
-        ..Default::default()
-    }
+/// The first still of an image sequence, the frame that decides its format and
+/// its raster.
+pub(crate) fn first_source_frame(directory: &Path) -> Result<PathBuf, String> {
+    let frames = find_source_frames(directory)
+        .map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
+    frames
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("no images in {}", directory.display()))
 }
 
-// ─── Streaming encode (ffmpeg → raw pipe → grk_compress) ──────────────────
+/// The picture's size: a container's own raster, or the first frame of an
+/// image sequence. A TIFF is read by postkit itself, since ffprobe cannot read
+/// a 12-bit one.
+pub fn source_raster(picture: &Path) -> Result<(u32, u32), String> {
+    let measured = match detect_input_type(picture) {
+        InputType::ImageSequence if picture.is_dir() => first_source_frame(picture)?,
+        _ => picture.to_path_buf(),
+    };
+    if detect_image_format(&measured) == ImageFormat::Tiff {
+        let frame = crate::grok::load_tiff(&measured)?;
+        return Ok((frame.width, frame.height));
+    }
+    let info = crate::probe::probe_video(&measured)
+        .ok_or_else(|| format!("cannot read the picture size of {}", measured.display()))?;
+    Ok((info.width, info.height))
+}
+
+// ─── Streaming encode (ffmpeg → raw pipe → in-process grok) ────────────────
 
 use std::io::Read;
-use std::process::{Child, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -600,10 +465,6 @@ pub struct StreamEncodeOptions {
     /// compressing them.
     #[serde(default)]
     pub frame_range: Option<FrameRange>,
-    /// Path to compressor binary (auto-detected if empty)
-    pub compressor_path: PathBuf,
-    /// Library directory for LD_LIBRARY_PATH (if needed)
-    pub lib_dir: Option<PathBuf>,
     /// Colour the decoded frames carry, which decides the encoder transform.
     #[serde(default)]
     pub source_colour: SourceColour,
@@ -626,8 +487,7 @@ pub struct StreamEncodeOptions {
     /// Per-codestream byte cap, e.g. the DCI HDR Addendum's raised cap. Each
     /// codestream is checked as it is written and the first one over the cap
     /// fails the encode there, so a bitrate set too high costs one frame rather
-    /// than the whole sequence. Only the in-process encoder can hold to it;
-    /// [`stream_encode_subprocess`] refuses a cap instead of ignoring it.
+    /// than the whole sequence.
     #[serde(default)]
     pub codestream_byte_cap: Option<u64>,
 }
@@ -650,8 +510,6 @@ impl Default for StreamEncodeOptions {
             fps: FrameRate::default(),
             read_source_at: None,
             frame_range: None,
-            compressor_path: PathBuf::new(),
-            lib_dir: None,
             source_colour: SourceColour::DisplayRgb,
             rsiz: default_rsiz(),
             decode_source: DecodeSource::Video,
@@ -672,35 +530,17 @@ pub struct StreamProgress {
     pub total_frames: u64,
     pub fps: f64,
     pub elapsed_secs: f64,
-    /// Time the frame reader spent blocked on ffmpeg's pipe.
+    /// Time the frame reader spent blocked waiting for the next frame, on
+    /// ffmpeg's pipe or on the TIFF loader threads.
     pub decode_wait_secs: f64,
     /// Time spent burning subtitles and converting colour, summed over the
-    /// encoder threads, so it can exceed `elapsed_secs`. Zero on the subprocess
-    /// path, which refuses both.
+    /// encoder threads, so it can exceed `elapsed_secs`.
     pub prepare_secs: f64,
     /// Time spent compressing, summed over the encoder threads, so it can
-    /// exceed `elapsed_secs`. On the subprocess path this is the whole
-    /// grk_compress run, which also covers the child's own read and write.
+    /// exceed `elapsed_secs`.
     pub encode_secs: f64,
-    /// Time spent writing codestreams to disk. Zero on the subprocess path,
-    /// where grk_compress writes them inside the child.
+    /// Time spent writing codestreams to disk.
     pub write_secs: f64,
-}
-
-/// Find the grk_compress binary, checking common locations.
-pub fn find_compressor() -> Option<(PathBuf, Option<PathBuf>)> {
-    // Check $HOME/bin/grok/bin first
-    if let Ok(home) = std::env::var("HOME") {
-        let grk = PathBuf::from(&home).join("bin/grok/bin/grk_compress");
-        if grk.exists() {
-            let lib_dir = PathBuf::from(&home).join("bin/grok/lib64");
-            return Some((grk, Some(lib_dir)));
-        }
-    }
-    if let Some(path) = crate::grok::find_grk_compress() {
-        return Some((path, None));
-    }
-    None
 }
 
 /// Probe a video file for dimensions and frame count.
@@ -791,18 +631,12 @@ pub(crate) fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> ReadR
     ReadResult::Ok
 }
 
-fn kill_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
 // ─── In-process stream encode (video → ffmpeg pipe → Grok FFI) ─────────────
 
 /// Stream-encode a video file to J2K using in-process Grok FFI.
 ///
 /// Uses ffmpeg to decode the video to raw 16-bit RGB frames, then compresses
 /// each frame in-process via the bounded-queue pipeline in `grok_encoder`.
-/// This eliminates per-frame subprocess overhead.
 pub fn stream_encode_inprocess<F>(
     opts: &StreamEncodeOptions,
     cancel: &Arc<AtomicBool>,
@@ -828,7 +662,7 @@ pub fn stream_encode_inprocess_with_mxf_feed<F>(
 where
     F: FnMut(StreamProgress),
 {
-    use crate::grok_encoder::{self, CompressParams, RawFrame};
+    use crate::grok_encoder::{self, RawFrame};
 
     if let SourceColour::DciLut(lut) = &opts.source_colour
         && !lut.is_file()
@@ -883,6 +717,16 @@ where
     }
 
     let frame_size = (width as usize) * (height as usize) * 3 * 2; // 16-bit RGB
+    let params = match compress_params(opts) {
+        Ok(params) => params,
+        Err(e) => {
+            return EncodeResult {
+                success: false,
+                error: e,
+                ..Default::default()
+            };
+        }
+    };
 
     // Start ffmpeg: decode to raw 16-bit big-endian RGB
     let filters = crate::picture_findings::with_detection_branch(&decode_filters(
@@ -943,35 +787,6 @@ where
                 ..Default::default()
             };
         }
-    };
-
-    let colour_transform = match opts.source_colour.frame_transform() {
-        Ok(t) => t,
-        Err(e) => {
-            kill_child(&mut ffmpeg);
-            return EncodeResult {
-                success: false,
-                error: e,
-                ..Default::default()
-            };
-        }
-    };
-
-    let params = CompressParams {
-        compression_ratio: opts.compression_ratio,
-        quality_psnr: opts.quality_psnr,
-        codestream_byte_cap: opts.codestream_byte_cap,
-        num_resolutions: opts.num_resolutions as u8,
-        codeblock_size: opts.codeblock_size,
-        // grok only sizes the per-frame byte budget from this, so the whole rate is enough
-        edit_rate: opts.fps,
-        profile: opts.rsiz,
-        apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
-        source_preparation: grok_encoder::SourcePreparation {
-            subtitle_burn: opts.subtitle_burn.clone(),
-            colour_transform,
-        },
-        ..CompressParams::default()
     };
 
     grok_encoder::initialize(0);
@@ -1057,165 +872,13 @@ where
     }
 }
 
-/// Stream-encode using subprocess pool (ffmpeg → raw frames → grk_compress subprocesses).
-///
-/// This achieves higher throughput than the FFI path because each subprocess
-/// gets its own independent Grok thread pool. Temporary frames are written to
-/// /dev/shm (ramdisk) to avoid disk I/O bottleneck.
-pub fn stream_encode_subprocess<F>(
+/// The compressor settings a stream encode asks for, with the source's frame
+/// transform built once for the whole run.
+fn compress_params(
     opts: &StreamEncodeOptions,
-    cancel: &Arc<AtomicBool>,
-    mut on_progress: F,
-) -> EncodeResult
-where
-    F: FnMut(StreamProgress),
-{
-    use crate::grok_encoder;
-
-    if let SourceColour::DciLut(lut) = &opts.source_colour
-        && !lut.is_file()
-    {
-        return EncodeResult {
-            success: false,
-            error: format!("HDR-to-DCI LUT not found: {}", lut.display()),
-            ..Default::default()
-        };
-    }
-    if let SourceColour::DisplayRgbIn(space) = &opts.source_colour {
-        return EncodeResult {
-            success: false,
-            error: format!(
-                "a {space:?} source needs the in-process encoder: the subprocess pool hands \
-                 raw frames to grk_compress, which only converts Rec.709"
-            ),
-            ..Default::default()
-        };
-    }
-    if opts.codestream_byte_cap.is_some() {
-        return EncodeResult {
-            success: false,
-            error: "a per-frame byte cap needs the in-process encoder: here grk_compress \
-                    writes each codestream itself, so postkit never has one to size"
-                .to_string(),
-            ..Default::default()
-        };
-    }
-    if opts.quality_psnr.is_some() {
-        return EncodeResult {
-            success: false,
-            error: "a PSNR target needs the in-process encoder: the cinema profile hands \
-                    grk_compress a frame rate rather than a layer allocation"
-                .to_string(),
-            ..Default::default()
-        };
-    }
-
-    let (source_width, source_height, source_frames) =
-        probe_decode_source(&opts.input, opts.decode_source);
-    if source_width == 0 || source_height == 0 {
-        return EncodeResult {
-            success: false,
-            error: "Could not determine video dimensions".to_string(),
-            ..Default::default()
-        };
-    }
-    if let Some(range) = opts.frame_range
-        && let Err(e) = range.check_against_probe(source_frames)
-    {
-        return EncodeResult {
-            success: false,
-            error: e,
-            ..Default::default()
-        };
-    }
-    let total_frames = opts
-        .frame_range
-        .map_or(source_frames, |range| range.frame_count);
-    let plan = match opts.picture.plan(source_width, source_height) {
-        Ok(plan) => plan,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: e,
-                ..Default::default()
-            };
-        }
-    };
-    tracing::info!("picture: {}", plan.describe());
-    let (width, height) = (plan.output_width, plan.output_height);
-
-    if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
-        return EncodeResult {
-            success: false,
-            error: format!("Failed to create output directory: {e}"),
-            ..Default::default()
-        };
-    }
-
-    let frame_size = (width as usize) * (height as usize) * 3 * 2;
-
-    // Start ffmpeg
-    let filters = crate::picture_findings::with_detection_branch(&decode_filters(
-        opts.fps,
-        &opts.source_colour,
-        &plan,
-        opts.frame_range,
-    ));
-    let input_args = match decode_input_args(opts.decode_source, opts.read_source_at) {
-        Ok(args) => args,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: e,
-                ..Default::default()
-            };
-        }
-    };
-    tracing::debug!(
-        "ffmpeg -y {} -i {} -vf {filters}",
-        input_args.join(" "),
-        opts.input.display()
-    );
-    let mut ffmpeg = match std::process::Command::new("ffmpeg")
-        .arg("-y")
-        // the progress line carries no newline, so the reader would hold the
-        // whole run in one string
-        .arg("-nostats")
-        .args(&input_args)
-        .arg("-i")
-        .arg(&opts.input)
-        .args(decode_output_args(&filters, opts.frame_range))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: format!("Failed to launch ffmpeg: {e}"),
-                ..Default::default()
-            };
-        }
-    };
-
-    let detection_reader = ffmpeg
-        .stderr
-        .take()
-        .map(crate::picture_findings::read_detection_lines);
-
-    let mut ffmpeg_stdout = match ffmpeg.stdout.take() {
-        Some(s) => s,
-        None => {
-            return EncodeResult {
-                success: false,
-                error: "Failed to capture ffmpeg stdout".to_string(),
-                ..Default::default()
-            };
-        }
-    };
-
-    let params = grok_encoder::CompressParams {
+) -> Result<crate::grok_encoder::CompressParams, String> {
+    let colour_transform = opts.source_colour.frame_transform()?;
+    Ok(crate::grok_encoder::CompressParams {
         compression_ratio: opts.compression_ratio,
         quality_psnr: opts.quality_psnr,
         codestream_byte_cap: opts.codestream_byte_cap,
@@ -1225,366 +888,243 @@ where
         edit_rate: opts.fps,
         profile: opts.rsiz,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
-        ..grok_encoder::CompressParams::default()
-    };
-
-    let grk_bin = if opts.compressor_path.as_os_str().is_empty() {
-        PathBuf::from("grk_compress")
-    } else {
-        opts.compressor_path.clone()
-    };
-
-    let encode_start = std::time::Instant::now();
-
-    let result = grok_encoder::encode_pipeline_subprocess(
-        &opts.output_dir,
-        &params,
-        &grk_bin,
-        total_frames,
-        width,
-        height,
-        frame_size,
-        &mut ffmpeg_stdout,
-        cancel,
-        |progress| {
-            let elapsed = encode_start.elapsed().as_secs_f64();
-            on_progress(StreamProgress {
-                frame: progress.frames_encoded,
-                total_frames: progress.total_frames,
-                fps: progress.fps,
-                elapsed_secs: elapsed,
-                decode_wait_secs: progress.decode_wait_secs,
-                prepare_secs: progress.prepare_secs,
-                encode_secs: progress.encode_secs,
-                write_secs: progress.write_secs,
-            });
+        source_preparation: crate::grok_encoder::SourcePreparation {
+            subtitle_burn: opts.subtitle_burn.clone(),
+            colour_transform,
         },
-    );
-
-    let picture_findings = crate::picture_findings::finish_detection(
-        &mut ffmpeg,
-        detection_reader,
-        result.success,
-        opts.fps.as_f64(),
-        result.frames_encoded,
-    );
-
-    EncodeResult {
-        success: result.success,
-        error: result.error,
-        frames_encoded: result.frames_encoded,
-        output_dir: opts.output_dir.clone(),
-        picture_findings,
-    }
+        ..crate::grok_encoder::CompressParams::default()
+    })
 }
 
-// ─── Parallel encode (image sequence → parallel grk_compress subprocesses) ─
+// ─── TIFF sequence encode (loader threads → in-process grok) ──────────────
 
-/// Progress callback for parallel encode.
-pub struct ParallelProgress {
-    pub done: u64,
-    pub total: u64,
-    pub fps: f64,
-    pub elapsed_secs: f64,
+/// The most loader threads an in-process encode gets. Loading a frame costs a
+/// fraction of compressing it, so a few loaders keep every encoder thread fed
+/// while the encoders take every core.
+const LOADER_THREADS_MAX: usize = 4;
+/// Cores each loader thread is worth.
+const CORES_PER_LOADER: usize = 4;
+
+fn loader_thread_count() -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(CORES_PER_LOADER);
+    (cores / CORES_PER_LOADER).clamp(1, LOADER_THREADS_MAX)
 }
 
-/// grk_compress's profile flags. A DCI Rsiz goes in as grok's own cinema mode,
-/// which brings the frame rate, the DCI per-frame byte cap, the TLM marker and
-/// the 12-bit X'Y'Z' output with it, and grok holds to the tighter of that cap
-/// and `-r`. Any other Rsiz is declared as it is.
-fn grk_compress_profile_args(
-    rsiz: u16,
-    fps: FrameRate,
-    codestream_byte_cap: Option<u64>,
-) -> Vec<String> {
-    const BITS_PER_BYTE: u64 = 8;
-    let cinema_flag = match crate::j2k::J2kProfile::from(rsiz) {
-        crate::j2k::J2kProfile::Cinema2k => "-w",
-        crate::j2k::J2kProfile::Cinema4k => "-x",
-        _ => return vec!["-Z".to_string(), rsiz.to_string()],
-    };
-    let frame_rate = fps.as_f64().round() as u64;
-    let cinema_mode = match codestream_byte_cap {
-        // grk_compress takes the cap as a bit rate it divides back by the frame rate
-        Some(cap) => format!("{frame_rate},{}", cap * BITS_PER_BYTE * frame_rate),
-        None => frame_rate.to_string(),
-    };
-    vec![cinema_flag.to_string(), cinema_mode]
-}
+/// Loads the frame at an index, on the loader thread that opened it.
+pub type FrameLoader<'a> =
+    Box<dyn FnMut(u64) -> Result<crate::grok_encoder::RawFrame, String> + 'a>;
 
-/// Encode the given image files using parallel single-threaded subprocesses.
+/// Encode frames a caller loads itself through the in-process grok pipeline.
 ///
-/// Spawns up to `parallelism` grk_compress processes concurrently, each
-/// processing one frame with `-H 1` (single thread). Returns when all
-/// frames are encoded or an error occurs. Each finished frame is held to
-/// `codestream_byte_cap` so a run fails at the frame that breaks it.
+/// `open_loader` runs once on each of a small pool of loader threads and gives
+/// back what that thread loads frames with, so a loader can hold a reader of
+/// its own. The loaders run ahead of the encoder threads, which take every
+/// core. Each frame gets the burn, the colour transform, the profile and the
+/// byte cap a decoded video frame does, and its codestream reaches `mxf_feed`
+/// the same way, so the frames can wrap as they encode. The codestreams are
+/// numbered from zero by the index the frame was loaded at.
 ///
-/// The caller lists the sequence with [`find_source_frames`] and passes the
-/// frames it wants, so encoding a window is passing fewer of them.
-///
-/// `quality_psnr` replaces the compression ratio with a PSNR target grk_compress
-/// allocates layers by.
-///
-/// `source_colour` decides whether grk_compress runs its X'Y'Z' transform. A
-/// cinema `rsiz` runs grk_compress in its cinema mode at `fps`, which writes
-/// 12-bit X'Y'Z' from stills of any depth and refuses a PSNR target, since
-/// that mode allocates by rate. Any other `rsiz` is declared as given, and
-/// grk_compress then writes each frame at the precision of the file it read,
-/// so an IMF caller passes 12-bit frames.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_parallel<F>(
-    frames: &[PathBuf],
-    output_dir: &Path,
-    compression_ratio: f64,
-    quality_psnr: Option<f64>,
-    codestream_byte_cap: Option<u64>,
-    rsiz: u16,
-    fps: FrameRate,
-    source_colour: &SourceColour,
+/// `opts.input`, `read_source_at`, `picture` and `decode_source` are ffmpeg's
+/// and are not read: the loaded frames are the input. A `DciLut` source is
+/// refused, since that LUT runs inside ffmpeg's decode.
+pub fn encode_loaded_frames<'a, O, F>(
+    frame_count: u64,
+    open_loader: O,
+    opts: &StreamEncodeOptions,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
+    mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
     mut on_progress: F,
 ) -> EncodeResult
 where
-    F: FnMut(ParallelProgress),
+    O: Fn() -> Result<FrameLoader<'a>, String> + Sync,
+    F: FnMut(StreamProgress),
+{
+    use crate::grok_encoder::{self, EncodePhase, RawFrame};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+
+    let failure = |error: String| EncodeResult {
+        success: false,
+        error,
+        output_dir: opts.output_dir.clone(),
+        ..Default::default()
+    };
+    if frame_count == 0 {
+        return failure("No frames to encode".to_string());
+    }
+    if let SourceColour::DciLut(lut) = &opts.source_colour {
+        return failure(format!(
+            "the HDR-to-DCI LUT {} runs inside ffmpeg's decode, which these frames never pass \
+             through: encode from a video instead",
+            lut.display()
+        ));
+    }
+    let params = match compress_params(opts) {
+        Ok(params) => params,
+        Err(e) => return failure(e),
+    };
+    if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
+        return failure(format!("Failed to create output directory: {e}"));
+    }
+
+    grok_encoder::initialize(0);
+
+    let encode_start = std::time::Instant::now();
+    let phase_clocks = Arc::new(grok_encoder::PhaseClocks::default());
+    let loader_count = loader_thread_count();
+    let next_frame = AtomicU64::new(0);
+    let load_error: Mutex<Option<String>> = Mutex::new(None);
+    let record_load_error = |error: String| {
+        let mut slot = load_error.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(error);
+        }
+    };
+    let (loaded_tx, loaded_rx) = std::sync::mpsc::sync_channel::<RawFrame>(loader_count);
+
+    let result = std::thread::scope(|scope| {
+        for _ in 0..loader_count {
+            let loaded_tx = loaded_tx.clone();
+            let next_frame = &next_frame;
+            let load_error = &load_error;
+            let record_load_error = &record_load_error;
+            let open_loader = &open_loader;
+            scope.spawn(move || {
+                let mut load_frame = match open_loader() {
+                    Ok(loader) => loader,
+                    Err(e) => return record_load_error(e),
+                };
+                loop {
+                    if cancel.load(Ordering::Relaxed) || load_error.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let index = next_frame.fetch_add(1, Ordering::Relaxed);
+                    if index >= frame_count {
+                        break;
+                    }
+                    match load_frame(index) {
+                        Ok(frame) => {
+                            if loaded_tx.send(frame).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            record_load_error(e);
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+        // the loaders hold the only other senders
+        drop(loaded_tx);
+
+        // a loader blocked on a full channel exits when the receiver drops
+        grok_encoder::encode_pipeline_with_mxf_feed(
+            &opts.output_dir,
+            &params,
+            frame_count,
+            cancel,
+            &phase_clocks,
+            mxf_feed,
+            opts.codestream_byte_cap,
+            || {
+                while pause.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed) {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                let wait_start = std::time::Instant::now();
+                let frame = loaded_rx.recv().ok();
+                phase_clocks.add(EncodePhase::DecoderWait, wait_start.elapsed());
+                frame
+            },
+            |progress| {
+                on_progress(StreamProgress {
+                    frame: progress.frames_encoded,
+                    total_frames: progress.total_frames,
+                    fps: progress.fps,
+                    elapsed_secs: encode_start.elapsed().as_secs_f64(),
+                    decode_wait_secs: progress.decode_wait_secs,
+                    prepare_secs: progress.prepare_secs,
+                    encode_secs: progress.encode_secs,
+                    write_secs: progress.write_secs,
+                });
+            },
+        )
+    });
+
+    let load_error = load_error.into_inner().unwrap();
+    let (success, error) = match (result.success, load_error) {
+        (false, _) => (false, result.error),
+        (true, Some(load_error)) => (false, load_error),
+        (true, None) => (true, String::new()),
+    };
+    EncodeResult {
+        success,
+        error,
+        frames_encoded: result.frames_encoded,
+        output_dir: opts.output_dir.clone(),
+        picture_findings: crate::picture_findings::PictureFindings::default(),
+    }
+}
+
+/// Encode a TIFF sequence through [`encode_loaded_frames`]: each loader thread
+/// reads the stills through `grok::load_tiff` into packed 16-bit RGB, so the
+/// burn, the colour transform, the profile, the byte cap and the MXF feed all
+/// apply to stills exactly as to decoded video. A still that cannot be read
+/// fails the run by name.
+pub fn encode_tiff_sequence_inprocess<F>(
+    frames: &[PathBuf],
+    opts: &StreamEncodeOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
+    on_progress: F,
+) -> EncodeResult
+where
+    F: FnMut(StreamProgress),
 {
     if frames.is_empty() {
         return EncodeResult {
             success: false,
             error: "No source image files found".to_string(),
+            output_dir: opts.output_dir.clone(),
             ..Default::default()
         };
     }
-
-    let apply_xyz_transform = source_colour.applies_xyz_transform();
-    if crate::j2k::J2kProfile::from(rsiz) == crate::j2k::J2kProfile::Imf && apply_xyz_transform {
-        return EncodeResult {
-            success: false,
-            error: format!(
-                "RSIZ {rsiz:#06x} is an IMF profile, whose picture is RGB, so the X'Y'Z' \
-                 transform cannot run"
-            ),
-            ..Default::default()
-        };
-    }
-    if crate::j2k::J2kProfile::from(rsiz).is_dci_cinema() && quality_psnr.is_some() {
-        return EncodeResult {
-            success: false,
-            error: format!(
-                "RSIZ {rsiz:#06x} is a cinema profile, which grk_compress allocates by rate \
-                 under the DCI cap, so a PSNR target cannot be honoured"
-            ),
-            ..Default::default()
-        };
-    }
-
-    let total = frames.len() as u64;
-    let (allocation_flag, allocation_value) = match quality_psnr {
-        Some(psnr) => ("-q", psnr),
-        None => ("-r", compression_ratio),
+    let open_loader = || -> Result<FrameLoader<'_>, String> {
+        Ok(Box::new(|index: u64| {
+            let path = &frames[index as usize];
+            let tiff = crate::grok::load_tiff(path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            Ok(tiff.into_rgb48be_frame(index))
+        }))
     };
-    let mut compress_args: Vec<String> = vec![
-        allocation_flag.to_string(),
-        allocation_value.to_string(),
-        "-n".to_string(),
-        "6".to_string(),
-        "-b".to_string(),
-        "32,32".to_string(),
-        "-p".to_string(),
-        "CPRL".to_string(),
-        "-H".to_string(),
-        "1".to_string(),
-        "-X".to_string(),
-    ];
-    if apply_xyz_transform {
-        compress_args.push("--xyz".to_string());
-    }
-    compress_args.extend(grk_compress_profile_args(rsiz, fps, codestream_byte_cap));
-
-    if let Err(e) = std::fs::create_dir_all(output_dir) {
-        return EncodeResult {
-            success: false,
-            error: format!("Failed to create output dir: {e}"),
-            ..Default::default()
-        };
-    }
-
-    let grk_bin = match crate::grok::find_grk_compress() {
-        Some(p) => p,
-        None => {
-            return EncodeResult {
-                success: false,
-                error: "Cannot find grk_compress binary".to_string(),
-                ..Default::default()
-            };
-        }
-    };
-    let lib_path = crate::grok::grok_lib_path();
-
-    let parallelism = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(16);
-
-    let encode_start = std::time::Instant::now();
-    let done_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let error_flag = Arc::new(AtomicBool::new(false));
-    let first_error = Arc::new(std::sync::Mutex::new(String::new()));
-
-    let work_idx = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-    std::thread::scope(|s| {
-        let _workers: Vec<_> = (0..parallelism)
-            .map(|_| {
-                let work_idx = work_idx.clone();
-                let done_count = done_count.clone();
-                let error_flag = error_flag.clone();
-                let first_error = first_error.clone();
-                let grk_bin = &grk_bin;
-                let lib_path = &lib_path;
-                let compress_args = &compress_args;
-
-                s.spawn(move || {
-                    loop {
-                        if cancel.load(Ordering::Relaxed) || error_flag.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        while pause.load(Ordering::Relaxed) {
-                            if cancel.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-
-                        let idx = work_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= frames.len() {
-                            break;
-                        }
-
-                        let frame = &frames[idx];
-                        let stem = frame
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("frame");
-                        let out_file = output_dir.join(format!("{stem}.j2k"));
-
-                        let result = std::process::Command::new(grk_bin)
-                            .env("LD_LIBRARY_PATH", lib_path)
-                            .args([
-                                "-i",
-                                &frame.to_string_lossy(),
-                                "-o",
-                                &out_file.to_string_lossy(),
-                            ])
-                            .args(compress_args)
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
-
-                        match result {
-                            Ok(status) if status.success() => {
-                                if let Some(cap) = codestream_byte_cap
-                                    && let Err(e) = check_codestream_size(&out_file, cap)
-                                {
-                                    error_flag.store(true, Ordering::Relaxed);
-                                    let mut err = first_error.lock().unwrap();
-                                    if err.is_empty() {
-                                        *err = e;
-                                    }
-                                    continue;
-                                }
-                                done_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Ok(status) => {
-                                error_flag.store(true, Ordering::Relaxed);
-                                let mut err = first_error.lock().unwrap();
-                                if err.is_empty() {
-                                    *err = format!(
-                                        "grk_compress failed on {}: {}",
-                                        frame.display(),
-                                        status
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                error_flag.store(true, Ordering::Relaxed);
-                                let mut err = first_error.lock().unwrap();
-                                if err.is_empty() {
-                                    *err = format!(
-                                        "Failed to spawn grk_compress for {}: {}",
-                                        frame.display(),
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        // Monitor progress
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-
-            let done = done_count.load(Ordering::Relaxed);
-            let elapsed = encode_start.elapsed().as_secs_f64();
-            let fps = if elapsed > 0.0 {
-                done as f64 / elapsed
-            } else {
-                0.0
-            };
-
-            on_progress(ParallelProgress {
-                done,
-                total,
-                fps,
-                elapsed_secs: elapsed,
-            });
-
-            if done >= total || error_flag.load(Ordering::Relaxed) || cancel.load(Ordering::Relaxed)
-            {
-                break;
-            }
-        }
-
-        // Scoped threads join automatically here
-    });
-
-    if cancel.load(Ordering::Relaxed) {
-        return EncodeResult {
-            success: false,
-            error: "Cancelled".to_string(),
-            frames_encoded: done_count.load(Ordering::Relaxed),
-            output_dir: output_dir.to_path_buf(),
-            ..Default::default()
-        };
-    }
-
-    let err_msg = first_error.lock().unwrap();
-    if !err_msg.is_empty() {
-        return EncodeResult {
-            success: false,
-            error: err_msg.clone(),
-            frames_encoded: done_count.load(Ordering::Relaxed),
-            output_dir: output_dir.to_path_buf(),
-            ..Default::default()
-        };
-    }
-
-    EncodeResult {
-        success: true,
-        error: String::new(),
-        frames_encoded: total,
-        output_dir: output_dir.to_path_buf(),
-        ..Default::default()
-    }
+    encode_loaded_frames(
+        frames.len() as u64,
+        open_loader,
+        opts,
+        cancel,
+        pause,
+        mxf_feed,
+        on_progress,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn write_noise_png(path: &Path, seed: u32) {
+    #[cfg(feature = "grok-ffi")]
+    fn write_noise_tiff(path: &Path, seed: u32) {
         let (w, h) = (128u32, 128u32);
         let mut state = seed;
         let data: Vec<u8> = (0..(w * h * 3))
@@ -1594,26 +1134,43 @@ mod tests {
             })
             .collect();
         let file = std::fs::File::create(path).unwrap();
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-        encoder.set_color(png::ColorType::Rgb);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()
+        tiff::encoder::TiffEncoder::new(std::io::BufWriter::new(file))
             .unwrap()
-            .write_image_data(&data)
+            .write_image::<tiff::encoder::colortype::RGB8>(w, h, &data)
             .unwrap();
     }
 
+    #[cfg(feature = "grok-ffi")]
+    fn encode_tiffs(
+        frames: &[PathBuf],
+        output: &Path,
+        ratio: f64,
+        cap: Option<u64>,
+    ) -> EncodeResult {
+        encode_tiff_sequence_inprocess(
+            frames,
+            &StreamEncodeOptions {
+                output_dir: output.to_path_buf(),
+                compression_ratio: ratio,
+                codestream_byte_cap: cap,
+                ..StreamEncodeOptions::default()
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            None,
+            |_| {},
+        )
+    }
+
+    #[cfg(feature = "grok-ffi")]
     #[test]
-    fn parallel_encode_honours_the_ratio_and_the_cap() {
+    fn a_tiff_sequence_honours_the_ratio_and_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in");
         std::fs::create_dir(&input).unwrap();
         for i in 0..2u32 {
-            write_noise_png(&input.join(format!("frame_{i:03}.png")), 7 + i);
+            write_noise_tiff(&input.join(format!("frame_{i:03}.tif")), 7 + i);
         }
-        let cancel = Arc::new(AtomicBool::new(false));
-        let pause = Arc::new(AtomicBool::new(false));
         let sizes = |out: &Path| -> Vec<u64> {
             let mut v: Vec<u64> = std::fs::read_dir(out)
                 .unwrap()
@@ -1626,21 +1183,9 @@ mod tests {
 
         let frames = find_source_frames(&input).unwrap();
         let loose_dir = dir.path().join("r10");
-        let result = encode_parallel(
-            &frames,
-            &loose_dir,
-            10.0,
-            None,
-            None,
-            default_rsiz(),
-            FrameRate::whole(24),
-            &SourceColour::DisplayRgb,
-            &cancel,
-            &pause,
-            |_| {},
-        );
+        let result = encode_tiffs(&frames, &loose_dir, 10.0, None);
         assert!(result.success, "{}", result.error);
-        let codestream = std::fs::read(loose_dir.join("frame_000.j2k")).unwrap();
+        let codestream = std::fs::read(loose_dir.join("frame_00000000.j2c")).unwrap();
         let header = crate::j2k::parse_j2k_header(&codestream).expect("codestream header");
         assert_eq!(
             header.profile, 0x0003,
@@ -1649,24 +1194,12 @@ mod tests {
         assert_eq!(
             header.bit_depths,
             vec![12, 12, 12],
-            "grok widens 8-bit stills to the 12 bits cinema requires"
+            "8-bit stills are widened to the 12 bits cinema requires"
         );
         crate::j2k::validate_dci_header(&header).expect("the AS-DCP wrap accepts the codestream");
 
         let tight_dir = dir.path().join("r40");
-        let result = encode_parallel(
-            &frames,
-            &tight_dir,
-            40.0,
-            None,
-            None,
-            default_rsiz(),
-            FrameRate::whole(24),
-            &SourceColour::DisplayRgb,
-            &cancel,
-            &pause,
-            |_| {},
-        );
+        let result = encode_tiffs(&frames, &tight_dir, 40.0, None);
         assert!(result.success, "{}", result.error);
         let loose = sizes(&loose_dir);
         let tight = sizes(&tight_dir);
@@ -1677,20 +1210,7 @@ mod tests {
             "noise at 40:1 must be smaller than at 10:1, got {tight:?} vs {loose:?}"
         );
 
-        let capped_dir = dir.path().join("capped");
-        let result = encode_parallel(
-            &frames,
-            &capped_dir,
-            10.0,
-            None,
-            Some(64),
-            default_rsiz(),
-            FrameRate::whole(24),
-            &SourceColour::DisplayRgb,
-            &cancel,
-            &pause,
-            |_| {},
-        );
+        let result = encode_tiffs(&frames, &dir.path().join("capped"), 10.0, Some(64));
         assert!(!result.success, "a 64 byte cap cannot hold a codestream");
         assert!(
             result.error.contains("per-frame cap"),
@@ -1699,13 +1219,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "grok-ffi")]
     #[test]
-    fn parallel_encode_compresses_only_the_frames_it_is_given() {
+    fn a_tiff_sequence_compresses_only_the_frames_it_is_given() {
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("in");
         std::fs::create_dir(&input).unwrap();
         for i in 0..6u32 {
-            write_noise_png(&input.join(format!("frame_{i:03}.png")), 11 + i);
+            write_noise_tiff(&input.join(format!("frame_{i:03}.tif")), 11 + i);
         }
         let frames = find_source_frames(&input).unwrap();
         let window = FrameRange {
@@ -1716,19 +1237,7 @@ mod tests {
         .unwrap();
 
         let output = dir.path().join("out");
-        let result = encode_parallel(
-            window,
-            &output,
-            10.0,
-            None,
-            None,
-            default_rsiz(),
-            FrameRate::whole(24),
-            &SourceColour::DisplayRgb,
-            &Arc::new(AtomicBool::new(false)),
-            &Arc::new(AtomicBool::new(false)),
-            |_| {},
-        );
+        let result = encode_tiffs(window, &output, 10.0, None);
         assert!(result.success, "{}", result.error);
         assert_eq!(result.frames_encoded, 3);
 
@@ -1740,9 +1249,57 @@ mod tests {
         written.sort();
         assert_eq!(
             written,
-            vec!["frame_002.j2k", "frame_003.j2k", "frame_004.j2k"],
-            "only the window's stills may be compressed"
+            vec![
+                "frame_00000000.j2c",
+                "frame_00000001.j2c",
+                "frame_00000002.j2c"
+            ],
+            "only the window's stills may be compressed, numbered from zero"
         );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn an_unreadable_still_fails_the_run_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in");
+        std::fs::create_dir(&input).unwrap();
+        write_noise_tiff(&input.join("frame_000.tif"), 3);
+        let broken = input.join("frame_001.tif");
+        std::fs::write(&broken, b"not really a tiff").unwrap();
+        write_noise_tiff(&input.join("frame_002.tif"), 5);
+
+        let frames = find_source_frames(&input).unwrap();
+        let result = encode_tiffs(&frames, &dir.path().join("out"), 10.0, None);
+        assert!(
+            !result.success,
+            "a still that cannot be read has to fail the run"
+        );
+        assert!(
+            result.error.contains("frame_001.tif"),
+            "the failure has to name the still: {}",
+            result.error
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn the_lut_source_needs_ffmpeg_so_a_tiff_sequence_refuses_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = encode_tiff_sequence_inprocess(
+            &[dir.path().join("frame_000.tif")],
+            &StreamEncodeOptions {
+                output_dir: dir.path().join("out"),
+                source_colour: SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+                ..StreamEncodeOptions::default()
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            None,
+            |_| {},
+        );
+        assert!(!result.success);
+        assert!(result.error.contains("hdr_to_dci.cube"), "{}", result.error);
     }
 
     #[test]
@@ -2077,24 +1634,5 @@ mod tests {
         let error = check_codestream_size(&frame, 2047).unwrap_err();
         assert!(error.contains("2048 bytes"), "{error}");
         assert!(check_codestream_size(&dir.path().join("missing.j2c"), 2048).is_err());
-    }
-
-    #[test]
-    fn the_subprocess_encoder_refuses_a_byte_cap() {
-        let result = stream_encode_subprocess(
-            &StreamEncodeOptions {
-                input: PathBuf::from("/nonexistent.mov"),
-                codestream_byte_cap: Some(1_302_083),
-                ..StreamEncodeOptions::default()
-            },
-            &Arc::new(AtomicBool::new(false)),
-            |_| {},
-        );
-        assert!(!result.success);
-        assert!(
-            result.error.contains("needs the in-process encoder"),
-            "{}",
-            result.error
-        );
     }
 }

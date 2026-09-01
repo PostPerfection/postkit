@@ -190,6 +190,7 @@ pub enum ProgressionOrder {
 impl CompressParams {
     /// grok sizes the per-frame byte budget from a whole rate, and DCI has only
     /// 24 and 48, so a 23.976 stream is a 24 fps one to the compressor.
+    #[cfg(feature = "grok-ffi")]
     fn grok_frame_rate(&self) -> u16 {
         self.edit_rate.as_f64().round() as u16
     }
@@ -552,6 +553,7 @@ where
         // backpressure paces this loop at encode speed, so it reports progress
         // too: the wait loop below only covers the final queue drain.
         let mut last_progress = std::time::Instant::now();
+        let mut frames_produced = 0u64;
         loop {
             if cancel.load(Ordering::Relaxed) || error_flag.load(Ordering::Relaxed) {
                 break;
@@ -562,6 +564,7 @@ where
                     if !input_queue.push(frame) {
                         break;
                     }
+                    frames_produced += 1;
                 }
                 None => break,
             }
@@ -582,7 +585,7 @@ where
         // Signal encoder threads that no more frames are coming
         input_queue.close();
 
-        // Report progress while waiting for encoders to finish
+        // the producer may stop short of `total_frames`
         loop {
             let done = frames_encoded.load(Ordering::Relaxed);
             let elapsed = encode_start.elapsed().as_secs_f64();
@@ -593,7 +596,7 @@ where
                 phase_clocks,
             ));
 
-            if done >= total_frames
+            if done >= frames_produced
                 || error_flag.load(Ordering::Relaxed)
                 || cancel.load(Ordering::Relaxed)
             {
@@ -966,7 +969,6 @@ fn compress_frame_once(
     }
 }
 
-/// Fallback: when grok-ffi feature is not enabled, use subprocess
 #[cfg(not(feature = "grok-ffi"))]
 fn compress_frame_grok(
     _frame: &RawFrame,
@@ -1257,309 +1259,6 @@ where
     PipelineResult {
         picture_findings,
         ..result
-    }
-}
-
-// ─── Subprocess-based encoder pipeline ─────────────────────────────────────────
-
-/// Encode frames using parallel `grk_compress` subprocesses.
-///
-/// Each subprocess gets its own independent Grok thread pool, avoiding the
-/// shared-pool bottleneck of the FFI approach. Frames are written as raw data
-/// to a ramdisk (/dev/shm), compressed by grk_compress, and the resulting
-/// .j2c files written to the output directory.
-///
-/// `input` provides raw frames (rgb48be) as a contiguous byte stream. Each frame
-/// is `frame_size` bytes. The producer reads directly from the stream to /dev/shm,
-/// avoiding intermediate buffer clones.
-///
-/// Of the phase clocks, only the decoder wait and the JPEG 2000 time are filled
-/// in: this path prepares nothing, and grk_compress writes the codestream inside
-/// the child, where nothing here can time it. The JPEG 2000 clock is the whole
-/// grk_compress run, summed over the workers, so it also covers the child's own
-/// read and write.
-#[allow(clippy::too_many_arguments)]
-pub fn encode_pipeline_subprocess<P>(
-    output_dir: &Path,
-    params: &CompressParams,
-    grk_compress_bin: &Path,
-    total_frames: u64,
-    width: u32,
-    height: u32,
-    frame_size: usize,
-    input: &mut dyn std::io::Read,
-    cancel: &Arc<AtomicBool>,
-    mut on_progress: P,
-) -> PipelineResult
-where
-    P: FnMut(EncodeProgress),
-{
-    use std::process::{Command, Stdio};
-
-    if crate::j2k::J2kProfile::from(params.profile) == crate::j2k::J2kProfile::Imf {
-        return PipelineResult {
-            success: false,
-            error: "grk_compress reads the pipeline's frames as 16-bit and has no way to \
-                    reduce them to the 12 bits IMF picture is written at: use the in-process \
-                    pipeline"
-                .to_string(),
-            frames_encoded: 0,
-            output_dir: output_dir.to_path_buf(),
-            picture_findings: crate::picture_findings::PictureFindings::default(),
-        };
-    }
-
-    if !params.source_preparation.is_empty() {
-        return PipelineResult {
-            success: false,
-            error: "the subprocess encoder writes raw frames straight to grk_compress and \
-                    cannot burn subtitles or run a source colour transform: use the \
-                    in-process pipeline"
-                .to_string(),
-            frames_encoded: 0,
-            output_dir: output_dir.to_path_buf(),
-            picture_findings: crate::picture_findings::PictureFindings::default(),
-        };
-    }
-
-    if let Err(e) = std::fs::create_dir_all(output_dir) {
-        return PipelineResult {
-            success: false,
-            error: format!("Failed to create output directory: {e}"),
-            frames_encoded: 0,
-            output_dir: output_dir.to_path_buf(),
-            picture_findings: crate::picture_findings::PictureFindings::default(),
-        };
-    }
-
-    let total_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(16);
-    // Use half as many workers as CPUs, with 2 threads each.
-    // This keeps memory manageable while ensuring good parallelism.
-    let num_workers = total_cpus / 2;
-    let threads_per_worker = 2;
-
-    // Use /dev/shm (ramdisk) for temporary frame I/O to avoid disk bottleneck
-    let tmp_dir = PathBuf::from("/dev/shm/grok_encode_tmp");
-    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
-        return PipelineResult {
-            success: false,
-            error: format!("Failed to create tmp dir: {e}"),
-            frames_encoded: 0,
-            output_dir: output_dir.to_path_buf(),
-            picture_findings: crate::picture_findings::PictureFindings::default(),
-        };
-    }
-
-    let frames_encoded = Arc::new(AtomicU64::new(0));
-    let error_flag = Arc::new(AtomicBool::new(false));
-    let first_error = Arc::new(Mutex::new(String::new()));
-    let encode_start = std::time::Instant::now();
-    let phase_clocks = Arc::new(PhaseClocks::default());
-
-    // Bounded queue for work items: (frame_index, input_path)
-    let work_queue: Arc<BoundedQueue<(u64, PathBuf, u32, u32)>> =
-        Arc::new(BoundedQueue::new(num_workers * 2));
-
-    let output_dir_owned = output_dir.to_path_buf();
-    let grk_bin = grk_compress_bin.to_path_buf();
-
-    // Build CLI args from params
-    let mut cinema_flag: Vec<String> = if params.profile == 0x0003 {
-        vec![
-            "-w".to_string(),
-            params.grok_frame_rate().to_string(),
-            "-H".to_string(),
-            threads_per_worker.to_string(),
-        ]
-    } else if params.profile == 0x0004 {
-        vec![
-            "-x".to_string(),
-            "-H".to_string(),
-            threads_per_worker.to_string(),
-        ]
-    } else {
-        vec![
-            "-r".to_string(),
-            format!("{}", params.compression_ratio),
-            "-b".to_string(),
-            format!("{},{}", params.codeblock_size, params.codeblock_size),
-            "-p".to_string(),
-            "CPRL".to_string(),
-        ]
-    };
-    if params.apply_xyz_transform {
-        cinema_flag.push("--xyz".to_string());
-    }
-
-    // Worker threads: each picks a frame from the queue, spawns grk_compress
-    std::thread::scope(|s| {
-        let worker_handles: Vec<_> = (0..num_workers)
-            .map(|_| {
-                let work_queue = work_queue.clone();
-                let error_flag = error_flag.clone();
-                let first_error = first_error.clone();
-                let cancel = cancel.clone();
-                let frames_encoded = frames_encoded.clone();
-                let output_dir = output_dir_owned.clone();
-                let grk_bin = grk_bin.clone();
-                let cinema_flag = cinema_flag.clone();
-                let phase_clocks = phase_clocks.clone();
-
-                s.spawn(move || {
-                    while !cancel.load(Ordering::Relaxed) && !error_flag.load(Ordering::Relaxed) {
-                        let Some((frame_idx, input_path, w, h)) = work_queue.pop() else {
-                            break;
-                        };
-
-                        let output_path = output_dir.join(format!("frame_{:08}.j2c", frame_idx));
-                        let raw_spec = format!("{w},{h},3,16,u");
-
-                        let compress_start = std::time::Instant::now();
-                        let status = Command::new(&grk_bin)
-                            .arg("-i")
-                            .arg(&input_path)
-                            .arg("-F")
-                            .arg(&raw_spec)
-                            .arg("-o")
-                            .arg(&output_path)
-                            .args(&cinema_flag)
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
-                        phase_clocks.add(EncodePhase::Jpeg2000, compress_start.elapsed());
-
-                        match status {
-                            Ok(s) if s.success() => {
-                                frames_encoded.fetch_add(1, Ordering::Relaxed);
-                                let _ = std::fs::remove_file(&input_path);
-                            }
-                            Ok(s) => {
-                                error_flag.store(true, Ordering::Relaxed);
-                                let mut err = first_error.lock().unwrap();
-                                if err.is_empty() {
-                                    *err = format!(
-                                        "grk_compress failed frame {frame_idx}: exit {}",
-                                        s.code().unwrap_or(-1)
-                                    );
-                                }
-                                break;
-                            }
-                            Err(e) => {
-                                error_flag.store(true, Ordering::Relaxed);
-                                let mut err = first_error.lock().unwrap();
-                                if err.is_empty() {
-                                    *err = format!("Failed to spawn grk_compress: {e}");
-                                }
-                                break;
-                            }
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        // Producer: read frames from input stream directly to /dev/shm files
-        let mut frame_index: u64 = 0;
-        let mut buf = vec![0u8; 64 * 1024]; // 64KB transfer buffer
-        while !cancel.load(Ordering::Relaxed) && !error_flag.load(Ordering::Relaxed) {
-            let input_path = tmp_dir.join(format!("frame_{:08}.raw", frame_index));
-
-            // Read exactly frame_size bytes from input, writing directly to file
-            let mut file = match std::fs::File::create(&input_path) {
-                Ok(f) => f,
-                Err(e) => {
-                    error_flag.store(true, Ordering::Relaxed);
-                    let mut err = first_error.lock().unwrap();
-                    if err.is_empty() {
-                        *err = format!("Failed to create frame file: {e}");
-                    }
-                    break;
-                }
-            };
-            let mut remaining = frame_size;
-            let mut hit_eof = false;
-            while remaining > 0 {
-                let chunk = remaining.min(buf.len());
-                let read_start = std::time::Instant::now();
-                let read = input.read_exact(&mut buf[..chunk]);
-                phase_clocks.add(EncodePhase::DecoderWait, read_start.elapsed());
-                match read {
-                    Ok(()) => {
-                        use std::io::Write;
-                        if let Err(e) = file.write_all(&buf[..chunk]) {
-                            error_flag.store(true, Ordering::Relaxed);
-                            let mut err = first_error.lock().unwrap();
-                            if err.is_empty() {
-                                *err = format!("Failed to write frame {frame_index}: {e}");
-                            }
-                            hit_eof = true;
-                            break;
-                        }
-                        remaining -= chunk;
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                        hit_eof = true;
-                        break;
-                    }
-                    Err(e) => {
-                        error_flag.store(true, Ordering::Relaxed);
-                        let mut err = first_error.lock().unwrap();
-                        if err.is_empty() {
-                            *err = format!("Read error frame {frame_index}: {e}");
-                        }
-                        hit_eof = true;
-                        break;
-                    }
-                }
-            }
-            if hit_eof {
-                let _ = std::fs::remove_file(&input_path);
-                break;
-            }
-            drop(file);
-
-            if !work_queue.push((frame_index, input_path, width, height)) {
-                break;
-            }
-            frame_index += 1;
-
-            // Progress reporting
-            let encoded = frames_encoded.load(Ordering::Relaxed);
-            let elapsed = encode_start.elapsed().as_secs_f64();
-            on_progress(EncodeProgress::new(
-                encoded,
-                total_frames,
-                elapsed,
-                &phase_clocks,
-            ));
-        }
-
-        work_queue.close();
-        for h in worker_handles {
-            let _ = h.join();
-        }
-    });
-
-    let elapsed = encode_start.elapsed().as_secs_f64();
-    let final_count = frames_encoded.load(Ordering::Relaxed);
-    on_progress(EncodeProgress::new(
-        final_count,
-        total_frames,
-        elapsed,
-        &phase_clocks,
-    ));
-
-    let _ = std::fs::remove_dir_all(&tmp_dir);
-
-    let err = first_error.lock().unwrap().clone();
-    PipelineResult {
-        success: err.is_empty() && final_count == total_frames,
-        error: err,
-        frames_encoded: final_count,
-        output_dir: output_dir.to_path_buf(),
-        picture_findings: crate::picture_findings::PictureFindings::default(),
     }
 }
 

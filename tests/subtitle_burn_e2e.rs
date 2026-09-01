@@ -1,7 +1,7 @@
 //! Subtitle burn-in through the real encode, end to end.
 //!
 //! Encodes the same clip twice, once plain and once with a bitmap cue burnt in,
-//! decodes both with `grk_decompress`, and compares the two rasters. The cue is
+//! decodes both in memory, and compares the two rasters. The cue is
 //! a solid PNG at a known spot, so its region has to move by a lot while the
 //! rest of the frame barely moves at all.
 //!
@@ -99,54 +99,18 @@ fn encode(video: &Path, output: &Path, burn: Option<Arc<SubtitleBurn>>) -> PathB
     .j2k_dir
 }
 
-/// Decode one codestream to a 16-bit-per-channel PPM and return its samples.
-fn decode_frame(grk_decompress: &Path, codestream: &Path, out: &Path) -> Vec<u16> {
-    let output = std::process::Command::new(grk_decompress)
-        .env("LD_LIBRARY_PATH", postkit::grok::grok_lib_path())
-        .args(["-i", &codestream.to_string_lossy()])
-        .args(["-o", &out.to_string_lossy()])
-        .output()
-        .expect("grk_decompress");
-    assert!(
-        output.status.success(),
-        "grk_decompress failed on {}: {}",
-        codestream.display(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let bytes = std::fs::read(out).expect("decoded ppm");
-    // P6 header: magic, width, height, maxval, each whitespace-separated, then
-    // one whitespace byte before the raster.
-    let mut at = 0usize;
-    let mut fields = 0;
-    while fields < 4 {
-        while bytes[at].is_ascii_whitespace() {
-            at += 1;
-        }
-        if bytes[at] == b'#' {
-            while bytes[at] != b'\n' {
-                at += 1;
-            }
-            continue;
-        }
-        while !bytes[at].is_ascii_whitespace() {
-            at += 1;
-        }
-        fields += 1;
-    }
-    at += 1;
-    bytes[at..]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|s| u16::from_be_bytes(*s))
-        .collect()
+/// Decode one codestream in memory and return its samples pixel-interleaved
+/// at the codestream's own 12 bits.
+fn decode_frame(codestream: &Path) -> Vec<u16> {
+    let data = std::fs::read(codestream).expect("codestream");
+    postkit::grok_decoder::decode(data, 0)
+        .unwrap_or_else(|e| panic!("cannot decode {}: {e}", codestream.display()))
+        .interleaved_samples()
+        .expect("three components")
 }
 
 #[test]
 fn a_burnt_cue_changes_its_own_region_and_nothing_else() {
-    let grk_decompress =
-        postkit::grok::find_grk_decompress().expect("grk_decompress is required for this test");
-
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mp4");
     make_clip(&video);
@@ -164,16 +128,8 @@ fn a_burnt_cue_changes_its_own_region_and_nothing_else() {
     let plain_dir = encode(&video, &dir.path().join("plain"), None);
     let burnt_dir = encode(&video, &dir.path().join("burnt"), Some(burn));
 
-    let plain = decode_frame(
-        &grk_decompress,
-        &plain_dir.join("frame_00000000.j2c"),
-        &dir.path().join("plain.ppm"),
-    );
-    let burnt = decode_frame(
-        &grk_decompress,
-        &burnt_dir.join("frame_00000000.j2c"),
-        &dir.path().join("burnt.ppm"),
-    );
+    let plain = decode_frame(&plain_dir.join("frame_00000000.j2c"));
+    let burnt = decode_frame(&burnt_dir.join("frame_00000000.j2c"));
     assert_eq!(plain.len(), (WIDTH * HEIGHT * 3) as usize);
     assert_eq!(burnt.len(), plain.len());
 
@@ -245,14 +201,10 @@ fn spread(frame: &[u16], left: usize, right: usize) -> u32 {
     (high - low) as u32
 }
 
-/// An image sequence is compressed straight from file by `grk_compress`, which
-/// never shows postkit a frame buffer. A burn takes it through ffmpeg's concat
-/// demuxer instead, so this proves the cue actually lands on those frames.
+/// A TIFF sequence is read by postkit's own loader rather than decoded by
+/// ffmpeg, so this proves the cue lands on those frames too.
 #[test]
-fn an_image_sequence_burns_through_the_concat_demuxer() {
-    let grk_decompress =
-        postkit::grok::find_grk_decompress().expect("grk_decompress is required for this test");
-
+fn a_tiff_sequence_burns_on_the_frames_postkit_reads() {
     let dir = tempfile::tempdir().unwrap();
     let frames_dir = dir.path().join("frames");
     std::fs::create_dir_all(&frames_dir).unwrap();
@@ -296,16 +248,8 @@ fn an_image_sequence_burns_through_the_concat_demuxer() {
         burnt_dir.display()
     );
 
-    let before = decode_frame(
-        &grk_decompress,
-        &burnt_dir.join("frame_00000000.j2c"),
-        &dir.path().join("before.ppm"),
-    );
-    let after = decode_frame(
-        &grk_decompress,
-        &burnt_dir.join(format!("frame_{cue_from_frame:08}.j2c")),
-        &dir.path().join("after.ppm"),
-    );
+    let before = decode_frame(&burnt_dir.join("frame_00000000.j2c"));
+    let after = decode_frame(&burnt_dir.join(format!("frame_{cue_from_frame:08}.j2c")));
     assert_cue_region_changed(&before, &after);
 }
 

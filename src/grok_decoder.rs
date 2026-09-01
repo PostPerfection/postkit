@@ -33,6 +33,25 @@ const DCI_PRECISION_BITS: u32 = 12;
 const XYZ12LE_SAMPLE_SHIFT: u32 = 4;
 
 impl DecodedFrame {
+    /// The three components pixel-interleaved at the codestream's own
+    /// precision, the order an image file holds them in.
+    pub fn interleaved_samples(&self) -> Result<Vec<u16>, String> {
+        if self.components.len() != DCI_COMPONENT_COUNT {
+            return Err(format!(
+                "a picture frame has {DCI_COMPONENT_COUNT} components, this codestream has {}",
+                self.components.len()
+            ));
+        }
+        let samples = self.width as usize * self.height as usize;
+        let mut interleaved = Vec::with_capacity(samples * DCI_COMPONENT_COUNT);
+        for sample in 0..samples {
+            for component in &self.components {
+                interleaved.push(component[sample].clamp(0, u16::MAX as i32) as u16);
+            }
+        }
+        Ok(interleaved)
+    }
+
     /// Pack the components into ffmpeg's `xyz12le` layout, which is what
     /// postkit's colour transforms read: X, Y, Z per pixel, each a
     /// little-endian 16-bit word holding its 12-bit sample in the high bits.

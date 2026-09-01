@@ -9,6 +9,33 @@ pub struct TiffFrame {
     pub path: PathBuf,
 }
 
+/// The sample depth of a packed rgb48be frame.
+const RGB48_PRECISION: u8 = 16;
+
+impl TiffFrame {
+    /// The frame as packed big-endian 16-bit RGB, the form the encoder threads
+    /// burn subtitles and convert colour on. Shallower samples are shifted up
+    /// to 16 bits, so a 12-bit still comes back exactly once the encoder
+    /// shifts it down again.
+    pub fn into_rgb48be_frame(self, index: u64) -> crate::grok_encoder::RawFrame {
+        let shift = RGB48_PRECISION - self.precision;
+        let [r, g, b] = self.components;
+        let mut data = Vec::with_capacity(r.len() * 6);
+        for ((r, g), b) in r.iter().zip(&g).zip(&b) {
+            for sample in [r, g, b] {
+                data.extend_from_slice(&((*sample as u16) << shift).to_be_bytes());
+            }
+        }
+        crate::grok_encoder::RawFrame::Packed {
+            data,
+            width: self.width,
+            height: self.height,
+            precision: RGB48_PRECISION,
+            index,
+        }
+    }
+}
+
 /// Load a TIFF file into planar int32 component buffers.
 ///
 /// Supports 8, 12, 16-bit RGB TIFFs. Returns 3 planar buffers (R, G, B).
@@ -110,40 +137,24 @@ pub fn load_tiff(path: &Path) -> Result<TiffFrame, String> {
         raw_data.extend_from_slice(&buf);
     }
 
-    // Unpack 12-bit packed samples (interleaved RGB)
-    // Each pair of 12-bit values is stored in 3 bytes: [A₁₁..A₄ | A₃..A₀ B₁₁..B₈ | B₇..B₀]
-    let total_samples = num_pixels * samples_per_pixel as usize;
-    let mut samples = Vec::with_capacity(total_samples);
-    let mut byte_idx = 0usize;
-    let mut sample_idx = 0usize;
-    while sample_idx < total_samples {
-        if byte_idx + 2 >= raw_data.len() {
-            break;
-        }
-        if sample_idx + 1 < total_samples {
-            // Two 12-bit samples from 3 bytes
-            let b0 = raw_data[byte_idx] as u16;
-            let b1 = raw_data[byte_idx + 1] as u16;
-            let b2 = raw_data[byte_idx + 2] as u16;
-            let s0 = (b0 << 4) | (b1 >> 4);
-            let s1 = ((b1 & 0x0F) << 8) | b2;
-            samples.push(s0 as i32);
-            samples.push(s1 as i32);
-            byte_idx += 3;
-            sample_idx += 2;
-        } else {
-            // Odd last sample
-            let b0 = raw_data[byte_idx] as u16;
-            let b1 = raw_data[byte_idx + 1] as u16;
-            let s0 = (b0 << 4) | (b1 >> 4);
-            samples.push(s0 as i32);
-            byte_idx += 2;
-            sample_idx += 1;
-        }
+    // 12-bit rows are bit packed and padded to a byte
+    let ch = samples_per_pixel as usize;
+    let row_bytes = packed_row_bytes(width as usize * ch, PACKED_12BIT_SAMPLE_BITS);
+    if raw_data.len() < row_bytes * height as usize {
+        return Err(format!(
+            "{} holds {} bytes of strips, fewer than its {}x{} 12-bit raster needs",
+            path.display(),
+            raw_data.len(),
+            width,
+            height
+        ));
+    }
+    let mut samples = Vec::with_capacity(num_pixels * ch);
+    for row in raw_data.chunks_exact(row_bytes).take(height as usize) {
+        unpack_12bit_row(row, width as usize * ch, &mut samples);
     }
 
     // De-interleave into planar buffers
-    let ch = samples_per_pixel as usize;
     let mut r = Vec::with_capacity(num_pixels);
     let mut g = Vec::with_capacity(num_pixels);
     let mut b = Vec::with_capacity(num_pixels);
@@ -162,97 +173,200 @@ pub fn load_tiff(path: &Path) -> Result<TiffFrame, String> {
     })
 }
 
-/// The directory a source build of grok installs its command line tools into.
-const HOME_GROK_BIN: &str = "bin/grok/bin";
+/// Bits a packed 12-bit sample takes.
+const PACKED_12BIT_SAMPLE_BITS: usize = 12;
+const BITS_PER_BYTE: usize = 8;
+/// A TIFF row of packed samples is padded to a whole byte.
+fn packed_row_bytes(samples_per_row: usize, bits_per_sample: usize) -> usize {
+    (samples_per_row * bits_per_sample).div_ceil(BITS_PER_BYTE)
+}
 
-/// Find one of grok's command line tools under `$HOME/bin/grok/bin`, then on PATH.
-fn find_grok_tool(stem: &str) -> Option<PathBuf> {
-    let name = format!("{stem}{}", std::env::consts::EXE_SUFFIX);
-    if let Ok(home) = std::env::var("HOME") {
-        let path = PathBuf::from(home).join(HOME_GROK_BIN).join(&name);
-        if path.is_file() {
-            return Some(path);
+/// Unpack one row of big-endian 12-bit samples: two samples share three bytes.
+fn unpack_12bit_row(row: &[u8], sample_count: usize, samples: &mut Vec<i32>) {
+    let mut accumulator: u32 = 0;
+    let mut pending_bits = 0usize;
+    let mut unpacked = 0usize;
+    for byte in row {
+        accumulator = (accumulator << BITS_PER_BYTE) | u32::from(*byte);
+        pending_bits += BITS_PER_BYTE;
+        while pending_bits >= PACKED_12BIT_SAMPLE_BITS && unpacked < sample_count {
+            pending_bits -= PACKED_12BIT_SAMPLE_BITS;
+            samples.push(((accumulator >> pending_bits) & 0xfff) as i32);
+            unpacked += 1;
         }
+        // keep only the bits still owed to the next sample
+        accumulator &= (1 << pending_bits) - 1;
     }
-    let path_variable = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_variable)
-        .map(|directory| directory.join(&name))
-        .find(|candidate| candidate.is_file())
 }
 
-/// Find the grk_compress binary.
-pub fn find_grk_compress() -> Option<PathBuf> {
-    find_grok_tool("grk_compress")
+/// Pack one row of 12-bit samples big-endian, two to three bytes, padded to a
+/// whole byte, the layout [`load_tiff`] reads back.
+fn pack_12bit_row(samples: &[u16], packed: &mut Vec<u8>) {
+    let mut accumulator: u32 = 0;
+    let mut pending_bits = 0usize;
+    for sample in samples {
+        accumulator = (accumulator << PACKED_12BIT_SAMPLE_BITS) | u32::from(*sample & 0xfff);
+        pending_bits += PACKED_12BIT_SAMPLE_BITS;
+        while pending_bits >= BITS_PER_BYTE {
+            pending_bits -= BITS_PER_BYTE;
+            packed.push(((accumulator >> pending_bits) & 0xff) as u8);
+        }
+        accumulator &= (1 << pending_bits) - 1;
+    }
+    if pending_bits > 0 {
+        packed.push(((accumulator << (BITS_PER_BYTE - pending_bits)) & 0xff) as u8);
+    }
 }
 
-/// Find the grk_decompress binary.
-pub fn find_grk_decompress() -> Option<PathBuf> {
-    find_grok_tool("grk_decompress")
-}
+/// TIFF field types.
+const TIFF_SHORT: u16 = 3;
+const TIFF_LONG: u16 = 4;
+/// The tags an uncompressed contiguous RGB TIFF needs, in ascending order.
+const TIFF_IFD_ENTRY_COUNT: u16 = 10;
+const TIFF_IFD_ENTRY_BYTES: u32 = 12;
+const TIFF_HEADER_BYTES: u32 = 8;
+const TIFF_RGB_SAMPLES_PER_PIXEL: u16 = 3;
 
-/// Compress a single TIFF to J2C by spawning a `grk_compress` subprocess.
-///
-/// Uses `-H 1` (single thread) so the caller can run many in parallel.
-#[allow(clippy::too_many_arguments)]
-pub fn compress_file_subprocess(
-    grk_bin: &Path,
-    lib_path: &str,
-    input: &Path,
-    output: &Path,
-    ratio: f64,
-    num_resolutions: u8,
-    codeblock_size: u32,
-    progression: &str,
+/// Write an uncompressed RGB TIFF at `precision` bits a sample (8, 12 or 16)
+/// from pixel-interleaved samples, the file [`load_tiff`] reads back exactly.
+/// 12-bit samples are bit-packed the way grok and libtiff write them.
+pub fn write_tiff_rgb(
+    path: &Path,
+    width: u32,
+    height: u32,
+    precision: u8,
+    samples: &[u16],
 ) -> Result<(), String> {
-    let status = std::process::Command::new(grk_bin)
-        .env("LD_LIBRARY_PATH", lib_path)
-        .args([
-            "-i",
-            &input.to_string_lossy(),
-            "-o",
-            &output.to_string_lossy(),
-            "-r",
-            &format!("{}", ratio),
-            "--xyz",
-            "-n",
-            &format!("{}", num_resolutions),
-            "-b",
-            &format!("{},{}", codeblock_size, codeblock_size),
-            "-p",
-            progression,
-            "-H",
-            "1",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to spawn grk_compress: {e}"))?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "grk_compress failed with status {} for {}",
-            status,
-            input.display()
-        ))
+    let sample_count = width as usize * height as usize * TIFF_RGB_SAMPLES_PER_PIXEL as usize;
+    if samples.len() != sample_count {
+        return Err(format!(
+            "{}x{} RGB is {sample_count} samples, {} were given",
+            width,
+            height,
+            samples.len()
+        ));
     }
-}
-
-/// Get the LD_LIBRARY_PATH for grok libraries.
-///
-/// Keeps the process's own LD_LIBRARY_PATH so callers can pass the result to
-/// `.env("LD_LIBRARY_PATH", ...)` without hiding grok libs already on the path.
-pub fn grok_lib_path() -> String {
-    let inherited = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-    if let Ok(home) = std::env::var("HOME") {
-        let p = format!("{}/bin/grok/lib64", home);
-        if std::path::Path::new(&p).exists() {
-            if inherited.is_empty() {
-                return p;
+    let samples_per_row = width as usize * TIFF_RGB_SAMPLES_PER_PIXEL as usize;
+    let pixels: Vec<u8> = match precision {
+        8 => samples.iter().map(|s| *s as u8).collect(),
+        12 => {
+            let mut packed = Vec::with_capacity(
+                packed_row_bytes(samples_per_row, PACKED_12BIT_SAMPLE_BITS) * height as usize,
+            );
+            for row in samples.chunks_exact(samples_per_row) {
+                pack_12bit_row(row, &mut packed);
             }
-            return format!("{p}:{inherited}");
+            packed
+        }
+        16 => samples.iter().flat_map(|s| s.to_le_bytes()).collect(),
+        other => {
+            return Err(format!(
+                "a TIFF is written at 8, 12 or 16 bits, not {other}"
+            ));
+        }
+    };
+
+    let ifd_bytes = 2 + u32::from(TIFF_IFD_ENTRY_COUNT) * TIFF_IFD_ENTRY_BYTES + 4;
+    let bits_per_sample_offset = TIFF_HEADER_BYTES + ifd_bytes;
+    let pixels_offset = bits_per_sample_offset + 2 * u32::from(TIFF_RGB_SAMPLES_PER_PIXEL);
+    let entries: [(u16, u16, u32, u32); TIFF_IFD_ENTRY_COUNT as usize] = [
+        (256, TIFF_LONG, 1, width),
+        (257, TIFF_LONG, 1, height),
+        (258, TIFF_SHORT, 3, bits_per_sample_offset),
+        (259, TIFF_SHORT, 1, 1),
+        (262, TIFF_SHORT, 1, 2),
+        (273, TIFF_LONG, 1, pixels_offset),
+        (277, TIFF_SHORT, 1, u32::from(TIFF_RGB_SAMPLES_PER_PIXEL)),
+        (278, TIFF_LONG, 1, height),
+        (279, TIFF_LONG, 1, pixels.len() as u32),
+        (284, TIFF_SHORT, 1, 1),
+    ];
+
+    let mut tiff: Vec<u8> = Vec::with_capacity(pixels_offset as usize + pixels.len());
+    tiff.extend_from_slice(b"II");
+    tiff.extend_from_slice(&42u16.to_le_bytes());
+    tiff.extend_from_slice(&TIFF_HEADER_BYTES.to_le_bytes());
+    tiff.extend_from_slice(&TIFF_IFD_ENTRY_COUNT.to_le_bytes());
+    for (tag, field_type, count, value) in entries {
+        tiff.extend_from_slice(&tag.to_le_bytes());
+        tiff.extend_from_slice(&field_type.to_le_bytes());
+        tiff.extend_from_slice(&count.to_le_bytes());
+        if field_type == TIFF_SHORT && count == 1 {
+            tiff.extend_from_slice(&(value as u16).to_le_bytes());
+            tiff.extend_from_slice(&[0, 0]);
+        } else {
+            tiff.extend_from_slice(&value.to_le_bytes());
         }
     }
-    inherited
+    tiff.extend_from_slice(&0u32.to_le_bytes());
+    for _ in 0..TIFF_RGB_SAMPLES_PER_PIXEL {
+        tiff.extend_from_slice(&u16::from(precision).to_le_bytes());
+    }
+    debug_assert_eq!(tiff.len() as u32, pixels_offset);
+    tiff.extend_from_slice(&pixels);
+    std::fs::write(path, tiff).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ramp(width: u32, height: u32, full_scale: u16) -> Vec<u16> {
+        (0..width * height * 3)
+            .map(|i| (i * 37 % (u32::from(full_scale) + 1)) as u16)
+            .collect()
+    }
+
+    #[test]
+    fn a_written_tiff_reads_back_at_every_depth() {
+        let dir = tempfile::tempdir().unwrap();
+        // an odd width makes a 12-bit row end mid-byte
+        for (precision, width) in [(8u8, 6u32), (12, 5), (12, 6), (16, 7)] {
+            let height = 3;
+            let full_scale = ((1u32 << precision) - 1) as u16;
+            let samples = ramp(width, height, full_scale);
+            let path = dir.path().join(format!("{precision}bit_{width}.tif"));
+            write_tiff_rgb(&path, width, height, precision, &samples).unwrap();
+            let read = load_tiff(&path).unwrap();
+            assert_eq!(
+                (read.width, read.height, read.precision),
+                (width, height, precision)
+            );
+            let mut interleaved = Vec::new();
+            for i in 0..(width * height) as usize {
+                for component in &read.components {
+                    interleaved.push(component[i] as u16);
+                }
+            }
+            assert_eq!(interleaved, samples, "{precision}-bit {width} wide");
+        }
+    }
+
+    #[test]
+    fn a_tiff_frame_packs_to_rgb48_with_its_samples_scaled_to_16_bits() {
+        let frame = TiffFrame {
+            components: [vec![0xfff, 1], vec![0, 0x800], vec![0x7ff, 0]],
+            width: 2,
+            height: 1,
+            precision: 12,
+            path: PathBuf::new(),
+        };
+        let crate::grok_encoder::RawFrame::Packed {
+            data,
+            width,
+            height,
+            precision,
+            index,
+        } = frame.into_rgb48be_frame(7)
+        else {
+            panic!("a tiff frame packs")
+        };
+        assert_eq!((width, height, precision, index), (2, 1, 16, 7));
+        assert_eq!(
+            data,
+            vec![
+                0xff, 0xf0, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00
+            ]
+        );
+    }
 }

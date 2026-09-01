@@ -4,6 +4,59 @@
 
 ### Added
 
+- **TIFF sequences encode in process**: `encode::encode_tiff_sequence_inprocess`
+  reads a sequence of 8, 12 or 16-bit TIFF stills on a small pool of loader
+  threads (a quarter of the cores, at most four) into packed 16-bit frames and
+  feeds the same encoder threads a decoded video uses, so a still sequence now
+  gets the per-frame byte cap, a PSNR target under a cinema profile, the P3 and
+  Rec.2020 transforms, a subtitle burn and the overlapped MXF wrap. The
+  pipeline routes every TIFF sequence there unless a picture change needs
+  ffmpeg's filters, and every other still format (DPX, EXR, BMP, PNG, JPEG)
+  through ffmpeg's concat demuxer. A still that cannot be read fails the run by
+  name. `TiffFrame::into_rgb48be_frame` is the packing, and a 12-bit sample
+  comes back exactly after the encoder shifts it down again.
+- **`grok::write_tiff_rgb`**: an uncompressed RGB TIFF at 8, 12 or 16 bits a
+  sample, the inverse of `load_tiff`, for an export that keeps the codestream's
+  own precision. 12-bit rows are bit-packed and padded to a byte, and
+  `load_tiff` now reads that padding, so an odd width round trips.
+- **`DecodedFrame::interleaved_samples`**: the three decoded components pixel
+  interleaved at the codestream's precision, what an image writer takes.
+- **`encode::encode_loaded_frames`**: the loader pool behind the TIFF sequence
+  encode, opened up to any caller that loads frames itself. `open_loader` runs
+  once on each loader thread and returns what that thread loads a frame with,
+  so a loader can hold its own MXF reader, and every frame gets the burn, the
+  colour transform, the profile, the byte cap and the MXF feed a decoded video
+  frame gets. `encode_tiff_sequence_inprocess` is now that with
+  `grok::load_tiff` as the loader.
+- **`encode::source_raster`**: the size of a container or of the first still of
+  an image sequence, reading a TIFF itself since ffprobe cannot read a 12-bit
+  one. Moved here from imfwizard so both wizards measure a source the same way.
+
+### Removed
+
+- **Every grok command line path**: `encode::encode` (which passed a bitrate
+  as grk_compress's ratio flag and declared no profile, so `create` refused its
+  output), `encode_parallel`, `stream_encode_subprocess`,
+  `grok_encoder::encode_pipeline_subprocess`, `grok::compress_file_subprocess`,
+  `find_grk_compress`, `find_grk_decompress` and `grok_lib_path`, together with
+  `StreamEncodeOptions.compressor_path` and `lib_dir`. Nothing in postkit
+  spawns grk_compress or grk_decompress any more: encoding and decoding go
+  through the linked library, so a build needs libgrokj2k and no grok binary.
+
+### Fixed
+
+- **The DCDM review movie played at whatever rate ffmpeg picked**:
+  `export_dcdm` now takes a `FrameRate` and passes it as an input option, so
+  the movie plays at the rate the caller asks for. The concat list's frame
+  durations never reached the output, which came out at the concat demuxer's
+  default 25 whatever the DCDM was, and the earlier fix that wrote 24 into the
+  list did not change that.
+
+- **A producer that stopped short hung the encode**: `encode_pipeline` waited
+  for `total_frames` codestreams, so a decoder that ended early or a loader
+  that failed left the pipeline sleeping forever. It now waits for the frames
+  the producer actually handed over.
+
 - **Every encoder entry point carries the IMF profile**: `StreamEncodeOptions`
   learned the Rsiz and `KeepRgb` a release ago, but the pipeline, the parallel
   image-sequence encoder and the still hold all built their own compress

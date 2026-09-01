@@ -2,10 +2,12 @@
 //! samples stay RGB, and they are written at 12 bits.
 //!
 //! One test per entry point an IMF caller has: the in-process encoder, the
-//! pipeline over an image sequence, the parallel grk_compress encoder under it,
-//! and a held still.
+//! pipeline over an image sequence, the TIFF sequence encoder under it, and a
+//! held still.
 
-use postkit::encode::{FrameRate, SourceColour, encode_parallel};
+use postkit::encode::{
+    FrameRate, SourceColour, StreamEncodeOptions, encode_tiff_sequence_inprocess,
+};
 use postkit::grok_encoder::{CompressParams, PipelineResult, RawFrame};
 use postkit::j2k::{ImfProfile, imf_levels, imf_rsiz};
 use postkit::pipeline::{EncodeRunOptions, run_encode_with_options};
@@ -117,70 +119,11 @@ fn an_imf_encode_refuses_the_xyz_transform() {
     );
 }
 
-/// One uncompressed 12-bit RGB TIFF of a single colour. grk_compress writes each
-/// codestream at the precision of the file it read, so an IMF image sequence
-/// starts at 12 bits.
+/// One uncompressed 12-bit RGB TIFF of a single colour, since an IMF sequence
+/// is written at 12 bits.
 fn write_12bit_tiff(path: &Path, colour: [u16; 3]) {
-    const BITS_PER_SAMPLE: u32 = 12;
-    const SAMPLES_PER_PIXEL: u32 = 3;
-    const IFD_ENTRIES: u16 = 10;
-    const SHORT: u16 = 3;
-    const LONG: u16 = 4;
-
-    let mut row: Vec<u8> = Vec::new();
-    let mut accumulator: u32 = 0;
-    let mut pending_bits = 0u32;
-    for _ in 0..WIDTH {
-        for sample in colour {
-            accumulator = (accumulator << BITS_PER_SAMPLE) | u32::from(sample);
-            pending_bits += BITS_PER_SAMPLE;
-            while pending_bits >= 8 {
-                pending_bits -= 8;
-                row.push(((accumulator >> pending_bits) & 0xff) as u8);
-            }
-        }
-    }
-    assert_eq!(pending_bits, 0, "a TIFF row has to end on a byte");
-    let pixels: Vec<u8> = row.repeat(HEIGHT as usize);
-
-    let ifd_size = 2 + u32::from(IFD_ENTRIES) * 12 + 4;
-    let bits_per_sample_offset = 8 + ifd_size;
-    let pixels_offset = bits_per_sample_offset + 6;
-    let entries: [(u16, u16, u32, u32); IFD_ENTRIES as usize] = [
-        (256, SHORT, 1, WIDTH),
-        (257, SHORT, 1, HEIGHT),
-        (258, SHORT, 3, bits_per_sample_offset),
-        (259, SHORT, 1, 1),
-        (262, SHORT, 1, 2),
-        (273, LONG, 1, pixels_offset),
-        (277, SHORT, 1, SAMPLES_PER_PIXEL),
-        (278, SHORT, 1, HEIGHT),
-        (279, LONG, 1, pixels.len() as u32),
-        (284, SHORT, 1, 1),
-    ];
-
-    let mut tiff: Vec<u8> = b"II".to_vec();
-    tiff.extend_from_slice(&42u16.to_le_bytes());
-    tiff.extend_from_slice(&8u32.to_le_bytes());
-    tiff.extend_from_slice(&IFD_ENTRIES.to_le_bytes());
-    for (tag, field_type, count, value) in entries {
-        tiff.extend_from_slice(&tag.to_le_bytes());
-        tiff.extend_from_slice(&field_type.to_le_bytes());
-        tiff.extend_from_slice(&count.to_le_bytes());
-        if field_type == SHORT && count == 1 {
-            tiff.extend_from_slice(&(value as u16).to_le_bytes());
-            tiff.extend_from_slice(&[0, 0]);
-        } else {
-            tiff.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-    tiff.extend_from_slice(&0u32.to_le_bytes());
-    for _ in 0..SAMPLES_PER_PIXEL {
-        tiff.extend_from_slice(&(BITS_PER_SAMPLE as u16).to_le_bytes());
-    }
-    assert_eq!(tiff.len() as u32, pixels_offset);
-    tiff.extend_from_slice(&pixels);
-    std::fs::write(path, tiff).unwrap();
+    let samples: Vec<u16> = colour.repeat((WIDTH * HEIGHT) as usize);
+    postkit::grok::write_tiff_rgb(path, WIDTH, HEIGHT, 12, &samples).unwrap();
 }
 
 /// A directory holding one saturated red 12-bit TIFF.
@@ -193,10 +136,6 @@ fn red_sequence(dir: &Path) -> std::path::PathBuf {
 
 #[test]
 fn the_pipeline_encodes_an_image_sequence_under_the_imf_rsiz() {
-    assert!(
-        postkit::grok::find_grk_compress().is_some(),
-        "grk_compress is required for this test"
-    );
     let rsiz = test_rsiz();
     let dir = tempfile::tempdir().unwrap();
     let frames = red_sequence(dir.path());
@@ -217,57 +156,45 @@ fn the_pipeline_encodes_an_image_sequence_under_the_imf_rsiz() {
     )
     .expect("IMF image sequence encode");
     assert_eq!(result.frames_encoded, 1);
-    assert_imf_red(&result.j2k_dir.join("frame_000.j2k"), rsiz);
+    assert_imf_red(&result.j2k_dir.join("frame_00000000.j2c"), rsiz);
+}
+
+fn encode_tiffs(
+    frames: &[std::path::PathBuf],
+    output: &Path,
+    source_colour: SourceColour,
+) -> postkit::encode::EncodeResult {
+    encode_tiff_sequence_inprocess(
+        frames,
+        &StreamEncodeOptions {
+            output_dir: output.to_path_buf(),
+            rsiz: test_rsiz(),
+            source_colour,
+            fps: FrameRate::whole(24),
+            ..StreamEncodeOptions::default()
+        },
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(AtomicBool::new(false)),
+        None,
+        |_| {},
+    )
 }
 
 #[test]
-fn the_parallel_encoder_writes_the_imf_rsiz_it_is_given() {
-    assert!(
-        postkit::grok::find_grk_compress().is_some(),
-        "grk_compress is required for this test"
-    );
-    let rsiz = test_rsiz();
+fn the_tiff_encoder_writes_the_imf_rsiz_it_is_given() {
     let dir = tempfile::tempdir().unwrap();
     let frames = postkit::encode::find_source_frames(&red_sequence(dir.path())).unwrap();
     let output = dir.path().join("j2k");
-    let result = encode_parallel(
-        &frames,
-        &output,
-        10.0,
-        None,
-        None,
-        rsiz,
-        FrameRate::whole(24),
-        &SourceColour::KeepRgb,
-        &Arc::new(AtomicBool::new(false)),
-        &Arc::new(AtomicBool::new(false)),
-        |_| {},
-    );
-    assert!(
-        result.success,
-        "IMF parallel encode failed: {}",
-        result.error
-    );
-    assert_imf_red(&output.join("frame_000.j2k"), rsiz);
+    let result = encode_tiffs(&frames, &output, SourceColour::KeepRgb);
+    assert!(result.success, "IMF tiff encode failed: {}", result.error);
+    assert_imf_red(&output.join("frame_00000000.j2c"), test_rsiz());
 }
 
 #[test]
-fn the_parallel_encoder_refuses_the_xyz_transform_under_an_imf_rsiz() {
+fn the_tiff_encoder_refuses_the_xyz_transform_under_an_imf_rsiz() {
     let dir = tempfile::tempdir().unwrap();
-    let frames = vec![dir.path().join("frame_000.tif")];
-    let result = encode_parallel(
-        &frames,
-        &dir.path().join("j2k"),
-        10.0,
-        None,
-        None,
-        test_rsiz(),
-        FrameRate::whole(24),
-        &SourceColour::DisplayRgb,
-        &Arc::new(AtomicBool::new(false)),
-        &Arc::new(AtomicBool::new(false)),
-        |_| {},
-    );
+    let frames = postkit::encode::find_source_frames(&red_sequence(dir.path())).unwrap();
+    let result = encode_tiffs(&frames, &dir.path().join("j2k"), SourceColour::DisplayRgb);
     assert!(!result.success, "an IMF X'Y'Z' encode has to be refused");
     assert!(
         result.error.contains("X'Y'Z'"),

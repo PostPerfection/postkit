@@ -246,6 +246,54 @@ fn a_cancelled_overlapped_wrap_leaves_the_codestreams_and_no_mxf() {
     );
 }
 
+/// A TIFF sequence is read by postkit itself, so its codestreams feed the wrap
+/// the way a decoded video's do.
+#[test]
+fn a_tiff_sequence_wraps_as_it_encodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let stills = dir.path().join("stills");
+    std::fs::create_dir_all(&stills).unwrap();
+    for index in 0..FRAME_COUNT {
+        let shade = (index * 4000 / FRAME_COUNT) as u16;
+        let samples: Vec<u16> = [shade, 2048, 4095 - shade].repeat((WIDTH * HEIGHT) as usize);
+        postkit::grok::write_tiff_rgb(
+            &stills.join(format!("still_{index:04}.tif")),
+            WIDTH,
+            HEIGHT,
+            12,
+            &samples,
+        )
+        .unwrap();
+    }
+
+    let output_dir = dir.path().join("out");
+    let mxf = output_dir.join("picture.mxf");
+    let (encode, track) = run_encode_and_wrap_picture(
+        &stills,
+        &output_dir,
+        &encode_options(FRAME_COUNT),
+        wrap_options(mxf.clone(), FRAME_COUNT),
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(AtomicBool::new(false)),
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    )
+    .expect("a tiff sequence wraps as it encodes");
+    assert_eq!(encode.frames_encoded, FRAME_COUNT);
+    assert_eq!(track.duration, FRAME_COUNT);
+
+    let wrapped = essence(&mxf);
+    let written: Vec<Vec<u8>> = codestreams(&encode.j2k_dir)
+        .iter()
+        .map(|path| std::fs::read(path).unwrap())
+        .collect();
+    assert_eq!(written.len(), FRAME_COUNT as usize);
+    assert_eq!(
+        wrapped, written,
+        "the MXF has to hold each still's codestream in order"
+    );
+}
+
 /// A wrap that fails takes the encode down with it, and the encoder only knows
 /// that the wrap stopped taking frames. The error that comes back has to be the
 /// wrap's own, or nobody can tell what went wrong.
@@ -301,8 +349,5 @@ fn an_input_that_never_reaches_the_encoder_refuses_an_overlapped_wrap() {
     let Err(error) = outcome else {
         panic!("a J2K sequence cannot be wrapped while it encodes");
     };
-    assert!(
-        error.contains("cannot be wrapped while it encodes"),
-        "{error}"
-    );
+    assert!(error.contains("never encoded here"), "{error}");
 }
