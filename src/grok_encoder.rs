@@ -1585,6 +1585,24 @@ mod tests {
 
     #[cfg(feature = "grok-ffi")]
     #[test]
+    fn a_4k_codestream_decodes_back_at_full_resolution() {
+        initialize(0);
+        let mut buf = Vec::new();
+        let bytes = compress_frame_grok(
+            &grey_frame(4096, 2160),
+            &CompressParams::default(),
+            &mut buf,
+        )
+        .expect("a 4K frame compresses");
+        let decoded =
+            crate::grok_decoder::decode(bytes.to_vec(), 0).expect("a 4K codestream decodes");
+        assert_eq!((decoded.width, decoded.height), (4096, 2160));
+        assert_eq!(decoded.components.len(), 3);
+        assert_eq!(decoded.components[0].len(), 4096 * 2160);
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
     fn a_frame_past_4k_is_refused_by_name() {
         initialize(0);
         let mut buf = Vec::new();
