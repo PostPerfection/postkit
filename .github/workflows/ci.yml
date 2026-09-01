@@ -98,7 +98,7 @@ jobs:
       - name: Setup grok
         uses: PostPerfection/setup-grok@v1
         with:
-          grok-ref: v20.4.0
+          grok-ref: master
 
       - name: Setup libmpv
         uses: PostPerfection/setup-libmpv@v1
