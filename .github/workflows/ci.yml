@@ -145,7 +145,8 @@ jobs:
           git clone --depth 1 --recurse-submodules --shallow-submodules --branch v20.4.0 \
             https://github.com/GrokImageCompression/grok.git "$RUNNER_TEMP/grok-asan-src"
           cmake -S "$RUNNER_TEMP/grok-asan-src" -B "$RUNNER_TEMP/grok-asan-build" \
-            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGRK_ENABLE_ASAN=ON \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE="-O2 -g" -DCMAKE_CXX_FLAGS_RELEASE="-O2 -g" \
+            -DGRK_ENABLE_ASAN=ON \
             -DCMAKE_INSTALL_PREFIX="$prefix" -DGRK_BUILD_CORE_SWIG_BINDINGS=OFF
           cmake --build "$RUNNER_TEMP/grok-asan-build" --parallel "$(getconf _NPROCESSORS_ONLN)"
           cmake --install "$RUNNER_TEMP/grok-asan-build"
