@@ -4,6 +4,13 @@
 
 ### Added
 
+- **`audio_mix_matrix::parse_named_audio_map`**: the `IN:OUT[@GAIN]` walk
+  with a lane name taken wherever an output channel number is, which both
+  wizards had a copy of. A `LaneVocabulary` holds the names each lane answers
+  to, matched ignoring case, and the rule that turns the highest destination
+  into an output channel count, so dcpwizard rounds a track up to 2, 6, 8 or
+  16 channels and imfwizard writes as many lanes as the map named. Each
+  wizard keeps only its own names.
 - **`grok_decoder::decode_with_threads`**: `decode` with the grok thread count
   chosen by the caller, 0 for the shared pool and 1 for the calling thread. The
   4K fixture `cinema4k_grey_4096x2160.j2c` decodes on the pool, on one thread

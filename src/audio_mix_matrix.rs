@@ -1,8 +1,9 @@
 // Audio channel mapping matrix (DoM's audio mapping): any input channel to any
 // output channel with a per-cell gain, summing where several inputs land on one
-// output. Channels are numbers here, naming them L/R/C/LFE/Ls/Rs/HI/VI is the
-// caller's job. The `IN:OUT@GAIN` spec grammar lives here so a CLI flag and a
-// GUI matrix widget cannot drift apart.
+// output. Channels are numbers in a `MixMatrix`; `parse_named_audio_map` takes a
+// destination name as well, and which names a lane answers to is the caller's
+// `LaneVocabulary`. The `IN:OUT@GAIN` spec grammar lives here so a CLI flag and
+// a GUI matrix widget cannot drift apart.
 
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::path::{Path, PathBuf};
@@ -136,37 +137,17 @@ impl MixMatrix {
         input_channels: usize,
         output_channels: usize,
     ) -> Result<MixMatrix, String> {
-        if spec.trim().is_empty() {
-            return Err("audio map is empty".to_string());
+        let entries = split_entries(spec)?;
+        let mut outputs = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            outputs.push(parse_channel_number(
+                entry.output_text,
+                "output",
+                output_channels,
+                entry.text,
+            )?);
         }
-        let mut matrix = MixMatrix::silent(input_channels, output_channels);
-        let mut routed: Vec<(usize, usize)> = Vec::new();
-        for entry in spec.split(SPEC_ENTRY_SEPARATOR) {
-            let entry = entry.trim();
-            if entry.is_empty() {
-                return Err("audio map has an empty entry".to_string());
-            }
-            let (channels, gain_db) = match entry.split_once(SPEC_GAIN_SEPARATOR) {
-                Some((channels, gain)) => (channels, parse_decibels(gain, entry)?),
-                None => (entry, UNITY_GAIN_DECIBELS),
-            };
-            let (input_text, output_text) =
-                channels.split_once(SPEC_CHANNEL_SEPARATOR).ok_or_else(|| {
-                    format!("audio map entry \"{entry}\" is not IN:OUT or IN:OUT@GAIN")
-                })?;
-            let input = parse_channel_number(input_text, "input", input_channels, entry)?;
-            let output = parse_channel_number(output_text, "output", output_channels, entry)?;
-            if routed.contains(&(input, output)) {
-                return Err(format!(
-                    "audio map routes input {} to output {} twice",
-                    input + FIRST_CHANNEL_NUMBER,
-                    output + FIRST_CHANNEL_NUMBER
-                ));
-            }
-            routed.push((input, output));
-            matrix.set_gain_db(input, output, gain_db)?;
-        }
-        Ok(matrix)
+        build_matrix(&entries, &outputs, input_channels, output_channels)
     }
 
     /// Render the routed cells back in `parse`'s grammar.
@@ -193,13 +174,139 @@ impl MixMatrix {
     }
 }
 
+/// One `IN:OUT[@GAIN]` entry, split but not yet resolved to channels. `text` is
+/// the whole entry as written, which is what an error names.
+struct SpecEntry<'a> {
+    text: &'a str,
+    input_text: &'a str,
+    output_text: &'a str,
+    gain_db: f64,
+}
+
+fn split_entries(spec: &str) -> Result<Vec<SpecEntry<'_>>, String> {
+    if spec.trim().is_empty() {
+        return Err("audio map is empty".to_string());
+    }
+    let mut entries = Vec::new();
+    for entry in spec.split(SPEC_ENTRY_SEPARATOR) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            return Err("audio map has an empty entry".to_string());
+        }
+        let (channels, gain_db) = match entry.split_once(SPEC_GAIN_SEPARATOR) {
+            Some((channels, gain)) => (channels, parse_decibels(gain, entry)?),
+            None => (entry, UNITY_GAIN_DECIBELS),
+        };
+        let (input_text, output_text) = channels
+            .split_once(SPEC_CHANNEL_SEPARATOR)
+            .ok_or_else(|| format!("audio map entry \"{entry}\" is not IN:OUT or IN:OUT@GAIN"))?;
+        entries.push(SpecEntry {
+            text: entry,
+            input_text: input_text.trim(),
+            output_text: output_text.trim(),
+            gain_db,
+        });
+    }
+    Ok(entries)
+}
+
+/// Route each entry to the 0-based output channel beside it in `outputs`.
+fn build_matrix(
+    entries: &[SpecEntry],
+    outputs: &[usize],
+    input_channels: usize,
+    output_channels: usize,
+) -> Result<MixMatrix, String> {
+    let mut matrix = MixMatrix::silent(input_channels, output_channels);
+    let mut routed: Vec<(usize, usize)> = Vec::new();
+    for (entry, &output) in entries.iter().zip(outputs) {
+        let input = parse_channel_number(entry.input_text, "input", input_channels, entry.text)?;
+        if routed.contains(&(input, output)) {
+            return Err(format!(
+                "audio map routes input {} to output {} twice",
+                input + FIRST_CHANNEL_NUMBER,
+                output + FIRST_CHANNEL_NUMBER
+            ));
+        }
+        routed.push((input, output));
+        matrix.set_gain_db(input, output, entry.gain_db)?;
+    }
+    Ok(matrix)
+}
+
+/// The destination names a map may use instead of a channel number, and how wide
+/// the output they ask for is.
+pub struct LaneVocabulary {
+    /// The names each lane answers to, in channel order, matched ignoring case.
+    /// A lane's first name is the one an error message shows.
+    pub lane_names: Vec<Vec<String>>,
+    /// The output channel count a map reaching this 1-based destination needs.
+    /// `|highest_destination| highest_destination` writes no more lanes than the
+    /// map named; a caller with fixed layouts rounds up to the next one.
+    pub output_channel_count: fn(highest_destination: usize) -> usize,
+}
+
+impl LaneVocabulary {
+    /// The name each lane is listed under, in channel order.
+    pub fn listed_names(&self) -> Vec<String> {
+        self.lane_names
+            .iter()
+            .filter_map(|names| names.first().cloned())
+            .collect()
+    }
+
+    /// The 1-based destination a text names: a channel number, or a lane name.
+    fn destination_number(&self, text: &str, entry: &str) -> Result<usize, String> {
+        if let Ok(number) = text.parse::<usize>() {
+            if number < FIRST_CHANNEL_NUMBER {
+                return Err(format!(
+                    "audio map entry \"{entry}\" names output channel {number}, and channels \
+                     count from {FIRST_CHANNEL_NUMBER}"
+                ));
+            }
+            return Ok(number);
+        }
+        let lane = self
+            .lane_names
+            .iter()
+            .position(|names| names.iter().any(|name| name.eq_ignore_ascii_case(text)));
+        lane.map(|lane| lane + FIRST_CHANNEL_NUMBER).ok_or_else(|| {
+            format!(
+                "audio map entry \"{entry}\" names output channel \"{text}\", which is neither a \
+                 channel number nor one of {}",
+                self.listed_names().join(", ")
+            )
+        })
+    }
+}
+
+/// Parse `MixMatrix::parse`'s grammar with `vocabulary`'s lane names accepted
+/// wherever an output channel number is. The output is as wide as the highest
+/// destination any entry names, put through the vocabulary's own rule, with the
+/// lanes nothing routed to left silent.
+pub fn parse_named_audio_map(
+    spec: &str,
+    input_channels: usize,
+    vocabulary: &LaneVocabulary,
+) -> Result<MixMatrix, String> {
+    let entries = split_entries(spec)?;
+    let mut destinations = Vec::with_capacity(entries.len());
+    let mut highest_destination = 0;
+    for entry in &entries {
+        let destination = vocabulary.destination_number(entry.output_text, entry.text)?;
+        highest_destination = highest_destination.max(destination);
+        destinations.push(destination - FIRST_CHANNEL_NUMBER);
+    }
+    let output_channels = (vocabulary.output_channel_count)(highest_destination);
+    build_matrix(&entries, &destinations, input_channels, output_channels)
+}
+
 fn parse_channel_number(
     text: &str,
     role: &str,
     channels: usize,
     entry: &str,
 ) -> Result<usize, String> {
-    let text = text.trim();
     let number: usize = text.parse().map_err(|_| {
         format!("audio map entry \"{entry}\" has a non-numeric {role} channel \"{text}\"")
     })?;
@@ -496,6 +603,109 @@ mod tests {
         ];
         for (spec, wanted) in cases {
             let error = MixMatrix::parse(spec, 2, 6).unwrap_err();
+            assert!(
+                error.contains(wanted),
+                "spec {spec:?} said {error:?}, wanted {wanted:?}"
+            );
+        }
+    }
+
+    fn stereo_vocabulary() -> LaneVocabulary {
+        LaneVocabulary {
+            lane_names: vec![
+                vec!["L".to_string(), "Left".to_string()],
+                vec!["R".to_string(), "Right".to_string()],
+            ],
+            output_channel_count: |highest_destination| highest_destination,
+        }
+    }
+
+    /// A caller whose wrapper only takes 2, 6, 8 or 16 channels.
+    fn rounded_vocabulary() -> LaneVocabulary {
+        LaneVocabulary {
+            output_channel_count: |highest_destination| {
+                [2, 6, 8, 16]
+                    .into_iter()
+                    .find(|layout| *layout >= highest_destination)
+                    .unwrap_or(highest_destination)
+            },
+            ..stereo_vocabulary()
+        }
+    }
+
+    #[test]
+    fn a_named_map_takes_channel_numbers_too() {
+        let matrix = parse_named_audio_map("1:1, 2:2", 2, &stereo_vocabulary()).unwrap();
+        assert_eq!(matrix.output_channels(), 2);
+        assert_eq!(matrix.to_spec(), "1:1,2:2");
+        assert!(matrix.is_pure_routing());
+    }
+
+    #[test]
+    fn a_lane_name_reaches_the_same_cell_as_its_number() {
+        let vocabulary = stereo_vocabulary();
+        for spec in ["1:R", "1:r", "1:Right", "1: right "] {
+            assert_eq!(
+                parse_named_audio_map(spec, 2, &vocabulary).unwrap(),
+                parse_named_audio_map("1:2", 2, &vocabulary).unwrap(),
+                "{spec}"
+            );
+        }
+        assert_eq!(
+            parse_named_audio_map("1:L", 2, &vocabulary)
+                .unwrap()
+                .output_channels(),
+            1,
+            "nothing reached the second lane"
+        );
+    }
+
+    #[test]
+    fn a_named_entry_carries_its_gain() {
+        let matrix = parse_named_audio_map("1:L,2:L@-6dB", 2, &stereo_vocabulary()).unwrap();
+        assert_eq!(matrix.gain_db(0, 0), Some(0.0));
+        assert!((matrix.gain_db(1, 0).unwrap() - -6.0).abs() < 1e-9);
+        assert!(!matrix.is_pure_routing());
+    }
+
+    #[test]
+    fn the_vocabulary_decides_how_wide_the_output_is() {
+        assert_eq!(
+            parse_named_audio_map("1:L", 2, &stereo_vocabulary())
+                .unwrap()
+                .output_channels(),
+            1
+        );
+        assert_eq!(
+            parse_named_audio_map("1:L", 2, &rounded_vocabulary())
+                .unwrap()
+                .output_channels(),
+            2
+        );
+        assert_eq!(
+            parse_named_audio_map("1:3,2:R", 2, &rounded_vocabulary())
+                .unwrap()
+                .output_channels(),
+            6
+        );
+    }
+
+    #[test]
+    fn a_named_map_fails_loud() {
+        let cases = [
+            ("", "audio map is empty"),
+            ("   ", "audio map is empty"),
+            ("1:L,,2:R", "empty entry"),
+            ("banana", "not IN:OUT"),
+            ("1:0", "channels count from 1"),
+            ("1:Middle", "neither a channel number nor one of L, R"),
+            ("3:L", "outside 1..=2"),
+            ("x:L", "non-numeric input"),
+            ("1:L,1:L", "twice"),
+            ("1:L@loud", "unknown gain unit"),
+        ];
+        for (spec, wanted) in cases {
+            let error = parse_named_audio_map(spec, 2, &stereo_vocabulary()).unwrap_err();
             assert!(
                 error.contains(wanted),
                 "spec {spec:?} said {error:?}, wanted {wanted:?}"
