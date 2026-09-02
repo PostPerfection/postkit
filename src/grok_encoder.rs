@@ -999,6 +999,94 @@ pub fn initialize(num_threads: u32) {
 #[cfg(not(feature = "grok-ffi"))]
 pub fn initialize(_num_threads: u32) {}
 
+// ─── grok's accelerator plugin ────────────────────────────────────────────────
+
+/// Whether the plugin is switched into grok's compress and decompress calls.
+/// [`use_gpu`] and [`use_cpu`] are the only writers.
+#[cfg(feature = "grok-ffi")]
+static ACCELERATOR_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// The plugin's in-memory path runs on the first device it finds, so there is
+/// no device left to choose.
+#[cfg(feature = "grok-ffi")]
+const ACCELERATOR_DEVICE_ID: i32 = 0;
+
+/// Run every `grk_compress` and `grk_decompress` in this process on grok's
+/// accelerator device. [`initialize`] has to have run first, because that is
+/// the call which loads the plugin.
+///
+/// grok does the routing from here on, so no encode or decode call in postkit
+/// changes. The device takes the wavelet and T1 while the host keeps the
+/// header, the rate allocation and the packets. Frames the plugin does not
+/// handle stay on the CPU inside grok, which covers a decode at a `reduce`
+/// above 0, a tiled stream and a code block style. A device failure fails the
+/// call rather than falling back.
+#[cfg(feature = "grok-ffi")]
+pub fn use_gpu() -> Result<(), String> {
+    let init_info = grokj2k_sys::grk_plugin_init_info {
+        device_id: ACCELERATOR_DEVICE_ID,
+        verbose: false,
+        license: std::ptr::null(),
+        server: std::ptr::null(),
+    };
+    if !unsafe { grokj2k_sys::grk_plugin_init(init_info) } {
+        return Err(
+            "grok's accelerator plugin did not initialise. initialize() \
+             looks for libgrokj2k_plugin under GRK_PLUGIN_PATH, then in the working \
+             directory, then next to the executable, and searches nowhere at all when \
+             GRK_NO_PLUGIN is set. A plugin that did load refuses here when the device \
+             is unavailable."
+                .to_string(),
+        );
+    }
+    unsafe { grokj2k_sys::grk_plugin_set_enabled(true) };
+    ACCELERATOR_ENABLED.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Send every frame back to the CPU. The plugin stays loaded and [`use_gpu`]
+/// switches it in again. Safe to call when no plugin was ever loaded.
+#[cfg(feature = "grok-ffi")]
+pub fn use_cpu() {
+    unsafe { grokj2k_sys::grk_plugin_set_enabled(false) };
+    ACCELERATOR_ENABLED.store(false, Ordering::Relaxed);
+}
+
+/// Whether [`use_gpu`] has succeeded and [`use_cpu`] has not undone it.
+#[cfg(feature = "grok-ffi")]
+pub fn gpu_active() -> bool {
+    ACCELERATOR_ENABLED.load(Ordering::Relaxed)
+}
+
+/// How many compress and decompress calls the device has run since the process
+/// started.
+#[cfg(feature = "grok-ffi")]
+pub fn accelerated_frames() -> u64 {
+    unsafe { grokj2k_sys::grk_plugin_accelerated_frames() }
+}
+
+/// Stub when grok-ffi is not enabled.
+#[cfg(not(feature = "grok-ffi"))]
+pub fn use_gpu() -> Result<(), String> {
+    Err("postkit was built without the grok-ffi feature".to_string())
+}
+
+/// Stub when grok-ffi is not enabled.
+#[cfg(not(feature = "grok-ffi"))]
+pub fn use_cpu() {}
+
+/// Stub when grok-ffi is not enabled.
+#[cfg(not(feature = "grok-ffi"))]
+pub fn gpu_active() -> bool {
+    false
+}
+
+/// Stub when grok-ffi is not enabled.
+#[cfg(not(feature = "grok-ffi"))]
+pub fn accelerated_frames() -> u64 {
+    0
+}
+
 // ─── Video-to-J2K in-process pipeline (ffmpeg pipe → Grok FFI) ─────────────────
 
 /// High-performance video-to-J2K pipeline: decodes video with ffmpeg and encodes

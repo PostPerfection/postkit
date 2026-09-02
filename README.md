@@ -79,6 +79,16 @@ install grok first (cmake, e.g. to `~/bin/grok`), then put its `lib/pkgconfig` o
 `PKG_CONFIG_PATH` and its `lib` on `LD_LIBRARY_PATH`. CI does this in a cached
 "Setup grok" step; see `.github/workflows/ci.yml`.
 
+grok's accelerator plugin runs the wavelet and T1 on a device. grok looks for
+`libgrokj2k_plugin` under `GRK_PLUGIN_PATH`, then in the working directory, then
+next to the executable, and searches nowhere at all when `GRK_NO_PLUGIN` is set,
+which keeps everything on the CPU. Call `grok_encoder::use_gpu` after
+`grok_encoder::initialize` and every encode and decode in the process runs on
+the device, `grok_encoder::use_cpu` sends them back. A reduced decode and a
+tiled stream stay on the CPU either way. `cargo test --features grok-gpu` runs
+the device round trip and needs a machine with the plugin, CI has no GPU. This
+needs a grok newer than v20.4.1, one that has `grk_plugin_set_enabled`.
+
 ## Usage
 
 Add to your `Cargo.toml`:

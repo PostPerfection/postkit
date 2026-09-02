@@ -4,6 +4,15 @@
 
 ### Added
 
+- **`grok_encoder::use_gpu`, `use_cpu`, `gpu_active`, `accelerated_frames`**:
+  grok's accelerator plugin, found through `GRK_PLUGIN_PATH`, the working
+  directory or the executable's directory, encodes and decodes on the device
+  after `use_gpu` (device 0, the plugin's first). Every compress and decompress
+  in the process routes through it for the frames the plugin handles, a reduced
+  decode or a tiled stream stays on the CPU, and `use_cpu` switches back.
+  `cargo test --features grok-gpu` runs the device round trip on a machine with
+  the plugin, CI has no GPU. Needs a grok newer than v20.4.1, which has
+  `grk_plugin_set_enabled`.
 - **`audio_mix_matrix::parse_named_audio_map`**: the `IN:OUT[@GAIN]` walk
   with a lane name taken wherever an output channel number is, which both
   wizards had a copy of. A `LaneVocabulary` holds the names each lane answers
