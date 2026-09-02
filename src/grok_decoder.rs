@@ -108,7 +108,18 @@ fn to_twelve_bits(sample: i32, precision: u8) -> u16 {
 ///
 /// Takes the buffer by value because grok reads the stream in place.
 #[cfg(feature = "grok-ffi")]
-pub fn decode(mut codestream: Vec<u8>, reduce: u8) -> Result<DecodedFrame, String> {
+pub fn decode(codestream: Vec<u8>, reduce: u8) -> Result<DecodedFrame, String> {
+    decode_with_threads(codestream, reduce, 0)
+}
+
+/// [`decode`] on `num_threads` grok threads, 0 for the shared pool and 1 for
+/// the calling thread alone.
+#[cfg(feature = "grok-ffi")]
+pub fn decode_with_threads(
+    mut codestream: Vec<u8>,
+    reduce: u8,
+    num_threads: u32,
+) -> Result<DecodedFrame, String> {
     use grokj2k_sys::{
         grk_decompress, grk_decompress_init, grk_decompress_parameters, grk_decompress_read_header,
         grk_header_info, grk_image, grk_object_unref, grk_stream_params,
@@ -133,6 +144,7 @@ pub fn decode(mut codestream: Vec<u8>, reduce: u8) -> Result<DecodedFrame, Strin
 
         let mut params: grk_decompress_parameters = std::mem::zeroed();
         params.core.reduce = reduce;
+        params.num_threads = num_threads;
 
         let codec = grk_decompress_init(&mut stream_params, &mut params);
         if codec.is_null() {
@@ -265,6 +277,37 @@ pub fn decode(_codestream: Vec<u8>, _reduce: u8) -> Result<DecodedFrame, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "grok-ffi")]
+    const CINEMA_4K_FIXTURE: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/cinema4k_grey_4096x2160.j2c"
+    ));
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_4k_fixture_decodes_on_the_shared_pool() {
+        crate::grok_encoder::initialize(0);
+        let frame = decode(CINEMA_4K_FIXTURE.to_vec(), 0).expect("4K fixture decodes");
+        assert_eq!((frame.width, frame.height), (4096, 2160));
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_4k_fixture_decodes_on_one_thread() {
+        crate::grok_encoder::initialize(0);
+        let frame =
+            decode_with_threads(CINEMA_4K_FIXTURE.to_vec(), 0, 1).expect("4K fixture decodes");
+        assert_eq!((frame.width, frame.height), (4096, 2160));
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_4k_fixture_decodes_reduced() {
+        crate::grok_encoder::initialize(0);
+        let frame = decode(CINEMA_4K_FIXTURE.to_vec(), 1).expect("4K fixture decodes at half size");
+        assert_eq!((frame.width, frame.height), (2048, 1080));
+    }
 
     #[test]
     fn twelve_bit_samples_pass_through_and_others_are_normalised() {

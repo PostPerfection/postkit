@@ -98,7 +98,7 @@ jobs:
       - name: Setup grok
         uses: PostPerfection/setup-grok@v1
         with:
-          grok-ref: master
+          grok-ref: v20.4.0
 
       - name: Setup libmpv
         uses: PostPerfection/setup-libmpv@v1
@@ -134,6 +134,16 @@ jobs:
 
       - name: Build (grok-ffi)
         run: cargo build --features "${{ matrix.grok-features }}"
+
+      - name: 4K decode under lldb (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          bin=$(cargo test --features "${{ matrix.grok-features }}" --lib --no-run --message-format=json 2>/dev/null | jq -r 'select(.executable != null and .target.name == "postkit") | .executable')
+          echo "test binary: $bin"
+          for t in a_4k_fixture_decodes_reduced a_4k_fixture_decodes_on_one_thread a_4k_fixture_decodes_on_the_shared_pool a_4k_codestream_decodes_back_at_full_resolution; do
+            echo "===== $t ====="
+            lldb --batch -o "run" -k "bt all" -k "quit" -- "$bin" "$t" --test-threads=1 2>&1 | tail -80 || true
+          done
 
       - name: Test (grok-ffi)
         run: cargo test --no-fail-fast --features "${{ matrix.grok-features }}"
