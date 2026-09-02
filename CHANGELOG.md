@@ -4,6 +4,11 @@
 
 ### Added
 
+- **`grok_decoder::decode_with_threads`**: `decode` with the grok thread count
+  chosen by the caller, 0 for the shared pool and 1 for the calling thread. The
+  4K fixture `cinema4k_grey_4096x2160.j2c` decodes on the pool, on one thread
+  and at half size in the unit tests, which is the decode that crashed grok
+  before v20.4.1 on arm64 macOS.
 - **`hints`**: the advisory rules a job raises before an encode, which both
   wizards carried a copy of. `audio_level_hint`, `audio_language_hint` and
   `subtitle_hints` (a first cue before 4 seconds, a cue under 15 frames, a gap
