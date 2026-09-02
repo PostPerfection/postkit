@@ -98,7 +98,7 @@ jobs:
       - name: Setup grok
         uses: PostPerfection/setup-grok@v1
         with:
-          grok-ref: v20.4.0
+          grok-ref: master
 
       - name: Setup libmpv
         uses: PostPerfection/setup-libmpv@v1
@@ -142,7 +142,7 @@ jobs:
           set -uo pipefail
           unset CMAKE_TOOLCHAIN_FILE VCPKG_ROOT
           prefix="$RUNNER_TEMP/grok-asan"
-          git clone --depth 1 --recurse-submodules --shallow-submodules --branch v20.4.0 \
+          git clone --depth 1 --recurse-submodules --shallow-submodules --branch master \
             https://github.com/GrokImageCompression/grok.git "$RUNNER_TEMP/grok-asan-src"
           cmake -S "$RUNNER_TEMP/grok-asan-src" -B "$RUNNER_TEMP/grok-asan-build" \
             -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS_RELEASE="-O2 -g" -DCMAKE_CXX_FLAGS_RELEASE="-O2 -g" \
