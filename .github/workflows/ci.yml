@@ -135,14 +135,34 @@ jobs:
       - name: Build (grok-ffi)
         run: cargo build --features "${{ matrix.grok-features }}"
 
-      - name: 4K decode under lldb (macOS)
+      - name: 4K decode under ASan (macOS)
         if: runner.os == 'macOS'
+        shell: bash
         run: |
+          set -uo pipefail
+          unset CMAKE_TOOLCHAIN_FILE VCPKG_ROOT
+          prefix="$RUNNER_TEMP/grok-asan"
+          git clone --depth 1 --recurse-submodules --shallow-submodules --branch v20.4.0 \
+            https://github.com/GrokImageCompression/grok.git "$RUNNER_TEMP/grok-asan-src"
+          cmake -S "$RUNNER_TEMP/grok-asan-src" -B "$RUNNER_TEMP/grok-asan-build" \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo -DGRK_ENABLE_ASAN=ON \
+            -DCMAKE_INSTALL_PREFIX="$prefix" -DGRK_BUILD_CORE_SWIG_BINDINGS=OFF
+          cmake --build "$RUNNER_TEMP/grok-asan-build" --parallel "$(getconf _NPROCESSORS_ONLN)"
+          cmake --install "$RUNNER_TEMP/grok-asan-build"
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/lib64/pkgconfig"
+          export DYLD_LIBRARY_PATH="$prefix/lib:$prefix/lib64"
+          export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
           bin=$(cargo test --features "${{ matrix.grok-features }}" --lib --no-run --message-format=json 2>/dev/null | jq -r 'select(.executable != null and .target.name == "postkit") | .executable')
           echo "test binary: $bin"
-          for t in a_4k_fixture_decodes_reduced a_4k_fixture_decodes_on_one_thread a_4k_fixture_decodes_on_the_shared_pool a_4k_codestream_decodes_back_at_full_resolution; do
-            echo "===== $t ====="
-            lldb --batch -o "run" -k "bt all" -k "quit" -- "$bin" "$t" --test-threads=1 2>&1 | tail -80 || true
+          otool -L "$bin" | grep -i grok
+          tests="a_4k_fixture_decodes_reduced a_4k_fixture_decodes_on_one_thread a_4k_fixture_decodes_on_the_shared_pool a_4k_codestream_decodes_back_at_full_resolution"
+          for t in $tests; do
+            echo "===== asan: $t ====="
+            "$bin" "$t" --test-threads=1 2>&1 | tail -120 || true
+          done
+          for t in $tests; do
+            echo "===== lldb: $t ====="
+            lldb --batch -o "run" -k "bt all" -k "quit" -- "$bin" "$t" --test-threads=1 2>&1 | grep -v "postkit-\|std::\|core::\|libsystem\|libc++\|dyld" | tail -60 || true
           done
 
       - name: Test (grok-ffi)
