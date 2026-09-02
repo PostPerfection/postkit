@@ -74,7 +74,7 @@ Cargo features: `grok-ffi` (J2K encoder), `async` (tokio), `icc`
 (monitor-ICC display path in `preview`/`colour`, needs liblcms2). All off by
 default.
 
-`grok-ffi` links libgrokj2k (grok >= 20.3.8, needed for per-codec thread isolation) found via pkg-config, so build and
+`grok-ffi` links libgrokj2k (grok >= 20.4.2) found via pkg-config, so build and
 install grok first (cmake, e.g. to `~/bin/grok`), then put its `lib/pkgconfig` on
 `PKG_CONFIG_PATH` and its `lib` on `LD_LIBRARY_PATH`. CI does this in a cached
 "Setup grok" step; see `.github/workflows/ci.yml`.
@@ -87,7 +87,7 @@ which keeps everything on the CPU. Call `grok_encoder::use_gpu` after
 the device, `grok_encoder::use_cpu` sends them back. A reduced decode and a
 tiled stream stay on the CPU either way. `cargo test --features grok-gpu` runs
 the device round trip and needs a machine with the plugin, CI has no GPU. This
-needs a grok newer than v20.4.1, one that has `grk_plugin_set_enabled`.
+needs grok v20.4.2 or newer, which has `grk_plugin_set_enabled`.
 
 ## Usage
 
