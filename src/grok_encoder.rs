@@ -1795,11 +1795,49 @@ pub fn encode_video_pipeline_resumable<P>(
     height: u32,
     cancel: &Arc<AtomicBool>,
     resume: bool,
+    video_filter: Option<&str>,
+    frame_range: Option<crate::encode::FrameRange>,
+    on_progress: P,
+) -> PipelineResult
+where
+    P: FnMut(EncodeProgress),
+{
+    encode_video_pipeline_resumable_with_mxf_feed(
+        input_video,
+        output_dir,
+        params,
+        total_frames,
+        width,
+        height,
+        cancel,
+        resume,
+        video_filter,
+        frame_range,
+        None,
+        on_progress,
+    )
+}
+
+/// Like [`encode_video_pipeline_resumable`], but the writer thread also hands
+/// each codestream to `mxf_feed` once it is on disk, so a picture MXF can be
+/// written while the encode runs. A resumed run hands the feed only the frames
+/// it encodes, so a caller that resumes has no complete wrap to feed.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_video_pipeline_resumable_with_mxf_feed<P>(
+    input_video: &Path,
+    output_dir: &Path,
+    params: &CompressParams,
+    total_frames: u64,
+    width: u32,
+    height: u32,
+    cancel: &Arc<AtomicBool>,
+    resume: bool,
     // ffmpeg -vf chain applied while decoding, for fades and the like. It must
     // not change the frame size or count: the reader slices stdout into fixed
     // width*height frames and the CPL already declares the count.
     video_filter: Option<&str>,
     frame_range: Option<crate::encode::FrameRange>,
+    mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
     mut on_progress: P,
 ) -> PipelineResult
 where
@@ -1956,12 +1994,14 @@ where
     // (done >= total) is reachable after a resume.
     let remaining_total = total_frames.saturating_sub(start_frame);
     let phase_clocks = Arc::new(PhaseClocks::default());
-    let result = encode_pipeline(
+    let result = encode_pipeline_with_mxf_feed(
         output_dir,
         params,
         remaining_total,
         cancel,
         &phase_clocks,
+        mxf_feed,
+        None,
         || {
             if cancel.load(Ordering::Relaxed) {
                 return None;

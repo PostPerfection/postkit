@@ -4,6 +4,12 @@
 
 ### Added
 
+- **`grok_encoder::encode_video_pipeline_resumable_with_mxf_feed`**: the
+  resumable video encode with the writer thread handing each codestream to an
+  MXF feed as it lands, so a caller that encodes through it can write the
+  picture MXF while the encode runs the way `pipeline::run_encode_and_wrap_picture`
+  does, instead of reading the whole J2K directory back afterwards.
+  `encode_video_pipeline_resumable` is that call with no feed.
 - **`grok_encoder::use_gpu`, `use_cpu`, `gpu_active`, `accelerated_frames`**:
   grok's accelerator plugin, found through `GRK_PLUGIN_PATH`, the working
   directory or the executable's directory, encodes and decodes on the device
