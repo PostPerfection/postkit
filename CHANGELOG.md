@@ -159,8 +159,8 @@
   content: hound first, and a file with no RIFF tag is opened as a PCM MXF
   through `asdcplib::pcm::MxfReader`, one edit unit at a time, batched to about
   a second of audio per block. Anything that is neither still fails loud. On a
-  15 minute six channel 24-bit track the MXF reads 0.90 s and 9.6 MB against
-  the WAV's 0.87 s and 9.9 MB, and the same Leq(m) to four decimals. Encrypted
+  15 minute six channel 24-bit track the MXF reads 2.20 s and 10.7 MB against
+  the WAV's 2.15 s and 11.1 MB, and the same Leq(m) within 0.0002 dB. Encrypted
   essence is not decrypted, it fails with asdcplib's error.
 - **Probing a video decoded every frame of it**: `probe::probe_video` counted
   frames with `ffprobe -count_frames`, a software decode of the whole file that
@@ -354,17 +354,32 @@
   VI, motion data, sync, sign language and the unused channel at -144 dB, so a
   narration or sync channel contributes nothing. A mono or stereo file is
   unaffected, both its channels sit at 0 dB. Multichannel numbers move: a
-  15 minute 5.1 WAV reads 83.14 dB where the mean-of-channels downmix read
+  15 minute 5.1 WAV reads 80.36 dB where the mean-of-channels downmix read
   70.19 dB and ffmpeg's `-ac 1`, which summed the layout at near unity, read
   84.00 dB. On one tone across a 5.1 layout the sum matches leqm-nrt to six
   decimals (6.991762 dB over the same tone in mono, against the
   10*log10(4 + 2*10^-0.3) the corrections predict). `measure_leq_m` and the
   `leqm=` gain target now weight a file the same way, so a QC report and an
-  adjustment agree on what it measures. postkit's absolute scale still sits
-  2.6 to 3.0 dB above leqm-nrt's: its weighting is normalized at 1 kHz where
-  the ISO 21727 M table is normalized at 2 kHz (5.6 dB), and its reference
-  offset is 105.0 dB from full-scale RMS where leqm-nrt derives 108.0103 dB
-  (3.0103 dB).
+  adjustment agree on what it measures. Each channel costs its own fft, so the
+  same 15 minute track takes 2.15 s against the mono downmix's 0.85 s, at
+  11 MB.
+
+- **Leq(m) is calibrated to the ISO 21727 reference**: three things put the
+  measurement 2.6 to 3.0 dB above leqm-nrt, the implementation DCP-o-matic
+  reports Leq(m) from. The weighting was normalized at 1 kHz where the
+  ISO 21727 M table is normalized at 2 kHz (5.6 dB); the reference offset was
+  105.0 dB from full-scale RMS where the calibration derives 108.010299957 dB
+  from 85 dB SPL at -20 dBFS through the reference tone's peak (3.0103 dB); and
+  the weighting was the ITU-R 468 rational curve, which is convex between the
+  points the ISO table samples and so runs 0.2 to 0.5 dB hotter over most of
+  the band, worth another 0.19 dB on a broadband programme. The weighting is
+  now the ISO 21727 table read straight between its points, and both constants
+  are the reference's. Against leqm-nrt built at the sha DCP-o-matic pins:
+  80.355616 dB against 80.325927 on a 15 minute 5.1 track, 92.832184 against
+  92.750967 on six tones. leqm-nrt's own filter is a 64 point interpolation, so
+  raising it to 1024 points moves it to 86.737542 dB on a 30 second cut where
+  postkit reads 86.738372. Every Leq(m) number a package was measured at before
+  this reads 2.6 to 3.0 dB high.
 
 - **CI runs every test**: ffmpeg 8.1 is installed on all three runners, from
   the BtbN static build on Linux and Windows and from conda-forge on macOS,
