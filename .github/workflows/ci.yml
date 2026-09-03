@@ -67,7 +67,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          /c/msys64/usr/bin/pacman.exe -Sy --noconfirm --needed mingw-w64-x86_64-xmlsec
+          # a slow msys2 mirror fails the whole install, so retry it
+          for attempt in 1 2 3 4 5; do
+            /c/msys64/usr/bin/pacman.exe -Sy --noconfirm --needed mingw-w64-x86_64-xmlsec && break
+            if [ "$attempt" -eq 5 ]; then
+              echo "pacman install failed after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep $((30 * attempt))
+          done
           echo "C:\msys64\mingw64\bin" >> "$GITHUB_PATH"
 
       - name: Install dependencies (Windows)
