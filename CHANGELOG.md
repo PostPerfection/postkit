@@ -137,6 +137,14 @@
 
 ### Fixed
 
+- **Probing a video decoded every frame of it**: `probe::probe_video` counted
+  frames with `ffprobe -count_frames`, a software decode of the whole file that
+  took 181 s on an 888 s 2048x872 H.264 feature, as long as the GPU encode of
+  the same film, with nothing logged while it ran. The count is now the video
+  stream's own duration at its frame rate (1442 on a 60 s cut, 21312 on the
+  feature, both exact), which ffprobe answers in about 20 ms. `-count_packets`
+  is the fallback for a stream without a duration only, because an MP4 edit
+  list trims packets it still counts: the same 60 s cut holds 1508 packets.
 - **A DCI LUT path with a colon or a comma broke the decode**: `decode_filters`
   put the `.cube` path into the `lut3d` filter as it was, and ffmpeg's filter
   graph reads a colon as the end of an option and a comma as the end of a
