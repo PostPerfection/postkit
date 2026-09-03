@@ -943,10 +943,11 @@ unsafe fn build_grok_image(
             comp.sgnd = false;
         }
 
+        // labelled sycc, grok switches mct off for every untransformed frame
         let image = grk_image_new(
             3,
             comps.as_mut_ptr(),
-            _GRK_COLOR_SPACE_GRK_CLRSPC_SYCC,
+            _GRK_COLOR_SPACE_GRK_CLRSPC_SRGB,
             true,
         );
         if image.is_null() {

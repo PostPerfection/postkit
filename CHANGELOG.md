@@ -137,6 +137,15 @@
 
 ### Fixed
 
+- **Untransformed RGB frames were compressed without the component transform**:
+  the grok image the encoder threads build for a planar or packed RGB frame was
+  labelled sYCC, and grok switches MCT off for that colour space with a warning
+  and writes the code stream without it, so every encode whose frames reach the
+  compressor untransformed (an IMF `KeepRgb` encode, `AlreadyPq`, the DCI LUT
+  and the P3 or Rec.2020 source transform) ignored `CompressParams.mct`. The
+  cinema encode with grok's own X'Y'Z' transform was not affected, since that
+  transform relabels the image. The image is now labelled sRGB, which is what
+  the samples are, and MCT follows the parameters on every path.
 - **Every 8-bit YUV source was compressed about two codes low**: swscale
   converts an 8-bit YUV pixel format straight to `rgb48be` at 8 bits, so the
   frames on the packed RGB pipe carried a level error of about two codes of
