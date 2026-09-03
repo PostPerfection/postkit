@@ -142,8 +142,14 @@ pub fn run_encode_with_ratio(
 
 /// Encode settings for one pipeline run.
 pub struct EncodeRunOptions {
-    /// J2K compression ratio (video input only).
+    /// J2K compression ratio (video input only). Ignored when
+    /// `target_codestream_bytes` is set.
     pub compression_ratio: f64,
+    /// The bytes per frame the allocation aims at, which replaces the ratio.
+    /// A ratio derived from the source raster misses this target once the
+    /// picture is padded to its container, so a caller with a bitrate sets it
+    /// here.
+    pub target_codestream_bytes: Option<u64>,
     /// A PSNR target in dB that grok allocates layers by instead of the
     /// compression ratio. `codestream_byte_cap` still holds: a frame the target
     /// cannot fit under the cap is compressed again by rate.
@@ -185,6 +191,7 @@ impl Default for EncodeRunOptions {
     fn default() -> Self {
         Self {
             compression_ratio: 10.0,
+            target_codestream_bytes: None,
             quality_psnr: None,
             fps: FrameRate::default(),
             read_source_at: None,
@@ -271,6 +278,7 @@ fn run_encode_and_maybe_wrap(
     on_log: impl Fn(&str),
 ) -> Result<(EncodeResult, Option<crate::mxf_wrap::MxfTrackFile>), String> {
     let compression_ratio = options.compression_ratio;
+    let target_codestream_bytes = options.target_codestream_bytes;
     let quality_psnr = options.quality_psnr;
     let fps = options.fps;
     if !video.exists() {
@@ -398,6 +406,7 @@ fn run_encode_and_maybe_wrap(
                     input: video.to_path_buf(),
                     output_dir: j2k_dir.clone(),
                     compression_ratio,
+                    target_codestream_bytes,
                     quality_psnr,
                     num_resolutions: 6,
                     codeblock_size: 32,
@@ -431,6 +440,7 @@ fn run_encode_and_maybe_wrap(
             let compress = StreamEncodeOptions {
                 output_dir: j2k_dir.clone(),
                 compression_ratio,
+                target_codestream_bytes,
                 quality_psnr,
                 num_resolutions: 6,
                 codeblock_size: 32,

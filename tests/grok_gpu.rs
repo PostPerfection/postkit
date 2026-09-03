@@ -28,6 +28,14 @@ const HEIGHT: u32 = 48;
 const PRECISION: u8 = 12;
 const MAX_SAMPLE: i32 = (1 << PRECISION) - 1;
 const FRAME_COUNT: u64 = 12;
+const TARGET_WIDTH: u32 = 2048;
+const TARGET_HEIGHT: u32 = 1080;
+
+// 230 Mbit/s at 24 fps, the shipped default, in bytes per frame
+const TARGET_BYTES: u64 = 1_197_917;
+
+// the fraction of the target the plugin's own allocator has to reach
+const DEVICE_TARGET_FLOOR: f64 = 0.90;
 
 /// A pattern where every component differs at every pixel and every frame
 /// differs from its neighbours, so a swapped component, a row read at the wrong
@@ -127,6 +135,76 @@ fn round_trip_returns_the_source_samples(label: &str) {
     }
 }
 
+/// 2K noise at 12 bits, incompressible enough that a rate allocation lands on
+/// its ceiling instead of a few header bytes.
+fn noise_2k_frame(index: u64) -> RawFrame {
+    let mut state = 7u32.wrapping_add(index as u32).wrapping_mul(2654435761);
+    let mut components = [Vec::new(), Vec::new(), Vec::new()];
+    for component in components.iter_mut() {
+        for _ in 0..(TARGET_WIDTH * TARGET_HEIGHT) {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            component.push(((state >> 8) as i32) & MAX_SAMPLE);
+        }
+    }
+    RawFrame::Planar {
+        components,
+        width: TARGET_WIDTH,
+        height: TARGET_HEIGHT,
+        precision: PRECISION,
+        index,
+    }
+}
+
+/// Encode noise frames at `TARGET_BYTES` and assert every code stream the
+/// device handed back lands on the target.
+fn a_device_encode_holds_the_byte_target() {
+    const FRAMES: u64 = 4;
+    let dir = tempfile::tempdir().unwrap();
+    let params = CompressParams {
+        target_codestream_bytes: Some(TARGET_BYTES),
+        ..CompressParams::default()
+    };
+
+    let before = accelerated_frames();
+    let mut next_index = 0u64;
+    let result = postkit::grok_encoder::encode_pipeline(
+        dir.path(),
+        &params,
+        FRAMES,
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(PhaseClocks::default()),
+        || {
+            if next_index >= FRAMES {
+                return None;
+            }
+            let frame = noise_2k_frame(next_index);
+            next_index += 1;
+            Some(frame)
+        },
+        |_| {},
+    );
+    assert!(result.success, "device encode failed: {}", result.error);
+    assert_eq!(result.frames_encoded, FRAMES);
+    assert!(
+        accelerated_frames() > before,
+        "the encode never reached the device, so it measures the cpu allocator"
+    );
+
+    for index in 0..FRAMES {
+        let path = dir.path().join(format!("frame_{index:08}.j2c"));
+        let size = std::fs::metadata(&path).unwrap().len();
+        let reached = size as f64 / TARGET_BYTES as f64;
+        assert!(
+            size <= TARGET_BYTES,
+            "frame {index} is {size} bytes, over the {TARGET_BYTES} byte target"
+        );
+        assert!(
+            reached >= DEVICE_TARGET_FLOOR,
+            "frame {index} is {size} bytes, only {reached} of the {TARGET_BYTES} byte target"
+        );
+    }
+}
+
 /// One test, because the plugin is a switch for the whole process and two
 /// tests would race over it.
 #[test]
@@ -144,6 +222,8 @@ fn the_device_takes_every_call_after_use_gpu_and_none_after_use_cpu() {
         before_device + FRAME_COUNT * 2,
         "the device has to have run one compress and one decompress per frame"
     );
+
+    a_device_encode_holds_the_byte_target();
 
     use_cpu();
     assert!(!gpu_active(), "use_cpu left the accelerator recorded as on");

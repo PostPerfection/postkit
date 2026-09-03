@@ -846,8 +846,14 @@ pub struct StreamEncodeOptions {
     pub input: PathBuf,
     /// Output J2K directory
     pub output_dir: PathBuf,
-    /// Target compression ratio (e.g. 10 for 10:1)
+    /// Target compression ratio (e.g. 10 for 10:1). Ignored when
+    /// `target_codestream_bytes` is set.
     pub compression_ratio: f64,
+    /// The bytes per frame the allocation aims at, which replaces the ratio. A
+    /// ratio derived from the source raster misses this target once the picture
+    /// is padded to its container, so a caller with a bitrate sets it here.
+    #[serde(default)]
+    pub target_codestream_bytes: Option<u64>,
     /// A PSNR target in dB that grok allocates layers by instead of the
     /// compression ratio. `codestream_byte_cap` still holds: a frame the target
     /// cannot fit under the cap is compressed again by rate.
@@ -911,6 +917,7 @@ impl Default for StreamEncodeOptions {
             input: PathBuf::new(),
             output_dir: PathBuf::new(),
             compression_ratio: 10.0,
+            target_codestream_bytes: None,
             quality_psnr: None,
             num_resolutions: 6,
             codeblock_size: 32,
@@ -1318,6 +1325,7 @@ fn compress_params(
     let colour_transform = opts.source_colour.frame_transform()?;
     Ok(crate::grok_encoder::CompressParams {
         compression_ratio: opts.compression_ratio,
+        target_codestream_bytes: opts.target_codestream_bytes,
         quality_psnr: opts.quality_psnr,
         codestream_byte_cap: opts.codestream_byte_cap,
         num_resolutions: opts.num_resolutions as u8,

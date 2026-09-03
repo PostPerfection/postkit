@@ -106,15 +106,22 @@ pub struct EncodedFrame {
 /// Compression parameters for DCI JPEG 2000.
 #[derive(Debug, Clone)]
 pub struct CompressParams {
-    /// Compression ratio (e.g. 10.0 for 10:1)
+    /// Compression ratio (e.g. 10.0 for 10:1). Ignored when
+    /// `target_codestream_bytes` is set.
     pub compression_ratio: f64,
+    /// The bytes per frame the allocation aims at. Set, it replaces
+    /// `compression_ratio`: grok's own byte budget is computed from the image
+    /// it sees, so the ratio a caller derived from the source raster misses the
+    /// target once the picture is padded to its container. grok subtracts its
+    /// header offsets from the budget, so codestreams land just under the
+    /// target.
+    pub target_codestream_bytes: Option<u64>,
     /// A PSNR target in dB that grok allocates layers by instead of the
     /// compression ratio. `codestream_byte_cap` still holds: grok is given it
     /// as `max_cs_size` and prefers it over the quality target.
     pub quality_psnr: Option<f64>,
-    /// Per-codestream byte cap, the same one the writer thread checks. It only
-    /// reaches grok under `quality_psnr`, where the quality target is the only
-    /// other thing sizing the codestream.
+    /// Per-codestream byte cap, the same one the writer thread checks. grok is
+    /// given it as `max_cs_size` and holds to it.
     pub codestream_byte_cap: Option<u64>,
     /// Number of decomposition levels (default 6 for 2K)
     pub num_resolutions: u8,
@@ -233,6 +240,7 @@ impl Default for CompressParams {
     fn default() -> Self {
         Self {
             compression_ratio: 10.0,
+            target_codestream_bytes: None,
             quality_psnr: None,
             codestream_byte_cap: None,
             num_resolutions: 6,
@@ -821,8 +829,9 @@ fn encoder_thread_fn(
 /// How grok sizes one codestream.
 #[cfg(feature = "grok-ffi")]
 enum Allocation {
-    /// grok's rate/distortion curve at this compression ratio. A non-zero
-    /// `max_bytes` is a hard ceiling grok holds to, whatever the ratio asks for.
+    /// grok's rate/distortion curve at this compression ratio, from
+    /// [`rate_allocation`]. A non-zero `max_bytes` is a hard ceiling grok holds
+    /// to, whatever the ratio asks for.
     Ratio { ratio: f64, max_bytes: u64 },
     /// grok's layer allocation at this PSNR target. `max_cs_size` does nothing
     /// here, so the target alone decides the size.
@@ -833,14 +842,49 @@ enum Allocation {
 #[cfg(feature = "grok-ffi")]
 const CINEMA_SAMPLE_PRECISION: u8 = 12;
 
+/// Components in the image [`build_grok_image`] hands grok.
+#[cfg(feature = "grok-ffi")]
+const GROK_IMAGE_COMPONENTS: u64 = 3;
+
+#[cfg(feature = "grok-ffi")]
+const BITS_PER_BYTE: u64 = 8;
+
 /// The cinema profiles encode 3 components at 12 bits, and grok measures its
 /// compression ratio against that rather than against the samples it was given.
 #[cfg(feature = "grok-ffi")]
 fn cinema_raw_frame_bytes(frame: &RawFrame) -> u64 {
-    const COMPONENTS: u64 = 3;
-    const BITS_PER_BYTE: u64 = 8;
-    frame.width() as u64 * frame.height() as u64 * COMPONENTS * CINEMA_SAMPLE_PRECISION as u64
+    frame.width() as u64
+        * frame.height() as u64
+        * GROK_IMAGE_COMPONENTS
+        * CINEMA_SAMPLE_PRECISION as u64
         / BITS_PER_BYTE
+}
+
+/// How grok sizes one codestream by rate, from the byte target when there is
+/// one and from the compression ratio otherwise. Both the CPU compressor and
+/// the plugin's batch size their frames through this.
+///
+/// grok's own budget is `numcomps * prec * pixels / (ratio * 8)` minus its
+/// header offsets, measured on the image after its cinema transform, so a ratio
+/// that asks for `target` bytes of that image is what puts the codestream on
+/// the target.
+#[cfg(feature = "grok-ffi")]
+fn rate_allocation(frame: &RawFrame, params: &CompressParams) -> Result<Allocation, String> {
+    let cap = params.codestream_byte_cap;
+    let Some(target) = params.target_codestream_bytes else {
+        return Ok(Allocation::Ratio {
+            ratio: params.compression_ratio,
+            max_bytes: cap.unwrap_or(0),
+        });
+    };
+    let (rsiz, image_precision, _) = frame_encoding_shape(frame, params)?;
+    let precision = grok_image_precision(rsiz, image_precision);
+    let image_bits =
+        GROK_IMAGE_COMPONENTS * precision as u64 * frame.width() as u64 * frame.height() as u64;
+    Ok(Allocation::Ratio {
+        ratio: image_bits as f64 / (BITS_PER_BYTE * target.max(1)) as f64,
+        max_bytes: cap.map_or(target, |cap| cap.min(target)),
+    })
 }
 
 /// Compress a single frame using Grok's in-process C API via FFI.
@@ -855,11 +899,8 @@ fn compress_frame_grok(
     output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     let Some(psnr) = params.quality_psnr else {
-        let by_ratio = Allocation::Ratio {
-            ratio: params.compression_ratio,
-            max_bytes: 0,
-        };
-        return compress_frame_once(frame, params, by_ratio, output_buf);
+        let by_rate = rate_allocation(frame, params)?;
+        return compress_frame_once(frame, params, by_rate, output_buf);
     };
 
     let compressed = compress_frame_once(frame, params, Allocation::Quality { psnr }, output_buf)?;
@@ -1232,11 +1273,8 @@ impl Batch {
         input_queue: &Arc<BoundedQueue<RawFrame>>,
     ) -> Result<Option<Self>, String> {
         let (rsiz, image_precision, bits_to_drop) = frame_encoding_shape(frame, params)?;
-        let by_ratio = Allocation::Ratio {
-            ratio: params.compression_ratio,
-            max_bytes: 0,
-        };
-        let mut parameters = Box::new(build_cparameters(params, rsiz, by_ratio));
+        let by_rate = rate_allocation(frame, params)?;
+        let mut parameters = Box::new(build_cparameters(params, rsiz, by_rate));
         let collector = Box::new(BatchCollector {
             writer_tx: writer_tx.clone(),
             error_flag: error_flag.clone(),
@@ -1249,7 +1287,7 @@ impl Batch {
         info.width = frame.width();
         info.height = frame.height();
         info.numcomps = 3;
-        info.prec = batch_precision(rsiz, image_precision);
+        info.prec = grok_image_precision(rsiz, image_precision);
         // a zeroed info already describes the planar RGB frames postkit
         // deinterleaves itself, so only a YUV or interleaved source fills
         // these in
@@ -1304,7 +1342,7 @@ impl Batch {
                 tracing::info!(
                     width = frame.width(),
                     height = frame.height(),
-                    precision = batch_precision(rsiz, image_precision),
+                    precision = grok_image_precision(rsiz, image_precision),
                     rsiz = format!("{rsiz:#06x}"),
                     "grok's accelerator plugin does not handle this frame shape or these \
                      compression parameters as a batch, compressing on the CPU"
@@ -1395,10 +1433,12 @@ pub fn plugin_takes_frame(_shape_only: &RawFrame, _params: &CompressParams) -> b
     false
 }
 
-/// The cinema profiles are written at 12 bits, and grok's X'Y'Z' transform
-/// emits 12 for a cinema rsiz, so a deeper frame is shifted down inside submit.
+/// The precision of the image grok compresses. The cinema profiles are written
+/// at 12 bits, and grok's X'Y'Z' transform emits 12 for a cinema rsiz, so a
+/// deeper frame is shifted down inside submit and grok's byte budget is
+/// measured at 12.
 #[cfg(feature = "grok-ffi")]
-fn batch_precision(rsiz: u16, image_precision: u8) -> u8 {
+fn grok_image_precision(rsiz: u16, image_precision: u8) -> u8 {
     let cinema = matches!(
         crate::j2k::J2kProfile::from(rsiz),
         crate::j2k::J2kProfile::Cinema2k | crate::j2k::J2kProfile::Cinema4k
@@ -2418,47 +2458,63 @@ mod tests {
         assert!(error.contains("4097x2160"), "{error}");
     }
 
+    // 230 Mbit/s at 24 fps, the shipped default, in bytes per frame
+    #[cfg(feature = "grok-ffi")]
+    const DEFAULT_TARGET_BYTES: u64 = 1_197_917;
+
+    #[cfg(feature = "grok-ffi")]
+    const FEATURE_FPS: u32 = 24;
+
+    // the fraction of the target a rate allocation must reach, below which the
+    // encode is spending fewer bits than it was asked for
+    #[cfg(feature = "grok-ffi")]
+    const TARGET_FLOOR: f64 = 0.97;
+
+    /// One 2K frame of noise at a byte target, on the cpu, and its size.
+    #[cfg(feature = "grok-ffi")]
+    fn compress_one_2k_frame_at_the_target(precision: u8, target: u64) -> u64 {
+        let frame = noise_frame(0, 2048, 1080, precision);
+        initialize(0);
+        let params = CompressParams {
+            target_codestream_bytes: Some(target),
+            edit_rate: crate::encode::FrameRate::whole(FEATURE_FPS),
+            ..CompressParams::default()
+        };
+        let mut buf = Vec::new();
+        compress_frame_grok(&frame, &params, &mut buf)
+            .unwrap()
+            .len() as u64
+    }
+
     #[cfg(feature = "grok-ffi")]
     #[test]
     fn the_default_bitrate_target_stays_under_the_dci_cap() {
-        // rate allocation lands a frame either side of the target, so the
-        // shipped target needs room under the cap. noise is incompressible
-        // enough to hit the rate ceiling on every frame.
-        let (w, h) = (2048u32, 1080u32);
-        let mut state = 7u32;
-        let data: Vec<u8> = (0..(w * h * 6))
-            .map(|_| {
-                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                (state >> 24) as u8
-            })
-            .collect();
-        let frame = RawFrame::Packed {
-            data,
-            order: SampleOrder::Big,
-            width: w,
-            height: h,
-            precision: 16,
-            index: 0,
-        };
-        initialize(0);
-
-        const DEFAULT_TARGET_MBPS: f64 = 230.0;
-        const FPS: u32 = 24;
-        let raw_bits = w as f64 * h as f64 * 36.0;
-        let params = CompressParams {
-            compression_ratio: raw_bits / (DEFAULT_TARGET_MBPS * 1_000_000.0 / FPS as f64),
-            apply_xyz_transform: true,
-            edit_rate: crate::encode::FrameRate::whole(FPS),
-            ..CompressParams::default()
-        };
-
-        let mut buf = Vec::new();
-        let bytes = compress_frame_grok(&frame, &params, &mut buf).unwrap();
-        let cap = crate::j2k::dci_codestream_byte_cap(FPS);
+        // noise is incompressible enough to hit the rate ceiling on every frame
+        let bytes = compress_one_2k_frame_at_the_target(16, DEFAULT_TARGET_BYTES);
+        let cap = crate::j2k::dci_codestream_byte_cap(FEATURE_FPS);
+        assert!(bytes <= cap, "{bytes} bytes exceeds the {cap} byte DCI cap");
         assert!(
-            (bytes.len() as u64) <= cap,
-            "{} bytes exceeds the {cap} byte DCI cap",
-            bytes.len()
+            bytes <= DEFAULT_TARGET_BYTES,
+            "{bytes} bytes exceeds the {DEFAULT_TARGET_BYTES} byte target"
+        );
+        let reached = bytes as f64 / DEFAULT_TARGET_BYTES as f64;
+        assert!(
+            reached >= TARGET_FLOOR,
+            "{bytes} bytes is only {reached} of the {DEFAULT_TARGET_BYTES} byte target"
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_12_bit_frame_hits_the_same_target_as_a_16_bit_one() {
+        // grok cuts a deeper cinema frame to 12 bits itself, so the target has
+        // to be measured against the image it ends up with either way
+        let at_16 = compress_one_2k_frame_at_the_target(16, DEFAULT_TARGET_BYTES);
+        let at_12 = compress_one_2k_frame_at_the_target(12, DEFAULT_TARGET_BYTES);
+        let difference = (at_12 as f64 - at_16 as f64).abs() / at_16 as f64;
+        assert!(
+            difference < 0.02,
+            "12-bit landed at {at_12} bytes and 16-bit at {at_16}"
         );
     }
 
@@ -2511,26 +2567,36 @@ mod tests {
     /// One 128x128 frame of noise, incompressible enough that every frame lands
     /// at about the rate ceiling rather than a few header bytes.
     #[cfg(feature = "grok-ffi")]
-    fn noise_frame(index: u64, width: u32, height: u32) -> RawFrame {
+    fn noise_frame(index: u64, width: u32, height: u32, precision: u8) -> RawFrame {
         let mut state = 7u32.wrapping_add(index as u32).wrapping_mul(2654435761);
-        let data: Vec<u8> = (0..(width * height * 6))
-            .map(|_| {
-                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
-                (state >> 24) as u8
-            })
-            .collect();
+        let mask = (1u32 << precision) - 1;
+        let mut data = Vec::with_capacity((width * height * 6) as usize);
+        for _ in 0..(width * height * 3) {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            data.extend_from_slice(&(((state >> 8) & mask) as u16).to_be_bytes());
+        }
         RawFrame::Packed {
             data,
             order: SampleOrder::Big,
             width,
             height,
-            precision: 16,
+            precision,
             index,
         }
     }
 
     #[cfg(feature = "grok-ffi")]
     fn encode_noise_frames(output_dir: &Path, total: u64, cap: Option<u64>) -> PipelineResult {
+        encode_noise_frames_at_the_target(output_dir, total, cap, None)
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    fn encode_noise_frames_at_the_target(
+        output_dir: &Path,
+        total: u64,
+        cap: Option<u64>,
+        target: Option<u64>,
+    ) -> PipelineResult {
         let (width, height) = (128u32, 128u32);
         let cancel = Arc::new(AtomicBool::new(false));
         let phase_clocks = Arc::new(PhaseClocks::default());
@@ -2538,7 +2604,11 @@ mod tests {
         initialize(0);
         encode_pipeline_with_mxf_feed(
             output_dir,
-            &CompressParams::default(),
+            &CompressParams {
+                codestream_byte_cap: cap,
+                target_codestream_bytes: target,
+                ..CompressParams::default()
+            },
             total,
             &cancel,
             &phase_clocks,
@@ -2548,12 +2618,21 @@ mod tests {
                 if next == total {
                     return None;
                 }
-                let frame = noise_frame(next, width, height);
+                let frame = noise_frame(next, width, height, 16);
                 next += 1;
                 Some(frame)
             },
             |_| {},
         )
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    fn largest_codestream(dir: &Path) -> u64 {
+        written_codestreams(dir)
+            .iter()
+            .map(|path| std::fs::metadata(path).unwrap().len())
+            .max()
+            .unwrap()
     }
 
     #[cfg(feature = "grok-ffi")]
@@ -2570,7 +2649,7 @@ mod tests {
 
     #[cfg(feature = "grok-ffi")]
     #[test]
-    fn a_frame_over_the_cap_stops_the_encode_where_it_lands() {
+    fn the_cap_holds_every_codestream() {
         const TOTAL: u64 = 64;
         let dir = tempfile::tempdir().unwrap();
 
@@ -2579,9 +2658,7 @@ mod tests {
         let reference = dir.path().join("reference");
         let result = encode_noise_frames(&reference, 1, None);
         assert!(result.success, "reference encode failed: {}", result.error);
-        let one_frame = std::fs::metadata(&written_codestreams(&reference)[0])
-            .unwrap()
-            .len();
+        let one_frame = largest_codestream(&reference);
         let cap = one_frame / 2;
         assert!(
             cap > 0,
@@ -2590,19 +2667,58 @@ mod tests {
 
         let capped = dir.path().join("capped");
         let result = encode_noise_frames(&capped, TOTAL, Some(cap));
-        assert!(!result.success, "an over-cap frame has to fail the encode");
+        assert!(result.success, "capped encode failed: {}", result.error);
+        assert_eq!(written_codestreams(&capped).len() as u64, TOTAL);
+        let largest = largest_codestream(&capped);
+        assert!(
+            largest <= cap,
+            "a codestream reached {largest} over the {cap} byte cap"
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_target_over_the_cap_still_holds_the_cap() {
+        const TOTAL: u64 = 8;
+        let dir = tempfile::tempdir().unwrap();
+
+        let reference = dir.path().join("reference");
+        let result = encode_noise_frames(&reference, 1, None);
+        assert!(result.success, "reference encode failed: {}", result.error);
+        let cap = largest_codestream(&reference) / 2;
+
+        let capped = dir.path().join("capped");
+        let result = encode_noise_frames_at_the_target(&capped, TOTAL, Some(cap), Some(cap * 4));
+        assert!(result.success, "capped encode failed: {}", result.error);
+        assert_eq!(written_codestreams(&capped).len() as u64, TOTAL);
+        let largest = largest_codestream(&capped);
+        assert!(
+            largest <= cap,
+            "a codestream reached {largest} over the {cap} byte cap, with a {} byte target",
+            cap * 4
+        );
+    }
+
+    /// A codestream's own markers run to a few hundred bytes, so a 100 byte cap
+    /// is one grok cannot meet however it allocates.
+    #[cfg(feature = "grok-ffi")]
+    const UNMEETABLE_CAP: u64 = 100;
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_cap_grok_cannot_meet_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("capped");
+        let result = encode_noise_frames(&output, 8, Some(UNMEETABLE_CAP));
+        assert!(!result.success, "a 100 byte cap has to fail the encode");
+        // grok emits over a cap it cannot reach, so the writer's own guard is
+        // what stops the run
         assert!(
             result.error.contains(&format!(
-                "over the {cap} byte per-frame cap: lower the bitrate"
+                "over the {UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
             )),
             "wrong refusal: {}",
             result.error
-        );
-        let written = written_codestreams(&capped).len() as u64;
-        assert!(
-            written < TOTAL,
-            "the encode wrote {written} of {TOTAL} frames instead of stopping at the first \
-             frame over the cap"
         );
     }
 

@@ -293,9 +293,9 @@ fn an_image_sequence_refuses_a_source_read_rate() {
     assert!(error.contains("another rate"), "{error}");
 }
 
-/// The cap has to reach the writer thread from `EncodeRunOptions`, and the run
-/// has to end at the frame that breaks it. The old sweep of the finished
-/// directory encoded the whole clip first.
+/// The cap has to reach both grok and the writer thread from `EncodeRunOptions`:
+/// grok holds a cap it can meet, and the run ends at the frame that breaks one
+/// it cannot.
 #[test]
 fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
     const CAPPED_FRAME_COUNT: u64 = 48;
@@ -330,8 +330,39 @@ fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
     let cancel = Arc::new(AtomicBool::new(false));
     let pause = Arc::new(AtomicBool::new(false));
 
-    // encode with no cap first, so the cap below is under what these frames
-    // compress to by construction rather than by a guessed number
+    // a codestream's own markers run to a few hundred bytes, so grok cannot
+    // reach this however it allocates and the writer is what stops the run
+    const UNMEETABLE_CAP: u64 = 100;
+    let capped_output = dir.path().join("capped");
+    let outcome = run_encode_with_options(
+        &video,
+        &capped_output,
+        &options(Some(UNMEETABLE_CAP)),
+        &cancel,
+        &pause,
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    );
+    let Err(error) = outcome else {
+        panic!("no frame fits a {UNMEETABLE_CAP} byte cap, so the run has to fail");
+    };
+    assert!(
+        error.contains(&format!(
+            "over the {UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
+        )),
+        "{error}"
+    );
+
+    let written = std::fs::read_dir(capped_output.join("j2k"))
+        .map(|entries| entries.count() as u64)
+        .unwrap_or(0);
+    assert!(
+        written < CAPPED_FRAME_COUNT,
+        "the run wrote {written} of {CAPPED_FRAME_COUNT} frames instead of stopping at the \
+         first frame over the cap"
+    );
+
+    // a cap grok can meet it holds itself, so the whole clip encodes under it
     let uncapped = run_encode_with_options(
         &video,
         &dir.path().join("uncapped"),
@@ -350,33 +381,25 @@ fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
         .expect("the uncapped encode wrote no codestreams");
     let cap = smallest / 2;
 
-    let capped_output = dir.path().join("capped");
-    let outcome = run_encode_with_options(
+    let held = run_encode_with_options(
         &video,
-        &capped_output,
+        &dir.path().join("held"),
         &options(Some(cap)),
         &cancel,
         &pause,
         |_: &PipelineProgress| {},
         |_: &str| {},
-    );
-    let Err(error) = outcome else {
-        panic!("every frame is over the {cap} byte cap, so the run has to fail");
-    };
+    )
+    .expect("an encode under a cap grok can meet");
+    assert_eq!(held.frames_encoded, CAPPED_FRAME_COUNT);
+    let largest = std::fs::read_dir(&held.j2k_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .max()
+        .expect("the capped encode wrote no codestreams");
     assert!(
-        error.contains(&format!(
-            "over the {cap} byte per-frame cap: lower the bitrate"
-        )),
-        "{error}"
-    );
-
-    let written = std::fs::read_dir(capped_output.join("j2k"))
-        .map(|entries| entries.count() as u64)
-        .unwrap_or(0);
-    assert!(
-        written < CAPPED_FRAME_COUNT,
-        "the run wrote {written} of {CAPPED_FRAME_COUNT} frames instead of stopping at the \
-         first frame over the cap"
+        largest <= cap,
+        "a codestream reached {largest} over the {cap} byte cap"
     );
 }
 

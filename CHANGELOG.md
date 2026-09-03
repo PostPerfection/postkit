@@ -152,6 +152,27 @@
 
 ### Fixed
 
+- **The encode aimed at a compression ratio and missed the bitrate**: a caller
+  with a bitrate divided the source raster's bytes by it, but the picture is
+  padded to its container before grok sees it, and grok computes its own budget
+  as `numcomps * prec * pixels / (ratio * 8)` on the image after its cinema
+  transform. A 2048x872 source in a 2048x1080 container gave grok a budget of
+  1,483,500 bytes for a 1,197,917 byte request, 24 percent over. Nothing bound
+  the codestreams below the DCI cap either, because both allocation sites passed
+  `max_bytes: 0`, so grok never got the cap as `max_cs_size` and a feature
+  failed at frame 408 with "codestream ... is 1312856 bytes, over the 1302083
+  byte per-frame cap". `CompressParams.target_codestream_bytes` is now the bytes
+  per frame the allocation aims at, threaded from `EncodeRunOptions` and
+  `StreamEncodeOptions`, and one `rate_allocation` turns it into the ratio grok
+  needs from the image geometry grok will see and hands grok `min(target, cap)`
+  as `max_cs_size`. Both the CPU compressor and the accelerator plugin's batch
+  size their frames through it, so neither can drift. On the frame that failed,
+  a 995,328 byte target lands at 995,262 bytes, the same size grok's own CLI
+  writes in cinema mode at ratio 10, and a 1,197,917 byte target under a
+  1,302,083 byte cap lands at 1,197,821. With no target the ratio is passed as
+  it was, and the cap now reaches grok either way, so a codestream over it is
+  the writer's guard catching a cap grok cannot meet rather than a bitrate
+  nothing bounded.
 - **The loudness passes could not read a packaged sound MXF**: `measure_loudness`,
   `measure_leq_m` and `measure_true_peak_dbtp` opened their input through hound,
   so a QC report handed a `sound_<uuid>.mxf` got "wav i/o: Ill-formed WAVE file:
