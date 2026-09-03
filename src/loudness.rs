@@ -2,7 +2,7 @@ use ebur128::{EbuR128, Mode};
 use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -118,6 +118,197 @@ fn parse_short_term_max(stderr: &str) -> Option<f64> {
         }
     }
     max
+}
+
+// frames per add_frames call, about a second of audio at 48 kHz
+const TRUE_PEAK_BLOCK_FRAMES: usize = 48_000;
+
+// every integer width is widened to i32 scale before this divide
+const FULL_SCALE_I32: f32 = 2_147_483_648.0;
+
+pub fn measure_true_peak_dbtp(input: &Path) -> Result<f64, AdjustError> {
+    let reader = WavReader::open(input)?;
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+    if channels == 0 || reader.duration() == 0 {
+        return Err(AdjustError::Empty);
+    }
+
+    let mut senders = Vec::with_capacity(channels);
+    let mut receivers = Vec::with_capacity(channels);
+    for _ in 0..channels {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        senders.push(sender);
+        receivers.push(receiver);
+    }
+
+    // true peak state is per channel, a mono meter per thread is exact
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = receivers
+            .into_iter()
+            .map(|receiver| {
+                let rate = spec.sample_rate;
+                scope.spawn(move || -> Result<f64, AdjustError> {
+                    let mut meter = EbuR128::new(1, rate, Mode::TRUE_PEAK)?;
+                    while let Ok(plane) = receiver.recv() {
+                        meter.add_frames_f32(&plane)?;
+                    }
+                    Ok(meter.true_peak(0)?)
+                })
+            })
+            .collect();
+
+        let fed = read_blocks(input, spec, |interleaved| {
+            let frames = interleaved.len() / channels;
+            let mut planes: Vec<Vec<f32>> =
+                (0..channels).map(|_| Vec::with_capacity(frames)).collect();
+            for frame in interleaved.chunks_exact(channels) {
+                for (plane, &sample) in planes.iter_mut().zip(frame) {
+                    plane.push(sample);
+                }
+            }
+            for (sender, plane) in senders.iter().zip(planes) {
+                // a worker that stopped early says why through its join
+                let _ = sender.send(plane);
+            }
+            Ok(())
+        });
+        drop(senders);
+
+        let mut peak_linear = 0.0f64;
+        for worker in workers {
+            peak_linear = peak_linear.max(worker.join().expect("true peak worker panicked")?);
+        }
+        fed?;
+        Ok(20.0 * peak_linear.log10())
+    })
+}
+
+// raw data bytes, only when the chunk is exactly the counted samples at their natural width
+struct PackedData {
+    reader: std::io::BufReader<std::fs::File>,
+    byte_count: usize,
+}
+
+type WidenSamples = fn(&[u8], &mut Vec<f32>);
+
+fn widen_samples(spec: WavSpec) -> Option<WidenSamples> {
+    Some(match (spec.sample_format, spec.bits_per_sample) {
+        (SampleFormat::Float, 32) => |bytes: &[u8], out: &mut Vec<f32>| {
+            out.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&b| f32::from_le_bytes(b)),
+            );
+        },
+        (SampleFormat::Int, 32) => |bytes: &[u8], out: &mut Vec<f32>| {
+            out.extend(
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&b| i32::from_le_bytes(b) as f32 / FULL_SCALE_I32),
+            );
+        },
+        (SampleFormat::Int, 24) => |bytes: &[u8], out: &mut Vec<f32>| {
+            out.extend(
+                bytes
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes([0, b[0], b[1], b[2]]) as f32 / FULL_SCALE_I32),
+            );
+        },
+        (SampleFormat::Int, 16) => |bytes: &[u8], out: &mut Vec<f32>| {
+            out.extend(
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|b| i32::from_le_bytes([0, 0, b[0], b[1]]) as f32 / FULL_SCALE_I32),
+            );
+        },
+        (SampleFormat::Int, 8) => |bytes: &[u8], out: &mut Vec<f32>| {
+            out.extend(
+                bytes
+                    .iter()
+                    .map(|&b| (((b as i32) - 128) << 24) as f32 / FULL_SCALE_I32),
+            );
+        },
+        _ => return None,
+    })
+}
+
+fn packed_data(input: &Path, spec: WavSpec) -> Result<Option<PackedData>, AdjustError> {
+    let parsed = WavReader::open(input)?;
+    let sample_count = parsed.len() as usize;
+    let mut reader = parsed.into_inner();
+    let data_start = reader.stream_position().map_err(hound::Error::from)?;
+    let file_length = std::fs::metadata(input).map_err(hound::Error::from)?.len();
+    let byte_count = (file_length - data_start) as usize;
+    if byte_count != sample_count * (spec.bits_per_sample as usize / 8) {
+        return Ok(None);
+    }
+    Ok(Some(PackedData { reader, byte_count }))
+}
+
+// hound's per sample iterator is the fallback for what the byte path will not claim
+fn read_blocks(
+    input: &Path,
+    spec: WavSpec,
+    mut on_block: impl FnMut(&[f32]) -> Result<(), AdjustError>,
+) -> Result<(), AdjustError> {
+    let channels = spec.channels as usize;
+    let block_samples = TRUE_PEAK_BLOCK_FRAMES * channels;
+    let mut samples: Vec<f32> = Vec::with_capacity(block_samples);
+
+    if let Some(widen) = widen_samples(spec)
+        && let Some(mut packed) = packed_data(input, spec)?
+    {
+        let mut bytes = vec![0u8; block_samples * (spec.bits_per_sample as usize / 8)];
+        let mut left = packed.byte_count;
+        while left > 0 {
+            let wanted = left.min(bytes.len());
+            packed
+                .reader
+                .read_exact(&mut bytes[..wanted])
+                .map_err(hound::Error::from)?;
+            left -= wanted;
+            samples.clear();
+            widen(&bytes[..wanted], &mut samples);
+            on_block(&samples)?;
+        }
+        return Ok(());
+    }
+
+    let mut reader = WavReader::open(input)?;
+    match spec.sample_format {
+        SampleFormat::Int => {
+            let shift = 32 - spec.bits_per_sample;
+            for sample in reader.samples::<i32>() {
+                samples.push((sample? << shift) as f32 / FULL_SCALE_I32);
+                if samples.len() == block_samples {
+                    on_block(&samples)?;
+                    samples.clear();
+                }
+            }
+        }
+        SampleFormat::Float => {
+            for sample in reader.samples::<f32>() {
+                samples.push(sample?);
+                if samples.len() == block_samples {
+                    on_block(&samples)?;
+                    samples.clear();
+                }
+            }
+        }
+    }
+    if !samples.is_empty() {
+        on_block(&samples)?;
+    }
+    Ok(())
 }
 
 // Leq(m) (ISO 21727) cinema loudness, CCIR 468 weighted.
@@ -659,6 +850,127 @@ mod tests {
         }
         // nothing was written.
         assert!(!dst.exists());
+    }
+
+    // a `seconds`-long `freq` Hz tone at `amplitude` on channel 0, silence on the
+    // rest, so the measured peak is the tone's and nothing sums into it.
+    fn write_tone_on_first_channel(
+        path: &Path,
+        spec: WavSpec,
+        freq: f32,
+        amplitude: f32,
+        seconds: f32,
+    ) {
+        let sr = spec.sample_rate;
+        let frames = (sr as f32 * seconds) as usize;
+        let mut w = WavWriter::create(path, spec).unwrap();
+        let full_scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+        for i in 0..frames {
+            let s = amplitude * (2.0 * PI * freq * i as f32 / sr as f32).sin();
+            for channel in 0..spec.channels {
+                let value = if channel == 0 { s } else { 0.0 };
+                match spec.sample_format {
+                    SampleFormat::Int => {
+                        w.write_sample((value * full_scale).round() as i32).unwrap()
+                    }
+                    SampleFormat::Float => w.write_sample(value).unwrap(),
+                }
+            }
+        }
+        w.finalize().unwrap();
+    }
+
+    // one meter over the whole normalized buffer in a single call: the answer
+    // blocking, de-interleaving and threading must not move.
+    fn true_peak_in_one_call(path: &Path) -> f64 {
+        let (spec, pcm) = load_pcm(path).unwrap();
+        let interleaved = pcm.normalized(spec.bits_per_sample);
+        let mut meter =
+            EbuR128::new(spec.channels as u32, spec.sample_rate, Mode::TRUE_PEAK).unwrap();
+        meter.add_frames_f32(&interleaved).unwrap();
+        let mut peak = 0.0f64;
+        for channel in 0..spec.channels as u32 {
+            peak = peak.max(meter.true_peak(channel).unwrap());
+        }
+        20.0 * peak.log10()
+    }
+
+    #[test]
+    fn true_peak_of_a_half_amplitude_tone_matches_a_single_meter() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("tone.wav");
+        write_tone_on_first_channel(&src, int_spec(2, 24), 997.0, 0.5, 4.0);
+
+        let measured = measure_true_peak_dbtp(&src).unwrap();
+        assert!(
+            (measured - (-6.02)).abs() < 0.1,
+            "measured {measured} dBTP, expected ~-6.02"
+        );
+        let reference = true_peak_in_one_call(&src);
+        assert!(
+            (measured - reference).abs() < 1e-9,
+            "streamed {measured} dBTP, single meter {reference}"
+        );
+    }
+
+    #[test]
+    fn true_peak_agrees_with_loudnorm() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("tone.wav");
+        write_tone_on_first_channel(&src, int_spec(2, 24), 997.0, 0.5, 4.0);
+
+        let measured = measure_true_peak_dbtp(&src).unwrap();
+        let ffmpeg = measure_loudness(&src);
+        assert!(ffmpeg.success, "{}", ffmpeg.error);
+        let difference = (measured - ffmpeg.true_peak_dbtp).abs();
+        assert!(
+            difference < 0.1,
+            "rust {measured} dBTP, loudnorm {} dBTP",
+            ffmpeg.true_peak_dbtp
+        );
+    }
+
+    #[test]
+    fn true_peak_of_a_wav_with_no_frames_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("silent.wav");
+        WavWriter::create(&src, int_spec(2, 24))
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        match measure_true_peak_dbtp(&src) {
+            Err(AdjustError::Empty) => {}
+            other => panic!("expected Empty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn true_peak_is_the_same_at_16_bit_and_as_float() {
+        let dir = tempfile::tempdir().unwrap();
+        let float_spec = WavSpec {
+            channels: 2,
+            sample_rate: 48000,
+            bits_per_sample: 32,
+            sample_format: SampleFormat::Float,
+        };
+        let mut measured = Vec::new();
+        for (name, spec) in [
+            ("i24.wav", int_spec(2, 24)),
+            ("i16.wav", int_spec(2, 16)),
+            ("f32.wav", float_spec),
+        ] {
+            let src = dir.path().join(name);
+            write_tone_on_first_channel(&src, spec, 997.0, 0.5, 4.0);
+            measured.push((name, measure_true_peak_dbtp(&src).unwrap()));
+        }
+        let (_, reference) = measured[0];
+        for (name, value) in &measured {
+            assert!(
+                (value - reference).abs() < 0.01,
+                "{name} measured {value} dBTP, 24 bit measured {reference}"
+            );
+        }
     }
 
     #[test]

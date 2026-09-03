@@ -132,6 +132,12 @@
 - **`encode::source_raster`**: the size of a container or of the first still of
   an image sequence, reading a TIFF itself since ffprobe cannot read a 12-bit
   one. Moved here from imfwizard so both wizards measure a source the same way.
+- **`loudness::measure_true_peak_dbtp`**: the audio level hint's true peak,
+  measured in process instead of by an ffmpeg loudnorm pass. Streams the WAV in
+  one second blocks with one `Mode::TRUE_PEAK` meter per channel on its own
+  thread, bit identical to a single meter over the whole file. On a 15 minute
+  six channel 24 bit WAV: 1.0 s and 10 MB against loudnorm's 107.7 s and 177 MB,
+  same -0.20 dBTP.
 
 ### Removed
 
