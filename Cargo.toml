@@ -117,3 +117,7 @@ required-features = ["grok-ffi"]
 [[test]]
 name = "grok_gpu"
 required-features = ["grok-gpu"]
+
+[[test]]
+name = "grok_gpu_yuv"
+required-features = ["grok-gpu"]

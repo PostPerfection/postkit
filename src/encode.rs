@@ -375,16 +375,38 @@ impl DecodeSource {
 /// Decode on the GPU and bring the frames back to system memory. Without
 /// `-hwaccel_output_format` ffmpeg downloads them itself, and a codec the device
 /// cannot decode falls back to software decoding with no error.
-const HARDWARE_DECODE_ARGS: [&str; 2] = ["-hwaccel", "cuda"];
+pub(crate) const HARDWARE_DECODE_ARGS: [&str; 2] = ["-hwaccel", "cuda"];
 
 /// Packed 16-bit big-endian RGB: three components per pixel, six bytes.
 const PACKED_RGB_PIXEL_FORMAT: &str = "rgb48be";
 const PACKED_RGB_BYTES_PER_PIXEL: usize = 6;
-const PACKED_RGB_PRECISION: u8 = 16;
+pub(crate) const PACKED_RGB_PRECISION: u8 = 16;
 
-/// An ffmpeg filter that converts the picture to a pixel format of its own,
-/// which is what [`crate::picture_processing`] inserts for any geometry work.
-const FORMAT_FILTER: &str = "format=";
+/// ffmpeg filters that change the pixel format or the colour, so the picture on
+/// the pipe is no longer the source's own planes. `format=` is what
+/// [`crate::picture_processing`] inserts for any geometry work. Geometry
+/// filters are not here: cropping, scaling, padding, rotating, deinterlacing
+/// and denoising all keep the pixel format they were given.
+const COLOUR_CHANGING_FILTERS: [&str; 10] = [
+    "format=",
+    "lut3d",
+    "haldclut",
+    "colorspace",
+    "zscale",
+    "tonemap",
+    "colorchannelmixer",
+    "colorlevels",
+    "curves",
+    "eq=",
+];
+
+/// Whether a filter chain converts the picture away from the source's own
+/// planes.
+pub(crate) fn filters_change_the_colour(filters: &str) -> bool {
+    COLOUR_CHANGING_FILTERS
+        .iter()
+        .any(|filter| filters.contains(filter))
+}
 
 /// ffprobe's `color_range` tag for samples that use the whole code value range.
 const FULL_RANGE_TAG: &str = "pc";
@@ -456,6 +478,12 @@ impl PlanarYuvPixelFormat {
     /// Bits one sample carries, 8 or 10.
     pub fn bit_depth(self) -> u8 {
         self.properties().bit_depth
+    }
+
+    /// Whether the chroma planes have half the rows as well as half the
+    /// columns, which is what separates 4:2:0 from 4:2:2.
+    pub fn chroma_is_half_height(self) -> bool {
+        self.properties().chroma_is_half_height
     }
 
     /// Bytes one sample takes on the pipe. A 10-bit sample arrives in a
@@ -577,7 +605,9 @@ pub(crate) struct PipeFormatInputs<'a> {
     /// grok's accelerator plugin is switched on, so the encode runs as a batch
     pub accelerator_active: bool,
     pub quality_psnr: Option<f64>,
-    pub subtitle_burn: bool,
+    /// postkit burns subtitles into the frame or converts its colour itself,
+    /// and both need samples it can read
+    pub postkit_prepares_the_frame: bool,
     pub source_colour: &'a SourceColour,
     /// the whole filter chain ffmpeg is given, detection branch included
     pub filters: &'a str,
@@ -597,7 +627,7 @@ pub(crate) fn choose_pipe_format(
     inputs: &PipeFormatInputs,
     plugin_takes_planar_yuv: bool,
 ) -> PipeFormat {
-    let postkit_reads_the_samples = inputs.subtitle_burn
+    let postkit_reads_the_samples = inputs.postkit_prepares_the_frame
         || matches!(
             inputs.source_colour,
             SourceColour::DisplayRgbIn(_) | SourceColour::DciLut(_)
@@ -609,7 +639,7 @@ pub(crate) fn choose_pipe_format(
         || !plugin_takes_planar_yuv
         || inputs.quality_psnr.is_some()
         || postkit_reads_the_samples
-        || inputs.filters.contains(FORMAT_FILTER)
+        || filters_change_the_colour(inputs.filters)
     {
         return PipeFormat::PackedRgb;
     }
@@ -1005,20 +1035,31 @@ where
         opts.frame_range,
     ));
     let accelerator_active = grok_encoder::gpu_active();
-    // TODO: ask grok's plugin whether it takes the source's planes, by beginning
-    // a batch and ending it right away, once grk_plugin_batch_memory_info
-    // carries source_format
-    let plugin_takes_planar_yuv = false;
-    let pipe_format = choose_pipe_format(
+    // the plugin is asked last, and only about a source everything else already
+    // allows through, because asking it starts a batch
+    let candidate = choose_pipe_format(
         &PipeFormatInputs {
             accelerator_active,
             quality_psnr: opts.quality_psnr,
-            subtitle_burn: opts.subtitle_burn.is_some(),
+            postkit_prepares_the_frame: opts.subtitle_burn.is_some(),
             source_colour: &opts.source_colour,
             filters: &filters,
             source: &crate::probe::probe_pixel_format(&opts.input),
         },
-        plugin_takes_planar_yuv,
+        true,
+    );
+    let pipe_format = match candidate {
+        PipeFormat::PlanarYuv(format)
+            if !grok_encoder::plugin_takes_planar_yuv(format, width, height, &params) =>
+        {
+            PipeFormat::PackedRgb
+        }
+        chosen => chosen,
+    };
+    tracing::info!(
+        pixel_format = pipe_format.ffmpeg_pixel_format(),
+        hardware_decode = accelerator_active,
+        "decoding to the pipe"
     );
     let frame_size = pipe_format.frame_bytes(width, height);
     let input_args =
@@ -1950,7 +1991,7 @@ mod tests {
         let accelerated = PipeFormatInputs {
             accelerator_active: true,
             quality_psnr: None,
-            subtitle_burn: false,
+            postkit_prepares_the_frame: false,
             source_colour: &display_rgb,
             filters: "fps=24",
             source: &source,
@@ -1993,7 +2034,7 @@ mod tests {
         assert_eq!(
             choose_pipe_format(
                 &PipeFormatInputs {
-                    subtitle_burn: true,
+                    postkit_prepares_the_frame: true,
                     ..accelerated
                 },
                 true
@@ -2011,6 +2052,32 @@ mod tests {
             ),
             PipeFormat::PackedRgb,
             "geometry work makes ffmpeg convert the picture itself"
+        );
+        assert_eq!(
+            choose_pipe_format(
+                &PipeFormatInputs {
+                    filters: "fps=24,lut3d=/luts/hdr_to_dci.cube",
+                    ..accelerated
+                },
+                true
+            ),
+            PipeFormat::PackedRgb,
+            "a colour filter in the chain leaves nothing of the source's own planes"
+        );
+        assert!(
+            matches!(
+                choose_pipe_format(
+                    &PipeFormatInputs {
+                        filters: "yadif,fps=24,crop=1998:1080:0:0,scale=w=1998:h=1080,\
+                                  split=2[picture][detect];[detect]blackdetect,nullsink;\
+                                  [picture]null",
+                        ..accelerated
+                    },
+                    true
+                ),
+                PipeFormat::PlanarYuv(_)
+            ),
+            "geometry and the detection branch keep the pixel format"
         );
 
         let wide_gamut = SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3);
@@ -2080,7 +2147,7 @@ mod tests {
             &PipeFormatInputs {
                 accelerator_active: true,
                 quality_psnr: None,
-                subtitle_burn: false,
+                postkit_prepares_the_frame: false,
                 source_colour: &display_rgb,
                 filters: "fps=24",
                 source: &source,

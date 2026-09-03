@@ -1239,10 +1239,23 @@ impl Batch {
         info.height = frame.height();
         info.numcomps = 3;
         info.prec = batch_precision(rsiz, image_precision);
-        // TODO: set source_format, yuv_matrix and yuv_full_range for a planar
-        // YUV frame once grk_plugin_batch_memory_info carries them
+        // a zeroed info already describes the planar RGB frames postkit
+        // converts itself, so only a YUV source fills these in
         info.source_prec = match frame {
-            RawFrame::PlanarYuv { format, .. } => format.pixel_format.bit_depth(),
+            RawFrame::PlanarYuv { format, .. } => {
+                info.source_format = if format.pixel_format.chroma_is_half_height() {
+                    grokj2k_sys::_GRK_SOURCE_FORMAT_GRK_SOURCE_YUV420P
+                } else {
+                    grokj2k_sys::_GRK_SOURCE_FORMAT_GRK_SOURCE_YUV422P
+                };
+                info.yuv_matrix = match format.matrix {
+                    crate::encode::YuvMatrix::Bt601 => grokj2k_sys::_GRK_YUV_MATRIX_GRK_YUV_BT601,
+                    crate::encode::YuvMatrix::Bt709 => grokj2k_sys::_GRK_YUV_MATRIX_GRK_YUV_BT709,
+                    crate::encode::YuvMatrix::Bt2020 => grokj2k_sys::_GRK_YUV_MATRIX_GRK_YUV_BT2020,
+                };
+                info.yuv_full_range = format.full_range;
+                format.pixel_format.bit_depth()
+            }
             _ => image_precision,
         };
         let mut xyz_on_device = false;
@@ -1323,6 +1336,62 @@ impl Batch {
     }
 }
 
+/// Whether grok's accelerator plugin takes the source's planes as they come off
+/// ffmpeg's pipe, asked by beginning a batch with the run's own compression
+/// parameters and ending it at once. The answer has to be had before the
+/// decoder starts, because it decides what ffmpeg writes.
+///
+/// `false` unless the plugin is switched on: nothing else reads planes.
+#[cfg(feature = "grok-ffi")]
+pub fn plugin_takes_planar_yuv(
+    format: crate::encode::YuvFrameFormat,
+    width: u32,
+    height: u32,
+    params: &CompressParams,
+) -> bool {
+    if !gpu_active() {
+        return false;
+    }
+    // the batch is asked about the frame shape and nothing is submitted, so
+    // this frame carries no bytes
+    let shape_only = RawFrame::PlanarYuv {
+        data: Vec::new(),
+        format,
+        width,
+        height,
+        index: 0,
+    };
+    let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel(1);
+    let error_flag = Arc::new(AtomicBool::new(false));
+    let first_error = Arc::new(Mutex::new(String::new()));
+    let input_queue = Arc::new(BoundedQueue::new(1));
+    match Batch::begin(
+        &shape_only,
+        params,
+        &writer_tx,
+        &error_flag,
+        &first_error,
+        &input_queue,
+    ) {
+        Ok(Some(batch)) => batch.end().is_ok(),
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!("grok's accelerator plugin could not be asked about the source: {e}");
+            false
+        }
+    }
+}
+
+#[cfg(not(feature = "grok-ffi"))]
+pub fn plugin_takes_planar_yuv(
+    _format: crate::encode::YuvFrameFormat,
+    _width: u32,
+    _height: u32,
+    _params: &CompressParams,
+) -> bool {
+    false
+}
+
 /// The cinema profiles are written at 12 bits, and grok's X'Y'Z' transform
 /// emits 12 for a cinema rsiz, so a deeper frame is shifted down inside submit.
 #[cfg(feature = "grok-ffi")]
@@ -1335,6 +1404,101 @@ fn batch_precision(rsiz: u16, image_precision: u8) -> u8 {
         CINEMA_SAMPLE_PRECISION
     } else {
         image_precision
+    }
+}
+
+/// A grok image whose three components point straight at the frame's planes.
+/// grok allocates nothing here and copies the planes inside submit, so the
+/// frame can be dropped as soon as that call comes back. The caller unrefs the
+/// image.
+#[cfg(feature = "grok-ffi")]
+unsafe fn build_yuv_grok_image(
+    data: &[u8],
+    format: crate::encode::YuvFrameFormat,
+    width: u32,
+    height: u32,
+) -> Result<*mut grokj2k_sys::grk_image, String> {
+    use grokj2k_sys::*;
+
+    let layout = format.pixel_format.plane_layout(width, height);
+    if data.len() < layout.frame_bytes {
+        return Err(format!(
+            "a {} frame at {width}x{height} is {} bytes and this one is {}",
+            format.pixel_format.ffmpeg_name(),
+            layout.frame_bytes,
+            data.len()
+        ));
+    }
+    let source_precision = format.pixel_format.bit_depth();
+    let data_type = if format.pixel_format.bytes_per_sample() > 1 {
+        _grk_data_type_GRK_INT_16
+    } else {
+        _grk_data_type_GRK_INT_8
+    };
+    let chroma_vertical_sampling = if format.pixel_format.chroma_is_half_height() {
+        2
+    } else {
+        1
+    };
+    let planes = [
+        (
+            layout.luma_offset,
+            layout.luma_width,
+            layout.luma_height,
+            1u8,
+            1u8,
+        ),
+        (
+            layout.blue_chroma_offset,
+            layout.chroma_width,
+            layout.chroma_height,
+            2,
+            chroma_vertical_sampling,
+        ),
+        (
+            layout.red_chroma_offset,
+            layout.chroma_width,
+            layout.chroma_height,
+            2,
+            chroma_vertical_sampling,
+        ),
+    ];
+
+    unsafe {
+        let mut comps: [grk_image_comp; 3] = std::mem::zeroed();
+        for (comp, (_, plane_width, plane_height, dx, dy)) in comps.iter_mut().zip(planes) {
+            comp.w = plane_width;
+            comp.h = plane_height;
+            comp.stride = plane_width;
+            comp.dx = dx;
+            comp.dy = dy;
+            comp.prec = source_precision;
+            comp.sgnd = false;
+            comp.data_type = data_type;
+        }
+
+        let image = grk_image_new(
+            3,
+            comps.as_mut_ptr(),
+            _GRK_COLOR_SPACE_GRK_CLRSPC_SYCC,
+            false,
+        );
+        if image.is_null() {
+            return Err("Failed to create Grok image".to_string());
+        }
+        for (index, (offset, plane_width, plane_height, dx, dy)) in planes.into_iter().enumerate() {
+            let comp = &mut *(*image).comps.add(index);
+            comp.w = plane_width;
+            comp.h = plane_height;
+            comp.stride = plane_width;
+            comp.dx = dx;
+            comp.dy = dy;
+            comp.prec = source_precision;
+            comp.data_type = data_type;
+            comp.owns_data = false;
+            comp.data = data.as_ptr().add(offset) as *mut std::ffi::c_void;
+        }
+        Ok(image)
     }
 }
 
@@ -1353,7 +1517,16 @@ fn submit_frame_to_batch(frame: &RawFrame, shape: BatchShape) -> Result<(), Stri
     }
 
     unsafe {
-        let image = build_grok_image(frame, shape.image_precision, shape.bits_to_drop)?;
+        let image = match frame {
+            RawFrame::PlanarYuv {
+                data,
+                format,
+                width,
+                height,
+                ..
+            } => build_yuv_grok_image(data, *format, *width, *height)?,
+            _ => build_grok_image(frame, shape.image_precision, shape.bits_to_drop)?,
+        };
         let frame_user = frame.index() as usize as *mut std::ffi::c_void;
         let submitted = grokj2k_sys::grk_plugin_batch_memory_submit(image, frame_user);
         grokj2k_sys::grk_object_unref(&mut (*image).obj);
@@ -1612,23 +1785,54 @@ where
         };
     }
 
-    // Launch ffmpeg to decode video → raw rgb48be frames on stdout
+    let picture_filters = window_filter_chain(video_filter, frame_range).unwrap_or_default();
+    let filters = crate::picture_findings::with_detection_branch(&picture_filters);
+    let accelerator_active = gpu_active();
+    // the plugin is asked last, and only about a source everything else already
+    // allows through, because asking it starts a batch
+    let candidate = crate::encode::choose_pipe_format(
+        &crate::encode::PipeFormatInputs {
+            accelerator_active,
+            quality_psnr: params.quality_psnr,
+            postkit_prepares_the_frame: !params.source_preparation.is_empty(),
+            // the colour this path can convert is the compressor's own
+            // transform, and a caller's colour filter is caught by the chain
+            source_colour: &crate::encode::SourceColour::DisplayRgb,
+            filters: &filters,
+            source: &crate::probe::probe_pixel_format(input_video),
+        },
+        true,
+    );
+    let pipe_format = match candidate {
+        crate::encode::PipeFormat::PlanarYuv(format)
+            if !plugin_takes_planar_yuv(format, width, height, params) =>
+        {
+            crate::encode::PipeFormat::PackedRgb
+        }
+        chosen => chosen,
+    };
+    tracing::info!(
+        pixel_format = pipe_format.ffmpeg_pixel_format(),
+        hardware_decode = accelerator_active,
+        "decoding to the pipe"
+    );
+
     let mut command = Command::new("ffmpeg");
     command
         .arg("-y")
         // the progress line carries no newline, so the reader would hold the
         // whole run in one string
-        .arg("-nostats")
-        .arg("-i")
-        .arg(input_video);
-    let picture_filters = window_filter_chain(video_filter, frame_range).unwrap_or_default();
+        .arg("-nostats");
+    if accelerator_active {
+        command.args(crate::encode::HARDWARE_DECODE_ARGS);
+    }
     command
+        .arg("-i")
+        .arg(input_video)
         .arg("-vf")
-        .arg(crate::picture_findings::with_detection_branch(
-            &picture_filters,
-        ))
+        .arg(&filters)
         .arg("-pix_fmt")
-        .arg("rgb48be")
+        .arg(pipe_format.ffmpeg_pixel_format())
         .arg("-f")
         .arg("rawvideo");
     if let Some(range) = frame_range {
@@ -1657,7 +1861,7 @@ where
         .take()
         .map(crate::picture_findings::read_detection_lines);
 
-    let frame_size = (width as usize) * (height as usize) * 6; // rgb48be = 6 bytes/pixel
+    let frame_size = pipe_format.frame_bytes(width, height);
     let mut stdout = child.stdout.take().unwrap();
 
     // discard the already-encoded prefix so ffmpeg stays frame-aligned.
@@ -1710,12 +1914,21 @@ where
                 Ok(()) => {
                     let idx = frame_index;
                     frame_index += 1;
-                    Some(RawFrame::Packed {
-                        data: buf,
-                        width,
-                        height,
-                        precision: 16,
-                        index: idx,
+                    Some(match pipe_format {
+                        crate::encode::PipeFormat::PackedRgb => RawFrame::Packed {
+                            data: buf,
+                            width,
+                            height,
+                            precision: crate::encode::PACKED_RGB_PRECISION,
+                            index: idx,
+                        },
+                        crate::encode::PipeFormat::PlanarYuv(format) => RawFrame::PlanarYuv {
+                            data: buf,
+                            format,
+                            width,
+                            height,
+                            index: idx,
+                        },
                     })
                 }
                 Err(e) => {
