@@ -344,13 +344,27 @@
   passes' 101.2 s and 177 MB, with integrated -17.64 LUFS against loudnorm's
   -17.68, LRA 24.06 against 24.00, true peak -0.20 dBTP against -0.20, and a
   short-term max of -9.39 LUFS against the ebur128 filter's -9.4.
-  `measure_leq_m` streams the same reader, downmixing each block with the mean
-  of its channels, which is the downmix `plan_gain` has always weighted a
-  Leq(m) target against. ffmpeg's `-ac 1` summed a 5.1 layout at near unity
-  instead, so a multichannel file now measures lower: the same WAV reads
-  70.19 dB where the ffmpeg decode read 84.00 dB. Handed that file's own
-  `-ac 1` mono, the streamed path returns the ffmpeg path's number to six
-  digits, so the weighting is unchanged and the shift is the downmix alone.
+  `measure_leq_m` streams the same reader.
+
+- **Leq(m) sums the corrected channel powers**: `measure_leq_m` and a
+  `LoudnessTarget::LeqM` gain plan weight each channel on its own, scale its
+  energy by the channel's correction for its DCP channel index, and sum the
+  channel energies. The corrections are leqm-nrt's, the ones DCP-o-matic passes
+  it: L, R, C and LFE at 0 dB, Ls, Rs, Lc, Rc, BsL and BsR at -3 dB, and HI,
+  VI, motion data, sync, sign language and the unused channel at -144 dB, so a
+  narration or sync channel contributes nothing. A mono or stereo file is
+  unaffected, both its channels sit at 0 dB. Multichannel numbers move: a
+  15 minute 5.1 WAV reads 83.14 dB where the mean-of-channels downmix read
+  70.19 dB and ffmpeg's `-ac 1`, which summed the layout at near unity, read
+  84.00 dB. On one tone across a 5.1 layout the sum matches leqm-nrt to six
+  decimals (6.991762 dB over the same tone in mono, against the
+  10*log10(4 + 2*10^-0.3) the corrections predict). `measure_leq_m` and the
+  `leqm=` gain target now weight a file the same way, so a QC report and an
+  adjustment agree on what it measures. postkit's absolute scale still sits
+  2.6 to 3.0 dB above leqm-nrt's: its weighting is normalized at 1 kHz where
+  the ISO 21727 M table is normalized at 2 kHz (5.6 dB), and its reference
+  offset is 105.0 dB from full-scale RMS where leqm-nrt derives 108.0103 dB
+  (3.0103 dB).
 
 - **CI runs every test**: ffmpeg 8.1 is installed on all three runners, from
   the BtbN static build on Linux and Windows and from conda-forge on macOS,

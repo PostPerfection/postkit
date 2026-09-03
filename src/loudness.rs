@@ -546,34 +546,81 @@ fn weighted_block_energy(fft: &dyn rustfft::Fft<f32>, samples: &[f32], sample_ra
     energy / n as f64
 }
 
-// the weighted energy of every whole LEQ_BLOCK fed in so far, plus the part block
+/// Per-channel level corrections in dB by DCP channel index, the ones
+/// leqm-nrt takes and DCP-o-matic passes it. The surrounds and the Lc/Rc pair
+/// are 3 dB down and the non-programme channels are excluded outright.
+const LEQ_M_CHANNEL_CORRECTIONS_DB: [f64; 16] = [
+    0.0,    // L
+    0.0,    // R
+    0.0,    // C
+    0.0,    // LFE
+    -3.0,   // Ls
+    -3.0,   // Rs
+    -144.0, // HI
+    -144.0, // VI
+    -3.0,   // Lc
+    -3.0,   // Rc
+    -3.0,   // BsL
+    -3.0,   // BsR
+    -144.0, // motion data
+    -144.0, // sync signal
+    -144.0, // sign language
+    -144.0, // unused
+];
+
+// a channel index past the table carries no programme audio either
+const LEQ_M_UNLISTED_CHANNEL_CORRECTION_DB: f64 = -144.0;
+
+fn channel_energy_scales(channels: usize) -> Vec<f64> {
+    (0..channels)
+        .map(|channel| {
+            let db = LEQ_M_CHANNEL_CORRECTIONS_DB
+                .get(channel)
+                .copied()
+                .unwrap_or(LEQ_M_UNLISTED_CHANNEL_CORRECTION_DB);
+            // the correction scales amplitude, so energy moves by twice the dB
+            10f64.powf(db / 10.0)
+        })
+        .collect()
+}
+
+// the weighted energy of every whole LEQ_BLOCK of frames fed in so far, plus
+// the part block, summed over the corrected channels
 struct LeqMEnergy {
     fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
     sample_rate: u32,
+    channels: usize,
+    channel_energy_scales: Vec<f64>,
+    plane: Vec<f32>,
     pending: Vec<f32>,
     total_energy: f64,
-    total_samples: u64,
+    total_frames: u64,
 }
 
 impl LeqMEnergy {
-    fn new(sample_rate: u32) -> Self {
+    fn new(channels: usize, sample_rate: u32) -> Self {
+        let block_samples = LEQ_BLOCK * channels.max(1);
         Self {
             fft: FftPlanner::<f32>::new().plan_fft_forward(LEQ_BLOCK),
             sample_rate,
-            pending: Vec::with_capacity(LEQ_BLOCK),
+            channels,
+            channel_energy_scales: channel_energy_scales(channels),
+            plane: Vec::with_capacity(LEQ_BLOCK),
+            pending: Vec::with_capacity(block_samples),
             total_energy: 0.0,
-            total_samples: 0,
+            total_frames: 0,
         }
     }
 
-    fn add(&mut self, mono: &[f32]) {
-        let mut rest = mono;
+    fn add(&mut self, interleaved: &[f32]) {
+        let block_samples = LEQ_BLOCK * self.channels;
+        let mut rest = interleaved;
         if !self.pending.is_empty() {
-            let wanted = (LEQ_BLOCK - self.pending.len()).min(rest.len());
+            let wanted = (block_samples - self.pending.len()).min(rest.len());
             let (head, tail) = rest.split_at(wanted);
             self.pending.extend_from_slice(head);
             rest = tail;
-            if self.pending.len() < LEQ_BLOCK {
+            if self.pending.len() < block_samples {
                 return;
             }
             let mut full = std::mem::take(&mut self.pending);
@@ -581,16 +628,24 @@ impl LeqMEnergy {
             full.clear();
             self.pending = full;
         }
-        let (blocks, remainder) = rest.as_chunks::<LEQ_BLOCK>();
-        for block in blocks {
+        let mut blocks = rest.chunks_exact(block_samples);
+        for block in &mut blocks {
             self.add_block(block);
         }
-        self.pending.extend_from_slice(remainder);
+        self.pending.extend_from_slice(blocks.remainder());
     }
 
-    fn add_block(&mut self, block: &[f32]) {
-        self.total_energy += weighted_block_energy(self.fft.as_ref(), block, self.sample_rate);
-        self.total_samples += block.len() as u64;
+    fn add_block(&mut self, interleaved: &[f32]) {
+        let frames = interleaved.len() / self.channels;
+        for channel in 0..self.channels {
+            self.plane.clear();
+            self.plane
+                .extend(interleaved.iter().skip(channel).step_by(self.channels));
+            self.total_energy +=
+                weighted_block_energy(self.fft.as_ref(), &self.plane, self.sample_rate)
+                    * self.channel_energy_scales[channel];
+        }
+        self.total_frames += frames as u64;
     }
 
     fn finish(mut self) -> f64 {
@@ -598,10 +653,10 @@ impl LeqMEnergy {
             let tail = std::mem::take(&mut self.pending);
             self.add_block(&tail);
         }
-        if self.total_samples == 0 {
+        if self.total_frames == 0 {
             return f64::NEG_INFINITY;
         }
-        let mean_square = self.total_energy / self.total_samples as f64;
+        let mean_square = self.total_energy / self.total_frames as f64;
         10.0 * mean_square.log10() + LEQ_M_REFERENCE_OFFSET_DB
     }
 }
@@ -610,16 +665,25 @@ impl LeqMEnergy {
 /// (-1.0..=1.0). The signal is CCIR 468-weighted and its equivalent continuous
 /// level is referenced to the cinema B-chain calibration.
 pub fn leq_m_from_samples(samples: &[f32], sample_rate: u32) -> f64 {
-    if samples.is_empty() || sample_rate == 0 {
+    leq_m_from_interleaved(samples, 1, sample_rate)
+}
+
+/// Compute Leq(m) (ISO 21727) in dB from interleaved PCM in full-scale units
+/// (-1.0..=1.0). Each channel is CCIR 468-weighted on its own, corrected by
+/// [`LEQ_M_CHANNEL_CORRECTIONS_DB`] for its DCP channel index, and the channel
+/// energies are summed.
+pub fn leq_m_from_interleaved(interleaved: &[f32], channels: usize, sample_rate: u32) -> f64 {
+    if interleaved.is_empty() || channels == 0 || sample_rate == 0 {
         return f64::NEG_INFINITY;
     }
-    let mut energy = LeqMEnergy::new(sample_rate);
-    energy.add(samples);
+    let mut energy = LeqMEnergy::new(channels, sample_rate);
+    energy.add(interleaved);
     energy.finish()
 }
 
 /// Measure Leq(m) (ISO 21727) of a WAV or PCM MXF file, streamed in bounded
-/// blocks and downmixed to mono at the file's own sample rate.
+/// blocks at the file's own sample rate, summing the corrected channel
+/// energies.
 pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
     if !audio_file.exists() {
         return LeqMResult {
@@ -643,9 +707,9 @@ pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
 fn stream_leq_m(input: &Path) -> Result<f64, AdjustError> {
     let pcm = open_pcm(input)?;
     let channels = pcm.spec.channels as usize;
-    let mut energy = LeqMEnergy::new(pcm.spec.sample_rate);
+    let mut energy = LeqMEnergy::new(channels, pcm.spec.sample_rate);
     read_blocks(&pcm, |interleaved| {
-        energy.add(&downmix_mono(interleaved, channels));
+        energy.add(interleaved);
         Ok(())
     })?;
     Ok(energy.finish())
@@ -744,14 +808,6 @@ fn load_pcm(input: &Path) -> Result<(WavSpec, Pcm), AdjustError> {
     Ok((spec, pcm))
 }
 
-// mono downmix (mean of channels) of an interleaved buffer.
-fn downmix_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {
-    interleaved
-        .chunks_exact(channels)
-        .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-        .collect()
-}
-
 // measured level (per the target's metric) and the input true peak in dBTP.
 fn measure(spec: &WavSpec, pcm: &Pcm, target: LoudnessTarget) -> Result<(f64, f64), AdjustError> {
     let channels = spec.channels as usize;
@@ -774,10 +830,7 @@ fn measure(spec: &WavSpec, pcm: &Pcm, target: LoudnessTarget) -> Result<(f64, f6
 
     let measured = match target {
         LoudnessTarget::IntegratedLufs(_) => meter.loudness_global()?,
-        LoudnessTarget::LeqM(_) => {
-            let mono = downmix_mono(&interleaved, channels);
-            leq_m_from_samples(&mono, spec.sample_rate)
-        }
+        LoudnessTarget::LeqM(_) => leq_m_from_interleaved(&interleaved, channels, spec.sample_rate),
     };
     Ok((measured, true_peak_dbtp))
 }
@@ -1095,11 +1148,12 @@ mod tests {
         assert!(!dst.exists());
     }
 
-    // a `seconds`-long `freq` Hz tone at `amplitude` on channel 0, silence on the
-    // rest, so the measured peak is the tone's and nothing sums into it.
-    fn write_tone_on_first_channel(
+    // a `seconds`-long `freq` Hz tone at `amplitude` on one channel, silence on
+    // the rest, so the measured peak is the tone's and nothing sums into it.
+    fn write_tone_on_channel(
         path: &Path,
         spec: WavSpec,
+        on_channel: u16,
         freq: f32,
         amplitude: f32,
         seconds: f32,
@@ -1111,7 +1165,7 @@ mod tests {
         for i in 0..frames {
             let s = amplitude * (2.0 * PI * freq * i as f32 / sr as f32).sin();
             for channel in 0..spec.channels {
-                let value = if channel == 0 { s } else { 0.0 };
+                let value = if channel == on_channel { s } else { 0.0 };
                 match spec.sample_format {
                     SampleFormat::Int => {
                         w.write_sample((value * full_scale).round() as i32).unwrap()
@@ -1142,7 +1196,7 @@ mod tests {
     fn true_peak_of_a_half_amplitude_tone_matches_a_single_meter() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("tone.wav");
-        write_tone_on_first_channel(&src, int_spec(2, 24), 997.0, 0.5, 4.0);
+        write_tone_on_channel(&src, int_spec(2, 24), 0, 997.0, 0.5, 4.0);
 
         let measured = measure_true_peak_dbtp(&src).unwrap();
         assert!(
@@ -1160,7 +1214,7 @@ mod tests {
     fn true_peak_agrees_with_loudnorm() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("tone.wav");
-        write_tone_on_first_channel(&src, int_spec(2, 24), 997.0, 0.5, 4.0);
+        write_tone_on_channel(&src, int_spec(2, 24), 0, 997.0, 0.5, 4.0);
 
         let measured = measure_true_peak_dbtp(&src).unwrap();
         let oracle = loudnorm_oracle(&src);
@@ -1245,14 +1299,51 @@ mod tests {
         assert!(streamed.success, "{}", streamed.error);
         let (spec, pcm) = load_pcm(&src).unwrap();
         let interleaved = pcm.normalized(spec.bits_per_sample);
-        let in_memory = leq_m_from_samples(
-            &downmix_mono(&interleaved, spec.channels as usize),
-            spec.sample_rate,
-        );
+        let in_memory =
+            leq_m_from_interleaved(&interleaved, spec.channels as usize, spec.sample_rate);
         assert!(
             (streamed.leq_m_db - in_memory).abs() < 0.01,
             "streamed {} dB, in memory {in_memory} dB",
             streamed.leq_m_db
+        );
+    }
+
+    #[test]
+    fn six_channels_of_one_tone_sum_by_their_corrections() {
+        let dir = tempfile::tempdir().unwrap();
+        let mono = dir.path().join("mono.wav");
+        let six = dir.path().join("six.wav");
+        write_tone(&mono, int_spec(1, 24), 1000.0, 0.5, 2.0);
+        write_tone(&six, int_spec(6, 24), 1000.0, 0.5, 2.0);
+
+        let from_mono = measure_leq_m(&mono);
+        let from_six = measure_leq_m(&six);
+        assert!(from_six.success, "{}", from_six.error);
+        // L R C LFE at 0 dB and Ls Rs at -3 dB, in energy
+        let expected = 10.0 * (4.0 + 2.0 * 10f64.powf(-0.3)).log10();
+        let measured = from_six.leq_m_db - from_mono.leq_m_db;
+        assert!(
+            (measured - expected).abs() < 0.05,
+            "six channels are {measured} dB over mono, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn the_hearing_impaired_channel_is_excluded() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_left = dir.path().join("left.wav");
+        let on_hi = dir.path().join("hi.wav");
+        write_tone_on_channel(&on_left, int_spec(8, 24), 0, 1000.0, 0.5, 2.0);
+        write_tone_on_channel(&on_hi, int_spec(8, 24), 6, 1000.0, 0.5, 2.0);
+
+        let left = measure_leq_m(&on_left);
+        let hearing_impaired = measure_leq_m(&on_hi);
+        assert!(hearing_impaired.success, "{}", hearing_impaired.error);
+        assert!(
+            hearing_impaired.leq_m_db < left.leq_m_db - 100.0,
+            "HI read {} dB against L's {} dB",
+            hearing_impaired.leq_m_db,
+            left.leq_m_db
         );
     }
 
@@ -1404,7 +1495,7 @@ mod tests {
             ("f32.wav", float_spec),
         ] {
             let src = dir.path().join(name);
-            write_tone_on_first_channel(&src, spec, 997.0, 0.5, 4.0);
+            write_tone_on_channel(&src, spec, 0, 997.0, 0.5, 4.0);
             measured.push((name, measure_true_peak_dbtp(&src).unwrap()));
         }
         let (_, reference) = measured[0];
