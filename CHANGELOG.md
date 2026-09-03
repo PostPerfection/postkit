@@ -137,6 +137,12 @@
 
 ### Fixed
 
+- **A DCI LUT path with a colon or a comma broke the decode**: `decode_filters`
+  put the `.cube` path into the `lut3d` filter as it was, and ffmpeg's filter
+  graph reads a colon as the end of an option and a comma as the end of a
+  filter, so every Windows path with a drive letter failed with "Error applying
+  option 'clut' to filter 'lut3d'". The path now goes through the same
+  quoting and escaping the subtitle burn already uses for its file name.
 - **Untransformed RGB frames were compressed without the component transform**:
   the grok image the encoder threads build for a planar or packed RGB frame was
   labelled sYCC, and grok switches MCT off for that colour space with a warning

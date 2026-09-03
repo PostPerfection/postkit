@@ -143,7 +143,7 @@ fn text_filter(opts: &BurninOptions, text: &str) -> String {
 /// Escape one option value for an ffmpeg filtergraph. Two levels: quote it for
 /// the filter's own argument parser, then escape the characters that separate
 /// filters in the graph description over the whole quoted token.
-fn filter_argument(value: &str) -> String {
+pub(crate) fn filter_argument(value: &str) -> String {
     let quoted = format!("'{}'", value.replace('\'', "'\\''"));
     let mut escaped = String::with_capacity(quoted.len());
     for c in quoted.chars() {

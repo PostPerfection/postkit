@@ -329,7 +329,10 @@ pub(crate) fn decode_filters(
         filters.splice(after_fps..after_fps, range.trim_filters());
     }
     if let SourceColour::DciLut(lut) = source_colour {
-        filters.push(format!("lut3d={}", lut.display()));
+        filters.push(format!(
+            "lut3d={}",
+            crate::burnin::filter_argument(&lut.to_string_lossy())
+        ));
     }
     filters.join(",")
 }
@@ -1805,7 +1808,7 @@ mod tests {
                 Some(window)
             ),
             "yadif,fps=24,trim=start_frame=7200:end_frame=7320,setpts=PTS-STARTPTS,hqdn3d,\
-             lut3d=/luts/hdr_to_dci.cube"
+             lut3d=\\'/luts/hdr_to_dci.cube\\'"
         );
     }
 
@@ -2023,7 +2026,7 @@ mod tests {
                 &plain,
                 None
             ),
-            "fps=48,lut3d=/luts/hdr_to_dci.cube"
+            "fps=48,lut3d=\\'/luts/hdr_to_dci.cube\\'"
         );
     }
 
@@ -2049,7 +2052,7 @@ mod tests {
                 &plan,
                 None
             ),
-            "yadif,fps=24,hqdn3d,format=gbrp16le,crop=1920:804:0:138,lut3d=/luts/hdr_to_dci.cube"
+            "yadif,fps=24,hqdn3d,format=gbrp16le,crop=1920:804:0:138,lut3d=\\'/luts/hdr_to_dci.cube\\'"
         );
     }
 
@@ -2173,7 +2176,7 @@ mod tests {
         assert_eq!(
             choose_pipe_format(
                 &PipeFormatInputs {
-                    filters: "fps=24,lut3d=/luts/hdr_to_dci.cube",
+                    filters: "fps=24,lut3d=\\'/luts/hdr_to_dci.cube\\'",
                     ..accelerated
                 },
                 true
