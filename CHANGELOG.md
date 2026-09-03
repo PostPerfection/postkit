@@ -4,6 +4,9 @@
 
 ### Added
 
+- **`mxf_wrap::MxfTrackFile::hash_base64`**: the wrap's SHA-1 in the form a CPL
+  or PKL declares, so a packager handed a wrapped picture can write its hash
+  without reading the file a second time.
 - **`grok_encoder::encode_video_pipeline_resumable_with_mxf_feed`**: the
   resumable video encode with the writer thread handing each codestream to an
   MXF feed as it lands, so a caller that encodes through it can write the

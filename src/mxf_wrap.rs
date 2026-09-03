@@ -128,7 +128,7 @@ pub struct MxfWrapOptions {
 pub struct MxfTrackFile {
     /// Generated UUID for this track file
     pub uuid: String,
-    /// SHA-1 hash of the output MXF
+    /// SHA-1 hash of the output MXF, lowercase hex
     pub hash: String,
     /// Output file size in bytes
     pub size: u64,
@@ -138,6 +138,20 @@ pub struct MxfTrackFile {
     pub path: PathBuf,
     pub success: bool,
     pub error: String,
+}
+
+impl MxfTrackFile {
+    /// The digest as a CPL or PKL writes it, standard base64 of the SHA-1 bytes,
+    /// so a package can declare a wrapped file without hashing it again. `None`
+    /// when the wrap recorded no hash.
+    pub fn hash_base64(&self) -> Option<String> {
+        use base64::Engine;
+        let digest = hex::decode(&self.hash).ok()?;
+        if digest.is_empty() {
+            return None;
+        }
+        Some(base64::engine::general_purpose::STANDARD.encode(digest))
+    }
 }
 
 /// Wrap essence into MXF using asdcplib FFI.
@@ -1720,6 +1734,31 @@ pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_wrap_hash_reads_back_as_the_pkl_writes_it() {
+        let track = super::MxfTrackFile {
+            uuid: String::new(),
+            hash: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+            size: 0,
+            duration: 0,
+            path: std::path::PathBuf::new(),
+            success: true,
+            error: String::new(),
+        };
+        assert_eq!(
+            track.hash_base64().as_deref(),
+            Some("2jmj7l5rSw0yVb/vlWAYkK/YBwk=")
+        );
+        assert_eq!(
+            super::MxfTrackFile {
+                hash: String::new(),
+                ..track
+            }
+            .hash_base64(),
+            None
+        );
+    }
+
     use super::*;
 
     /// Build a minimal PCM WAV (fmt + data chunks) with the given parameters.
