@@ -32,30 +32,57 @@ pub enum RawFrame {
         precision: u8,
         index: u64,
     },
+    /// The source's own planar YUV exactly as ffmpeg's rawvideo muxer wrote it:
+    /// the whole luma plane, then blue chroma, then red chroma, laid out by
+    /// [`crate::encode::PlanarYuvPixelFormat::plane_layout`]. Only grok's
+    /// accelerator plugin takes these: it upsamples the chroma and converts the
+    /// colour on the device.
+    PlanarYuv {
+        data: Vec<u8>,
+        format: crate::encode::YuvFrameFormat,
+        width: u32,
+        height: u32,
+        index: u64,
+    },
 }
+
+/// The depth grok's plugin writes samples at when it converts a planar YUV
+/// frame, whether it ends in X'Y'Z' or in RGB. It is the depth both the cinema
+/// profiles and IMF App 2E carry, so nothing is shifted after it.
+pub const PLANAR_YUV_SAMPLE_PRECISION: u8 = 12;
 
 impl RawFrame {
     pub fn index(&self) -> u64 {
         match self {
-            RawFrame::Planar { index, .. } | RawFrame::Packed { index, .. } => *index,
+            RawFrame::Planar { index, .. }
+            | RawFrame::Packed { index, .. }
+            | RawFrame::PlanarYuv { index, .. } => *index,
         }
     }
 
     pub fn width(&self) -> u32 {
         match self {
-            RawFrame::Planar { width, .. } | RawFrame::Packed { width, .. } => *width,
+            RawFrame::Planar { width, .. }
+            | RawFrame::Packed { width, .. }
+            | RawFrame::PlanarYuv { width, .. } => *width,
         }
     }
 
     pub fn height(&self) -> u32 {
         match self {
-            RawFrame::Planar { height, .. } | RawFrame::Packed { height, .. } => *height,
+            RawFrame::Planar { height, .. }
+            | RawFrame::Packed { height, .. }
+            | RawFrame::PlanarYuv { height, .. } => *height,
         }
     }
 
+    /// The depth of the samples the compressor sees, which for a planar YUV
+    /// frame is what the plugin's conversion writes rather than what the pipe
+    /// carried.
     pub fn precision(&self) -> u8 {
         match self {
             RawFrame::Planar { precision, .. } | RawFrame::Packed { precision, .. } => *precision,
+            RawFrame::PlanarYuv { .. } => PLANAR_YUV_SAMPLE_PRECISION,
         }
     }
 }
@@ -462,8 +489,10 @@ where
     let queue_capacity = (num_encoder_threads * 2).clamp(4, 32);
     let input_queue: Arc<BoundedQueue<RawFrame>> = Arc::new(BoundedQueue::new(queue_capacity));
 
-    // Writer channel (unbounded — disk I/O should keep up with encoding)
-    let (writer_tx, writer_rx) = std::sync::mpsc::channel::<EncodedFrame>();
+    // Writer channel, bounded like the input queue: a disk that cannot keep up
+    // blocks whoever is sending, the encoder threads or the plugin's callback
+    // threads, instead of piling finished codestreams up in memory
+    let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel::<EncodedFrame>(queue_capacity);
 
     let frames_encoded = Arc::new(AtomicU64::new(0));
     let error_flag = Arc::new(AtomicBool::new(false));
@@ -522,7 +551,43 @@ where
     // Encoder threads
     let mut params = params.clone();
     params.threads_per_codec = threads_per_codec as u32;
-    std::thread::scope(|s| {
+
+    // The plugin's batch is fixed to one frame shape and needs it before the
+    // first submit, so the first frame is pulled here and pushed ahead of the
+    // rest. A PSNR target re-encodes by ratio when it overshoots the byte cap,
+    // which the batch has no way to do, so it stays on the CPU.
+    let mut pending_first_frame = None;
+    let mut batch = None;
+    if gpu_active()
+        && params.quality_psnr.is_none()
+        && let Some(frame) = frame_producer()
+    {
+        match Batch::begin(
+            &frame,
+            &params,
+            &writer_tx,
+            &error_flag,
+            &first_error,
+            &input_queue,
+        ) {
+            Ok(started) => batch = started,
+            Err(e) => {
+                drop(writer_tx);
+                let _ = writer_handle.join();
+                return PipelineResult {
+                    success: false,
+                    error: e,
+                    frames_encoded: 0,
+                    output_dir: output_dir.to_path_buf(),
+                    picture_findings: crate::picture_findings::PictureFindings::default(),
+                };
+            }
+        }
+        pending_first_frame = Some(frame);
+    }
+    let batch_shape = batch.as_ref().map(Batch::shape);
+
+    let frames_produced = std::thread::scope(|s| {
         let encoder_handles: Vec<_> = (0..num_encoder_threads)
             .map(|_| {
                 let input_queue = input_queue.clone();
@@ -542,6 +607,7 @@ where
                         &cancel,
                         &params,
                         &phase_clocks,
+                        batch_shape,
                     );
                 })
             })
@@ -560,7 +626,7 @@ where
                 break;
             }
 
-            match frame_producer() {
+            match pending_first_frame.take().or_else(&mut frame_producer) {
                 Some(frame) => {
                     if !input_queue.push(frame) {
                         break;
@@ -586,29 +652,38 @@ where
         // Signal encoder threads that no more frames are coming
         input_queue.close();
 
-        // the producer may stop short of `total_frames`
-        loop {
-            let done = frames_encoded.load(Ordering::Relaxed);
-            let elapsed = encode_start.elapsed().as_secs_f64();
-            on_progress(EncodeProgress::new(
-                done,
-                total_frames,
-                elapsed,
-                phase_clocks,
-            ));
-
-            if done >= frames_produced
-                || error_flag.load(Ordering::Relaxed)
-                || cancel.load(Ordering::Relaxed)
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-
         // Scoped threads join here
         drop(encoder_handles);
+        frames_produced
     });
+
+    // The tail of the batch only reaches the callback in end(), so the drain
+    // loop below has to wait for it.
+    if let Some(batch) = batch
+        && let Err(e) = batch.end()
+    {
+        fail_pipeline(&error_flag, &first_error, &input_queue, e);
+    }
+
+    // the producer may stop short of `total_frames`
+    loop {
+        let done = frames_encoded.load(Ordering::Relaxed);
+        let elapsed = encode_start.elapsed().as_secs_f64();
+        on_progress(EncodeProgress::new(
+            done,
+            total_frames,
+            elapsed,
+            phase_clocks,
+        ));
+
+        if done >= frames_produced
+            || error_flag.load(Ordering::Relaxed)
+            || cancel.load(Ordering::Relaxed)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 
     // Wait for writer to flush
     let _ = writer_handle.join();
@@ -662,18 +737,27 @@ fn fail_pipeline(
 
 /// Per-thread encoder function. Pops frames from the queue, compresses them
 /// in-process via Grok FFI, and sends encoded data to the writer channel.
+///
+/// With `batch_shape` set the thread submits each frame to the accelerator
+/// plugin's running batch instead, and the batch's callback is what sends the
+/// codestream to the writer channel.
+#[allow(clippy::too_many_arguments)]
 fn encoder_thread_fn(
     input_queue: &BoundedQueue<RawFrame>,
-    writer_tx: &std::sync::mpsc::Sender<EncodedFrame>,
+    writer_tx: &std::sync::mpsc::SyncSender<EncodedFrame>,
     error_flag: &AtomicBool,
     first_error: &Mutex<String>,
     cancel: &AtomicBool,
     params: &CompressParams,
     phase_clocks: &PhaseClocks,
+    batch_shape: Option<BatchShape>,
 ) {
     // Pre-allocate output buffer once per thread and reuse across frames
     let buf_size = 2048 * 1080 * 3 * 2; // max 2K frame uncompressed size
-    let mut output_buf = vec![0u8; buf_size];
+    let mut output_buf = match batch_shape {
+        Some(_) => Vec::new(),
+        None => vec![0u8; buf_size],
+    };
 
     while !cancel.load(Ordering::Relaxed) && !error_flag.load(Ordering::Relaxed) {
         let Some(mut frame) = input_queue.pop() else {
@@ -697,11 +781,14 @@ fn encoder_thread_fn(
         }
 
         let encode_start = std::time::Instant::now();
-        let compressed = compress_frame_grok(&frame, params, &mut output_buf);
+        let compressed = match batch_shape {
+            Some(shape) => submit_frame_to_batch(&frame, shape).map(|()| None),
+            None => compress_frame_grok(&frame, params, &mut output_buf).map(Some),
+        };
         phase_clocks.add(EncodePhase::Jpeg2000, encode_start.elapsed());
 
         match compressed {
-            Ok(data) => {
+            Ok(Some(data)) => {
                 let encoded = EncodedFrame {
                     data,
                     index: frame.index(),
@@ -710,6 +797,7 @@ fn encoder_thread_fn(
                     break;
                 }
             }
+            Ok(None) => {}
             Err(e) => {
                 fail_pipeline(
                     error_flag,
@@ -736,14 +824,18 @@ enum Allocation {
     Quality { psnr: f64 },
 }
 
+/// The bit depth the cinema profiles' picture is written at.
+#[cfg(feature = "grok-ffi")]
+const CINEMA_SAMPLE_PRECISION: u8 = 12;
+
 /// The cinema profiles encode 3 components at 12 bits, and grok measures its
 /// compression ratio against that rather than against the samples it was given.
 #[cfg(feature = "grok-ffi")]
 fn cinema_raw_frame_bytes(frame: &RawFrame) -> u64 {
     const COMPONENTS: u64 = 3;
-    const BITS_PER_SAMPLE: u64 = 12;
     const BITS_PER_BYTE: u64 = 8;
-    frame.width() as u64 * frame.height() as u64 * COMPONENTS * BITS_PER_SAMPLE / BITS_PER_BYTE
+    frame.width() as u64 * frame.height() as u64 * COMPONENTS * CINEMA_SAMPLE_PRECISION as u64
+        / BITS_PER_BYTE
 }
 
 /// Compress a single frame using Grok's in-process C API via FFI.
@@ -785,19 +877,14 @@ fn compress_frame_grok(
 #[cfg(feature = "grok-ffi")]
 const IMF_SAMPLE_PRECISION: u8 = 12;
 
+/// The rsiz the codestream carries, the precision the grok image is built at
+/// and how far each source sample is shifted down to reach it.
 #[cfg(feature = "grok-ffi")]
-fn compress_frame_once(
+fn frame_encoding_shape(
     frame: &RawFrame,
     params: &CompressParams,
-    allocation: Allocation,
-    output_buf: &mut Vec<u8>,
-) -> Result<Vec<u8>, String> {
-    use grokj2k_sys::*;
-    use std::ptr;
-
-    let width = frame.width();
-    let height = frame.height();
-    let rsiz = crate::j2k::rsiz_for_raster(params.profile, width, height)?;
+) -> Result<(u16, u8, u8), String> {
+    let rsiz = crate::j2k::rsiz_for_raster(params.profile, frame.width(), frame.height())?;
     // grok reduces deeper samples to the 12 bits cinema profiles require,
     // fused with its X'Y'Z' transform, so frames pass through at full precision
     let mut precision = frame.precision();
@@ -822,11 +909,22 @@ fn compress_frame_once(
         precision = IMF_SAMPLE_PRECISION;
     }
 
-    // Ensure buffer is large enough for this frame
-    let needed = (width as usize) * (height as usize) * 3 * 2;
-    if output_buf.len() < needed {
-        output_buf.resize(needed, 0);
-    }
+    Ok((rsiz, precision, bits_to_drop))
+}
+
+/// A planar 32-bit grok image carrying the frame's samples shifted down by
+/// `bits_to_drop`. The caller unrefs it.
+#[cfg(feature = "grok-ffi")]
+unsafe fn build_grok_image(
+    frame: &RawFrame,
+    precision: u8,
+    bits_to_drop: u8,
+) -> Result<*mut grokj2k_sys::grk_image, String> {
+    use grokj2k_sys::*;
+    use std::ptr;
+
+    let width = frame.width();
+    let height = frame.height();
 
     unsafe {
         // Set up image components
@@ -907,9 +1005,30 @@ fn compress_frame_once(
                     }
                 }
             }
+            RawFrame::PlanarYuv { format, .. } => {
+                grk_object_unref(&mut (*image).obj);
+                return Err(format!(
+                    "a {} frame is grok's accelerator plugin's to convert and this \
+                     compressor takes RGB",
+                    format.pixel_format.ffmpeg_name()
+                ));
+            }
         }
 
-        // Set up compression parameters
+        Ok(image)
+    }
+}
+
+/// The compression settings one codestream is written with.
+#[cfg(feature = "grok-ffi")]
+fn build_cparameters(
+    params: &CompressParams,
+    rsiz: u16,
+    allocation: Allocation,
+) -> grokj2k_sys::grk_cparameters {
+    use grokj2k_sys::*;
+
+    unsafe {
         let mut cparams: grk_cparameters = std::mem::zeroed();
         grk_compress_set_default_params(&mut cparams);
 
@@ -917,8 +1036,11 @@ fn compress_frame_once(
         cparams.numlayers = params.num_layers;
         match allocation {
             Allocation::Ratio { ratio, max_bytes } => {
-                cparams.allocation_by_rate_distortion = true;
-                cparams.layer_rate[0] = ratio;
+                // at 1:1 the rate search still drops a pass, so ask for no allocation
+                if ratio > 1.0 {
+                    cparams.allocation_by_rate_distortion = true;
+                    cparams.layer_rate[0] = ratio;
+                }
                 cparams.max_cs_size = max_bytes;
             }
             Allocation::Quality { psnr } => {
@@ -938,6 +1060,8 @@ fn compress_frame_once(
         cparams.mct = if params.mct { 1 } else { 0 };
         cparams.rsiz = rsiz;
         cparams.numgbits = params.num_guard_bits;
+        // grok's default search tries every truncation point and halves the frame rate
+        cparams.rate_control_algorithm = _GRK_RATE_CONTROL_ALGORITHM_GRK_RATE_CONTROL_PCRD_OPT;
         cparams.framerate = params.grok_frame_rate();
         cparams.num_threads = params.threads_per_codec;
         cparams.apply_xyz_transform = params.apply_xyz_transform;
@@ -952,6 +1076,31 @@ fn compress_frame_once(
             ProgressionOrder::Pcrl => _GRK_PROG_ORDER_GRK_PCRL,
             ProgressionOrder::Cprl => _GRK_PROG_ORDER_GRK_CPRL,
         };
+
+        cparams
+    }
+}
+
+#[cfg(feature = "grok-ffi")]
+fn compress_frame_once(
+    frame: &RawFrame,
+    params: &CompressParams,
+    allocation: Allocation,
+    output_buf: &mut Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    use grokj2k_sys::*;
+    use std::ptr;
+
+    let (rsiz, precision, bits_to_drop) = frame_encoding_shape(frame, params)?;
+
+    let needed = (frame.width() as usize) * (frame.height() as usize) * 3 * 2;
+    if output_buf.len() < needed {
+        output_buf.resize(needed, 0);
+    }
+
+    unsafe {
+        let image = build_grok_image(frame, precision, bits_to_drop)?;
+        let mut cparams = build_cparameters(params, rsiz, allocation);
 
         let mut stream_params: grk_stream_params = std::mem::zeroed();
         stream_params.buf = output_buf.as_mut_ptr();
@@ -982,6 +1131,242 @@ fn compress_frame_grok(
     _output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     Err("grok-ffi feature not enabled — cannot use in-process encoder".to_string())
+}
+
+// ─── the accelerator plugin's in-memory batch ─────────────────────────────────
+
+/// The frame shape one batch was begun with. Every frame submitted to it has to
+/// match, and the encoder threads build their grok image from it.
+#[cfg(feature = "grok-ffi")]
+#[derive(Clone, Copy)]
+struct BatchShape {
+    width: u32,
+    height: u32,
+    /// what the grok image the encoder threads build carries
+    image_precision: u8,
+    /// how far a source sample is shifted down to reach `image_precision`
+    bits_to_drop: u8,
+}
+
+#[cfg(not(feature = "grok-ffi"))]
+#[derive(Clone, Copy)]
+enum BatchShape {}
+
+/// What the plugin's callback threads need to hand a finished codestream to the
+/// writer thread. One of these is shared by every callback thread.
+#[cfg(feature = "grok-ffi")]
+struct BatchCollector {
+    writer_tx: std::sync::mpsc::SyncSender<EncodedFrame>,
+    error_flag: Arc<AtomicBool>,
+    first_error: Arc<Mutex<String>>,
+    input_queue: Arc<BoundedQueue<RawFrame>>,
+}
+
+/// How many frames the plugin's batch has handed back with a codestream.
+/// `grk_plugin_accelerated_frames` counts only the per-call routed path.
+#[cfg(feature = "grok-ffi")]
+static BATCH_ACCELERATED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Runs on the plugin's threads, concurrently with itself and with the encoder
+/// threads still submitting.
+#[cfg(feature = "grok-ffi")]
+unsafe extern "C" fn batch_frame_callback(
+    user: *mut std::ffi::c_void,
+    frame_user: *mut std::ffi::c_void,
+    codestream: *const u8,
+    length: usize,
+) {
+    let collector = unsafe { &*(user as *const BatchCollector) };
+    let index = frame_user as u64;
+
+    if length == 0 || codestream.is_null() {
+        fail_pipeline(
+            &collector.error_flag,
+            &collector.first_error,
+            &collector.input_queue,
+            format!("Encode failed frame {index}: the batch returned no codestream"),
+        );
+        return;
+    }
+
+    let data = unsafe { std::slice::from_raw_parts(codestream, length) }.to_vec();
+    BATCH_ACCELERATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    let _ = collector.writer_tx.send(EncodedFrame { data, index });
+}
+
+/// One run of the accelerator plugin's in-memory batch. Dropping it after
+/// [`Batch::end`] releases the parameters and the callback state the plugin
+/// held for the whole batch.
+#[cfg(feature = "grok-ffi")]
+struct Batch {
+    shape: BatchShape,
+    /// the plugin reads both of these until `end` returns
+    _parameters: Box<grokj2k_sys::grk_cparameters>,
+    _collector: Box<BatchCollector>,
+}
+
+#[cfg(not(feature = "grok-ffi"))]
+enum Batch {}
+
+#[cfg(feature = "grok-ffi")]
+impl Batch {
+    /// Start a batch shaped by `frame`. `Ok(None)` means the plugin declined
+    /// these parameters and the caller compresses on the CPU.
+    fn begin(
+        frame: &RawFrame,
+        params: &CompressParams,
+        writer_tx: &std::sync::mpsc::SyncSender<EncodedFrame>,
+        error_flag: &Arc<AtomicBool>,
+        first_error: &Arc<Mutex<String>>,
+        input_queue: &Arc<BoundedQueue<RawFrame>>,
+    ) -> Result<Option<Self>, String> {
+        let (rsiz, image_precision, bits_to_drop) = frame_encoding_shape(frame, params)?;
+        let by_ratio = Allocation::Ratio {
+            ratio: params.compression_ratio,
+            max_bytes: 0,
+        };
+        let mut parameters = Box::new(build_cparameters(params, rsiz, by_ratio));
+        let collector = Box::new(BatchCollector {
+            writer_tx: writer_tx.clone(),
+            error_flag: error_flag.clone(),
+            first_error: first_error.clone(),
+            input_queue: input_queue.clone(),
+        });
+
+        let mut info: grokj2k_sys::grk_plugin_batch_memory_info = unsafe { std::mem::zeroed() };
+        info.compress_parameters = parameters.as_mut() as *mut grokj2k_sys::grk_cparameters;
+        info.width = frame.width();
+        info.height = frame.height();
+        info.numcomps = 3;
+        info.prec = batch_precision(rsiz, image_precision);
+        // TODO: set source_format, yuv_matrix and yuv_full_range for a planar
+        // YUV frame once grk_plugin_batch_memory_info carries them
+        info.source_prec = match frame {
+            RawFrame::PlanarYuv { format, .. } => format.pixel_format.bit_depth(),
+            _ => image_precision,
+        };
+        let mut xyz_on_device = false;
+        info.xyz_on_device = &mut xyz_on_device;
+        info.callback = Some(batch_frame_callback);
+        info.user = collector.as_ref() as *const BatchCollector as *mut std::ffi::c_void;
+
+        match unsafe { grokj2k_sys::grk_plugin_batch_memory_begin(info) } {
+            0 => {
+                tracing::info!(
+                    colour_transform_on_device = xyz_on_device,
+                    "grok's accelerator plugin batch is running"
+                );
+                Ok(Some(Self {
+                    shape: BatchShape {
+                        width: frame.width(),
+                        height: frame.height(),
+                        image_precision,
+                        bits_to_drop,
+                    },
+                    _parameters: parameters,
+                    _collector: collector,
+                }))
+            }
+            1 => {
+                tracing::info!(
+                    width = frame.width(),
+                    height = frame.height(),
+                    precision = batch_precision(rsiz, image_precision),
+                    rsiz = format!("{rsiz:#06x}"),
+                    "grok's accelerator plugin does not handle this frame shape or these \
+                     compression parameters as a batch, compressing on the CPU"
+                );
+                Ok(None)
+            }
+            code => Err(format!(
+                "grok's accelerator plugin failed to start a batch: \
+                 grk_plugin_batch_memory_begin returned {code}"
+            )),
+        }
+    }
+
+    fn shape(&self) -> BatchShape {
+        self.shape
+    }
+
+    /// Drain the batch. Every submitted frame has reached the callback when
+    /// this returns.
+    fn end(self) -> Result<(), String> {
+        if unsafe { grokj2k_sys::grk_plugin_batch_memory_end() } {
+            return Ok(());
+        }
+        Err("grok's accelerator plugin failed to drain the batch: \
+             grk_plugin_batch_memory_end returned false"
+            .to_string())
+    }
+}
+
+#[cfg(not(feature = "grok-ffi"))]
+impl Batch {
+    fn begin(
+        _frame: &RawFrame,
+        _params: &CompressParams,
+        _writer_tx: &std::sync::mpsc::SyncSender<EncodedFrame>,
+        _error_flag: &Arc<AtomicBool>,
+        _first_error: &Arc<Mutex<String>>,
+        _input_queue: &Arc<BoundedQueue<RawFrame>>,
+    ) -> Result<Option<Self>, String> {
+        Ok(None)
+    }
+
+    fn shape(&self) -> BatchShape {
+        match *self {}
+    }
+
+    fn end(self) -> Result<(), String> {
+        match self {}
+    }
+}
+
+/// The cinema profiles are written at 12 bits, and grok's X'Y'Z' transform
+/// emits 12 for a cinema rsiz, so a deeper frame is shifted down inside submit.
+#[cfg(feature = "grok-ffi")]
+fn batch_precision(rsiz: u16, image_precision: u8) -> u8 {
+    let cinema = matches!(
+        crate::j2k::J2kProfile::from(rsiz),
+        crate::j2k::J2kProfile::Cinema2k | crate::j2k::J2kProfile::Cinema4k
+    );
+    if cinema {
+        CINEMA_SAMPLE_PRECISION
+    } else {
+        image_precision
+    }
+}
+
+/// Hand one frame to the running batch. Blocks while the plugin's pipeline is
+/// full, which is what paces the encoder threads.
+#[cfg(feature = "grok-ffi")]
+fn submit_frame_to_batch(frame: &RawFrame, shape: BatchShape) -> Result<(), String> {
+    if frame.width() != shape.width || frame.height() != shape.height {
+        return Err(format!(
+            "the batch was begun at {}x{} and this frame is {}x{}",
+            shape.width,
+            shape.height,
+            frame.width(),
+            frame.height()
+        ));
+    }
+
+    unsafe {
+        let image = build_grok_image(frame, shape.image_precision, shape.bits_to_drop)?;
+        let frame_user = frame.index() as usize as *mut std::ffi::c_void;
+        let submitted = grokj2k_sys::grk_plugin_batch_memory_submit(image, frame_user);
+        grokj2k_sys::grk_object_unref(&mut (*image).obj);
+        if !submitted {
+            return Err("grk_plugin_batch_memory_submit refused the frame".to_string());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "grok-ffi"))]
+fn submit_frame_to_batch(_frame: &RawFrame, shape: BatchShape) -> Result<(), String> {
+    match shape {}
 }
 
 /// Initialize the Grok library. Must be called once before using the encoder.
@@ -1059,10 +1444,12 @@ pub fn gpu_active() -> bool {
 }
 
 /// How many compress and decompress calls the device has run since the process
-/// started.
+/// started. grok counts the calls it routed one at a time and postkit counts
+/// the frames its batches got a codestream back for.
 #[cfg(feature = "grok-ffi")]
 pub fn accelerated_frames() -> u64 {
-    unsafe { grokj2k_sys::grk_plugin_accelerated_frames() }
+    let routed = unsafe { grokj2k_sys::grk_plugin_accelerated_frames() };
+    routed + BATCH_ACCELERATED_FRAMES.load(Ordering::Relaxed)
 }
 
 /// Stub when grok-ffi is not enabled.
@@ -1359,6 +1746,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A planar YUV frame is shifted nowhere after the plugin converts it, so
+    /// the depth it converts to has to be the depth the code stream carries.
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn the_yuv_conversion_writes_the_code_stream_depth() {
+        assert_eq!(PLANAR_YUV_SAMPLE_PRECISION, CINEMA_SAMPLE_PRECISION);
+        assert_eq!(PLANAR_YUV_SAMPLE_PRECISION, IMF_SAMPLE_PRECISION);
+    }
 
     /// The window is cut after the caller's filters, so a fade keeps the timing
     /// a full encode would have given it.

@@ -85,7 +85,14 @@ next to the executable, and searches nowhere at all when `GRK_NO_PLUGIN` is set,
 which keeps everything on the CPU. Call `grok_encoder::use_gpu` after
 `grok_encoder::initialize` and every encode and decode in the process runs on
 the device, `grok_encoder::use_cpu` sends them back. A reduced decode and a
-tiled stream stay on the CPU either way. `cargo test --features grok-gpu` runs
+tiled stream stay on the CPU either way. An encode then runs as one batch
+through the plugin's pipeline: the encoder threads submit their frames and the
+writer collects the code streams the plugin hands back on its own threads, so
+the pipeline stays full instead of taking one frame at a time. The frame shape
+comes from the first frame, and a shape or a set of parameters the plugin
+declines puts the whole run back on the CPU. A decode still routes per call,
+and an encode with a PSNR target stays on the CPU, because a frame over the
+byte cap is compressed again by rate. `cargo test --features grok-gpu` runs
 the device round trip and needs a machine with the plugin, CI has no GPU. This
 needs grok v20.4.2 or newer, which has `grk_plugin_set_enabled`.
 

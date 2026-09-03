@@ -71,6 +71,10 @@ name = "bench_j2k"
 required-features = ["grok-ffi"]
 
 [[test]]
+name = "mxf_wrap_memory"
+required-features = ["grok-ffi"]
+
+[[test]]
 name = "grok_decode"
 required-features = ["grok-ffi"]
 

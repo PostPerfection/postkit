@@ -9,7 +9,15 @@
   directory or the executable's directory, encodes and decodes on the device
   after `use_gpu` (device 0, the plugin's first). Every compress and decompress
   in the process routes through it for the frames the plugin handles, a reduced
-  decode or a tiled stream stays on the CPU, and `use_cpu` switches back.
+  decode or a tiled stream stays on the CPU, and `use_cpu` switches back. An
+  encode runs as one batch through the plugin's pipeline rather than one frame
+  at a time: the encoder threads submit into it and the writer thread collects
+  the code streams the plugin hands back on its own threads. The first frame
+  fixes the batch's shape, a shape or a set of parameters the plugin declines
+  puts the run back on the CPU, and an encode with a PSNR target stays on the
+  CPU because a frame over the byte cap is compressed again by rate. A decode
+  still routes per call. `accelerated_frames` counts both the calls grok routed
+  and the frames the batches got a code stream back for.
   `cargo test --features grok-gpu` runs the device round trip on a machine with
   the plugin, CI has no GPU. Needs a grok newer than v20.4.1, which has
   `grk_plugin_set_enabled`.

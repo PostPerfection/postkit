@@ -383,16 +383,35 @@ fn setup_encryption(
     })
 }
 
+/// Bytes read at a time when hashing a finished MXF. A feature's picture track
+/// file is tens of gigabytes, so it is never held in memory at once.
+const HASH_READ_BYTES: usize = 1 << 20;
+
 fn compute_hash_and_size(path: &std::path::Path) -> (String, u64) {
     use sha1::Digest;
-    let data = match std::fs::read(path) {
-        Ok(d) => d,
-        Err(_) => return (String::new(), 0),
+    use std::io::Read;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (String::new(), 0);
     };
-    let hash = sha1::Sha1::digest(&data);
+    let mut hasher = sha1::Sha1::new();
+    let mut buffer = vec![0u8; HASH_READ_BYTES];
+    let mut size = 0u64;
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                hasher.update(&buffer[..read]);
+                size += read as u64;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return (String::new(), 0),
+        }
+    }
+    let hash = hasher.finalize();
     (
         hash.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-        data.len() as u64,
+        size,
     )
 }
 
@@ -506,33 +525,6 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    // Read all J2K frames
-    let mut frames: Vec<Vec<u8>> = Vec::new();
-    for f in &opts.input_files {
-        match std::fs::read(f) {
-            Ok(data) => frames.push(data),
-            Err(e) => {
-                return MxfTrackFile {
-                    error: format!("failed to read {}: {e}", f.display()),
-                    ..Default::default()
-                };
-            }
-        }
-    }
-
-    let mut first_header = None;
-    for (path, frame) in opts.input_files.iter().zip(frames.iter()) {
-        match check_j2k_codestream(frame, opts.standard, &path.display().to_string()) {
-            Ok(header) => first_header.get_or_insert(header),
-            Err(error) => {
-                return MxfTrackFile {
-                    error,
-                    ..Default::default()
-                };
-            }
-        };
-    }
-    let header = first_header.expect("input_files is not empty");
     if let Err(error) = check_as02_picture_colour(opts.standard, opts.hdr.as_ref()) {
         return MxfTrackFile {
             error,
@@ -550,49 +542,12 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
             };
         }
     };
-    let desc = match j2k_picture_descriptor(
-        &header,
-        &frames[0],
-        opts.fps_num,
-        opts.fps_den,
-        frames.len() as u32,
-    ) {
-        Ok(desc) => desc,
-        Err(error) => {
-            return MxfTrackFile {
-                error,
-                ..Default::default()
-            };
-        }
-    };
 
-    let mut writer = J2kWriter::new(opts.standard);
-    let output_str = opts.output.to_string_lossy().to_string();
-    if let Err(e) = writer.open_write(
-        &output_str,
-        &info,
-        &desc,
-        opts.hdr.as_ref(),
-        MXF_HEADER_SIZE,
-    ) {
+    if let Err(error) = write_j2k_frames(opts, &info, &mut crypto) {
+        // the writer closed the file on its way out, so the part-written MXF can go
+        let _ = std::fs::remove_file(&opts.output);
         return MxfTrackFile {
-            error: format!("JP2K open_write failed: {e}"),
-            ..Default::default()
-        };
-    }
-
-    for frame in &frames {
-        if let Err(e) = writer.write_frame(frame, &mut crypto) {
-            return MxfTrackFile {
-                error: format!("JP2K write_frame failed: {e}"),
-                ..Default::default()
-            };
-        }
-    }
-
-    if let Err(e) = writer.finalize() {
-        return MxfTrackFile {
-            error: format!("JP2K finalize failed: {e}"),
+            error,
             ..Default::default()
         };
     }
@@ -606,11 +561,51 @@ fn wrap_j2k(opts: &MxfWrapOptions) -> MxfTrackFile {
         uuid: uuid_str,
         hash,
         size,
-        duration: frames.len() as u64,
+        duration: opts.input_files.len() as u64,
         path: opts.output.clone(),
         success: true,
         error: String::new(),
     }
+}
+
+/// Write every input codestream into the MXF at `opts.output`, holding one in
+/// memory at a time: a feature's picture essence does not fit in memory.
+fn write_j2k_frames(
+    opts: &MxfWrapOptions,
+    info: &asdcplib::WriterInfo,
+    crypto: &mut EssenceCrypto,
+) -> Result<(), String> {
+    let output_str = opts.output.to_string_lossy().to_string();
+    let mut writer: Option<J2kWriter> = None;
+    for path in &opts.input_files {
+        let frame =
+            std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let header = check_j2k_codestream(&frame, opts.standard, &path.display().to_string())?;
+        if writer.is_none() {
+            let desc = j2k_picture_descriptor(
+                &header,
+                &frame,
+                opts.fps_num,
+                opts.fps_den,
+                opts.input_files.len() as u32,
+            )?;
+            let mut opened = J2kWriter::new(opts.standard);
+            opened
+                .open_write(&output_str, info, &desc, opts.hdr.as_ref(), MXF_HEADER_SIZE)
+                .map_err(|e| format!("JP2K open_write failed: {e}"))?;
+            writer = Some(opened);
+        }
+        writer
+            .as_mut()
+            .expect("opened just above")
+            .write_frame(&frame, crypto)
+            .map_err(|e| format!("JP2K write_frame failed: {e}"))?;
+    }
+    writer
+        .expect("input_files is not empty")
+        .finalize()
+        .map(|_| ())
+        .map_err(|e| format!("JP2K finalize failed: {e}"))
 }
 
 /// What a J2K picture wrap needs before its first frame arrives.
@@ -946,12 +941,18 @@ struct WavFormat {
     sample_rate: u32,
     bits_per_sample: u16,
     /// Byte offset and length of the `data` chunk payload.
-    data_offset: usize,
-    data_len: usize,
+    data_offset: u64,
+    data_len: u64,
 }
 
 const WAVE_FORMAT_PCM: u16 = 0x0001;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+/// A `fmt ` chunk is 16 to 40 bytes, so a larger one is a corrupt header.
+const MAXIMUM_FMT_CHUNK_BYTES: u32 = 4096;
+
+const RIFF_HEADER_BYTES: usize = 12;
+const CHUNK_HEADER_BYTES: usize = 8;
 
 fn le_u16(d: &[u8], off: usize) -> u16 {
     u16::from_le_bytes([d[off], d[off + 1]])
@@ -961,26 +962,44 @@ fn le_u32(d: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
 }
 
-/// Parse a RIFF/WAVE header: read the `fmt ` chunk and locate the `data` chunk.
+/// Parse a RIFF/WAVE header: read the `fmt ` chunk and locate the `data` chunk,
+/// seeking past every chunk body so a feature-length file is never read here.
 ///
 /// Only linear PCM is accepted (tag 1, or WAVE_FORMAT_EXTENSIBLE whose subformat
 /// is PCM). Anything malformed or non-PCM is an error rather than a wrong MXF.
-fn parse_wav(data: &[u8]) -> Result<WavFormat, String> {
-    if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
+fn parse_wav<R: std::io::Read + std::io::Seek>(reader: &mut R) -> Result<WavFormat, String> {
+    use std::io::SeekFrom;
+
+    let file_len = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|e| format!("cannot size the WAV: {e}"))?;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| format!("cannot seek the WAV: {e}"))?;
+
+    let mut riff = [0u8; RIFF_HEADER_BYTES];
+    if reader.read_exact(&mut riff).is_err() || &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
         return Err("not a RIFF/WAVE file".into());
     }
 
     let mut fmt: Option<(u16, u16, u32, u16)> = None; // (tag, channels, rate, bits)
-    let mut data_chunk: Option<(usize, usize)> = None;
+    let mut data_chunk: Option<(u64, u64)> = None;
 
     // Chunks start after the 12-byte RIFF/WAVE header; each is an 8-byte header
     // (4-byte id + 4-byte LE size) followed by size bytes, padded to even.
-    let mut pos = 12usize;
-    while pos + 8 <= data.len() {
-        let id = &data[pos..pos + 4];
-        let size = le_u32(data, pos + 4) as usize;
-        let body = pos + 8;
-        if body + size > data.len() {
+    let mut pos = RIFF_HEADER_BYTES as u64;
+    let mut chunk_header = [0u8; CHUNK_HEADER_BYTES];
+    while pos + CHUNK_HEADER_BYTES as u64 <= file_len {
+        reader
+            .seek(SeekFrom::Start(pos))
+            .map_err(|e| format!("cannot seek the WAV: {e}"))?;
+        reader
+            .read_exact(&mut chunk_header)
+            .map_err(|e| format!("cannot read a WAV chunk header: {e}"))?;
+        let id = &chunk_header[0..4];
+        let size = le_u32(&chunk_header, 4);
+        let body = pos + CHUNK_HEADER_BYTES as u64;
+        if body + size as u64 > file_len {
             return Err(format!(
                 "chunk '{}' claims {size} bytes past end of file",
                 String::from_utf8_lossy(id)
@@ -991,23 +1010,30 @@ fn parse_wav(data: &[u8]) -> Result<WavFormat, String> {
             if size < 16 {
                 return Err("fmt chunk is too short".into());
             }
-            let mut tag = le_u16(data, body);
-            let channels = le_u16(data, body + 2);
-            let sample_rate = le_u32(data, body + 4);
-            let bits = le_u16(data, body + 14);
+            if size > MAXIMUM_FMT_CHUNK_BYTES {
+                return Err(format!("fmt chunk claims {size} bytes"));
+            }
+            let mut chunk = vec![0u8; size as usize];
+            reader
+                .read_exact(&mut chunk)
+                .map_err(|e| format!("cannot read the fmt chunk: {e}"))?;
+            let mut tag = le_u16(&chunk, 0);
+            let channels = le_u16(&chunk, 2);
+            let sample_rate = le_u32(&chunk, 4);
+            let bits = le_u16(&chunk, 14);
             // WAVE_FORMAT_EXTENSIBLE stores the real tag in the SubFormat GUID.
             if tag == WAVE_FORMAT_EXTENSIBLE {
                 if size < 40 {
                     return Err("extensible fmt chunk is too short for a SubFormat".into());
                 }
-                tag = le_u16(data, body + 24);
+                tag = le_u16(&chunk, 24);
             }
             fmt = Some((tag, channels, sample_rate, bits));
         } else if id == b"data" {
-            data_chunk = Some((body, size));
+            data_chunk = Some((body, size as u64));
         }
 
-        pos = body + size + (size & 1);
+        pos = body + size as u64 + (size & 1) as u64;
     }
 
     let (tag, channels, sample_rate, bits) = fmt.ok_or("no fmt chunk")?;
@@ -1040,6 +1066,8 @@ fn channel_format_for(channels: u32) -> asdcplib::pcm::ChannelFormat {
 }
 
 fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
+    use std::io::{Read, Seek};
+
     if opts.input_files.is_empty() {
         return MxfTrackFile {
             error: "no input files".to_string(),
@@ -1054,8 +1082,8 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    let wav_data = match std::fs::read(&opts.input_files[0]) {
-        Ok(d) => d,
+    let mut wav_file = match std::fs::File::open(&opts.input_files[0]) {
+        Ok(file) => std::io::BufReader::new(file),
         Err(e) => {
             return MxfTrackFile {
                 error: format!("failed to read WAV: {e}"),
@@ -1065,7 +1093,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
     };
 
     // Parse the real RIFF/WAVE header instead of assuming 5.1/24-bit/48k.
-    let wav = match parse_wav(&wav_data) {
+    let wav = match parse_wav(&mut wav_file) {
         Ok(w) => w,
         Err(e) => {
             return MxfTrackFile {
@@ -1084,8 +1112,7 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         (sample_rate as f64 / (opts.fps_num as f64 / opts.fps_den as f64)).ceil() as u32;
     let frame_size = samples_per_frame * block_align;
 
-    let pcm_data = &wav_data[wav.data_offset..wav.data_offset + wav.data_len];
-    let num_frames = (pcm_data.len() as u32).checked_div(frame_size).unwrap_or(0);
+    let num_frames = wav.data_len.checked_div(frame_size as u64).unwrap_or(0) as u32;
 
     let desc = asdcplib::pcm::AudioDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
@@ -1119,13 +1146,21 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    for i in 0..num_frames {
-        let start = (i * frame_size) as usize;
-        let end = start + frame_size as usize;
-        if end > pcm_data.len() {
-            break;
+    if let Err(e) = wav_file.seek(std::io::SeekFrom::Start(wav.data_offset)) {
+        return MxfTrackFile {
+            error: format!("failed to read WAV: {e}"),
+            ..Default::default()
+        };
+    }
+    let mut frame = vec![0u8; frame_size as usize];
+    for _ in 0..num_frames {
+        if let Err(e) = wav_file.read_exact(&mut frame) {
+            return MxfTrackFile {
+                error: format!("failed to read WAV: {e}"),
+                ..Default::default()
+            };
         }
-        if let Err(e) = writer.write_frame(&pcm_data[start..end], &mut crypto) {
+        if let Err(e) = writer.write_frame(&frame, &mut crypto) {
             return MxfTrackFile {
                 error: format!("PCM write_frame failed: {e}"),
                 ..Default::default()
@@ -1447,20 +1482,6 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    // Read all Atmos frames
-    let mut frames: Vec<Vec<u8>> = Vec::new();
-    for f in &opts.input_files {
-        match std::fs::read(f) {
-            Ok(data) => frames.push(data),
-            Err(e) => {
-                return MxfTrackFile {
-                    error: format!("failed to read {}: {e}", f.display()),
-                    ..Default::default()
-                };
-            }
-        }
-    }
-
     let mut info = make_writer_info(opts.asset_uuid);
     let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
         Ok(c) => c,
@@ -1473,7 +1494,7 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
     };
     let desc = asdcplib::atmos::AtmosDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
-        container_duration: frames.len() as u32,
+        container_duration: opts.input_files.len() as u32,
         asset_id: info.asset_uuid,
         data_essence_coding: [0; 16],
         first_frame: 0,
@@ -1492,9 +1513,19 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
         };
     }
 
-    for frame in &frames {
+    // one frame is held at a time, as in the picture wrap
+    for path in &opts.input_files {
+        let frame = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(e) => {
+                return MxfTrackFile {
+                    error: format!("failed to read {}: {e}", path.display()),
+                    ..Default::default()
+                };
+            }
+        };
         let (enc, hmac) = crypto.contexts();
-        if let Err(e) = writer.write_frame(frame, enc, hmac) {
+        if let Err(e) = writer.write_frame(&frame, enc, hmac) {
             return MxfTrackFile {
                 error: format!("Atmos write_frame failed: {e}"),
                 ..Default::default()
@@ -1518,7 +1549,7 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
         uuid: uuid_str,
         hash,
         size,
-        duration: frames.len() as u64,
+        duration: opts.input_files.len() as u64,
         path: opts.output.clone(),
         success: true,
         error: String::new(),
@@ -1572,73 +1603,20 @@ pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
         };
     }
 
-    // Read all left and right frames.
-    let read_all = |files: &[PathBuf]| -> Result<Vec<Vec<u8>>, String> {
-        files
-            .iter()
-            .map(|f| std::fs::read(f).map_err(|e| format!("failed to read {}: {e}", f.display())))
-            .collect()
-    };
-    let left = match read_all(&opts.left_files) {
-        Ok(f) => f,
-        Err(error) => {
-            return MxfTrackFile {
-                error,
-                ..Default::default()
-            };
-        }
-    };
-    let right = match read_all(&opts.right_files) {
-        Ok(f) => f,
-        Err(error) => {
-            return MxfTrackFile {
-                error,
-                ..Default::default()
-            };
-        }
-    };
-
-    let Some(header) = crate::j2k::parse_j2k_header(&left[0]) else {
-        return MxfTrackFile {
-            error: format!(
-                "invalid JPEG 2000 codestream: {}",
-                opts.left_files[0].display()
-            ),
-            ..Default::default()
+    let read_frame = |path: &std::path::Path| -> Result<(Vec<u8>, crate::j2k::J2kHeader), String> {
+        let data =
+            std::fs::read(path).map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let Some(header) = crate::j2k::parse_j2k_header(&data) else {
+            return Err(format!("invalid JPEG 2000 codestream: {}", path.display()));
         };
-    };
-    if let Err(error) = crate::j2k::validate_dci_header(&header) {
-        return MxfTrackFile {
-            error: format!(
+        crate::j2k::validate_dci_header(&header).map_err(|error| {
+            format!(
                 "invalid DCI JPEG 2000 codestream: {error}: {}",
-                opts.left_files[0].display()
-            ),
-            ..Default::default()
-        };
-    }
-    for (path, frame) in opts
-        .left_files
-        .iter()
-        .zip(left.iter())
-        .skip(1)
-        .chain(opts.right_files.iter().zip(right.iter()))
-    {
-        let Some(header) = crate::j2k::parse_j2k_header(frame) else {
-            return MxfTrackFile {
-                error: format!("invalid JPEG 2000 codestream: {}", path.display()),
-                ..Default::default()
-            };
-        };
-        if let Err(error) = crate::j2k::validate_dci_header(&header) {
-            return MxfTrackFile {
-                error: format!(
-                    "invalid DCI JPEG 2000 codestream: {error}: {}",
-                    path.display()
-                ),
-                ..Default::default()
-            };
-        }
-    }
+                path.display()
+            )
+        })?;
+        Ok((data, header))
+    };
 
     let mut info = make_writer_info(opts.asset_uuid);
     let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
@@ -1650,42 +1628,65 @@ pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
             };
         }
     };
-    // container_duration counts stereo frame pairs, not individual eye writes.
-    let desc = match j2k_picture_descriptor(
-        &header,
-        &left[0],
-        opts.fps_num,
-        opts.fps_den,
-        left.len() as u32,
-    ) {
-        Ok(desc) => desc,
-        Err(error) => {
-            return MxfTrackFile {
-                error,
-                ..Default::default()
-            };
-        }
-    };
 
-    let mut writer = asdcplib::jp2k::StereoMxfWriter::new();
+    // one pair of codestreams is held at a time, as in the monoscopic wrap
+    let mut writer: Option<asdcplib::jp2k::StereoMxfWriter> = None;
     let output_str = opts.output.to_string_lossy().to_string();
-    if let Err(e) = writer.open_write(&output_str, &info, &desc, 16384) {
-        return MxfTrackFile {
-            error: format!("stereoscopic open_write failed: {e}"),
-            ..Default::default()
+    for (left_path, right_path) in opts.left_files.iter().zip(opts.right_files.iter()) {
+        let (left, header) = match read_frame(left_path) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return MxfTrackFile {
+                    error,
+                    ..Default::default()
+                };
+            }
         };
-    }
-
-    for (l, r) in left.iter().zip(right.iter()) {
+        let (right, _) = match read_frame(right_path) {
+            Ok(frame) => frame,
+            Err(error) => {
+                return MxfTrackFile {
+                    error,
+                    ..Default::default()
+                };
+            }
+        };
+        if writer.is_none() {
+            // container_duration counts stereo frame pairs, not individual eye writes.
+            let desc = match j2k_picture_descriptor(
+                &header,
+                &left,
+                opts.fps_num,
+                opts.fps_den,
+                opts.left_files.len() as u32,
+            ) {
+                Ok(desc) => desc,
+                Err(error) => {
+                    return MxfTrackFile {
+                        error,
+                        ..Default::default()
+                    };
+                }
+            };
+            let mut opened = asdcplib::jp2k::StereoMxfWriter::new();
+            if let Err(e) = opened.open_write(&output_str, &info, &desc, 16384) {
+                return MxfTrackFile {
+                    error: format!("stereoscopic open_write failed: {e}"),
+                    ..Default::default()
+                };
+            }
+            writer = Some(opened);
+        }
+        let writer = writer.as_mut().expect("opened just above");
         let (e, h) = crypto.contexts();
-        if let Err(err) = writer.write_frame(l, StereoscopicPhase::Left, e, h) {
+        if let Err(err) = writer.write_frame(&left, StereoscopicPhase::Left, e, h) {
             return MxfTrackFile {
                 error: format!("stereoscopic write_frame (left) failed: {err}"),
                 ..Default::default()
             };
         }
         let (e, h) = crypto.contexts();
-        if let Err(err) = writer.write_frame(r, StereoscopicPhase::Right, e, h) {
+        if let Err(err) = writer.write_frame(&right, StereoscopicPhase::Right, e, h) {
             return MxfTrackFile {
                 error: format!("stereoscopic write_frame (right) failed: {err}"),
                 ..Default::default()
@@ -1693,6 +1694,7 @@ pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
         }
     }
 
+    let mut writer = writer.expect("left_files is not empty");
     if let Err(e) = writer.finalize() {
         return MxfTrackFile {
             error: format!("stereoscopic finalize failed: {e}"),
@@ -1709,7 +1711,7 @@ pub fn wrap_stereoscopic(opts: &StereoscopicWrapOptions) -> MxfTrackFile {
         uuid: uuid_str,
         hash,
         size,
-        duration: left.len() as u64,
+        duration: opts.left_files.len() as u64,
         path: opts.output.clone(),
         success: true,
         error: String::new(),
@@ -1745,22 +1747,23 @@ mod tests {
     #[test]
     fn parse_wav_reads_non_default_params() {
         let wav = make_wav(2, 44100, 16, 100);
-        let f = parse_wav(&wav).expect("parse");
+        let f = parse_wav(&mut std::io::Cursor::new(&wav)).expect("parse");
         assert_eq!(f.channels, 2);
         assert_eq!(f.sample_rate, 44100);
         assert_eq!(f.bits_per_sample, 16);
         assert_eq!(f.data_len, 2 * 2 * 100);
-        assert_eq!(&wav[f.data_offset..f.data_offset + 4], &[0, 0, 0, 0]);
+        let data_offset = f.data_offset as usize;
+        assert_eq!(&wav[data_offset..data_offset + 4], &[0, 0, 0, 0]);
     }
 
     #[test]
     fn parse_wav_rejects_malformed_and_non_pcm() {
-        assert!(parse_wav(b"not a wav at all").is_err());
+        assert!(parse_wav(&mut std::io::Cursor::new(b"not a wav at all")).is_err());
 
         // Float (tag 3) is not linear PCM.
         let mut wav = make_wav(2, 48000, 32, 10);
         wav[20..22].copy_from_slice(&3u16.to_le_bytes());
-        let err = parse_wav(&wav).expect_err("float must be rejected");
+        let err = parse_wav(&mut std::io::Cursor::new(&wav)).expect_err("float must be rejected");
         assert!(err.contains("not linear PCM"), "got: {err}");
     }
 

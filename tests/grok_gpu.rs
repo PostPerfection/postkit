@@ -6,6 +6,10 @@
 //! counter is what separates the two: it grows once per compress and once per
 //! decompress the device handled, and it stands still after `use_cpu`.
 //!
+//! With the plugin on, the encode runs as one batch through the plugin's
+//! pipeline, so the run is several frames long: every frame differs from every
+//! other and each code stream has to decode back to its own frame.
+//!
 //! This test needs a machine with the plugin, which is what the `grok-gpu`
 //! feature is for. A missing plugin fails it rather than skipping it.
 
@@ -23,23 +27,27 @@ const WIDTH: u32 = 64;
 const HEIGHT: u32 = 48;
 const PRECISION: u8 = 12;
 const MAX_SAMPLE: i32 = (1 << PRECISION) - 1;
+const FRAME_COUNT: u64 = 12;
 
-/// A pattern where every component differs at every pixel, so a swapped
-/// component or a row read at the wrong offset cannot pass.
-fn pattern() -> [Vec<i32>; 3] {
+/// A pattern where every component differs at every pixel and every frame
+/// differs from its neighbours, so a swapped component, a row read at the wrong
+/// offset or a code stream filed under the wrong frame cannot pass.
+fn pattern(frame_index: u64) -> [Vec<i32>; 3] {
+    let shift = frame_index as i32 * 137;
     let mut components = [Vec::new(), Vec::new(), Vec::new()];
     for y in 0..HEIGHT as i32 {
         for x in 0..WIDTH as i32 {
-            components[0].push((x * 37 + y * 11) % (MAX_SAMPLE + 1));
-            components[1].push((x * 5 + y * 71) % (MAX_SAMPLE + 1));
-            components[2].push((x * 13 + y * 29 + 7) % (MAX_SAMPLE + 1));
+            components[0].push((x * 37 + y * 11 + shift) % (MAX_SAMPLE + 1));
+            components[1].push((x * 5 + y * 71 + shift * 3) % (MAX_SAMPLE + 1));
+            components[2].push((x * 13 + y * 29 + 7 + shift * 5) % (MAX_SAMPLE + 1));
         }
     }
     components
 }
 
-/// Encode one frame losslessly and hand back its codestream.
-fn encode_reversible(components: [Vec<i32>; 3]) -> Vec<u8> {
+/// Encode `frames` pattern frames losslessly and hand back the directory the
+/// code streams landed in.
+fn encode_reversible_run(frames: u64) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let params = CompressParams {
         // reversible 5/3 wavelet at 1:1, so nothing is thrown away
@@ -54,53 +62,68 @@ fn encode_reversible(components: [Vec<i32>; 3]) -> Vec<u8> {
         ..CompressParams::default()
     };
 
-    let mut frame = Some(RawFrame::Planar {
-        components,
-        width: WIDTH,
-        height: HEIGHT,
-        precision: PRECISION,
-        index: 0,
-    });
+    let mut next_index = 0u64;
     let result = postkit::grok_encoder::encode_pipeline(
         dir.path(),
         &params,
-        1,
+        frames,
         &Arc::new(AtomicBool::new(false)),
         &Arc::new(PhaseClocks::default()),
-        || frame.take(),
+        || {
+            if next_index >= frames {
+                return None;
+            }
+            let frame = RawFrame::Planar {
+                components: pattern(next_index),
+                width: WIDTH,
+                height: HEIGHT,
+                precision: PRECISION,
+                index: next_index,
+            };
+            next_index += 1;
+            Some(frame)
+        },
         |_| {},
     );
     assert!(result.success, "encode failed: {}", result.error);
-
-    let codestream = std::fs::read(dir.path().join("frame_00000000.j2c"))
-        .expect("the encoder wrote a codestream");
-    assert!(!codestream.is_empty());
-    codestream
+    assert_eq!(result.frames_encoded, frames, "not every frame was written");
+    dir
 }
 
-/// Encode the pattern and decode it back, asserting every sample survived.
+/// Encode a run and decode every frame back, asserting each code stream carries
+/// its own frame's samples.
 fn round_trip_returns_the_source_samples(label: &str) {
-    let sent = pattern();
-    let codestream = encode_reversible(sent.clone());
+    let dir = encode_reversible_run(FRAME_COUNT);
 
-    let frame = grok_decoder::decode(codestream, 0).unwrap_or_else(|e| panic!("{label}: {e}"));
-    assert_eq!((frame.width, frame.height), (WIDTH, HEIGHT), "{label}");
-    assert_eq!(frame.precision, PRECISION, "{label}");
-    assert_eq!(frame.components.len(), 3, "{label}");
-    for (index, (got, want)) in frame.components.iter().zip(sent.iter()).enumerate() {
-        assert_eq!(
-            got.len(),
-            want.len(),
-            "{label}: component {index} came back the wrong length"
-        );
-        let first_difference = got.iter().zip(want.iter()).position(|(a, b)| a != b);
-        assert!(
-            first_difference.is_none(),
-            "{label}: component {index} differs at sample {:?}: got {:?}, want {:?}",
-            first_difference,
-            first_difference.map(|i| got[i]),
-            first_difference.map(|i| want[i]),
-        );
+    for index in 0..FRAME_COUNT {
+        let path = dir.path().join(format!("frame_{index:08}.j2c"));
+        let codestream = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("{label}: frame {index} was not written: {e}"));
+        assert!(!codestream.is_empty(), "{label}: frame {index} is empty");
+
+        let frame = grok_decoder::decode(codestream, 0)
+            .unwrap_or_else(|e| panic!("{label}: frame {index}: {e}"));
+        assert_eq!((frame.width, frame.height), (WIDTH, HEIGHT), "{label}");
+        assert_eq!(frame.precision, PRECISION, "{label}");
+        assert_eq!(frame.components.len(), 3, "{label}");
+
+        let sent = pattern(index);
+        for (component, (got, want)) in frame.components.iter().zip(sent.iter()).enumerate() {
+            assert_eq!(
+                got.len(),
+                want.len(),
+                "{label}: frame {index} component {component} came back the wrong length"
+            );
+            let first_difference = got.iter().zip(want.iter()).position(|(a, b)| a != b);
+            assert!(
+                first_difference.is_none(),
+                "{label}: frame {index} component {component} differs at sample {:?}: \
+                 got {:?}, want {:?}",
+                first_difference,
+                first_difference.map(|i| got[i]),
+                first_difference.map(|i| want[i]),
+            );
+        }
     }
 }
 
@@ -118,8 +141,8 @@ fn the_device_takes_every_call_after_use_gpu_and_none_after_use_cpu() {
     round_trip_returns_the_source_samples("on the device");
     assert_eq!(
         accelerated_frames(),
-        before_device + 2,
-        "the device has to have run one compress and one decompress"
+        before_device + FRAME_COUNT * 2,
+        "the device has to have run one compress and one decompress per frame"
     );
 
     use_cpu();
