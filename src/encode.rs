@@ -386,6 +386,12 @@ const PACKED_RGB_LITTLE_ENDIAN_PIXEL_FORMAT: &str = "rgb48le";
 const PACKED_RGB_BYTES_PER_PIXEL: usize = 6;
 pub(crate) const PACKED_RGB_PRECISION: u8 = 16;
 
+/// The filter that converts an 8-bit YUV source to 16-bit planar RGB before
+/// anything else reads it. swscale's own conversion from 8-bit YUV to rgb48
+/// runs at 8 bits and leaves every sample about two codes of 255 off the exact
+/// value.
+const SIXTEEN_BIT_RGB_FILTER: &str = "format=gbrp16le";
+
 /// ffmpeg filters that change the pixel format or the colour, so the picture on
 /// the pipe is no longer the source's own planes. `format=` is what
 /// [`crate::picture_processing`] inserts for any geometry work. Geometry
@@ -414,6 +420,20 @@ pub(crate) fn filters_change_the_colour(filters: &str) -> bool {
 
 /// ffprobe's `color_range` tag for samples that use the whole code value range.
 const FULL_RANGE_TAG: &str = "pc";
+
+/// Every 8-bit YUV pixel format ffmpeg decodes to, planar and semi-planar. A
+/// format with a depth suffix takes swscale's high depth path and converts to
+/// rgb48 exactly, and so does RGB of any depth.
+const EIGHT_BIT_YUV_PIXEL_FORMATS: [&str; 19] = [
+    "yuv410p", "yuv411p", "yuvj411p", "yuv420p", "yuvj420p", "yuv422p", "yuvj422p", "yuv440p",
+    "yuvj440p", "yuv444p", "yuvj444p", "yuva420p", "yuva422p", "yuva444p", "nv12", "nv21", "nv16",
+    "nv24", "nv42",
+];
+
+/// Whether ffprobe read the source as 8-bit YUV.
+pub(crate) fn is_eight_bit_yuv_pixel_format(pix_fmt: &str) -> bool {
+    EIGHT_BIT_YUV_PIXEL_FORMATS.contains(&pix_fmt)
+}
 
 /// A planar YUV pixel format postkit passes to grok's accelerator plugin as it
 /// comes off the pipe. The name is ffprobe's and `-pix_fmt`'s.
@@ -707,6 +727,31 @@ pub(crate) fn pipe_format_for_run(
         }
     }
     PipeFormat::PackedRgb(packed_rgb_sample_order(width, height, params))
+}
+
+/// The whole filter chain one decode runs: the picture filters with the
+/// detectors split off them, and for an 8-bit YUV source going to a packed RGB
+/// pipe the 16-bit conversion ahead of everything.
+///
+/// The conversion goes first so the geometry work, the decode LUT and the
+/// packing to rgb48 all run at 16 bits. `lut3d` and `haldclut` take RGB, and
+/// ffmpeg would otherwise convert to 8-bit RGB for them.
+pub(crate) fn decode_filter_chain(
+    picture_filters: &str,
+    pipe_format: PipeFormat,
+    source_pix_fmt: &str,
+) -> String {
+    let convert_to_sixteen_bits = matches!(pipe_format, PipeFormat::PackedRgb(_))
+        && is_eight_bit_yuv_pixel_format(source_pix_fmt);
+    if !convert_to_sixteen_bits {
+        return crate::picture_findings::with_detection_branch(picture_filters);
+    }
+    let mut converted = SIXTEEN_BIT_RGB_FILTER.to_string();
+    if !picture_filters.is_empty() {
+        converted.push(',');
+        converted.push_str(picture_filters);
+    }
+    crate::picture_findings::with_detection_branch(&converted)
 }
 
 /// Every ffmpeg argument that goes before `-i` for a stream decode: what the
@@ -1087,26 +1132,25 @@ where
         }
     };
 
-    let filters = crate::picture_findings::with_detection_branch(&decode_filters(
-        opts.fps,
-        &opts.source_colour,
-        &plan,
-        opts.frame_range,
-    ));
+    let picture_filters = decode_filters(opts.fps, &opts.source_colour, &plan, opts.frame_range);
+    let source = crate::probe::probe_pixel_format(&opts.input);
     let accelerator_active = grok_encoder::gpu_active();
+    // the pipe format is decided on the chain the caller asked for, so the
+    // conversion decode_filter_chain inserts cannot move the decision
     let pipe_format = pipe_format_for_run(
         &PipeFormatInputs {
             accelerator_active,
             quality_psnr: opts.quality_psnr,
             postkit_prepares_the_frame: opts.subtitle_burn.is_some(),
             source_colour: &opts.source_colour,
-            filters: &filters,
-            source: &crate::probe::probe_pixel_format(&opts.input),
+            filters: &crate::picture_findings::with_detection_branch(&picture_filters),
+            source: &source,
         },
         width,
         height,
         &params,
     );
+    let filters = decode_filter_chain(&picture_filters, pipe_format, &source.pix_fmt);
     tracing::info!(
         pixel_format = pipe_format.ffmpeg_pixel_format(),
         hardware_decode = accelerator_active,
@@ -2383,5 +2427,261 @@ mod tests {
             Vec::<String>::new(),
             "the CPU path's arguments do not change"
         );
+    }
+
+    #[test]
+    fn the_eight_bit_yuv_formats_are_the_ones_swscale_converts_at_eight_bits() {
+        for pix_fmt in [
+            "yuv420p", "yuvj420p", "yuv422p", "yuvj422p", "yuv444p", "yuvj444p", "yuv410p",
+            "yuv411p", "yuv440p", "nv12", "nv21",
+        ] {
+            assert!(is_eight_bit_yuv_pixel_format(pix_fmt), "{pix_fmt}");
+        }
+        for pix_fmt in [
+            "yuv420p10le",
+            "yuv422p10le",
+            "yuv422p12le",
+            "yuv444p16le",
+            "nv20le",
+            "rgb24",
+            "rgb48be",
+            "gbrp",
+            "gbrp16le",
+            "gray",
+            "gray10le",
+            "pal8",
+        ] {
+            assert!(!is_eight_bit_yuv_pixel_format(pix_fmt), "{pix_fmt}");
+        }
+    }
+
+    #[test]
+    fn only_an_eight_bit_yuv_source_on_the_rgb_pipe_converts_to_sixteen_bits() {
+        let untouched = crate::picture_findings::with_detection_branch("fps=24");
+        let planar_yuv = PipeFormat::PlanarYuv(YuvFrameFormat {
+            pixel_format: PlanarYuvPixelFormat::Yuv420p,
+            matrix: YuvMatrix::Bt601,
+            full_range: false,
+        });
+        assert_eq!(
+            decode_filter_chain("fps=24", planar_yuv, "yuv420p"),
+            untouched,
+            "the plugin converts the planes itself"
+        );
+        assert_eq!(
+            decode_filter_chain(
+                "fps=24",
+                PipeFormat::PackedRgb(SampleOrder::Big),
+                "yuv420p10le"
+            ),
+            untouched,
+            "a 10-bit source already converts at full precision"
+        );
+        assert_eq!(
+            decode_filter_chain("fps=24", PipeFormat::PackedRgb(SampleOrder::Big), "gbrp"),
+            untouched,
+            "an RGB source has no matrix to apply"
+        );
+        assert_eq!(
+            decode_filter_chain("", PipeFormat::PackedRgb(SampleOrder::Little), "yuv420p"),
+            crate::picture_findings::with_detection_branch("format=gbrp16le"),
+            "a decode with no picture filters of its own still converts"
+        );
+    }
+
+    /// The BT.601 luma coefficients and the studio range an 8-bit YUV source's
+    /// samples sit in: luma 16 to 235, chroma 128 either way by 112.
+    const BT601_RED_COEFFICIENT: f64 = 0.299;
+    const BT601_BLUE_COEFFICIENT: f64 = 0.114;
+    const STUDIO_LUMA_FLOOR: f64 = 16.0;
+    const STUDIO_LUMA_RANGE: f64 = 219.0;
+    const STUDIO_CHROMA_MIDDLE: f64 = 128.0;
+    const STUDIO_CHROMA_RANGE: f64 = 224.0;
+    const EIGHT_BIT_PEAK: f64 = 255.0;
+    const SIXTEEN_BIT_PEAK: f64 = 65535.0;
+
+    /// The exact limited range BT.601 conversion of one YUV sample, as 16-bit
+    /// RGB.
+    fn exact_bt601_rgb(sample: [u8; 3]) -> [f64; 3] {
+        let [luma_sample, blue_sample, red_sample] = sample.map(f64::from);
+        let luma = (luma_sample - STUDIO_LUMA_FLOOR) * EIGHT_BIT_PEAK / STUDIO_LUMA_RANGE;
+        let chroma_scale = 2.0 * EIGHT_BIT_PEAK / STUDIO_CHROMA_RANGE;
+        let green_coefficient = 1.0 - BT601_RED_COEFFICIENT - BT601_BLUE_COEFFICIENT;
+        let from_red =
+            chroma_scale * (1.0 - BT601_RED_COEFFICIENT) * (red_sample - STUDIO_CHROMA_MIDDLE);
+        let from_blue =
+            chroma_scale * (1.0 - BT601_BLUE_COEFFICIENT) * (blue_sample - STUDIO_CHROMA_MIDDLE);
+        let rgb = [
+            luma + from_red,
+            luma - from_red * BT601_RED_COEFFICIENT / green_coefficient
+                - from_blue * BT601_BLUE_COEFFICIENT / green_coefficient,
+            luma + from_blue,
+        ];
+        rgb.map(|value| value * SIXTEEN_BIT_PEAK / EIGHT_BIT_PEAK)
+    }
+
+    /// How far off the exact conversion a sample on the pipe may sit, in codes
+    /// of 65535. swscale rounds the studio range expansion at 16 bits, which
+    /// costs under 200 codes, while its 8-bit conversion of the same colour is
+    /// 280 codes or more low.
+    const EXACT_TOLERANCE_CODES: f64 = 200.0;
+    const SOLID_COLOUR_SIZE: u32 = 64;
+
+    fn run_ffmpeg(arguments: &[&str]) {
+        let run = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y"])
+            .args(arguments)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "ffmpeg {}: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+
+    /// A lossless one-frame clip of a single colour in 8-bit YUV, and the Y, Cb
+    /// and Cr ffmpeg wrote into it.
+    fn solid_colour_clip(dir: &Path, colour: &str) -> (PathBuf, [u8; 3]) {
+        let clip = dir.join("colour.mkv");
+        run_ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("color=c={colour}:size={SOLID_COLOUR_SIZE}x{SOLID_COLOUR_SIZE}:rate=1"),
+            "-frames:v",
+            "1",
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            "yuv420p",
+            &clip.to_string_lossy(),
+        ]);
+        let planes = dir.join("colour.yuv");
+        run_ffmpeg(&[
+            "-i",
+            &clip.to_string_lossy(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            &planes.to_string_lossy(),
+        ]);
+        let frame = std::fs::read(&planes).unwrap();
+        let luma_samples = (SOLID_COLOUR_SIZE * SOLID_COLOUR_SIZE) as usize;
+        (
+            clip,
+            [
+                frame[0],
+                frame[luma_samples],
+                frame[luma_samples + luma_samples / 4],
+            ],
+        )
+    }
+
+    /// The middle pixel of the first frame the decode writes to the pipe, which
+    /// is inside the picture whether or not the chain pads it.
+    fn middle_pixel_on_the_pipe(clip: &Path, filters: &str) -> [u16; 3] {
+        let pipe_format = PipeFormat::PackedRgb(SampleOrder::Big);
+        let run = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y"])
+            .args(decode_input_args(DecodeSource::Video, None, false).unwrap())
+            .arg("-i")
+            .arg(clip)
+            .args(decode_output_args(filters, pipe_format, None))
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{filters}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let frame_bytes = pipe_format.frame_bytes(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE);
+        assert!(
+            run.stdout.len() >= frame_bytes,
+            "{filters}: the pipe carried {} bytes of a {frame_bytes} byte frame",
+            run.stdout.len()
+        );
+        let middle = SOLID_COLOUR_SIZE as usize / 2;
+        let offset = (middle * SOLID_COLOUR_SIZE as usize + middle) * PACKED_RGB_BYTES_PER_PIXEL;
+        [0, 1, 2].map(|component| {
+            let at = offset + component * 2;
+            u16::from_be_bytes([run.stdout[at], run.stdout[at + 1]])
+        })
+    }
+
+    #[test]
+    fn an_eight_bit_yuv_source_reaches_the_pipe_at_the_exact_colour() {
+        let dir = tempfile::tempdir().unwrap();
+        let (clip, sample) = solid_colour_clip(dir.path(), "0x4080c0");
+        let source = crate::probe::probe_pixel_format(&clip);
+        assert_eq!(source.pix_fmt, "yuv420p");
+        let exact = exact_bt601_rgb(sample);
+        let packed_rgb = PipeFormat::PackedRgb(SampleOrder::Big);
+
+        let plain = crate::picture_processing::PictureProcessing::default()
+            .plan(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE)
+            .unwrap();
+        // what a subtitle burn to a DCI raster decodes through: postkit reads
+        // the samples, so the pipe is packed RGB and the geometry runs on it
+        let burn = crate::picture_processing::PictureProcessing {
+            fit: Some(crate::picture_processing::Fit {
+                box_width: 48,
+                box_height: 48,
+                raster_width: SOLID_COLOUR_SIZE,
+                raster_height: SOLID_COLOUR_SIZE,
+            }),
+            ..crate::picture_processing::PictureProcessing::default()
+        }
+        .plan(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE)
+        .unwrap();
+        let lut = dir.path().join("identity.cube");
+        std::fs::write(
+            &lut,
+            "LUT_3D_SIZE 2\n0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n",
+        )
+        .unwrap();
+
+        let chains = [
+            (
+                "plain",
+                decode_filters(
+                    FrameRate::whole(24),
+                    &SourceColour::DisplayRgb,
+                    &plain,
+                    None,
+                ),
+            ),
+            (
+                "burn",
+                decode_filters(FrameRate::whole(24), &SourceColour::DisplayRgb, &burn, None),
+            ),
+            (
+                "lut",
+                decode_filters(
+                    FrameRate::whole(24),
+                    &SourceColour::DciLut(lut),
+                    &plain,
+                    None,
+                ),
+            ),
+        ];
+        for (name, picture_filters) in chains {
+            let filters = decode_filter_chain(&picture_filters, packed_rgb, &source.pix_fmt);
+            assert!(
+                filters.starts_with("format=gbrp16le,"),
+                "{name}: the conversion has to run before everything else: {filters}"
+            );
+            let pixel = middle_pixel_on_the_pipe(&clip, &filters);
+            for (component, (measured, exact)) in pixel.iter().zip(exact).enumerate() {
+                let error = f64::from(*measured) - exact;
+                assert!(
+                    error.abs() <= EXACT_TOLERANCE_CODES,
+                    "{name}: component {component} came off the pipe at {measured} against the \
+                     exact {exact:.0}, {error:.0} codes out"
+                );
+            }
+        }
     }
 }

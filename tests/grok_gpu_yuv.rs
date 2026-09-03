@@ -10,11 +10,8 @@
 //!
 //! Its own process, because the plugin is a switch for the whole process.
 //!
-//! The two 8-bit cases sit about 45 dB apart rather than over the floor:
-//! ffmpeg writes an 8-bit YUV source to `rgb48be` about 1.7 code values of 255
-//! below the exact conversion, and that offset is in every packed RGB frame the
-//! device run is measured against. TODO: put the pipe on a format swscale
-//! converts 8-bit YUV to at full precision.
+//! The packed RGB side of an 8-bit YUV source converts through 16-bit planar
+//! RGB, which is what puts the two 8-bit cases over the floor.
 
 #![cfg(feature = "grok-gpu")]
 

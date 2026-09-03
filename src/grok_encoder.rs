@@ -1849,8 +1849,10 @@ where
     }
 
     let picture_filters = window_filter_chain(video_filter, frame_range).unwrap_or_default();
-    let filters = crate::picture_findings::with_detection_branch(&picture_filters);
+    let source = crate::probe::probe_pixel_format(input_video);
     let accelerator_active = gpu_active();
+    // the pipe format is decided on the chain the caller asked for, so the
+    // conversion decode_filter_chain inserts cannot move the decision
     let pipe_format = crate::encode::pipe_format_for_run(
         &crate::encode::PipeFormatInputs {
             accelerator_active,
@@ -1859,13 +1861,15 @@ where
             // the colour this path can convert is the compressor's own
             // transform, and a caller's colour filter is caught by the chain
             source_colour: &crate::encode::SourceColour::DisplayRgb,
-            filters: &filters,
-            source: &crate::probe::probe_pixel_format(input_video),
+            filters: &crate::picture_findings::with_detection_branch(&picture_filters),
+            source: &source,
         },
         width,
         height,
         params,
     );
+    let filters =
+        crate::encode::decode_filter_chain(&picture_filters, pipe_format, &source.pix_fmt);
     tracing::info!(
         pixel_format = pipe_format.ffmpeg_pixel_format(),
         hardware_decode = accelerator_active,

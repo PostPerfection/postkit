@@ -105,7 +105,9 @@ buffers. postkit asks the plugin which of those it takes before starting the
 decoder, since the answer decides what ffmpeg writes. A subtitle burn,
 postkit's own P3 or Rec.2020 transform, the HDR-to-DCI LUT, a filter that
 changes the pixel format or the colour, and a PSNR target each keep a run on
-packed RGB.
+packed RGB. An 8-bit YUV source on that pipe decodes through `format=gbrp16le`
+first, because swscale converts 8-bit YUV straight to rgb48 at 8 bits and lands
+about two codes of 255 off the exact colour.
 
 `cargo test --features grok-gpu` runs the device round trip and needs a machine
 with the plugin, CI has no GPU: `tests/grok_gpu.rs` for the round trip,

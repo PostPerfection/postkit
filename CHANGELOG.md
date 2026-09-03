@@ -137,6 +137,31 @@
 
 ### Fixed
 
+- **Every 8-bit YUV source was compressed about two codes low**: swscale
+  converts an 8-bit YUV pixel format straight to `rgb48be` at 8 bits, so the
+  frames on the packed RGB pipe carried a level error of about two codes of
+  255. A yuv420p frame of Y=126 Cb=Cr=128, whose exact limited range BT.601
+  conversion is 128.08 of 255, came off the pipe at 0x7e7e per channel, 126
+  times 257, and 0x4080c0, exactly 63.77, 128.38, 193.09, came off at 62, 127
+  and 192 times 257. No `-sws_flags` value converts it any better.
+  `encode::decode_filter_chain` now inserts `format=gbrp16le` ahead of every
+  other filter when the pipe is packed RGB and `probe::probe_pixel_format` read
+  one of the formats `encode::is_eight_bit_yuv_pixel_format` names, so
+  everything downstream of the decoder runs at 16 bits, the packing to rgb48
+  included, and those two colours arrive at 0x8016 and at 0x3fc6 0x8063 0xc119,
+  each within 200 codes of 65535 of exact. The conversion has to go first
+  because the HDR-to-DCI LUT takes RGB input and ffmpeg would otherwise convert
+  the frame to 8-bit RGB for it, through the same 8-bit path. It costs about
+  2.5 core milliseconds a frame at 2048x872, and the pipe format is still
+  decided on the chain before the insertion, so a run that would have taken the
+  source's own planes still takes them. A 10-bit YUV source already took
+  swscale's high depth path, an RGB source has no matrix to apply, and the
+  device converts the planar YUV it is handed itself, so none of those three
+  changed. The one still on the old path is `still.rs`, which decodes a single
+  still through its own ffmpeg call, so a JPEG still is still converted at 8
+  bits. `tests/grok_gpu_yuv.rs` measures a device encode against a host encode
+  of the same clip: the two 8-bit cases sat 45.2 dB apart and now clear the
+  50 dB floor at 51.7 and 55.5 dB.
 - **A wrap held the whole track file in memory**: the J2K, Atmos and
   stereoscopic wraps read every codestream into one `Vec<Vec<u8>>` before
   writing a frame, `wrap_pcm` read the whole WAV, and `compute_hash_and_size`
