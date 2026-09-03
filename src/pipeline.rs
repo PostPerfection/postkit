@@ -142,13 +142,8 @@ pub fn run_encode_with_ratio(
 
 /// Encode settings for one pipeline run.
 pub struct EncodeRunOptions {
-    /// J2K compression ratio (video input only). Ignored when
-    /// `target_codestream_bytes` is set.
+    /// J2K compression ratio (video input only), ignored under `target_codestream_bytes`.
     pub compression_ratio: f64,
-    /// The bytes per frame the allocation aims at, which replaces the ratio.
-    /// A ratio derived from the source raster misses this target once the
-    /// picture is padded to its container, so a caller with a bitrate sets it
-    /// here.
     pub target_codestream_bytes: Option<u64>,
     /// A PSNR target in dB that grok allocates layers by instead of the
     /// compression ratio. `codestream_byte_cap` still holds: a frame the target

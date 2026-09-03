@@ -135,8 +135,7 @@ fn round_trip_returns_the_source_samples(label: &str) {
     }
 }
 
-/// 2K noise at 12 bits, incompressible enough that a rate allocation lands on
-/// its ceiling instead of a few header bytes.
+// noise is incompressible enough to land a rate allocation on its ceiling
 fn noise_2k_frame(index: u64) -> RawFrame {
     let mut state = 7u32.wrapping_add(index as u32).wrapping_mul(2654435761);
     let mut components = [Vec::new(), Vec::new(), Vec::new()];
@@ -155,8 +154,6 @@ fn noise_2k_frame(index: u64) -> RawFrame {
     }
 }
 
-/// Encode noise frames at `TARGET_BYTES` and assert every code stream the
-/// device handed back lands on the target.
 fn a_device_encode_holds_the_byte_target() {
     const FRAMES: u64 = 4;
     let dir = tempfile::tempdir().unwrap();

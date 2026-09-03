@@ -293,9 +293,7 @@ fn an_image_sequence_refuses_a_source_read_rate() {
     assert!(error.contains("another rate"), "{error}");
 }
 
-/// The cap has to reach both grok and the writer thread from `EncodeRunOptions`:
-/// grok holds a cap it can meet, and the run ends at the frame that breaks one
-/// it cannot.
+/// The cap reaches both grok and the writer thread from `EncodeRunOptions`.
 #[test]
 fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
     const CAPPED_FRAME_COUNT: u64 = 48;

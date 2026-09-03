@@ -846,12 +846,8 @@ pub struct StreamEncodeOptions {
     pub input: PathBuf,
     /// Output J2K directory
     pub output_dir: PathBuf,
-    /// Target compression ratio (e.g. 10 for 10:1). Ignored when
-    /// `target_codestream_bytes` is set.
+    /// Target compression ratio (e.g. 10 for 10:1), ignored under `target_codestream_bytes`.
     pub compression_ratio: f64,
-    /// The bytes per frame the allocation aims at, which replaces the ratio. A
-    /// ratio derived from the source raster misses this target once the picture
-    /// is padded to its container, so a caller with a bitrate sets it here.
     #[serde(default)]
     pub target_codestream_bytes: Option<u64>,
     /// A PSNR target in dB that grok allocates layers by instead of the

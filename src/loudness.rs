@@ -21,8 +21,7 @@ pub struct LoudnessResult {
     pub error: String,
 }
 
-/// Measure audio loudness per EBU R128 from a WAV or a PCM MXF, in one streamed
-/// pass.
+/// Measure audio loudness per EBU R128 from a WAV or a PCM MXF, in one streamed pass.
 pub fn measure_loudness(input: &Path) -> LoudnessResult {
     match stream_loudness(input) {
         Ok((true_peak_dbtp, summary)) => LoudnessResult {
@@ -501,7 +500,7 @@ const LEQ_BLOCK: usize = 32768;
 // reference tone sits at -20 dBFS, so full scale is 108.010299957 dB.
 const LEQ_M_REFERENCE_OFFSET_DB: f64 = 108.010_299_957;
 
-/// The M weighting ISO 21727 tabulates, in Hz and in dB relative to 2 kHz.
+// the m weighting iso 21727 tabulates, in dB relative to 2 kHz
 const M_WEIGHTING_HZ: [f64; 21] = [
     31.0, 63.0, 100.0, 200.0, 400.0, 800.0, 1000.0, 2000.0, 3150.0, 4000.0, 5000.0, 6300.0, 7100.0,
     8000.0, 9000.0, 10000.0, 12500.0, 14000.0, 16000.0, 20000.0, 31500.0,
@@ -511,11 +510,7 @@ const M_WEIGHTING_DB: [f64; 21] = [
     -5.6, -10.9, -17.3, -27.8, -48.3,
 ];
 
-/// M weighting at `frequency` in dB, the table read straight between its points
-/// the way leqm-nrt reads it. The ITU-R 468 rational curve the table samples is
-/// convex between them, so it runs 0.2 to 0.5 dB hotter over most of the band
-/// and a broadband programme measures that much louder through it. Outside the
-/// tabulated band the end values hold.
+// the itu-r 468 curve these points sample is convex between them and reads 0.2 to 0.5 dB hotter
 fn m_weighting_db(frequency: f64) -> f64 {
     let last = M_WEIGHTING_HZ.len() - 1;
     if frequency <= M_WEIGHTING_HZ[0] {
@@ -534,8 +529,6 @@ fn m_weighting_db(frequency: f64) -> f64 {
     M_WEIGHTING_DB[lower] + span * (M_WEIGHTING_DB[upper] - M_WEIGHTING_DB[lower])
 }
 
-/// Squared M weighting for every fft bin at `sample_rate`, so a block costs one
-/// multiply per bin.
 fn bin_weights_squared(sample_rate: u32) -> Vec<f64> {
     let n = LEQ_BLOCK;
     (0..n)
@@ -549,9 +542,7 @@ fn bin_weights_squared(sample_rate: u32) -> Vec<f64> {
         .collect()
 }
 
-/// Sum of squares of the M-weighted block (Parseval in the frequency domain),
-/// i.e. the weighted energy contributed by `samples`. `samples` is zero-padded
-/// to the fft length, so its true length still sets the sample count.
+/// Weighted energy of `samples`, zero-padded to the fft length, its own length the sample count.
 fn weighted_block_energy(
     fft: &dyn rustfft::Fft<f32>,
     samples: &[f32],
@@ -572,9 +563,7 @@ fn weighted_block_energy(
     energy / n as f64
 }
 
-/// Per-channel level corrections in dB by DCP channel index, the ones
-/// leqm-nrt takes and DCP-o-matic passes it. The surrounds and the Lc/Rc pair
-/// are 3 dB down and the non-programme channels are excluded outright.
+// the corrections leqm-nrt takes, in the dcp channel order, as dcp-o-matic passes them
 const LEQ_M_CHANNEL_CORRECTIONS_DB: [f64; 16] = [
     0.0,    // L
     0.0,    // R
@@ -694,10 +683,7 @@ pub fn leq_m_from_samples(samples: &[f32], sample_rate: u32) -> f64 {
     leq_m_from_interleaved(samples, 1, sample_rate)
 }
 
-/// Compute Leq(m) (ISO 21727) in dB from interleaved PCM in full-scale units
-/// (-1.0..=1.0). Each channel is CCIR 468-weighted on its own, corrected by
-/// [`LEQ_M_CHANNEL_CORRECTIONS_DB`] for its DCP channel index, and the channel
-/// energies are summed.
+// each channel is weighted and corrected on its own, then the energies are summed
 pub fn leq_m_from_interleaved(interleaved: &[f32], channels: usize, sample_rate: u32) -> f64 {
     if interleaved.is_empty() || channels == 0 || sample_rate == 0 {
         return f64::NEG_INFINITY;
@@ -707,9 +693,7 @@ pub fn leq_m_from_interleaved(interleaved: &[f32], channels: usize, sample_rate:
     energy.finish()
 }
 
-/// Measure Leq(m) (ISO 21727) of a WAV or PCM MXF file, streamed in bounded
-/// blocks at the file's own sample rate, summing the corrected channel
-/// energies.
+/// Measure Leq(m) (ISO 21727) of a WAV or PCM MXF file, streamed in bounded blocks.
 pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
     if !audio_file.exists() {
         return LeqMResult {

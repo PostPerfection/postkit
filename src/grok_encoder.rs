@@ -106,22 +106,14 @@ pub struct EncodedFrame {
 /// Compression parameters for DCI JPEG 2000.
 #[derive(Debug, Clone)]
 pub struct CompressParams {
-    /// Compression ratio (e.g. 10.0 for 10:1). Ignored when
-    /// `target_codestream_bytes` is set.
+    /// Compression ratio (e.g. 10.0 for 10:1), ignored under `target_codestream_bytes`.
     pub compression_ratio: f64,
-    /// The bytes per frame the allocation aims at. Set, it replaces
-    /// `compression_ratio`: grok's own byte budget is computed from the image
-    /// it sees, so the ratio a caller derived from the source raster misses the
-    /// target once the picture is padded to its container. grok subtracts its
-    /// header offsets from the budget, so codestreams land just under the
-    /// target.
     pub target_codestream_bytes: Option<u64>,
     /// A PSNR target in dB that grok allocates layers by instead of the
     /// compression ratio. `codestream_byte_cap` still holds: grok is given it
     /// as `max_cs_size` and prefers it over the quality target.
     pub quality_psnr: Option<f64>,
-    /// Per-codestream byte cap, the same one the writer thread checks. grok is
-    /// given it as `max_cs_size` and holds to it.
+    /// Per-codestream byte cap, the same one the writer checks, given to grok as `max_cs_size`.
     pub codestream_byte_cap: Option<u64>,
     /// Number of decomposition levels (default 6 for 2K)
     pub num_resolutions: u8,
@@ -829,9 +821,7 @@ fn encoder_thread_fn(
 /// How grok sizes one codestream.
 #[cfg(feature = "grok-ffi")]
 enum Allocation {
-    /// grok's rate/distortion curve at this compression ratio, from
-    /// [`rate_allocation`]. A non-zero `max_bytes` is a hard ceiling grok holds
-    /// to, whatever the ratio asks for.
+    /// grok's rate/distortion curve at this ratio, with a non-zero `max_bytes` a hard ceiling.
     Ratio { ratio: f64, max_bytes: u64 },
     /// grok's layer allocation at this PSNR target. `max_cs_size` does nothing
     /// here, so the target alone decides the size.
@@ -842,7 +832,6 @@ enum Allocation {
 #[cfg(feature = "grok-ffi")]
 const CINEMA_SAMPLE_PRECISION: u8 = 12;
 
-/// Components in the image [`build_grok_image`] hands grok.
 #[cfg(feature = "grok-ffi")]
 const GROK_IMAGE_COMPONENTS: u64 = 3;
 
@@ -860,14 +849,7 @@ fn cinema_raw_frame_bytes(frame: &RawFrame) -> u64 {
         / BITS_PER_BYTE
 }
 
-/// How grok sizes one codestream by rate, from the byte target when there is
-/// one and from the compression ratio otherwise. Both the CPU compressor and
-/// the plugin's batch size their frames through this.
-///
-/// grok's own budget is `numcomps * prec * pixels / (ratio * 8)` minus its
-/// header offsets, measured on the image after its cinema transform, so a ratio
-/// that asks for `target` bytes of that image is what puts the codestream on
-/// the target.
+// grok budgets numcomps * prec * pixels / (ratio * 8), so a byte target becomes that ratio
 #[cfg(feature = "grok-ffi")]
 fn rate_allocation(frame: &RawFrame, params: &CompressParams) -> Result<Allocation, String> {
     let cap = params.codestream_byte_cap;
@@ -1433,10 +1415,7 @@ pub fn plugin_takes_frame(_shape_only: &RawFrame, _params: &CompressParams) -> b
     false
 }
 
-/// The precision of the image grok compresses. The cinema profiles are written
-/// at 12 bits, and grok's X'Y'Z' transform emits 12 for a cinema rsiz, so a
-/// deeper frame is shifted down inside submit and grok's byte budget is
-/// measured at 12.
+// grok budgets from the 12 bit image its cinema transform emits, not the frame's depth
 #[cfg(feature = "grok-ffi")]
 fn grok_image_precision(rsiz: u16, image_precision: u8) -> u8 {
     let cinema = matches!(
@@ -2465,12 +2444,10 @@ mod tests {
     #[cfg(feature = "grok-ffi")]
     const FEATURE_FPS: u32 = 24;
 
-    // the fraction of the target a rate allocation must reach, below which the
-    // encode is spending fewer bits than it was asked for
+    // below this a rate allocation is spending fewer bits than it was asked for
     #[cfg(feature = "grok-ffi")]
     const TARGET_FLOOR: f64 = 0.97;
 
-    /// One 2K frame of noise at a byte target, on the cpu, and its size.
     #[cfg(feature = "grok-ffi")]
     fn compress_one_2k_frame_at_the_target(precision: u8, target: u64) -> u64 {
         let frame = noise_frame(0, 2048, 1080, precision);
@@ -2699,8 +2676,7 @@ mod tests {
         );
     }
 
-    /// A codestream's own markers run to a few hundred bytes, so a 100 byte cap
-    /// is one grok cannot meet however it allocates.
+    // a codestream's own markers already run past this
     #[cfg(feature = "grok-ffi")]
     const UNMEETABLE_CAP: u64 = 100;
 
