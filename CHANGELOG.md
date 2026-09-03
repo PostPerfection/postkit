@@ -152,6 +152,16 @@
 
 ### Fixed
 
+- **The loudness passes could not read a packaged sound MXF**: `measure_loudness`,
+  `measure_leq_m` and `measure_true_peak_dbtp` opened their input through hound,
+  so a QC report handed a `sound_<uuid>.mxf` got "wav i/o: Ill-formed WAVE file:
+  no RIFF tag found" instead of a measurement. The container is now detected by
+  content: hound first, and a file with no RIFF tag is opened as a PCM MXF
+  through `asdcplib::pcm::MxfReader`, one edit unit at a time, batched to about
+  a second of audio per block. Anything that is neither still fails loud. On a
+  15 minute six channel 24-bit track the MXF reads 0.90 s and 9.6 MB against
+  the WAV's 0.87 s and 9.9 MB, and the same Leq(m) to four decimals. Encrypted
+  essence is not decrypted, it fails with asdcplib's error.
 - **Probing a video decoded every frame of it**: `probe::probe_video` counted
   frames with `ffprobe -count_frames`, a software decode of the whole file that
   took 181 s on an 888 s 2048x872 H.264 feature, as long as the GPU encode of

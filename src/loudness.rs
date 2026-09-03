@@ -21,7 +21,8 @@ pub struct LoudnessResult {
     pub error: String,
 }
 
-/// Measure audio loudness per EBU R128 from a WAV, in one streamed pass.
+/// Measure audio loudness per EBU R128 from a WAV or a PCM MXF, in one streamed
+/// pass.
 pub fn measure_loudness(input: &Path) -> LoudnessResult {
     match stream_loudness(input) {
         Ok((true_peak_dbtp, summary)) => LoudnessResult {
@@ -41,7 +42,7 @@ pub fn measure_loudness(input: &Path) -> LoudnessResult {
 }
 
 pub fn measure_true_peak_dbtp(input: &Path) -> Result<f64, AdjustError> {
-    stream_true_peak(input, None)
+    stream_true_peak(&open_pcm(input)?, None)
 }
 
 // frames per add_frames call, about a second of audio at 48 kHz
@@ -161,9 +162,9 @@ impl R128Meter {
 }
 
 fn stream_loudness(input: &Path) -> Result<(f64, R128Summary), AdjustError> {
-    let spec = WavReader::open(input)?.spec();
-    let channels = spec.channels as u32;
-    let rate = spec.sample_rate;
+    let pcm = open_pcm(input)?;
+    let channels = pcm.spec.channels as u32;
+    let rate = pcm.spec.sample_rate;
     let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(QUEUED_BLOCKS_PER_METER);
     let meter_thread = std::thread::spawn(move || -> Result<R128Summary, AdjustError> {
         let mut meter = R128Meter::new(channels, rate)?;
@@ -172,22 +173,18 @@ fn stream_loudness(input: &Path) -> Result<(f64, R128Summary), AdjustError> {
         }
         meter.finish()
     });
-    let true_peak = stream_true_peak(input, Some(sender));
+    let true_peak = stream_true_peak(&pcm, Some(sender));
     let summary = meter_thread.join().expect("r128 meter thread panicked");
     Ok((true_peak?, summary?))
 }
 
 // per channel true peak, handing `also` the same interleaved blocks when it is there
 fn stream_true_peak(
-    input: &Path,
+    input: &PcmInput,
     also: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
 ) -> Result<f64, AdjustError> {
-    let reader = WavReader::open(input)?;
-    let spec = reader.spec();
+    let spec = input.spec;
     let channels = spec.channels as usize;
-    if channels == 0 || reader.duration() == 0 {
-        return Err(AdjustError::Empty);
-    }
 
     let mut senders = Vec::with_capacity(channels);
     let mut receivers = Vec::with_capacity(channels);
@@ -213,7 +210,7 @@ fn stream_true_peak(
             })
             .collect();
 
-        let fed = read_blocks(input, spec, |interleaved| {
+        let fed = read_blocks(input, |interleaved| {
             let frames = interleaved.len() / channels;
             let mut planes: Vec<Vec<f32>> =
                 (0..channels).map(|_| Vec::with_capacity(frames)).collect();
@@ -247,6 +244,72 @@ fn stream_true_peak(
 struct PackedData {
     reader: std::io::BufReader<std::fs::File>,
     byte_count: usize,
+}
+
+// hound's only signal that a file carries no riff header at all
+const HOUND_NO_RIFF_TAG: &str = "no RIFF tag found";
+
+// where the interleaved samples come from and how many of them there are
+enum PcmContainer {
+    Wav,
+    Mxf {
+        edit_units: u32,
+        bytes_per_edit_unit: usize,
+    },
+}
+
+struct PcmInput {
+    path: std::path::PathBuf,
+    spec: WavSpec,
+    container: PcmContainer,
+}
+
+fn open_pcm(input: &Path) -> Result<PcmInput, AdjustError> {
+    let (spec, frames, container) = match WavReader::open(input) {
+        Ok(reader) => (reader.spec(), reader.duration() as u64, PcmContainer::Wav),
+        Err(hound::Error::FormatError(HOUND_NO_RIFF_TAG)) => open_pcm_mxf(input)?,
+        Err(error) => return Err(error.into()),
+    };
+    if spec.channels == 0 || frames == 0 {
+        return Err(AdjustError::Empty);
+    }
+    Ok(PcmInput {
+        path: input.to_path_buf(),
+        spec,
+        container,
+    })
+}
+
+fn open_pcm_mxf(input: &Path) -> Result<(WavSpec, u64, PcmContainer), AdjustError> {
+    let mut reader = asdcplib::pcm::MxfReader::new();
+    reader.open_read(&input.to_string_lossy())?;
+    let descriptor = reader.audio_descriptor()?;
+    let sample_rate = descriptor.audio_sampling_rate.numerator.max(0) as u32;
+    let spec = WavSpec {
+        channels: descriptor.channel_count as u16,
+        sample_rate,
+        bits_per_sample: descriptor.quantization_bits as u16,
+        sample_format: SampleFormat::Int,
+    };
+    if widen_samples(spec).is_none() {
+        return Err(AdjustError::UnsupportedPcmDepth(spec.bits_per_sample));
+    }
+    let edit_rate = descriptor.edit_rate;
+    if edit_rate.numerator <= 0 || descriptor.block_align == 0 {
+        return Err(AdjustError::Empty);
+    }
+    let frames_per_edit_unit = (sample_rate as u64 * edit_rate.denominator.max(1) as u64)
+        .div_ceil(edit_rate.numerator as u64);
+    let bytes_per_edit_unit = frames_per_edit_unit as usize * descriptor.block_align as usize;
+    let edit_units = descriptor.container_duration;
+    Ok((
+        spec,
+        frames_per_edit_unit * edit_units as u64,
+        PcmContainer::Mxf {
+            edit_units,
+            bytes_per_edit_unit,
+        },
+    ))
 }
 
 type WidenSamples = fn(&[u8], &mut Vec<f32>);
@@ -313,8 +376,55 @@ fn packed_data(input: &Path, spec: WavSpec) -> Result<Option<PackedData>, Adjust
     Ok(Some(PackedData { reader, byte_count }))
 }
 
-// hound's per sample iterator is the fallback for what the byte path will not claim
 fn read_blocks(
+    input: &PcmInput,
+    on_block: impl FnMut(&[f32]) -> Result<(), AdjustError>,
+) -> Result<(), AdjustError> {
+    match input.container {
+        PcmContainer::Wav => read_wav_blocks(&input.path, input.spec, on_block),
+        PcmContainer::Mxf {
+            edit_units,
+            bytes_per_edit_unit,
+        } => read_mxf_blocks(input, edit_units, bytes_per_edit_unit, on_block),
+    }
+}
+
+// one edit unit at a time out of the mxf, batched up to about a second per block
+fn read_mxf_blocks(
+    input: &PcmInput,
+    edit_units: u32,
+    bytes_per_edit_unit: usize,
+    mut on_block: impl FnMut(&[f32]) -> Result<(), AdjustError>,
+) -> Result<(), AdjustError> {
+    let spec = input.spec;
+    let widen =
+        widen_samples(spec).ok_or(AdjustError::UnsupportedPcmDepth(spec.bits_per_sample))?;
+    let block_align = spec.channels as usize * (spec.bits_per_sample as usize / 8);
+    let frames_per_edit_unit = (bytes_per_edit_unit / block_align).max(1);
+    let edit_units_per_block = (TRUE_PEAK_BLOCK_FRAMES / frames_per_edit_unit).max(1);
+
+    let mut reader = asdcplib::pcm::MxfReader::new();
+    reader.open_read(&input.path.to_string_lossy())?;
+    let mut essence = vec![0u8; bytes_per_edit_unit];
+    let mut samples: Vec<f32> =
+        Vec::with_capacity(edit_units_per_block * frames_per_edit_unit * spec.channels as usize);
+    for edit_unit in 0..edit_units {
+        let read = reader.read_frame(edit_unit, &mut essence, None, None)?;
+        let whole_frames = read - read % block_align;
+        widen(&essence[..whole_frames], &mut samples);
+        if (edit_unit as usize + 1).is_multiple_of(edit_units_per_block) {
+            on_block(&samples)?;
+            samples.clear();
+        }
+    }
+    if !samples.is_empty() {
+        on_block(&samples)?;
+    }
+    Ok(())
+}
+
+// hound's per sample iterator is the fallback for what the byte path will not claim
+fn read_wav_blocks(
     input: &Path,
     spec: WavSpec,
     mut on_block: impl FnMut(&[f32]) -> Result<(), AdjustError>,
@@ -508,8 +618,8 @@ pub fn leq_m_from_samples(samples: &[f32], sample_rate: u32) -> f64 {
     energy.finish()
 }
 
-/// Measure Leq(m) (ISO 21727) of a WAV file, streamed in bounded blocks and
-/// downmixed to mono at the file's own sample rate.
+/// Measure Leq(m) (ISO 21727) of a WAV or PCM MXF file, streamed in bounded
+/// blocks and downmixed to mono at the file's own sample rate.
 pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
     if !audio_file.exists() {
         return LeqMResult {
@@ -531,14 +641,10 @@ pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
 }
 
 fn stream_leq_m(input: &Path) -> Result<f64, AdjustError> {
-    let reader = WavReader::open(input)?;
-    let spec = reader.spec();
-    let channels = spec.channels as usize;
-    if channels == 0 || reader.duration() == 0 {
-        return Err(AdjustError::Empty);
-    }
-    let mut energy = LeqMEnergy::new(spec.sample_rate);
-    read_blocks(input, spec, |interleaved| {
+    let pcm = open_pcm(input)?;
+    let channels = pcm.spec.channels as usize;
+    let mut energy = LeqMEnergy::new(pcm.spec.sample_rate);
+    read_blocks(&pcm, |interleaved| {
         energy.add(&downmix_mono(interleaved, channels));
         Ok(())
     })?;
@@ -575,6 +681,10 @@ pub struct GainPlan {
 pub enum AdjustError {
     #[error("wav i/o: {0}")]
     Wav(#[from] hound::Error),
+    #[error("mxf pcm i/o: {0}")]
+    Mxf(#[from] asdcplib::Error),
+    #[error("{0}-bit pcm is not a depth the loudness readers widen")]
+    UnsupportedPcmDepth(u16),
     #[error("ebur128: {0}")]
     Ebur128(#[from] ebur128::Error),
     #[error("no audio samples to measure")]
@@ -1144,6 +1254,95 @@ mod tests {
             "streamed {} dB, in memory {in_memory} dB",
             streamed.leq_m_db
         );
+    }
+
+    // this crate's own pcm wrap, so the mxf under test is one a dcp would carry
+    fn wrap_pcm_mxf(wav: &Path, output: &Path) {
+        let options = crate::mxf_wrap::MxfWrapOptions {
+            input_files: vec![wav.to_path_buf()],
+            output: output.to_path_buf(),
+            essence_type: crate::mxf_wrap::EssenceType::Pcm,
+            standard: crate::mxf_wrap::MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: None,
+            resource_ids: vec![],
+            hdr: None,
+            asset_uuid: None,
+            timed_text_duration_frames: None,
+        };
+        let wrapped = crate::mxf_wrap::mxf_wrap(&options);
+        assert!(wrapped.success, "pcm wrap failed: {}", wrapped.error);
+    }
+
+    #[test]
+    fn a_pcm_mxf_measures_the_same_as_its_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        let wav = dir.path().join("stepped6.wav");
+        let mxf = dir.path().join("stepped6.mxf");
+        write_stepped_tone(&wav, int_spec(6, 24), 2.0);
+        wrap_pcm_mxf(&wav, &mxf);
+
+        let from_wav = measure_leq_m(&wav);
+        let from_mxf = measure_leq_m(&mxf);
+        assert!(from_mxf.success, "{}", from_mxf.error);
+        assert!(
+            (from_mxf.leq_m_db - from_wav.leq_m_db).abs() < 0.01,
+            "mxf {} dB, wav {} dB",
+            from_mxf.leq_m_db,
+            from_wav.leq_m_db
+        );
+
+        let wav_loudness = measure_loudness(&wav);
+        let mxf_loudness = measure_loudness(&mxf);
+        assert!(mxf_loudness.success, "{}", mxf_loudness.error);
+        for (name, from_mxf, from_wav) in [
+            (
+                "integrated",
+                mxf_loudness.integrated_lufs,
+                wav_loudness.integrated_lufs,
+            ),
+            ("range", mxf_loudness.range_lu, wav_loudness.range_lu),
+            (
+                "true peak",
+                mxf_loudness.true_peak_dbtp,
+                wav_loudness.true_peak_dbtp,
+            ),
+            (
+                "short term max",
+                mxf_loudness.short_term_max_lufs,
+                wav_loudness.short_term_max_lufs,
+            ),
+        ] {
+            assert!(
+                (from_mxf - from_wav).abs() < 0.01,
+                "{name}: mxf {from_mxf}, wav {from_wav}"
+            );
+        }
+
+        let peak_from_mxf = measure_true_peak_dbtp(&mxf).unwrap();
+        let peak_from_wav = measure_true_peak_dbtp(&wav).unwrap();
+        assert!(
+            (peak_from_mxf - peak_from_wav).abs() < 0.01,
+            "mxf {peak_from_mxf} dBTP, wav {peak_from_wav} dBTP"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_neither_wav_nor_mxf_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let bogus = dir.path().join("audio.dat");
+        std::fs::write(&bogus, b"neither riff nor an mxf partition pack").unwrap();
+
+        let loudness = measure_loudness(&bogus);
+        assert!(!loudness.success);
+        assert!(!loudness.error.is_empty());
+        let leq_m = measure_leq_m(&bogus);
+        assert!(!leq_m.success);
+        assert!(!leq_m.error.is_empty());
+        assert!(measure_true_peak_dbtp(&bogus).is_err());
     }
 
     #[test]
