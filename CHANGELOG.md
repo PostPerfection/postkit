@@ -323,6 +323,25 @@
 
 ### Changed
 
+- **`loudness::measure_loudness` and `measure_leq_m` measure in process**: no
+  ffmpeg, so the input is a WAV (PCM 8/16/24/32-bit integer or 32-bit float,
+  whatever hound reads). `measure_loudness` makes one streamed pass that feeds
+  a `Mode::TRUE_PEAK` meter per channel and one `Mode::I | Mode::LRA` meter
+  over every channel, reading short-term loudness at R128's own 100 ms cadence
+  as the mean of the meter's 100 ms energies, and returns the integrated
+  loudness, the range, the true peak and the largest short-term window. On a
+  15 minute six channel 24-bit WAV: 2.0 s and 21 MB against the two ffmpeg
+  passes' 101.2 s and 177 MB, with integrated -17.64 LUFS against loudnorm's
+  -17.68, LRA 24.06 against 24.00, true peak -0.20 dBTP against -0.20, and a
+  short-term max of -9.39 LUFS against the ebur128 filter's -9.4.
+  `measure_leq_m` streams the same reader, downmixing each block with the mean
+  of its channels, which is the downmix `plan_gain` has always weighted a
+  Leq(m) target against. ffmpeg's `-ac 1` summed a 5.1 layout at near unity
+  instead, so a multichannel file now measures lower: the same WAV reads
+  70.19 dB where the ffmpeg decode read 84.00 dB. Handed that file's own
+  `-ac 1` mono, the streamed path returns the ffmpeg path's number to six
+  digits, so the weighting is unchanged and the shift is the downmix alone.
+
 - **CI runs every test**: ffmpeg 8.1 is installed on all three runners, from
   the BtbN static build on Linux and Windows and from conda-forge on macOS,
   where Homebrew's is built without libass or freetype and the burn-in tests

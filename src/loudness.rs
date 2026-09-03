@@ -4,7 +4,6 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek};
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 /// EBU R128 loudness measurement result.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -22,111 +21,167 @@ pub struct LoudnessResult {
     pub error: String,
 }
 
-/// Measure audio loudness per EBU R128 using ffmpeg.
+/// Measure audio loudness per EBU R128 from a WAV, in one streamed pass.
 pub fn measure_loudness(input: &Path) -> LoudnessResult {
-    let output = match std::process::Command::new("ffmpeg")
-        .args([
-            "-i",
-            &input.to_string_lossy(),
-            "-af",
-            "loudnorm=print_format=json",
-            "-f",
-            "null",
-            "-",
-        ])
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
-            return LoudnessResult {
-                success: false,
-                error: format!("Failed to run ffmpeg: {e}"),
-                ..Default::default()
-            };
-        }
-    };
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // Parse loudnorm JSON output from ffmpeg stderr
-    if let Some(json_start) = stderr.rfind('{')
-        && let Some(json_end) = stderr[json_start..].find('}')
-    {
-        let json_str = &stderr[json_start..json_start + json_end + 1];
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-            return LoudnessResult {
-                integrated_lufs: val["input_i"]
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0),
-                range_lu: val["input_lra"]
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0),
-                true_peak_dbtp: val["input_tp"]
-                    .as_str()
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0.0),
-                // loudnorm's JSON has no short-term field; measure it separately.
-                short_term_max_lufs: measure_short_term_max(input).unwrap_or(0.0),
-                success: true,
-                error: String::new(),
-            };
-        }
-    }
-
-    LoudnessResult {
-        success: false,
-        error: "Failed to parse loudnorm output from ffmpeg".to_string(),
-        ..Default::default()
+    match stream_loudness(input) {
+        Ok((true_peak_dbtp, summary)) => LoudnessResult {
+            integrated_lufs: summary.integrated_lufs,
+            range_lu: summary.range_lu,
+            true_peak_dbtp,
+            short_term_max_lufs: summary.short_term_max_lufs,
+            success: true,
+            error: String::new(),
+        },
+        Err(error) => LoudnessResult {
+            success: false,
+            error: error.to_string(),
+            ..Default::default()
+        },
     }
 }
 
-/// Max short-term (3s window) loudness via ffmpeg's ebur128 filter.
-fn measure_short_term_max(input: &Path) -> Option<f64> {
-    let output = std::process::Command::new("ffmpeg")
-        .args([
-            "-i",
-            &input.to_string_lossy(),
-            "-af",
-            "ebur128",
-            "-f",
-            "null",
-            "-",
-        ])
-        .output()
-        .ok()?;
-    parse_short_term_max(&String::from_utf8_lossy(&output.stderr))
-}
-
-/// Largest `S:` (short-term LUFS) value in ebur128 stderr output.
-///
-/// ebur128 prints per-window lines like
-/// `[Parsed_ebur128_0 @ ..] t: 3 M: -22.0 S: -19.8 I: -23.0 LUFS ...`; the
-/// short-term max is the largest finite `S:` across them.
-fn parse_short_term_max(stderr: &str) -> Option<f64> {
-    let mut max: Option<f64> = None;
-    for line in stderr.lines() {
-        if let Some(pos) = line.find("S:") {
-            let rest = line[pos + 2..].trim_start();
-            let token = rest.split_whitespace().next().unwrap_or("");
-            if let Ok(v) = token.parse::<f64>()
-                && v.is_finite()
-            {
-                max = Some(max.map_or(v, |m: f64| m.max(v)));
-            }
-        }
-    }
-    max
+pub fn measure_true_peak_dbtp(input: &Path) -> Result<f64, AdjustError> {
+    stream_true_peak(input, None)
 }
 
 // frames per add_frames call, about a second of audio at 48 kHz
 const TRUE_PEAK_BLOCK_FRAMES: usize = 48_000;
 
+// blocks a meter may fall behind by before the reader waits for it
+const QUEUED_BLOCKS_PER_METER: usize = 2;
+
 // every integer width is widened to i32 scale before this divide
 const FULL_SCALE_I32: f32 = 2_147_483_648.0;
 
-pub fn measure_true_peak_dbtp(input: &Path) -> Result<f64, AdjustError> {
+// short term loudness is read at R128's own 100 ms block cadence
+const SHORT_TERM_SUB_BLOCK_MILLISECONDS: u32 = 100;
+
+const MILLISECONDS_PER_SECOND: u32 = 1000;
+
+// the 3 s short term window is this many sub blocks
+const SHORT_TERM_WINDOW_SUB_BLOCKS: usize = 30;
+
+// BS.1770 loudness of an energy is 10 * log10(energy) minus this
+const R128_LOUDNESS_OFFSET_DB: f64 = 0.691;
+
+struct R128Summary {
+    integrated_lufs: f64,
+    range_lu: f64,
+    short_term_max_lufs: f64,
+}
+
+// one meter over every channel, reading short term loudness as the audio goes in
+struct R128Meter {
+    meter: EbuR128,
+    sub_block_samples: usize,
+    pending: Vec<f32>,
+    sub_block_energies: std::collections::VecDeque<f64>,
+    short_term_max_lufs: f64,
+}
+
+impl R128Meter {
+    fn new(channels: u32, sample_rate: u32) -> Result<Self, AdjustError> {
+        let meter = EbuR128::new(channels, sample_rate, Mode::I | Mode::LRA)?;
+        let sub_block_frames =
+            (sample_rate * SHORT_TERM_SUB_BLOCK_MILLISECONDS / MILLISECONDS_PER_SECOND) as usize;
+        let sub_block_samples = sub_block_frames * channels as usize;
+        Ok(Self {
+            meter,
+            sub_block_samples,
+            pending: Vec::with_capacity(sub_block_samples),
+            sub_block_energies: std::collections::VecDeque::with_capacity(
+                SHORT_TERM_WINDOW_SUB_BLOCKS,
+            ),
+            short_term_max_lufs: f64::NEG_INFINITY,
+        })
+    }
+
+    fn add(&mut self, interleaved: &[f32]) -> Result<(), AdjustError> {
+        let mut rest = interleaved;
+        if !self.pending.is_empty() {
+            let wanted = (self.sub_block_samples - self.pending.len()).min(rest.len());
+            let (head, tail) = rest.split_at(wanted);
+            self.pending.extend_from_slice(head);
+            rest = tail;
+            if self.pending.len() < self.sub_block_samples {
+                return Ok(());
+            }
+            let mut full = std::mem::take(&mut self.pending);
+            self.add_sub_block(&full)?;
+            full.clear();
+            self.pending = full;
+        }
+        let mut sub_blocks = rest.chunks_exact(self.sub_block_samples);
+        for sub_block in &mut sub_blocks {
+            self.add_sub_block(sub_block)?;
+        }
+        self.pending.extend_from_slice(sub_blocks.remainder());
+        Ok(())
+    }
+
+    fn add_sub_block(&mut self, interleaved: &[f32]) -> Result<(), AdjustError> {
+        self.meter.add_frames_f32(interleaved)?;
+        // loudness_shortterm re-sums the whole 3 s window on every call
+        let loudness = self
+            .meter
+            .loudness_window(SHORT_TERM_SUB_BLOCK_MILLISECONDS)?;
+        let energy = if loudness.is_finite() {
+            10f64.powf((loudness + R128_LOUDNESS_OFFSET_DB) / 10.0)
+        } else {
+            0.0
+        };
+        if self.sub_block_energies.len() == SHORT_TERM_WINDOW_SUB_BLOCKS {
+            self.sub_block_energies.pop_front();
+        }
+        self.sub_block_energies.push_back(energy);
+        if self.sub_block_energies.len() < SHORT_TERM_WINDOW_SUB_BLOCKS {
+            return Ok(());
+        }
+        let window_energy =
+            self.sub_block_energies.iter().sum::<f64>() / SHORT_TERM_WINDOW_SUB_BLOCKS as f64;
+        if window_energy > 0.0 {
+            let short_term = 10.0 * window_energy.log10() - R128_LOUDNESS_OFFSET_DB;
+            self.short_term_max_lufs = self.short_term_max_lufs.max(short_term);
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<R128Summary, AdjustError> {
+        // a part sub block gets no short term reading of its own
+        if !self.pending.is_empty() {
+            let tail = std::mem::take(&mut self.pending);
+            self.meter.add_frames_f32(&tail)?;
+        }
+        Ok(R128Summary {
+            integrated_lufs: self.meter.loudness_global()?,
+            range_lu: self.meter.loudness_range()?,
+            short_term_max_lufs: self.short_term_max_lufs,
+        })
+    }
+}
+
+fn stream_loudness(input: &Path) -> Result<(f64, R128Summary), AdjustError> {
+    let spec = WavReader::open(input)?.spec();
+    let channels = spec.channels as u32;
+    let rate = spec.sample_rate;
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(QUEUED_BLOCKS_PER_METER);
+    let meter_thread = std::thread::spawn(move || -> Result<R128Summary, AdjustError> {
+        let mut meter = R128Meter::new(channels, rate)?;
+        while let Ok(interleaved) = receiver.recv() {
+            meter.add(&interleaved)?;
+        }
+        meter.finish()
+    });
+    let true_peak = stream_true_peak(input, Some(sender));
+    let summary = meter_thread.join().expect("r128 meter thread panicked");
+    Ok((true_peak?, summary?))
+}
+
+// per channel true peak, handing `also` the same interleaved blocks when it is there
+fn stream_true_peak(
+    input: &Path,
+    also: Option<std::sync::mpsc::SyncSender<Vec<f32>>>,
+) -> Result<f64, AdjustError> {
     let reader = WavReader::open(input)?;
     let spec = reader.spec();
     let channels = spec.channels as usize;
@@ -137,7 +192,7 @@ pub fn measure_true_peak_dbtp(input: &Path) -> Result<f64, AdjustError> {
     let mut senders = Vec::with_capacity(channels);
     let mut receivers = Vec::with_capacity(channels);
     for _ in 0..channels {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(2);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<f32>>(QUEUED_BLOCKS_PER_METER);
         senders.push(sender);
         receivers.push(receiver);
     }
@@ -171,9 +226,13 @@ pub fn measure_true_peak_dbtp(input: &Path) -> Result<f64, AdjustError> {
                 // a worker that stopped early says why through its join
                 let _ = sender.send(plane);
             }
+            if let Some(sender) = &also {
+                let _ = sender.send(interleaved.to_vec());
+            }
             Ok(())
         });
         drop(senders);
+        drop(also);
 
         let mut peak_linear = 0.0f64;
         for worker in workers {
@@ -377,6 +436,66 @@ fn weighted_block_energy(fft: &dyn rustfft::Fft<f32>, samples: &[f32], sample_ra
     energy / n as f64
 }
 
+// the weighted energy of every whole LEQ_BLOCK fed in so far, plus the part block
+struct LeqMEnergy {
+    fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
+    sample_rate: u32,
+    pending: Vec<f32>,
+    total_energy: f64,
+    total_samples: u64,
+}
+
+impl LeqMEnergy {
+    fn new(sample_rate: u32) -> Self {
+        Self {
+            fft: FftPlanner::<f32>::new().plan_fft_forward(LEQ_BLOCK),
+            sample_rate,
+            pending: Vec::with_capacity(LEQ_BLOCK),
+            total_energy: 0.0,
+            total_samples: 0,
+        }
+    }
+
+    fn add(&mut self, mono: &[f32]) {
+        let mut rest = mono;
+        if !self.pending.is_empty() {
+            let wanted = (LEQ_BLOCK - self.pending.len()).min(rest.len());
+            let (head, tail) = rest.split_at(wanted);
+            self.pending.extend_from_slice(head);
+            rest = tail;
+            if self.pending.len() < LEQ_BLOCK {
+                return;
+            }
+            let mut full = std::mem::take(&mut self.pending);
+            self.add_block(&full);
+            full.clear();
+            self.pending = full;
+        }
+        let (blocks, remainder) = rest.as_chunks::<LEQ_BLOCK>();
+        for block in blocks {
+            self.add_block(block);
+        }
+        self.pending.extend_from_slice(remainder);
+    }
+
+    fn add_block(&mut self, block: &[f32]) {
+        self.total_energy += weighted_block_energy(self.fft.as_ref(), block, self.sample_rate);
+        self.total_samples += block.len() as u64;
+    }
+
+    fn finish(mut self) -> f64 {
+        if !self.pending.is_empty() {
+            let tail = std::mem::take(&mut self.pending);
+            self.add_block(&tail);
+        }
+        if self.total_samples == 0 {
+            return f64::NEG_INFINITY;
+        }
+        let mean_square = self.total_energy / self.total_samples as f64;
+        10.0 * mean_square.log10() + LEQ_M_REFERENCE_OFFSET_DB
+    }
+}
+
 /// Compute Leq(m) (ISO 21727) in dB from mono PCM samples in full-scale units
 /// (-1.0..=1.0). The signal is CCIR 468-weighted and its equivalent continuous
 /// level is referenced to the cinema B-chain calibration.
@@ -384,17 +503,13 @@ pub fn leq_m_from_samples(samples: &[f32], sample_rate: u32) -> f64 {
     if samples.is_empty() || sample_rate == 0 {
         return f64::NEG_INFINITY;
     }
-    let fft = FftPlanner::<f32>::new().plan_fft_forward(LEQ_BLOCK);
-    let mut total_energy = 0.0f64;
-    for block in samples.chunks(LEQ_BLOCK) {
-        total_energy += weighted_block_energy(fft.as_ref(), block, sample_rate);
-    }
-    let mean_square = total_energy / samples.len() as f64;
-    10.0 * mean_square.log10() + LEQ_M_REFERENCE_OFFSET_DB
+    let mut energy = LeqMEnergy::new(sample_rate);
+    energy.add(samples);
+    energy.finish()
 }
 
-/// Measure Leq(m) (ISO 21727) of an audio file. Decodes to mono f32 PCM at
-/// 48 kHz via ffmpeg and processes it in bounded blocks.
+/// Measure Leq(m) (ISO 21727) of a WAV file, streamed in bounded blocks and
+/// downmixed to mono at the file's own sample rate.
 pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
     if !audio_file.exists() {
         return LeqMResult {
@@ -402,86 +517,32 @@ pub fn measure_leq_m(audio_file: &Path) -> LeqMResult {
             ..Default::default()
         };
     }
-
-    const SR: u32 = 48000;
-    let mut child = match Command::new("ffmpeg")
-        .args([
-            "-v",
-            "quiet",
-            "-i",
-            &audio_file.to_string_lossy(),
-            "-ac",
-            "1",
-            "-ar",
-            "48000",
-            "-f",
-            "f32le",
-            "-",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return LeqMResult {
-                error: format!("Failed to run ffmpeg: {e}"),
-                ..Default::default()
-            };
-        }
-    };
-
-    let mut stdout = child.stdout.take().unwrap();
-    let fft = FftPlanner::<f32>::new().plan_fft_forward(LEQ_BLOCK);
-    let mut total_energy = 0.0f64;
-    let mut total_samples = 0u64;
-    let mut block: Vec<f32> = Vec::with_capacity(LEQ_BLOCK);
-    let mut byte_buf = [0u8; LEQ_BLOCK * 4];
-    let mut carry: Vec<u8> = Vec::new();
-
-    loop {
-        let n = match stdout.read(&mut byte_buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(e) => {
-                let _ = child.wait();
-                return LeqMResult {
-                    error: format!("Failed to read ffmpeg output: {e}"),
-                    ..Default::default()
-                };
-            }
-        };
-        carry.extend_from_slice(&byte_buf[..n]);
-        let whole = carry.len() / 4 * 4;
-        for chunk in carry[..whole].as_chunks::<4>().0 {
-            block.push(f32::from_le_bytes(*chunk));
-            if block.len() == LEQ_BLOCK {
-                total_energy += weighted_block_energy(fft.as_ref(), &block, SR);
-                total_samples += block.len() as u64;
-                block.clear();
-            }
-        }
-        carry.drain(..whole);
-    }
-    if !block.is_empty() {
-        total_energy += weighted_block_energy(fft.as_ref(), &block, SR);
-        total_samples += block.len() as u64;
-    }
-    let _ = child.wait();
-
-    if total_samples == 0 {
-        return LeqMResult {
-            error: "ffmpeg decoded no audio samples".into(),
+    match stream_leq_m(audio_file) {
+        Ok(leq_m_db) => LeqMResult {
+            leq_m_db,
+            success: true,
+            error: String::new(),
+        },
+        Err(error) => LeqMResult {
+            error: error.to_string(),
             ..Default::default()
-        };
+        },
     }
+}
 
-    let mean_square = total_energy / total_samples as f64;
-    LeqMResult {
-        leq_m_db: 10.0 * mean_square.log10() + LEQ_M_REFERENCE_OFFSET_DB,
-        success: true,
-        error: String::new(),
+fn stream_leq_m(input: &Path) -> Result<f64, AdjustError> {
+    let reader = WavReader::open(input)?;
+    let spec = reader.spec();
+    let channels = spec.channels as usize;
+    if channels == 0 || reader.duration() == 0 {
+        return Err(AdjustError::Empty);
     }
+    let mut energy = LeqMEnergy::new(spec.sample_rate);
+    read_blocks(input, spec, |interleaved| {
+        energy.add(&downmix_mono(interleaved, channels));
+        Ok(())
+    })?;
+    Ok(energy.finish())
 }
 
 // Loudness adjustment (dom#1382): pure sample-domain gain to hit a target.
@@ -690,6 +751,78 @@ pub fn adjust_loudness(
 mod tests {
     use super::*;
     use std::f32::consts::PI;
+    use std::process::Command;
+
+    // what ffmpeg's loudnorm filter measured, the oracle these tests hold to
+    struct LoudnormOracle {
+        integrated_lufs: f64,
+        range_lu: f64,
+        true_peak_dbtp: f64,
+    }
+
+    fn parse_loudnorm(stderr: &str) -> Option<LoudnormOracle> {
+        let start = stderr.rfind('{')?;
+        let end = stderr[start..].find('}')?;
+        let value: serde_json::Value =
+            serde_json::from_str(&stderr[start..start + end + 1]).ok()?;
+        let field = |name: &str| value[name].as_str().and_then(|s| s.parse::<f64>().ok());
+        Some(LoudnormOracle {
+            integrated_lufs: field("input_i")?,
+            range_lu: field("input_lra")?,
+            true_peak_dbtp: field("input_tp")?,
+        })
+    }
+
+    fn loudnorm_oracle(input: &Path) -> LoudnormOracle {
+        let output = Command::new("ffmpeg")
+            .args([
+                "-i",
+                &input.to_string_lossy(),
+                "-af",
+                "loudnorm=print_format=json",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .expect("ffmpeg must be on PATH");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        parse_loudnorm(&stderr).unwrap_or_else(|| panic!("no loudnorm json in:\n{stderr}"))
+    }
+
+    // largest finite `S:` (short-term LUFS) in ebur128 stderr output
+    fn parse_short_term_max(stderr: &str) -> Option<f64> {
+        let mut max: Option<f64> = None;
+        for line in stderr.lines() {
+            if let Some(pos) = line.find("S:") {
+                let rest = line[pos + 2..].trim_start();
+                let token = rest.split_whitespace().next().unwrap_or("");
+                if let Ok(v) = token.parse::<f64>()
+                    && v.is_finite()
+                {
+                    max = Some(max.map_or(v, |m: f64| m.max(v)));
+                }
+            }
+        }
+        max
+    }
+
+    fn ebur128_short_term_max_oracle(input: &Path) -> f64 {
+        let output = Command::new("ffmpeg")
+            .args([
+                "-i",
+                &input.to_string_lossy(),
+                "-af",
+                "ebur128",
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .expect("ffmpeg must be on PATH");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        parse_short_term_max(&stderr).unwrap_or_else(|| panic!("no ebur128 S: lines in:\n{stderr}"))
+    }
 
     #[test]
     fn parses_max_short_term_from_ebur128() {
@@ -920,14 +1053,125 @@ mod tests {
         write_tone_on_first_channel(&src, int_spec(2, 24), 997.0, 0.5, 4.0);
 
         let measured = measure_true_peak_dbtp(&src).unwrap();
-        let ffmpeg = measure_loudness(&src);
-        assert!(ffmpeg.success, "{}", ffmpeg.error);
-        let difference = (measured - ffmpeg.true_peak_dbtp).abs();
+        let oracle = loudnorm_oracle(&src);
+        let difference = (measured - oracle.true_peak_dbtp).abs();
         assert!(
             difference < 0.1,
             "rust {measured} dBTP, loudnorm {} dBTP",
-            ffmpeg.true_peak_dbtp
+            oracle.true_peak_dbtp
         );
+    }
+
+    // a 997 Hz tone stepping -30, -12, -30 dBFS on the left with the right 6 dB
+    // down, so the integrated level, the range and the short term max all differ
+    fn write_stepped_tone(path: &Path, spec: WavSpec, step_seconds: f32) {
+        const RIGHT_CHANNEL_SCALE: f32 = 0.5;
+        let amplitudes = [0.031_622_776, 0.251_188_64, 0.031_622_776];
+        let sample_rate = spec.sample_rate;
+        let step_frames = (sample_rate as f32 * step_seconds) as usize;
+        let full_scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
+        let mut writer = WavWriter::create(path, spec).unwrap();
+        for (step, amplitude) in amplitudes.iter().enumerate() {
+            for frame in 0..step_frames {
+                let index = (step * step_frames + frame) as f32;
+                let value = amplitude * (2.0 * PI * 997.0 * index / sample_rate as f32).sin();
+                for channel in 0..spec.channels {
+                    let scaled = if channel == 0 {
+                        value
+                    } else {
+                        value * RIGHT_CHANNEL_SCALE
+                    };
+                    writer
+                        .write_sample((scaled * full_scale).round() as i32)
+                        .unwrap();
+                }
+            }
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn loudness_agrees_with_ffmpeg() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("stepped.wav");
+        write_stepped_tone(&src, int_spec(2, 24), 6.0);
+
+        let measured = measure_loudness(&src);
+        assert!(measured.success, "{}", measured.error);
+        let oracle = loudnorm_oracle(&src);
+        assert!(
+            (measured.integrated_lufs - oracle.integrated_lufs).abs() < 0.1,
+            "rust {} LUFS, loudnorm {} LUFS",
+            measured.integrated_lufs,
+            oracle.integrated_lufs
+        );
+        assert!(
+            (measured.range_lu - oracle.range_lu).abs() < 0.5,
+            "rust {} LU, loudnorm {} LU",
+            measured.range_lu,
+            oracle.range_lu
+        );
+        assert!(
+            (measured.true_peak_dbtp - oracle.true_peak_dbtp).abs() < 0.1,
+            "rust {} dBTP, loudnorm {} dBTP",
+            measured.true_peak_dbtp,
+            oracle.true_peak_dbtp
+        );
+        let short_term_oracle = ebur128_short_term_max_oracle(&src);
+        assert!(
+            (measured.short_term_max_lufs - short_term_oracle).abs() < 0.15,
+            "rust {} LUFS, ebur128 filter {short_term_oracle} LUFS",
+            measured.short_term_max_lufs
+        );
+    }
+
+    #[test]
+    fn leq_m_matches_the_in_memory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("stepped6.wav");
+        write_stepped_tone(&src, int_spec(6, 24), 2.0);
+
+        let streamed = measure_leq_m(&src);
+        assert!(streamed.success, "{}", streamed.error);
+        let (spec, pcm) = load_pcm(&src).unwrap();
+        let interleaved = pcm.normalized(spec.bits_per_sample);
+        let in_memory = leq_m_from_samples(
+            &downmix_mono(&interleaved, spec.channels as usize),
+            spec.sample_rate,
+        );
+        assert!(
+            (streamed.leq_m_db - in_memory).abs() < 0.01,
+            "streamed {} dB, in memory {in_memory} dB",
+            streamed.leq_m_db
+        );
+    }
+
+    #[test]
+    fn a_missing_file_fails_loud() {
+        let missing = Path::new("/nonexistent/loudness/input.wav");
+        let loudness = measure_loudness(missing);
+        assert!(!loudness.success);
+        assert!(!loudness.error.is_empty());
+        let leq_m = measure_leq_m(missing);
+        assert!(!leq_m.success);
+        assert!(!leq_m.error.is_empty());
+    }
+
+    #[test]
+    fn a_wav_with_no_frames_fails_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("silent.wav");
+        WavWriter::create(&src, int_spec(2, 24))
+            .unwrap()
+            .finalize()
+            .unwrap();
+
+        let loudness = measure_loudness(&src);
+        assert!(!loudness.success);
+        assert!(!loudness.error.is_empty());
+        let leq_m = measure_leq_m(&src);
+        assert!(!leq_m.success);
+        assert!(!leq_m.error.is_empty());
     }
 
     #[test]
