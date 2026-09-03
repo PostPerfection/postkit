@@ -13,9 +13,10 @@
 //! A bitmap cue rather than text, so the test does not depend on a system font.
 
 use postkit::encode::FrameRate;
+use postkit::grok_encoder::SampleOrder;
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_with_options};
 use postkit::subtitle_formats::{Rgba, StyledCue, StyledRun, VAlign};
-use postkit::subtitle_raster::{BurnEffect, BurnStyle, SampleOrder, SubtitleBurn};
+use postkit::subtitle_raster::{BurnEffect, BurnStyle, SubtitleBurn};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

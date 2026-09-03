@@ -1,3 +1,4 @@
+use crate::grok_encoder::SampleOrder;
 use std::path::{Path, PathBuf};
 
 /// Loaded TIFF frame: planar int32 component buffers + metadata.
@@ -9,25 +10,30 @@ pub struct TiffFrame {
     pub path: PathBuf,
 }
 
-/// The sample depth of a packed rgb48be frame.
+/// The sample depth of a packed rgb48 frame.
 const RGB48_PRECISION: u8 = 16;
 
 impl TiffFrame {
-    /// The frame as packed big-endian 16-bit RGB, the form the encoder threads
+    /// The frame as packed 16-bit RGB in `order`, the form the encoder threads
     /// burn subtitles and convert colour on. Shallower samples are shifted up
     /// to 16 bits, so a 12-bit still comes back exactly once the encoder
     /// shifts it down again.
-    pub fn into_rgb48be_frame(self, index: u64) -> crate::grok_encoder::RawFrame {
+    pub fn into_rgb48_frame(self, index: u64, order: SampleOrder) -> crate::grok_encoder::RawFrame {
         let shift = RGB48_PRECISION - self.precision;
         let [r, g, b] = self.components;
         let mut data = Vec::with_capacity(r.len() * 6);
         for ((r, g), b) in r.iter().zip(&g).zip(&b) {
             for sample in [r, g, b] {
-                data.extend_from_slice(&((*sample as u16) << shift).to_be_bytes());
+                let sample = (*sample as u16) << shift;
+                match order {
+                    SampleOrder::Big => data.extend_from_slice(&sample.to_be_bytes()),
+                    SampleOrder::Little => data.extend_from_slice(&sample.to_le_bytes()),
+                }
             }
         }
         crate::grok_encoder::RawFrame::Packed {
             data,
+            order,
             width: self.width,
             height: self.height,
             precision: RGB48_PRECISION,
@@ -344,28 +350,40 @@ mod tests {
 
     #[test]
     fn a_tiff_frame_packs_to_rgb48_with_its_samples_scaled_to_16_bits() {
-        let frame = TiffFrame {
+        let still = || TiffFrame {
             components: [vec![0xfff, 1], vec![0, 0x800], vec![0x7ff, 0]],
             width: 2,
             height: 1,
             precision: 12,
             path: PathBuf::new(),
         };
-        let crate::grok_encoder::RawFrame::Packed {
-            data,
-            width,
-            height,
-            precision,
-            index,
-        } = frame.into_rgb48be_frame(7)
-        else {
-            panic!("a tiff frame packs")
+        let packed = |order| {
+            let crate::grok_encoder::RawFrame::Packed {
+                data,
+                order: packed_order,
+                width,
+                height,
+                precision,
+                index,
+            } = still().into_rgb48_frame(7, order)
+            else {
+                panic!("a tiff frame packs")
+            };
+            assert_eq!((width, height, precision, index), (2, 1, 16, 7));
+            assert_eq!(packed_order, order);
+            data
         };
-        assert_eq!((width, height, precision, index), (2, 1, 16, 7));
+
         assert_eq!(
-            data,
+            packed(SampleOrder::Big),
             vec![
                 0xff, 0xf0, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00
+            ]
+        );
+        assert_eq!(
+            packed(SampleOrder::Little),
+            vec![
+                0xf0, 0xff, 0x00, 0x00, 0xf0, 0x7f, 0x10, 0x00, 0x00, 0x80, 0x00, 0x00
             ]
         );
     }

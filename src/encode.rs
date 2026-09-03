@@ -1,3 +1,4 @@
+use crate::grok_encoder::SampleOrder;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -377,8 +378,11 @@ impl DecodeSource {
 /// cannot decode falls back to software decoding with no error.
 pub(crate) const HARDWARE_DECODE_ARGS: [&str; 2] = ["-hwaccel", "cuda"];
 
-/// Packed 16-bit big-endian RGB: three components per pixel, six bytes.
-const PACKED_RGB_PIXEL_FORMAT: &str = "rgb48be";
+/// Packed 16-bit RGB: three components per pixel, six bytes. postkit
+/// deinterleaves the big-endian layout itself and hands the little-endian one to
+/// grok's accelerator plugin as it arrives.
+const PACKED_RGB_BIG_ENDIAN_PIXEL_FORMAT: &str = "rgb48be";
+const PACKED_RGB_LITTLE_ENDIAN_PIXEL_FORMAT: &str = "rgb48le";
 const PACKED_RGB_BYTES_PER_PIXEL: usize = 6;
 pub(crate) const PACKED_RGB_PRECISION: u8 = 16;
 
@@ -572,9 +576,10 @@ pub struct YuvFrameFormat {
 /// What ffmpeg writes to the pipe for a stream encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipeFormat {
-    /// Packed 16-bit big-endian RGB. postkit deinterleaves it and the
-    /// compressor converts the colour.
-    PackedRgb,
+    /// Packed 16-bit RGB in that byte order. The compressor converts the
+    /// colour either way: postkit deinterleaves the big-endian layout, and
+    /// grok's accelerator plugin takes the little-endian one interleaved.
+    PackedRgb(SampleOrder),
     /// The source's own planar YUV, handed to grok's accelerator plugin as it
     /// arrives: the plugin upsamples the chroma and converts the colour.
     PlanarYuv(YuvFrameFormat),
@@ -583,7 +588,8 @@ pub enum PipeFormat {
 impl PipeFormat {
     pub fn ffmpeg_pixel_format(&self) -> &'static str {
         match self {
-            PipeFormat::PackedRgb => PACKED_RGB_PIXEL_FORMAT,
+            PipeFormat::PackedRgb(SampleOrder::Big) => PACKED_RGB_BIG_ENDIAN_PIXEL_FORMAT,
+            PipeFormat::PackedRgb(SampleOrder::Little) => PACKED_RGB_LITTLE_ENDIAN_PIXEL_FORMAT,
             PipeFormat::PlanarYuv(format) => format.pixel_format.ffmpeg_name(),
         }
     }
@@ -591,7 +597,9 @@ impl PipeFormat {
     /// Bytes one frame takes on the pipe.
     pub fn frame_bytes(&self, width: u32, height: u32) -> usize {
         match self {
-            PipeFormat::PackedRgb => width as usize * height as usize * PACKED_RGB_BYTES_PER_PIXEL,
+            PipeFormat::PackedRgb(_) => {
+                width as usize * height as usize * PACKED_RGB_BYTES_PER_PIXEL
+            }
             PipeFormat::PlanarYuv(format) => {
                 format.pixel_format.plane_layout(width, height).frame_bytes
             }
@@ -633,7 +641,7 @@ pub(crate) fn choose_pipe_format(
             SourceColour::DisplayRgbIn(_) | SourceColour::DciLut(_)
         );
     let Some(pixel_format) = PlanarYuvPixelFormat::from_ffmpeg_name(&inputs.source.pix_fmt) else {
-        return PipeFormat::PackedRgb;
+        return PipeFormat::PackedRgb(SampleOrder::Big);
     };
     if !inputs.accelerator_active
         || !plugin_takes_planar_yuv
@@ -641,13 +649,64 @@ pub(crate) fn choose_pipe_format(
         || postkit_reads_the_samples
         || filters_change_the_colour(inputs.filters)
     {
-        return PipeFormat::PackedRgb;
+        return PipeFormat::PackedRgb(SampleOrder::Big);
     }
     PipeFormat::PlanarYuv(YuvFrameFormat {
         pixel_format,
         matrix: YuvMatrix::for_ffprobe_color_space(&inputs.source.color_space),
         full_range: inputs.source.color_range == FULL_RANGE_TAG,
     })
+}
+
+/// rgb48le when grok's accelerator plugin takes an interleaved 16-bit RGB batch
+/// at this frame shape and these compression parameters, and rgb48be otherwise,
+/// which postkit deinterleaves itself.
+pub(crate) fn packed_rgb_sample_order(
+    width: u32,
+    height: u32,
+    params: &crate::grok_encoder::CompressParams,
+) -> SampleOrder {
+    let shape_only = crate::grok_encoder::RawFrame::Packed {
+        data: Vec::new(),
+        order: SampleOrder::Little,
+        width,
+        height,
+        precision: PACKED_RGB_PRECISION,
+        index: 0,
+    };
+    if crate::grok_encoder::plugin_takes_frame(&shape_only, params) {
+        SampleOrder::Little
+    } else {
+        SampleOrder::Big
+    }
+}
+
+/// The pixel format one run's decode writes: what [`choose_pipe_format`] allows,
+/// then grok's accelerator plugin asked about the frames that source would send
+/// it.
+///
+/// The plugin is asked last, and only about a source everything else already
+/// allows through, because each ask starts a batch. A run asks at most twice: a
+/// declined YUV source falls back to packed RGB, which is asked about in turn.
+pub(crate) fn pipe_format_for_run(
+    inputs: &PipeFormatInputs,
+    width: u32,
+    height: u32,
+    params: &crate::grok_encoder::CompressParams,
+) -> PipeFormat {
+    if let PipeFormat::PlanarYuv(format) = choose_pipe_format(inputs, true) {
+        let shape_only = crate::grok_encoder::RawFrame::PlanarYuv {
+            data: Vec::new(),
+            format,
+            width,
+            height,
+            index: 0,
+        };
+        if crate::grok_encoder::plugin_takes_frame(&shape_only, params) {
+            return PipeFormat::PlanarYuv(format);
+        }
+    }
+    PipeFormat::PackedRgb(packed_rgb_sample_order(width, height, params))
 }
 
 /// Every ffmpeg argument that goes before `-i` for a stream decode: what the
@@ -1035,9 +1094,7 @@ where
         opts.frame_range,
     ));
     let accelerator_active = grok_encoder::gpu_active();
-    // the plugin is asked last, and only about a source everything else already
-    // allows through, because asking it starts a batch
-    let candidate = choose_pipe_format(
+    let pipe_format = pipe_format_for_run(
         &PipeFormatInputs {
             accelerator_active,
             quality_psnr: opts.quality_psnr,
@@ -1046,16 +1103,10 @@ where
             filters: &filters,
             source: &crate::probe::probe_pixel_format(&opts.input),
         },
-        true,
+        width,
+        height,
+        &params,
     );
-    let pipe_format = match candidate {
-        PipeFormat::PlanarYuv(format)
-            if !grok_encoder::plugin_takes_planar_yuv(format, width, height, &params) =>
-        {
-            PipeFormat::PackedRgb
-        }
-        chosen => chosen,
-    };
     tracing::info!(
         pixel_format = pipe_format.ffmpeg_pixel_format(),
         hardware_decode = accelerator_active,
@@ -1159,11 +1210,12 @@ where
             frame_index += 1;
 
             // Pass the bytes on as they came off the pipe: the encoder threads
-            // deinterleave packed RGB into grok's component buffers, and planar
-            // YUV goes to the plugin untouched
+            // deinterleave big-endian packed RGB into grok's component buffers,
+            // and the other two formats reach the plugin untouched
             Some(match pipe_format {
-                PipeFormat::PackedRgb => RawFrame::Packed {
+                PipeFormat::PackedRgb(order) => RawFrame::Packed {
                     data: frame_buf.clone(),
+                    order,
                     width,
                     height,
                     precision: PACKED_RGB_PRECISION,
@@ -1416,6 +1468,26 @@ where
     }
 }
 
+/// rgb48le when grok's accelerator plugin takes an interleaved batch at the
+/// first still's frame shape, and rgb48be otherwise. Asked once, before the
+/// loaders start, because every frame of a batch has the shape its begin call
+/// declared.
+///
+/// The run itself reports a bad parameter set or an unreadable first still, so
+/// either only decides the byte order here.
+fn tiff_sequence_sample_order(first: &Path, opts: &StreamEncodeOptions) -> SampleOrder {
+    if !crate::grok_encoder::gpu_active() {
+        return SampleOrder::Big;
+    }
+    let Ok(params) = compress_params(opts) else {
+        return SampleOrder::Big;
+    };
+    let Ok(still) = crate::grok::load_tiff(first) else {
+        return SampleOrder::Big;
+    };
+    packed_rgb_sample_order(still.width, still.height, &params)
+}
+
 /// Encode a TIFF sequence through [`encode_loaded_frames`]: each loader thread
 /// reads the stills through `grok::load_tiff` into packed 16-bit RGB, so the
 /// burn, the colour transform, the profile, the byte cap and the MXF feed all
@@ -1440,12 +1512,13 @@ where
             ..Default::default()
         };
     }
+    let order = tiff_sequence_sample_order(&frames[0], opts);
     let open_loader = || -> Result<FrameLoader<'_>, String> {
-        Ok(Box::new(|index: u64| {
+        Ok(Box::new(move |index: u64| {
             let path = &frames[index as usize];
             let tiff = crate::grok::load_tiff(path)
                 .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-            Ok(tiff.into_rgb48be_frame(index))
+            Ok(tiff.into_rgb48_frame(index, order))
         }))
     };
     encode_loaded_frames(
@@ -1695,7 +1768,7 @@ mod tests {
     #[test]
     fn a_frame_window_stops_ffmpeg_at_its_end() {
         assert_eq!(
-            decode_output_args("fps=24", PipeFormat::PackedRgb, None),
+            decode_output_args("fps=24", PipeFormat::PackedRgb(SampleOrder::Big), None),
             vec![
                 "-vf", "fps=24", "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1"
             ]
@@ -1703,7 +1776,7 @@ mod tests {
         assert_eq!(
             decode_output_args(
                 "fps=24",
-                PipeFormat::PackedRgb,
+                PipeFormat::PackedRgb(SampleOrder::Big),
                 Some(FrameRange {
                     first_frame: 10,
                     frame_count: 5,
@@ -2006,7 +2079,7 @@ mod tests {
 
         assert_eq!(
             choose_pipe_format(&accelerated, false),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "a plugin that will not take the planes leaves the run on RGB"
         );
         assert_eq!(
@@ -2017,7 +2090,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "nothing but the plugin reads the planes"
         );
         assert_eq!(
@@ -2028,7 +2101,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "a PSNR target keeps the run off the batch"
         );
         assert_eq!(
@@ -2039,7 +2112,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "a burn needs samples postkit can write into"
         );
         assert_eq!(
@@ -2050,7 +2123,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "geometry work makes ffmpeg convert the picture itself"
         );
         assert_eq!(
@@ -2061,7 +2134,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "a colour filter in the chain leaves nothing of the source's own planes"
         );
         assert!(
@@ -2089,7 +2162,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "postkit converts this source itself and needs RGB"
         );
         let lut = SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube"));
@@ -2101,7 +2174,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "lut3d puts RGB on the pipe"
         );
 
@@ -2130,7 +2203,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb,
+            PipeFormat::PackedRgb(SampleOrder::Big),
             "a source that is not one of the four planar YUV formats stays on RGB"
         );
     }
@@ -2224,8 +2297,22 @@ mod tests {
 
     #[test]
     fn a_pipe_format_names_its_pixel_format_and_sizes_its_frame() {
-        assert_eq!(PipeFormat::PackedRgb.ffmpeg_pixel_format(), "rgb48be");
-        assert_eq!(PipeFormat::PackedRgb.frame_bytes(64, 48), 64 * 48 * 6);
+        assert_eq!(
+            PipeFormat::PackedRgb(SampleOrder::Big).ffmpeg_pixel_format(),
+            "rgb48be"
+        );
+        assert_eq!(
+            PipeFormat::PackedRgb(SampleOrder::Little).ffmpeg_pixel_format(),
+            "rgb48le"
+        );
+        assert_eq!(
+            PipeFormat::PackedRgb(SampleOrder::Big).frame_bytes(64, 48),
+            64 * 48 * 6
+        );
+        assert_eq!(
+            PipeFormat::PackedRgb(SampleOrder::Little).frame_bytes(64, 48),
+            64 * 48 * 6
+        );
         for (pixel_format, name) in [
             (PlanarYuvPixelFormat::Yuv420p, "yuv420p"),
             (PlanarYuvPixelFormat::Yuv422p, "yuv422p"),

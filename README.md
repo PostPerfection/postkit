@@ -92,9 +92,26 @@ the pipeline stays full instead of taking one frame at a time. The frame shape
 comes from the first frame, and a shape or a set of parameters the plugin
 declines puts the whole run back on the CPU. A decode still routes per call,
 and an encode with a PSNR target stays on the CPU, because a frame over the
-byte cap is compressed again by rate. `cargo test --features grok-gpu` runs
-the device round trip and needs a machine with the plugin, CI has no GPU. This
-needs grok v20.4.2 or newer, which has `grk_plugin_set_enabled`.
+byte cap is compressed again by rate.
+
+With the plugin on, ffmpeg decodes with `-hwaccel cuda` and the frames reach
+the batch in the layout the plugin takes rather than the one postkit converts
+itself. A yuv420p, yuv422p, yuv420p10le or yuv422p10le source goes to the pipe
+as its own three planes and the device upsamples the chroma, converts YUV to
+RGB and runs the X'Y'Z' transform. Every other source goes as packed 16-bit
+RGB, little-endian when the plugin takes the interleaved buffer as it comes off
+the pipe and big-endian when postkit deinterleaves it into grok's component
+buffers. postkit asks the plugin which of those it takes before starting the
+decoder, since the answer decides what ffmpeg writes. A subtitle burn,
+postkit's own P3 or Rec.2020 transform, the HDR-to-DCI LUT, a filter that
+changes the pixel format or the colour, and a PSNR target each keep a run on
+packed RGB.
+
+`cargo test --features grok-gpu` runs the device round trip and needs a machine
+with the plugin, CI has no GPU: `tests/grok_gpu.rs` for the round trip,
+`tests/grok_gpu_yuv.rs` for the planar YUV source and
+`tests/grok_gpu_rgb48le.rs` for the interleaved one. This needs grok v20.4.2 or
+newer, which has `grk_plugin_set_enabled`.
 
 ## Usage
 

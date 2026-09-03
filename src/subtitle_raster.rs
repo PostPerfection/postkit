@@ -25,6 +25,7 @@ use cosmic_text::{
     Weight, Wrap,
 };
 
+use crate::grok_encoder::SampleOrder;
 use crate::subtitle_formats::{HAlign, Rgba, StyledCue, StyledRun, SubtitleError, VAlign};
 
 /// Text height as a fraction of frame height when the caller names none. 1/22nd
@@ -359,13 +360,6 @@ impl PositionedBitmap {
         }
         self.pixels[at + 3] = out_alpha as u8;
     }
-}
-
-/// Byte order of the 16-bit samples in a packed rgb48 frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SampleOrder {
-    Big,
-    Little,
 }
 
 /// Alpha-blend `bitmaps` onto a packed rgb48 frame, in order, clipping each to

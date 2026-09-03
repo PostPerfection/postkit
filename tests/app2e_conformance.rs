@@ -110,6 +110,7 @@ fn red_frame() -> postkit::grok_encoder::RawFrame {
     }
     postkit::grok_encoder::RawFrame::Packed {
         data,
+        order: postkit::grok_encoder::SampleOrder::Big,
         width: WIDTH,
         height: HEIGHT,
         precision: 16,

@@ -21,6 +21,47 @@
   `cargo test --features grok-gpu` runs the device round trip on a machine with
   the plugin, CI has no GPU. Needs a grok newer than v20.4.1, which has
   `grk_plugin_set_enabled`.
+- **A source's own planar YUV reaches the device unconverted**:
+  `probe::probe_pixel_format` reads the stream's pixel format, colour space and
+  colour range, and `encode::choose_pipe_format` decides from those what ffmpeg
+  writes to the pipe. With the accelerator on, a yuv420p, yuv422p, yuv420p10le
+  or yuv422p10le source goes to the pipe as its own three planes and
+  `grok_encoder::plugin_takes_frame` asks the plugin whether it takes that
+  shape, by beginning a batch with the run's own compression parameters and
+  ending it with no frame submitted. The plugin then upsamples the chroma,
+  converts YUV to RGB and runs the X'Y'Z' transform on the device, and the code
+  stream carries the 12 bits both the cinema profiles and App 2E are written
+  at. A subtitle burn, postkit's own P3 or Rec.2020 transform, the HDR-to-DCI
+  LUT, a filter chain that changes the pixel format or the colour, and a PSNR
+  target each keep the run on packed RGB, since every one of them reads or
+  rewrites the samples between the decoder and the compressor. ffmpeg decodes
+  with `-hwaccel cuda` whenever the accelerator is on, whatever the pipe
+  format. `EncodeResult.pipe_pixel_format` names what the pipe carried, and
+  `tests/grok_gpu_yuv.rs` encodes a yuv420p clip through the plugin and decodes
+  every frame back.
+- **Packed RGB reaches the device interleaved**: `RawFrame::Packed` and
+  `PipeFormat::PackedRgb` carry a `grok_encoder::SampleOrder`, so ffmpeg writes
+  rgb48le or rgb48be and the run says which. `encode::pipe_format_for_run` runs
+  `choose_pipe_format` and then asks the plugin about the source that survived
+  it, planar YUV first and interleaved RGB after, so a run asks at most twice
+  and only about a shape everything else already allows through. A little-endian
+  frame reaches grok as the one buffer it came off the pipe in, as
+  `GRK_SOURCE_RGB48LE`: the image's first component points at the buffer with
+  the row pitch in 16-bit samples, the other two carry no data, and nothing is
+  deinterleaved or copied on the host before submit. The plugin takes that
+  source for a cinema code stream at 12 bits out of a 16-bit frame with the
+  X'Y'Z' transform on, and declines a batch over a 16-bit source at 12 bits
+  with the transform off, interleaved and planar alike, which leaves the IMF
+  profile and the already-converted cinema colours on rgb48be with postkit
+  deinterleaving into grok's component buffers. TIFF sequences take the same
+  route: `TiffFrame::into_rgb48_frame` packs a still in either order and
+  `encode_tiff_sequence_inprocess` asks the plugin once, at the first still's
+  raster, before the loader threads start. `subtitle_raster::composite_rgb48`
+  already read both orders and `colour::DcdmTransform::frame_rgb48_inplace` now
+  writes both, so a burn and a source transform land the same either way.
+  `tests/grok_gpu_rgb48le.rs` holds the device's interleaved encode of a video
+  source and of a TIFF sequence to within 50 dB of the host's encode of the
+  same frames, per component per frame.
 - **`audio_mix_matrix::parse_named_audio_map`**: the `IN:OUT[@GAIN]` walk
   with a lane name taken wherever an output channel number is, which both
   wizards had a copy of. A `LaneVocabulary` holds the names each lane answers
@@ -64,7 +105,7 @@
   pipeline routes every TIFF sequence there unless a picture change needs
   ffmpeg's filters, and every other still format (DPX, EXR, BMP, PNG, JPEG)
   through ffmpeg's concat demuxer. A still that cannot be read fails the run by
-  name. `TiffFrame::into_rgb48be_frame` is the packing, and a 12-bit sample
+  name. `TiffFrame::into_rgb48_frame` is the packing, and a 12-bit sample
   comes back exactly after the encoder shifts it down again.
 - **`grok::write_tiff_rgb`**: an uncompressed RGB TIFF at 8, 12 or 16 bits a
   sample, the inverse of `load_tiff`, for an export that keeps the codestream's
@@ -96,6 +137,19 @@
 
 ### Fixed
 
+- **A wrap held the whole track file in memory**: the J2K, Atmos and
+  stereoscopic wraps read every codestream into one `Vec<Vec<u8>>` before
+  writing a frame, `wrap_pcm` read the whole WAV, and `compute_hash_and_size`
+  read the finished MXF back with `fs::read` to hash it, so wrapping a feature
+  needed tens of gigabytes and was killed instead of returning. Each of the
+  four now reads one frame at a time inside its write loop, `parse_wav` takes a
+  `Read + Seek` and skips past every chunk body instead of a slice of the whole
+  file, and the hash runs over 1 MiB reads. `wrap_pcm` also cast the WAV data
+  length to `u32` before dividing it into audio frames, so a data chunk past
+  4 GiB wrapped round to a short frame count and the rest of the sound was
+  dropped without an error: `WavFormat.data_len` is a `u64` and the division
+  happens there. `tests/mxf_wrap_memory.rs` counts every allocation through a
+  global allocator and holds each wrap to a quarter of the essence it writes.
 - **No 4K frame could be compressed**: every DCP encode asked grok for the
   Cinema 2K profile whatever the raster, and grok refuses a frame past
   2048x1080 under it, so a 4K encode died at "Failed to initialize Grok

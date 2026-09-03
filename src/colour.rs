@@ -1,3 +1,4 @@
+use crate::grok_encoder::SampleOrder;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -368,21 +369,30 @@ impl DcdmTransform {
         }
     }
 
-    /// Convert one rgb48be frame in place, to 16-bit code values in the same
-    /// layout. This is ffmpeg's rawvideo format and what the J2K encoder reads.
-    pub fn frame_rgb48be_inplace(&self, buf: &mut [u8]) {
+    /// Convert one packed rgb48 frame in place, to 16-bit code values in the
+    /// same layout and byte order. This is ffmpeg's rawvideo format and what the
+    /// J2K encoder reads.
+    pub fn frame_rgb48_inplace(&self, buf: &mut [u8], order: SampleOrder) {
         for px in buf.as_chunks_mut::<6>().0 {
+            let read = |bytes: [u8; 2]| match order {
+                SampleOrder::Big => u16::from_be_bytes(bytes),
+                SampleOrder::Little => u16::from_le_bytes(bytes),
+            };
             let codes = self.pixel(
                 [
-                    u16::from_be_bytes([px[0], px[1]]),
-                    u16::from_be_bytes([px[2], px[3]]),
-                    u16::from_be_bytes([px[4], px[5]]),
+                    read([px[0], px[1]]),
+                    read([px[2], px[3]]),
+                    read([px[4], px[5]]),
                 ],
                 u16::MAX,
             );
             for (i, code) in codes.iter().enumerate() {
-                px[i * 2] = (code >> 8) as u8;
-                px[i * 2 + 1] = *code as u8;
+                let bytes = match order {
+                    SampleOrder::Big => code.to_be_bytes(),
+                    SampleOrder::Little => code.to_le_bytes(),
+                };
+                px[i * 2] = bytes[0];
+                px[i * 2 + 1] = bytes[1];
             }
         }
     }
@@ -398,7 +408,7 @@ impl DcdmTransform {
 pub fn rgb_to_xyz_inplace(buf: &mut [u8]) {
     DcdmTransform::to_xyz(ColourSpace::Rec709)
         .expect("Rec.709 has a matrix")
-        .frame_rgb48be_inplace(buf);
+        .frame_rgb48_inplace(buf, SampleOrder::Big);
 }
 
 // ─── Display transform: DCI X'Y'Z' code values → sRGB ─────────────────────
@@ -1045,7 +1055,9 @@ mod tests_xyz {
         }
         let mut out = vec![0u16; 6];
         transform.frame_rgb48le(&le, 65535, &mut out);
-        transform.frame_rgb48be_inplace(&mut be);
+        let mut le_in_place = le.clone();
+        transform.frame_rgb48_inplace(&mut le_in_place, SampleOrder::Little);
+        transform.frame_rgb48_inplace(&mut be, SampleOrder::Big);
 
         for (i, px) in pixels.iter().enumerate() {
             let want = transform.pixel(*px, 65535);
@@ -1056,6 +1068,11 @@ mod tests_xyz {
                     u16::from_be_bytes([be[off], be[off + 1]]),
                     *want_channel,
                     "rgb48be pixel {i} channel {c}"
+                );
+                assert_eq!(
+                    u16::from_le_bytes([le_in_place[off], le_in_place[off + 1]]),
+                    *want_channel,
+                    "in place rgb48le pixel {i} channel {c}"
                 );
             }
         }

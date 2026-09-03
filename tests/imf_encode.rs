@@ -44,6 +44,7 @@ fn red_frame() -> RawFrame {
     }
     RawFrame::Packed {
         data,
+        order: postkit::grok_encoder::SampleOrder::Big,
         width: WIDTH,
         height: HEIGHT,
         precision: 16,

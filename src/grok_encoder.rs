@@ -13,6 +13,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
+/// Byte order of the 16-bit samples in a packed rgb48 frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleOrder {
+    Big,
+    Little,
+}
+
 /// A raw frame ready for JPEG 2000 compression.
 /// Can be either planar (from TIFF loader) or packed interleaved (from ffmpeg pipe).
 pub enum RawFrame {
@@ -24,9 +31,12 @@ pub enum RawFrame {
         precision: u8,
         index: u64,
     },
-    /// Packed interleaved rgb48be bytes (6 bytes per pixel, big-endian)
+    /// Packed interleaved rgb48 bytes, 6 bytes per pixel, in `order`. Only
+    /// grok's accelerator plugin takes the little-endian layout, as one
+    /// interleaved buffer: everything else deinterleaves the frame on the host.
     Packed {
         data: Vec<u8>,
+        order: SampleOrder,
         width: u32,
         height: u32,
         precision: u8,
@@ -160,7 +170,7 @@ impl SourcePreparation {
     }
 
     /// Burn subtitles in, then convert the colour. Both steps need a packed
-    /// 16-bit rgb48be frame.
+    /// 16-bit rgb48 frame, in either byte order.
     fn apply(&self, frame: &mut RawFrame, compressor_transform: bool) -> Result<(), String> {
         if self.is_empty() {
             return Ok(());
@@ -173,34 +183,29 @@ impl SourcePreparation {
             );
         }
         let index = frame.index();
-        let (data, width, height) = match frame {
+        let (data, order, width, height) = match frame {
             RawFrame::Packed {
                 data,
+                order,
                 width,
                 height,
                 precision: 16,
                 ..
-            } => (data, *width, *height),
+            } => (data, *order, *width, *height),
             _ => {
                 return Err(
                     "a subtitle burn or a source colour transform needs a packed 16-bit \
-                     rgb48be frame"
+                     RGB frame"
                         .to_string(),
                 );
             }
         };
         if let Some(burn) = &self.subtitle_burn {
-            burn.burn_rgb48(
-                data,
-                width,
-                height,
-                crate::subtitle_raster::SampleOrder::Big,
-                index,
-            )
-            .map_err(|e| e.to_string())?;
+            burn.burn_rgb48(data, width, height, order, index)
+                .map_err(|e| e.to_string())?;
         }
         if let Some(transform) = &self.colour_transform {
-            transform.frame_rgb48be_inplace(data);
+            transform.frame_rgb48_inplace(data, order);
         }
         Ok(())
     }
@@ -976,8 +981,8 @@ unsafe fn build_grok_image(
                     }
                 }
             }
-            RawFrame::Packed { data, .. } => {
-                // Deinterleave rgb48be directly into Grok component buffers
+            RawFrame::Packed { data, order, .. } => {
+                // Deinterleave rgb48 directly into Grok component buffers
                 // (avoids 21MB intermediate Vec<i32> allocation per frame)
                 let comp0 = &*(*image).comps.add(0);
                 let comp1 = &*(*image).comps.add(1);
@@ -991,14 +996,19 @@ unsafe fn build_grok_image(
                 }
                 let stride = comp0.stride as usize;
 
+                let sample = |bytes: [u8; 2]| match order {
+                    SampleOrder::Big => u16::from_be_bytes(bytes),
+                    SampleOrder::Little => u16::from_le_bytes(bytes),
+                } as i32;
+
                 for y in 0..h {
                     let row_offset = y * stride;
                     let src_row_offset = y * w * 6;
                     for x in 0..w {
                         let off = src_row_offset + x * 6;
-                        let r = ((data[off] as i32) << 8) | (data[off + 1] as i32);
-                        let g = ((data[off + 2] as i32) << 8) | (data[off + 3] as i32);
-                        let b = ((data[off + 4] as i32) << 8) | (data[off + 5] as i32);
+                        let r = sample([data[off], data[off + 1]]);
+                        let g = sample([data[off + 2], data[off + 3]]);
+                        let b = sample([data[off + 4], data[off + 5]]);
                         *r_data.add(row_offset + x) = r >> bits_to_drop;
                         *g_data.add(row_offset + x) = g >> bits_to_drop;
                         *b_data.add(row_offset + x) = b >> bits_to_drop;
@@ -1240,7 +1250,8 @@ impl Batch {
         info.numcomps = 3;
         info.prec = batch_precision(rsiz, image_precision);
         // a zeroed info already describes the planar RGB frames postkit
-        // converts itself, so only a YUV source fills these in
+        // deinterleaves itself, so only a YUV or interleaved source fills
+        // these in
         info.source_prec = match frame {
             RawFrame::PlanarYuv { format, .. } => {
                 info.source_format = if format.pixel_format.chroma_is_half_height() {
@@ -1255,6 +1266,14 @@ impl Batch {
                 };
                 info.yuv_full_range = format.full_range;
                 format.pixel_format.bit_depth()
+            }
+            RawFrame::Packed {
+                order: SampleOrder::Little,
+                precision,
+                ..
+            } => {
+                info.source_format = grokj2k_sys::_GRK_SOURCE_FORMAT_GRK_SOURCE_RGB48LE;
+                *precision
             }
             _ => image_precision,
         };
@@ -1336,37 +1355,25 @@ impl Batch {
     }
 }
 
-/// Whether grok's accelerator plugin takes the source's planes as they come off
-/// ffmpeg's pipe, asked by beginning a batch with the run's own compression
-/// parameters and ending it at once. The answer has to be had before the
+/// Whether grok's accelerator plugin takes frames shaped like `shape_only`,
+/// asked by beginning a batch with the run's own compression parameters and
+/// ending it at once with nothing submitted. `shape_only` carries the frame's
+/// size, format and precision and no bytes. The answer has to be had before the
 /// decoder starts, because it decides what ffmpeg writes.
 ///
-/// `false` unless the plugin is switched on: nothing else reads planes.
+/// Every ask starts a batch, so a run asks at most once per candidate source.
+/// `false` unless the plugin is switched on: nothing else takes these sources.
 #[cfg(feature = "grok-ffi")]
-pub fn plugin_takes_planar_yuv(
-    format: crate::encode::YuvFrameFormat,
-    width: u32,
-    height: u32,
-    params: &CompressParams,
-) -> bool {
+pub fn plugin_takes_frame(shape_only: &RawFrame, params: &CompressParams) -> bool {
     if !gpu_active() {
         return false;
     }
-    // the batch is asked about the frame shape and nothing is submitted, so
-    // this frame carries no bytes
-    let shape_only = RawFrame::PlanarYuv {
-        data: Vec::new(),
-        format,
-        width,
-        height,
-        index: 0,
-    };
     let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel(1);
     let error_flag = Arc::new(AtomicBool::new(false));
     let first_error = Arc::new(Mutex::new(String::new()));
     let input_queue = Arc::new(BoundedQueue::new(1));
     match Batch::begin(
-        &shape_only,
+        shape_only,
         params,
         &writer_tx,
         &error_flag,
@@ -1383,12 +1390,7 @@ pub fn plugin_takes_planar_yuv(
 }
 
 #[cfg(not(feature = "grok-ffi"))]
-pub fn plugin_takes_planar_yuv(
-    _format: crate::encode::YuvFrameFormat,
-    _width: u32,
-    _height: u32,
-    _params: &CompressParams,
-) -> bool {
+pub fn plugin_takes_frame(_shape_only: &RawFrame, _params: &CompressParams) -> bool {
     false
 }
 
@@ -1502,6 +1504,59 @@ unsafe fn build_yuv_grok_image(
     }
 }
 
+/// A grok image over one interleaved rgb48le frame, the shape
+/// `GRK_SOURCE_RGB48LE` takes: three components at the frame's own precision,
+/// `comps[0]` pointing at the buffer with the row pitch in 16-bit samples and
+/// the other two carrying no data. grok allocates nothing here and copies the
+/// buffer inside submit. The caller unrefs the image.
+#[cfg(feature = "grok-ffi")]
+unsafe fn build_rgb48le_grok_image(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    precision: u8,
+) -> Result<*mut grokj2k_sys::grk_image, String> {
+    use grokj2k_sys::*;
+
+    const BYTES_PER_PIXEL: usize = 6;
+    const SAMPLES_PER_PIXEL: u32 = 3;
+    let frame_bytes = width as usize * height as usize * BYTES_PER_PIXEL;
+    if data.len() < frame_bytes {
+        return Err(format!(
+            "an rgb48le frame at {width}x{height} is {frame_bytes} bytes and this one is {}",
+            data.len()
+        ));
+    }
+
+    unsafe {
+        let mut comps: [grk_image_comp; 3] = std::mem::zeroed();
+        for comp in comps.iter_mut() {
+            comp.w = width;
+            comp.h = height;
+            comp.dx = 1;
+            comp.dy = 1;
+            comp.prec = precision;
+            comp.sgnd = false;
+            comp.data_type = _grk_data_type_GRK_INT_16;
+        }
+
+        let image = grk_image_new(
+            3,
+            comps.as_mut_ptr(),
+            _GRK_COLOR_SPACE_GRK_CLRSPC_SRGB,
+            false,
+        );
+        if image.is_null() {
+            return Err("Failed to create Grok image".to_string());
+        }
+        let first = &mut *(*image).comps;
+        first.stride = width * SAMPLES_PER_PIXEL;
+        first.owns_data = false;
+        first.data = data.as_ptr() as *mut std::ffi::c_void;
+        Ok(image)
+    }
+}
+
 /// Hand one frame to the running batch. Blocks while the plugin's pipeline is
 /// full, which is what paces the encoder threads.
 #[cfg(feature = "grok-ffi")]
@@ -1525,6 +1580,14 @@ fn submit_frame_to_batch(frame: &RawFrame, shape: BatchShape) -> Result<(), Stri
                 height,
                 ..
             } => build_yuv_grok_image(data, *format, *width, *height)?,
+            RawFrame::Packed {
+                data,
+                order: SampleOrder::Little,
+                width,
+                height,
+                precision,
+                ..
+            } => build_rgb48le_grok_image(data, *width, *height, *precision)?,
             _ => build_grok_image(frame, shape.image_precision, shape.bits_to_drop)?,
         };
         let frame_user = frame.index() as usize as *mut std::ffi::c_void;
@@ -1788,9 +1851,7 @@ where
     let picture_filters = window_filter_chain(video_filter, frame_range).unwrap_or_default();
     let filters = crate::picture_findings::with_detection_branch(&picture_filters);
     let accelerator_active = gpu_active();
-    // the plugin is asked last, and only about a source everything else already
-    // allows through, because asking it starts a batch
-    let candidate = crate::encode::choose_pipe_format(
+    let pipe_format = crate::encode::pipe_format_for_run(
         &crate::encode::PipeFormatInputs {
             accelerator_active,
             quality_psnr: params.quality_psnr,
@@ -1801,16 +1862,10 @@ where
             filters: &filters,
             source: &crate::probe::probe_pixel_format(input_video),
         },
-        true,
+        width,
+        height,
+        params,
     );
-    let pipe_format = match candidate {
-        crate::encode::PipeFormat::PlanarYuv(format)
-            if !plugin_takes_planar_yuv(format, width, height, params) =>
-        {
-            crate::encode::PipeFormat::PackedRgb
-        }
-        chosen => chosen,
-    };
     tracing::info!(
         pixel_format = pipe_format.ffmpeg_pixel_format(),
         hardware_decode = accelerator_active,
@@ -1915,8 +1970,9 @@ where
                     let idx = frame_index;
                     frame_index += 1;
                     Some(match pipe_format {
-                        crate::encode::PipeFormat::PackedRgb => RawFrame::Packed {
+                        crate::encode::PipeFormat::PackedRgb(order) => RawFrame::Packed {
                             data: buf,
+                            order,
                             width,
                             height,
                             precision: crate::encode::PACKED_RGB_PRECISION,
@@ -2043,6 +2099,7 @@ mod tests {
                 .iter()
                 .flat_map(|c| c.to_be_bytes())
                 .collect(),
+            order: SampleOrder::Big,
             width: 1,
             height: 1,
             precision: 16,
@@ -2117,6 +2174,7 @@ mod tests {
         };
         let mut frame = RawFrame::Packed {
             data: vec![0u8; 6],
+            order: SampleOrder::Big,
             width: 1,
             height: 1,
             precision: 16,
@@ -2146,6 +2204,7 @@ mod tests {
         };
         let mut frame = RawFrame::Packed {
             data: vec![0u8; 6],
+            order: SampleOrder::Big,
             width: 1,
             height: 1,
             precision: 16,
@@ -2228,6 +2287,7 @@ mod tests {
         let (w, h) = (128u32, 128u32);
         let frame = RawFrame::Packed {
             data: vec![0x80u8; (w * h * 6) as usize],
+            order: SampleOrder::Big,
             width: w,
             height: h,
             precision: 16,
@@ -2246,6 +2306,7 @@ mod tests {
     fn grey_frame(width: u32, height: u32) -> RawFrame {
         RawFrame::Packed {
             data: vec![0x80u8; (width * height * 6) as usize],
+            order: SampleOrder::Big,
             width,
             height,
             precision: 16,
@@ -2328,6 +2389,7 @@ mod tests {
             .collect();
         let frame = RawFrame::Packed {
             data,
+            order: SampleOrder::Big,
             width: w,
             height: h,
             precision: 16,
@@ -2383,6 +2445,7 @@ mod tests {
                             left -= 1;
                             Some(RawFrame::Packed {
                                 data: vec![0x80u8; (w * h * 6) as usize],
+                                order: SampleOrder::Big,
                                 width: w,
                                 height: h,
                                 precision: 16,
@@ -2413,6 +2476,7 @@ mod tests {
             .collect();
         RawFrame::Packed {
             data,
+            order: SampleOrder::Big,
             width,
             height,
             precision: 16,
@@ -2537,6 +2601,7 @@ mod tests {
     fn test_compress_requires_grok_ffi() {
         let frame = RawFrame::Packed {
             data: vec![0; 6],
+            order: SampleOrder::Big,
             width: 1,
             height: 1,
             precision: 16,

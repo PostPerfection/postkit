@@ -160,6 +160,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
             let index = next.next()?;
             Some(RawFrame::Packed {
                 data: data.clone(),
+                order: crate::grok_encoder::SampleOrder::Big,
                 width,
                 height,
                 precision: 16,
