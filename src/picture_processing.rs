@@ -17,16 +17,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::encode::DecodeSource;
 
-/// Planar 16-bit RGB for every geometry step. A chroma-subsampled source would
-/// round a crop offset to the chroma grid and mix pad black with neighbouring
-/// chroma, so the picture is unpacked to full-resolution components first.
-const GEOMETRY_PIXEL_FORMAT: &str = "gbrp16le";
-
-/// swscale algorithm for the fit scale.
-const SCALE_ALGORITHM: &str = "lanczos";
+/// Algorithm for the fit scale, spelled the same way by swscale's `flags` and
+/// by `scale_cuda`'s `interp_algo`.
+pub(crate) const SCALE_ALGORITHM: &str = "lanczos";
 
 /// Colour of the padding around a fitted picture.
-const PAD_COLOUR: &str = "black";
+pub(crate) const PAD_COLOUR: &str = "black";
 
 /// ffmpeg filter that turns fields into progressive frames.
 const DEINTERLACE_FILTER: &str = "yadif";
@@ -87,9 +83,10 @@ impl Crop {
             let kept =
                 floor_to_even((source_height as f64 * target_ratio) as u32).min(source_width);
             let total = source_width - kept;
+            let left = floor_to_even(total / 2);
             Crop {
-                left: total / 2,
-                right: total - total / 2,
+                left,
+                right: total - left,
                 top: 0,
                 bottom: 0,
             }
@@ -97,13 +94,35 @@ impl Crop {
             let kept =
                 floor_to_even((source_width as f64 / target_ratio) as u32).min(source_height);
             let total = source_height - kept;
+            let top = floor_to_even(total / 2);
             Crop {
                 left: 0,
                 right: 0,
-                top: total / 2,
-                bottom: total - total / 2,
+                top,
+                bottom: total - top,
             }
         }
+    }
+
+    /// This crop of a source that size, with its offsets and the size it leaves
+    /// on the 4:2:0 chroma grid. ffmpeg's `crop` rounds both an odd offset and
+    /// an odd size down on a subsampled source, so the picture would sit a
+    /// column off what the plan says and the frames would be smaller than the
+    /// encoder reads.
+    fn on_the_chroma_grid(&self, source_width: u32, source_height: u32) -> (Crop, u32, u32) {
+        let left = floor_to_even(self.left);
+        let top = floor_to_even(self.top);
+        let width =
+            floor_to_even(source_width.saturating_sub(self.left.saturating_add(self.right)));
+        let height =
+            floor_to_even(source_height.saturating_sub(self.top.saturating_add(self.bottom)));
+        let crop = Crop {
+            left,
+            right: source_width - left - width,
+            top,
+            bottom: source_height - top - height,
+        };
+        (crop, width, height)
     }
 }
 
@@ -223,16 +242,14 @@ impl PictureProcessing {
                 "source raster is {source_width}x{source_height}, so there is no picture to process"
             ));
         }
-        let horizontal_crop = self.crop.left.saturating_add(self.crop.right);
-        let vertical_crop = self.crop.top.saturating_add(self.crop.bottom);
-        if horizontal_crop >= source_width || vertical_crop >= source_height {
+        let (crop, cropped_width, cropped_height) =
+            self.crop.on_the_chroma_grid(source_width, source_height);
+        if cropped_width == 0 || cropped_height == 0 {
             return Err(format!(
                 "crop {}/{}/{}/{} leaves nothing of a {source_width}x{source_height} source",
                 self.crop.left, self.crop.right, self.crop.top, self.crop.bottom
             ));
         }
-        let cropped_width = source_width - horizontal_crop;
-        let cropped_height = source_height - vertical_crop;
         let (rotated_width, rotated_height) =
             self.rotation.applied_to(cropped_width, cropped_height);
 
@@ -249,17 +266,19 @@ impl PictureProcessing {
             }
             None => (rotated_width, rotated_height, rotated_width, rotated_height),
         };
-        let pad_left = (output_width - scaled_width) / 2;
-        let pad_top = (output_height - scaled_height) / 2;
+        // an odd offset is rounded down by ffmpeg's pad on a subsampled source,
+        // so the picture would sit a column or a row off what this plan says
+        let pad_left = floor_to_even((output_width - scaled_width) / 2);
+        let pad_top = floor_to_even((output_height - scaled_height) / 2);
 
-        let scale_needed = (scaled_width, scaled_height) != (rotated_width, rotated_height);
-        let pad_needed = (output_width, output_height) != (scaled_width, scaled_height);
-        let geometry_needed = !self.crop.is_none()
+        let scales = (scaled_width, scaled_height) != (rotated_width, rotated_height);
+        let pads = (output_width, output_height) != (scaled_width, scaled_height);
+        let crops_rotates_or_flips = !crop.is_none()
             || self.rotation != Rotation::None
             || self.flip_horizontal
-            || self.flip_vertical
-            || scale_needed
-            || pad_needed;
+            || self.flip_vertical;
+        let changes_geometry = crops_rotates_or_flips || scales || pads;
+        let only_scales_and_pads = !crops_rotates_or_flips && !self.deinterlace && !self.denoise;
 
         let mut filters = Vec::new();
         if self.deinterlace {
@@ -269,13 +288,11 @@ impl PictureProcessing {
         if self.denoise {
             filters.push(DENOISE_FILTER.to_string());
         }
-        if geometry_needed {
-            filters.push(format!("format={GEOMETRY_PIXEL_FORMAT}"));
-        }
-        if !self.crop.is_none() {
+        let geometry_format_position = filters.len();
+        if !crop.is_none() {
             filters.push(format!(
                 "crop={cropped_width}:{cropped_height}:{}:{}",
-                self.crop.left, self.crop.top
+                crop.left, crop.top
             ));
         }
         filters.extend(self.rotation.filters());
@@ -285,19 +302,19 @@ impl PictureProcessing {
         if self.flip_vertical {
             filters.push("vflip".to_string());
         }
-        if scale_needed {
+        if scales {
             filters.push(format!(
                 "scale=w={scaled_width}:h={scaled_height}:flags={SCALE_ALGORITHM}"
             ));
         }
-        if pad_needed {
+        if pads {
             filters.push(format!(
                 "pad=w={output_width}:h={output_height}:x={pad_left}:y={pad_top}:color={PAD_COLOUR}"
             ));
         }
 
         Ok(PicturePlan {
-            crop: self.crop,
+            crop,
             rotation: self.rotation,
             cropped_width,
             cropped_height,
@@ -309,8 +326,13 @@ impl PictureProcessing {
             output_height,
             pad_left,
             pad_top,
+            scales,
+            pads,
+            changes_geometry,
+            only_scales_and_pads,
             filters,
             fps_position,
+            geometry_format_position,
         })
     }
 }
@@ -330,15 +352,27 @@ pub struct PicturePlan {
     /// the codestream declares.
     pub output_width: u32,
     pub output_height: u32,
-    /// Where the scaled picture sits on the output raster.
+    /// Where the scaled picture sits on the output raster, on the chroma grid.
     pub pad_left: u32,
     pub pad_top: u32,
+    pub scales: bool,
+    pub pads: bool,
+    /// Whether a crop, a rotation, a flip, a scale or a pad moves the picture
+    /// around. A deinterlace, a denoise and the frame rate are not that.
+    pub changes_geometry: bool,
+    /// Whether a scale and a pad are the whole plan: nothing else it can do has
+    /// a CUDA filter, so this is what lets the geometry run on the device.
+    pub only_scales_and_pads: bool,
     /// The `-vf` items in order, ready to join with ','.
     pub filters: Vec<String>,
     /// Where the frame rate filter belongs in `filters`: deinterlacing turns
     /// fields into frames, so it has to run before any rate conversion, and
     /// everything else runs after it.
     pub fps_position: usize,
+    /// Where a pixel format filter belongs in `filters` for a pipe that needs
+    /// the geometry run in another format: after the deinterlace and the
+    /// denoise, which keep whatever format they are given.
+    pub geometry_format_position: usize,
 }
 
 impl PicturePlan {
@@ -740,7 +774,6 @@ mod tests {
         assert_eq!(
             plan.filters,
             vec![
-                "format=gbrp16le".to_string(),
                 "crop=1920:804:0:138".to_string(),
                 "scale=w=2048:h=856:flags=lanczos".to_string(),
                 "pad=w=2048:h=1080:x=0:y=112:color=black".to_string(),
@@ -753,6 +786,69 @@ mod tests {
     }
 
     #[test]
+    fn an_odd_crop_lands_on_the_chroma_grid() {
+        let plan = PictureProcessing {
+            crop: Crop {
+                left: 3,
+                right: 0,
+                top: 1,
+                bottom: 2,
+            },
+            ..PictureProcessing::default()
+        }
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!(
+            plan.crop,
+            Crop {
+                left: 2,
+                right: 2,
+                top: 0,
+                bottom: 4
+            }
+        );
+        assert_eq!((plan.cropped_width, plan.cropped_height), (1916, 1076));
+        assert_eq!(plan.filters, vec!["crop=1916:1076:2:0"]);
+
+        // an odd source keeps the size even by cropping one more column
+        let odd = PictureProcessing {
+            crop: Crop::to_aspect(1919, 1080, 1, 1),
+            ..PictureProcessing::default()
+        }
+        .plan(1919, 1080)
+        .unwrap();
+        assert_eq!(odd.crop.left, 418);
+        assert_eq!((odd.cropped_width, odd.cropped_height), (1080, 1080));
+    }
+
+    #[test]
+    fn a_pad_offset_lands_on_the_chroma_grid() {
+        let plan = PictureProcessing {
+            fit: Some(Fit {
+                box_width: 1998,
+                box_height: 858,
+                raster_width: 2048,
+                raster_height: 1080,
+            }),
+            ..PictureProcessing::default()
+        }
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!((plan.scaled_width, plan.scaled_height), (1524, 858));
+        assert_eq!((plan.pad_left, plan.pad_top), (262, 110));
+        assert_eq!(
+            plan.filters,
+            vec![
+                "scale=w=1524:h=858:flags=lanczos".to_string(),
+                "pad=w=2048:h=1080:x=262:y=110:color=black".to_string(),
+            ]
+        );
+        assert!(plan.only_scales_and_pads);
+        assert!(plan.scales);
+        assert!(plan.pads);
+    }
+
+    #[test]
     fn a_quarter_turn_swaps_the_dimensions() {
         let plan = PictureProcessing {
             rotation: Rotation::Clockwise90,
@@ -761,7 +857,10 @@ mod tests {
         .plan(1920, 1080)
         .unwrap();
         assert_eq!((plan.output_width, plan.output_height), (1080, 1920));
-        assert_eq!(plan.filters, vec!["format=gbrp16le", "transpose=clock"]);
+        assert_eq!(plan.filters, vec!["transpose=clock"]);
+        assert_eq!(plan.geometry_format_position, 0);
+        assert!(plan.changes_geometry);
+        assert!(!plan.only_scales_and_pads, "a turn has no CUDA filter");
 
         let half = PictureProcessing {
             rotation: Rotation::Half,
@@ -770,10 +869,7 @@ mod tests {
         .plan(1920, 1080)
         .unwrap();
         assert_eq!((half.output_width, half.output_height), (1920, 1080));
-        assert_eq!(
-            half.filters,
-            vec!["format=gbrp16le", "transpose=clock", "transpose=clock"]
-        );
+        assert_eq!(half.filters, vec!["transpose=clock", "transpose=clock"]);
     }
 
     #[test]
@@ -823,10 +919,7 @@ mod tests {
         }
         .plan(640, 480)
         .unwrap();
-        assert_eq!(
-            plan.filters,
-            vec!["format=gbrp16le", "transpose=clock", "hflip", "vflip"]
-        );
+        assert_eq!(plan.filters, vec!["transpose=clock", "hflip", "vflip"]);
     }
 
     #[test]

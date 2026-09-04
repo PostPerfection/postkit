@@ -109,6 +109,18 @@ packed RGB. An 8-bit YUV source on that pipe decodes through `format=gbrp16le`
 first, because swscale converts 8-bit YUV straight to rgb48 at 8 bits and lands
 about two codes of 255 off the exact colour.
 
+A crop, a scale or a pad runs on whatever the pipe carries, so on the planar
+pipe it runs on the source's own planes: 6.3 CPU seconds over the bare decode
+on 1442 frames of 2048x872 yuv420p, against 73.0 for the same plan converted to
+16-bit RGB first. A run whose plan only scales and pads goes further and keeps
+the frames on the device for both steps, with `-hwaccel_output_format cuda`,
+`scale_cuda`, `pad_cuda` and `hwdownload`: 1.1 seconds on the same clip. That
+needs a yuv420p source ffmpeg opens itself, since nothing else in a plan has a
+CUDA filter and `pad_cuda` refuses anything deeper than 8 bits, and postkit
+decodes one frame first to check nvdec can hand this source out on the device,
+because a codec it cannot read fails the whole run under that flag. The log
+line names where the geometry ran and why.
+
 `cargo test --features grok-gpu` runs the device round trip and needs a machine
 with the plugin, CI has no GPU: `tests/grok_gpu.rs` for the round trip,
 `tests/grok_gpu_yuv.rs` for the planar YUV source and

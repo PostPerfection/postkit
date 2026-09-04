@@ -1913,40 +1913,45 @@ where
     let picture_filters = window_filter_chain(video_filter, frame_range).unwrap_or_default();
     let source = crate::probe::probe_pixel_format(input_video);
     let accelerator_active = gpu_active();
-    // the pipe format is decided on the chain the caller asked for, so the
-    // conversion decode_filter_chain inserts cannot move the decision
-    let pipe_format = crate::encode::pipe_format_for_run(
-        &crate::encode::PipeFormatInputs {
-            accelerator_active,
-            quality_psnr: params.quality_psnr,
-            postkit_prepares_the_frame: !params.source_preparation.is_empty(),
+    let chain = match crate::encode::decode_chain_for_run(
+        &crate::encode::DecodeChainInputs {
+            decode_source: crate::encode::DecodeSource::Video,
+            read_source_at: None,
+            picture: crate::encode::PictureFilters::Given(&picture_filters),
             // the colour this path can convert is the compressor's own
             // transform, and a caller's colour filter is caught by the chain
             source_colour: &crate::encode::SourceColour::DisplayRgb,
-            filters: &crate::picture_findings::with_detection_branch(&picture_filters),
             source: &source,
+            accelerator_active,
+            quality_psnr: params.quality_psnr,
+            postkit_prepares_the_frame: !params.source_preparation.is_empty(),
         },
+        input_video,
         width,
         height,
         params,
-    );
-    let filters =
-        crate::encode::decode_filter_chain(&picture_filters, pipe_format, &source.pix_fmt);
-    tracing::info!(
-        pixel_format = pipe_format.ffmpeg_pixel_format(),
-        hardware_decode = accelerator_active,
-        "decoding to the pipe"
-    );
+    ) {
+        Ok(chain) => chain,
+        Err(e) => {
+            return PipelineResult {
+                success: false,
+                error: e,
+                frames_encoded: 0,
+                output_dir: output_dir.to_path_buf(),
+                picture_findings: crate::picture_findings::PictureFindings::default(),
+            };
+        }
+    };
+    let pipe_format = chain.pipe_format;
+    let filters = chain.filters;
 
     let mut command = Command::new("ffmpeg");
     command
         .arg("-y")
         // the progress line carries no newline, so the reader would hold the
         // whole run in one string
-        .arg("-nostats");
-    if accelerator_active {
-        command.args(crate::encode::HARDWARE_DECODE_ARGS);
-    }
+        .arg("-nostats")
+        .args(&chain.input_args);
     command
         .arg("-i")
         .arg(input_video)
