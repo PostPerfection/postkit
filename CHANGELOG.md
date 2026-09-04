@@ -138,23 +138,6 @@
   thread, bit identical to a single meter over the whole file. On a 15 minute
   six channel 24 bit WAV: 1.0 s and 10 MB against loudnorm's 107.7 s and 177 MB,
   same -0.20 dBTP.
-- **The geometry of a plan runs on the device**: with the accelerator on, a run
-  whose picture plan only scales and pads keeps the frames on the device for
-  those two steps. The input arguments gain `-hwaccel_output_format cuda` and
-  the chain is the frame rate and the window, `scale_cuda`, `pad_cuda`,
-  `hwdownload,format=nv12,format=yuv420p` and the detection branch: 1.1 CPU
-  seconds over the bare decode on 1442 frames of 2048x872 yuv420p against 6.3
-  for the same plan on the host. Every condition has to hold at once: the pipe
-  carries the source's own planes, the source is yuv420p, ffmpeg opens the
-  source itself, a scale and a pad are the whole plan, and `nvdec` decoded one
-  frame under that flag. Nothing else a plan can hold has a CUDA filter,
-  `pad_cuda` refuses anything deeper than 8 bits, and a codec nvdec cannot
-  decode fails the whole run under that flag where plain `-hwaccel cuda` falls
-  back to software silently, so `encode::decode_chain_for_run` probes one frame
-  before it commits, at most once per encode and only when nothing else is in
-  the way. `DecodeChain.describe` is the log line naming where the geometry ran
-  and, for a plan left on the host, why. `scale_cuda`'s lanczos differs from
-  swscale's by up to 2 codes of 255 on the planes.
 
 ### Changed
 
@@ -169,8 +152,12 @@
   geometry. Every crop and pad offset a plan emits is now on the chroma grid,
   because ffmpeg's `crop` and `pad` round an odd offset down on a subsampled
   source and the picture would sit a column or a row off what the plan says.
-  `encode::decode_chain_for_run` decides the arguments, the pipe format and the
-  chain for the stream encode and the resumable video encode alike.
+  `encode::decode_chain` decides the arguments, the pipe format and the chain
+  for the stream encode and the resumable video encode alike. Running the scale
+  and the pad on the device instead, with `-hwaccel_output_format cuda`,
+  `scale_cuda` and `pad_cuda`, was measured and left out: it saves 3.6 ms of CPU
+  a frame and `scale_cuda`'s lanczos differs from swscale's by up to two codes
+  of 255 with a mean bias of 0.6 code, 36.85 dB against the CPU run.
 - **grok is pinned at the v20.4.3 release**: `grokj2k-sys` and CI both build the
   tag instead of a commit on master.
 

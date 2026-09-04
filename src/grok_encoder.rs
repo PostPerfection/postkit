@@ -1913,7 +1913,7 @@ where
     let picture_filters = window_filter_chain(video_filter, frame_range).unwrap_or_default();
     let source = crate::probe::probe_pixel_format(input_video);
     let accelerator_active = gpu_active();
-    let chain = match crate::encode::decode_chain_for_run(
+    let chain = match crate::encode::decode_chain(
         &crate::encode::DecodeChainInputs {
             decode_source: crate::encode::DecodeSource::Video,
             read_source_at: None,
@@ -1926,7 +1926,6 @@ where
             quality_psnr: params.quality_psnr,
             postkit_prepares_the_frame: !params.source_preparation.is_empty(),
         },
-        input_video,
         width,
         height,
         params,

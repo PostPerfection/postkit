@@ -328,9 +328,6 @@ struct DecodeFilters {
     /// where a pixel format filter goes for a pipe that needs the geometry run
     /// in another format, `None` when the plan has no geometry
     geometry_format_position: Option<usize>,
-    /// the same picture with the CUDA filters running its geometry and the
-    /// frames downloaded after them, when a scale and a pad are the whole plan
-    on_the_device: Option<String>,
 }
 
 impl DecodeFilters {
@@ -362,7 +359,6 @@ fn decode_filters(picture: &PictureFilters, source_colour: &SourceColour) -> Dec
                     vec![(*given).to_string()]
                 },
                 geometry_format_position: None,
-                on_the_device: None,
             };
         }
         PictureFilters::Planned {
@@ -387,32 +383,6 @@ fn decode_filters(picture: &PictureFilters, source_colour: &SourceColour) -> Dec
     }
     let geometry_position = plan.geometry_format_position + inserted;
 
-    let on_the_device = (plan.only_scales_and_pads && (plan.scales || plan.pads)).then(|| {
-        // everything before the geometry is the frame rate and the window, and
-        // both pass CUDA frames through
-        let mut device = items[..geometry_position].to_vec();
-        if plan.scales {
-            device.push(format!(
-                "scale_cuda={}:{}:interp_algo={}",
-                plan.scaled_width,
-                plan.scaled_height,
-                crate::picture_processing::SCALE_ALGORITHM
-            ));
-        }
-        if plan.pads {
-            device.push(format!(
-                "pad_cuda={}:{}:{}:{}:color={}",
-                plan.output_width,
-                plan.output_height,
-                plan.pad_left,
-                plan.pad_top,
-                crate::picture_processing::PAD_COLOUR
-            ));
-        }
-        device.push(DEVICE_DOWNLOAD_FILTERS.to_string());
-        device.join(",")
-    });
-
     if let SourceColour::DciLut(lut) = source_colour {
         items.push(format!(
             "lut3d={}",
@@ -422,7 +392,6 @@ fn decode_filters(picture: &PictureFilters, source_colour: &SourceColour) -> Dec
     DecodeFilters {
         items,
         geometry_format_position: plan.changes_geometry.then_some(geometry_position),
-        on_the_device,
     }
 }
 
@@ -469,30 +438,6 @@ impl DecodeSource {
 /// `-hwaccel_output_format` ffmpeg downloads them itself, and a codec the device
 /// cannot decode falls back to software decoding with no error.
 const HARDWARE_DECODE_ARGS: [&str; 2] = ["-hwaccel", "cuda"];
-
-/// Leave the decoded frames on the device, so the CUDA geometry filters run on
-/// them. A codec nvdec cannot decode fails the whole run under this rather
-/// than falling back to software, which [`probe_nvdec_frames`] rules out first.
-const DEVICE_FRAME_ARGS: [&str; 2] = ["-hwaccel_output_format", "cuda"];
-
-/// Bring the device frames back to system memory: nvdec hands out nv12 for an
-/// 8-bit source, and the pipe carries the source's own planes.
-const DEVICE_DOWNLOAD_FILTERS: &str = "hwdownload,format=nv12,format=yuv420p";
-
-/// The one source pixel format the CUDA geometry filters run on: `pad_cuda`
-/// refuses anything deeper than 8 bits, and nvdec hands out nv12 for this one.
-const DEVICE_GEOMETRY_PIXEL_FORMAT: &str = "yuv420p";
-
-/// What ffmpeg does with the frames the hardware decoder produces.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HardwareDecode {
-    /// no hardware decoder, so ffmpeg decodes on the CPU
-    Off,
-    /// decode on the device and download each frame right after it
-    ToSystemMemory,
-    /// leave the frames on the device for the CUDA geometry filters
-    OnTheDevice,
-}
 
 /// Packed 16-bit RGB: three components per pixel, six bytes. postkit
 /// deinterleaves the big-endian layout itself and hands the little-endian one to
@@ -846,8 +791,8 @@ pub(crate) fn pipe_format_for_run(
     PipeFormat::PackedRgb(packed_rgb_sample_order(width, height, params))
 }
 
-/// The whole filter chain one decode runs on the host: the picture filters with
-/// the detectors split off them, and the pixel format filter a packed RGB pipe
+/// The whole filter chain one decode runs: the picture filters with the
+/// detectors split off them, and the pixel format filter a packed RGB pipe
 /// needs where it belongs.
 ///
 /// An 8-bit YUV source converts at the head, which covers the geometry too, so
@@ -859,7 +804,7 @@ pub(crate) fn pipe_format_for_run(
 /// chroma grid and mixes pad black with neighbouring chroma. A planar YUV pipe
 /// carries the source's own planes to grok's plugin, so it takes no pixel
 /// format filter at all and the geometry runs on the planes.
-fn host_filter_chain(
+fn decode_filter_chain(
     picture: &DecodeFilters,
     pipe_format: PipeFormat,
     source_pix_fmt: &str,
@@ -883,24 +828,15 @@ fn host_filter_chain(
 pub(crate) fn decode_input_args(
     decode_source: DecodeSource,
     read_source_at: Option<FrameRate>,
-    hardware_decode: HardwareDecode,
+    hardware_decode: bool,
 ) -> Result<Vec<String>, String> {
     let mut args: Vec<String> = decode_source
         .demuxer_args()
         .iter()
         .map(|arg| (*arg).to_string())
         .collect();
-    match hardware_decode {
-        HardwareDecode::Off => {}
-        HardwareDecode::ToSystemMemory => {
-            args.extend(HARDWARE_DECODE_ARGS.iter().map(|arg| (*arg).to_string()));
-        }
-        HardwareDecode::OnTheDevice => args.extend(
-            HARDWARE_DECODE_ARGS
-                .iter()
-                .chain(DEVICE_FRAME_ARGS.iter())
-                .map(|arg| (*arg).to_string()),
-        ),
+    if hardware_decode {
+        args.extend(HARDWARE_DECODE_ARGS.iter().map(|arg| (*arg).to_string()));
     }
     let Some(rate) = read_source_at else {
         return Ok(args);
@@ -921,7 +857,7 @@ pub(crate) fn decode_input_args(
 
 /// Everything one decode's arguments, pipe format and filter chain are decided
 /// from.
-pub struct DecodeChainInputs<'a> {
+pub(crate) struct DecodeChainInputs<'a> {
     pub decode_source: DecodeSource,
     pub read_source_at: Option<FrameRate>,
     pub picture: PictureFilters<'a>,
@@ -936,177 +872,19 @@ pub struct DecodeChainInputs<'a> {
 }
 
 /// What one decode runs.
-pub struct DecodeChain {
+pub(crate) struct DecodeChain {
     /// every argument before `-i`
     pub input_args: Vec<String>,
     pub pipe_format: PipeFormat,
     /// the whole `-vf` chain, detection branch included
     pub filters: String,
-    /// whether the CUDA filters run the plan's geometry before the frames are
-    /// downloaded
-    pub device_geometry: bool,
-    /// why the geometry runs on the host, for a plan that has geometry while
-    /// grok's accelerator plugin is on
-    pub host_geometry_reason: Option<String>,
 }
 
-impl DecodeChain {
-    /// One line naming where the geometry ran and why.
-    pub fn describe(&self) -> String {
-        let where_it_ran = if self.device_geometry {
-            "geometry on the device"
-        } else {
-            "geometry on the host"
-        };
-        match &self.host_geometry_reason {
-            Some(reason) => format!("{where_it_ran}: {reason}"),
-            None => where_it_ran.to_string(),
-        }
-    }
-}
-
-/// What the geometry of one picture plan can run on, read from everything but
-/// the device decode probe.
-enum DeviceGeometry<'a> {
-    /// nothing but the probe is in the way, and this chain is what runs it
-    Ready(&'a str),
-    /// the geometry runs on the host, for this reason
-    OnTheHost(String),
-    /// no plan geometry to place, or the accelerator is off
-    NothingToSay,
-}
-
-/// nvdec answered that it cannot hand out device frames for the source
-const NVDEC_REFUSAL: &str = "nvdec cannot hand this source out as device frames";
-
-/// Whether the CUDA filters can run this plan's geometry, and why they cannot.
-///
-/// Every condition has to hold at once: the frames reach postkit as the
-/// source's own planes, the source is the one pixel format the CUDA filters
-/// take, ffmpeg opens the source itself, and a scale and a pad are the whole
-/// plan, because nothing else a plan can hold has a CUDA filter.
-fn device_geometry<'a>(
+/// Everything one stream decode runs: the arguments before `-i`, the pixel
+/// format on the pipe and the whole filter chain. Both the stream encode and
+/// the resumable video encode decide here, so neither can drift from the other.
+pub(crate) fn decode_chain(
     inputs: &DecodeChainInputs,
-    picture: &'a DecodeFilters,
-    pipe_format: PipeFormat,
-) -> DeviceGeometry<'a> {
-    let PictureFilters::Planned { plan, .. } = &inputs.picture else {
-        return DeviceGeometry::NothingToSay;
-    };
-    if !plan.changes_geometry || !inputs.accelerator_active {
-        return DeviceGeometry::NothingToSay;
-    }
-    if !matches!(pipe_format, PipeFormat::PlanarYuv(_)) {
-        return DeviceGeometry::OnTheHost(format!(
-            "the frames reach postkit as {} rather than the source's own planes",
-            pipe_format.ffmpeg_pixel_format()
-        ));
-    }
-    if inputs.source.pix_fmt != DEVICE_GEOMETRY_PIXEL_FORMAT {
-        return DeviceGeometry::OnTheHost(format!(
-            "the source is {} and the CUDA filters take {DEVICE_GEOMETRY_PIXEL_FORMAT}",
-            inputs.source.pix_fmt
-        ));
-    }
-    if inputs.decode_source != DecodeSource::Video {
-        return DeviceGeometry::OnTheHost(
-            "a concat list of stills decodes on the host".to_string(),
-        );
-    }
-    let Some(device_chain) = picture.on_the_device.as_deref() else {
-        return DeviceGeometry::OnTheHost(
-            "the plan does more than a scale and a pad, and only those two have CUDA filters"
-                .to_string(),
-        );
-    };
-    DeviceGeometry::Ready(device_chain)
-}
-
-/// The arguments, the pipe format and the filter chain of one decode, with the
-/// pipe format already decided and the device decode already probed.
-fn decode_chain(
-    inputs: &DecodeChainInputs,
-    pipe_format: PipeFormat,
-    nvdec_hands_out_frames: bool,
-) -> Result<DecodeChain, String> {
-    let picture = decode_filters(&inputs.picture, inputs.source_colour);
-    let on_the_host = || {
-        (
-            host_filter_chain(&picture, pipe_format, &inputs.source.pix_fmt),
-            if inputs.accelerator_active {
-                HardwareDecode::ToSystemMemory
-            } else {
-                HardwareDecode::Off
-            },
-        )
-    };
-    let (filters, hardware_decode, host_geometry_reason) =
-        match device_geometry(inputs, &picture, pipe_format) {
-            DeviceGeometry::Ready(device_chain) if nvdec_hands_out_frames => (
-                crate::picture_findings::with_detection_branch(device_chain),
-                HardwareDecode::OnTheDevice,
-                None,
-            ),
-            DeviceGeometry::Ready(_) => {
-                let (filters, hardware_decode) = on_the_host();
-                (filters, hardware_decode, Some(NVDEC_REFUSAL.to_string()))
-            }
-            DeviceGeometry::OnTheHost(reason) => {
-                let (filters, hardware_decode) = on_the_host();
-                (filters, hardware_decode, Some(reason))
-            }
-            DeviceGeometry::NothingToSay => {
-                let (filters, hardware_decode) = on_the_host();
-                (filters, hardware_decode, None)
-            }
-        };
-    Ok(DecodeChain {
-        input_args: decode_input_args(
-            inputs.decode_source,
-            inputs.read_source_at,
-            hardware_decode,
-        )?,
-        pipe_format,
-        filters,
-        device_geometry: hardware_decode == HardwareDecode::OnTheDevice,
-        host_geometry_reason,
-    })
-}
-
-/// Decode one frame of this source and download it, which is what the CUDA
-/// geometry chain needs nvdec to do: a codec nvdec cannot read fails here in a
-/// fraction of a second instead of failing the encode.
-fn probe_nvdec_frames(input: &Path) -> bool {
-    let probe = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-loglevel", "error"])
-        .args(HARDWARE_DECODE_ARGS)
-        .args(DEVICE_FRAME_ARGS)
-        .arg("-i")
-        .arg(input)
-        .args([
-            "-frames:v",
-            "1",
-            "-vf",
-            DEVICE_DOWNLOAD_FILTERS,
-            "-f",
-            "null",
-            "-",
-        ])
-        .output();
-    match probe {
-        Ok(output) => output.status.success(),
-        Err(e) => {
-            tracing::warn!("cannot run ffmpeg to probe the device decode: {e}");
-            false
-        }
-    }
-}
-
-/// Everything one stream decode runs, with grok's accelerator plugin asked
-/// about the pipe format and the device decode probed once.
-pub fn decode_chain_for_run(
-    inputs: &DecodeChainInputs,
-    input: &Path,
     width: u32,
     height: u32,
     params: &crate::grok_encoder::CompressParams,
@@ -1127,20 +905,20 @@ pub fn decode_chain_for_run(
         height,
         params,
     );
-    // the probe costs a decode, so nothing asks for it until every other
-    // condition holds
-    let probed = matches!(
-        device_geometry(inputs, &picture, pipe_format),
-        DeviceGeometry::Ready(_)
-    ) && probe_nvdec_frames(input);
-    let chain = decode_chain(inputs, pipe_format, probed)?;
     tracing::info!(
-        pixel_format = chain.pipe_format.ffmpeg_pixel_format(),
+        pixel_format = pipe_format.ffmpeg_pixel_format(),
         hardware_decode = inputs.accelerator_active,
-        "decoding to the pipe, {}",
-        chain.describe()
+        "decoding to the pipe"
     );
-    Ok(chain)
+    Ok(DecodeChain {
+        input_args: decode_input_args(
+            inputs.decode_source,
+            inputs.read_source_at,
+            inputs.accelerator_active,
+        )?,
+        pipe_format,
+        filters: decode_filter_chain(&picture, pipe_format, &inputs.source.pix_fmt),
+    })
 }
 
 /// Every ffmpeg argument after `-i` for a stream decode: the filter chain, the
@@ -1495,7 +1273,7 @@ where
 
     let source = crate::probe::probe_pixel_format(&opts.input);
     let accelerator_active = grok_encoder::gpu_active();
-    let chain = match decode_chain_for_run(
+    let chain = match decode_chain(
         &DecodeChainInputs {
             decode_source: opts.decode_source,
             read_source_at: opts.read_source_at,
@@ -1510,7 +1288,6 @@ where
             quality_psnr: opts.quality_psnr,
             postkit_prepares_the_frame: opts.subtitle_burn.is_some(),
         },
-        &opts.input,
         width,
         height,
         &params,
@@ -1672,7 +1449,7 @@ where
 
 /// The compressor settings a stream encode asks for, with the source's frame
 /// transform built once for the whole run.
-pub fn compress_params(
+fn compress_params(
     opts: &StreamEncodeOptions,
 ) -> Result<crate::grok_encoder::CompressParams, String> {
     let colour_transform = opts.source_colour.frame_transform()?;
@@ -2325,28 +2102,19 @@ mod tests {
     #[test]
     fn a_source_read_rate_reaches_ffmpeg_as_an_input_rate() {
         assert_eq!(
-            decode_input_args(DecodeSource::Video, None, HardwareDecode::Off).unwrap(),
+            decode_input_args(DecodeSource::Video, None, false).unwrap(),
             Vec::<String>::new()
         );
         assert_eq!(
-            decode_input_args(
-                DecodeSource::Video,
-                Some(FrameRate::whole(24)),
-                HardwareDecode::Off
-            )
-            .unwrap(),
+            decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24)), false).unwrap(),
             vec!["-r", "24"]
         );
         assert_eq!(
-            decode_input_args(DecodeSource::ImageList, None, HardwareDecode::Off).unwrap(),
+            decode_input_args(DecodeSource::ImageList, None, false).unwrap(),
             vec!["-f", "concat", "-safe", "0"]
         );
-        let refused = decode_input_args(
-            DecodeSource::ImageList,
-            Some(FrameRate::whole(24)),
-            HardwareDecode::Off,
-        )
-        .unwrap_err();
+        let refused = decode_input_args(DecodeSource::ImageList, Some(FrameRate::whole(24)), false)
+            .unwrap_err();
         assert!(refused.contains("concat list"), "{refused}");
     }
 
@@ -2807,30 +2575,20 @@ mod tests {
     #[test]
     fn an_accelerated_decode_asks_for_the_hardware_decoder() {
         assert_eq!(
-            decode_input_args(DecodeSource::Video, None, HardwareDecode::ToSystemMemory).unwrap(),
+            decode_input_args(DecodeSource::Video, None, true).unwrap(),
             vec!["-hwaccel", "cuda"]
         );
         assert_eq!(
-            decode_input_args(
-                DecodeSource::ImageList,
-                None,
-                HardwareDecode::ToSystemMemory
-            )
-            .unwrap(),
+            decode_input_args(DecodeSource::ImageList, None, true).unwrap(),
             vec!["-f", "concat", "-safe", "0", "-hwaccel", "cuda"]
         );
         assert_eq!(
-            decode_input_args(
-                DecodeSource::Video,
-                Some(FrameRate::whole(24)),
-                HardwareDecode::ToSystemMemory
-            )
-            .unwrap(),
+            decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24)), true).unwrap(),
             vec!["-hwaccel", "cuda", "-r", "24"],
             "the hardware decoder goes before -i with the rest of the input arguments"
         );
         assert_eq!(
-            decode_input_args(DecodeSource::Video, None, HardwareDecode::Off).unwrap(),
+            decode_input_args(DecodeSource::Video, None, false).unwrap(),
             Vec::<String>::new(),
             "the CPU path's arguments do not change"
         );
@@ -2880,12 +2638,12 @@ mod tests {
             full_range: false,
         });
         assert_eq!(
-            host_filter_chain(&picture, planar_yuv, "yuv420p"),
+            decode_filter_chain(&picture, planar_yuv, "yuv420p"),
             untouched,
             "the plugin converts the planes itself"
         );
         assert_eq!(
-            host_filter_chain(
+            decode_filter_chain(
                 &picture,
                 PipeFormat::PackedRgb(SampleOrder::Big),
                 "yuv420p10le"
@@ -2894,12 +2652,12 @@ mod tests {
             "a 10-bit source with no geometry already converts at full precision"
         );
         assert_eq!(
-            host_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "gbrp"),
+            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "gbrp"),
             untouched,
             "an RGB source has no matrix to apply"
         );
         assert_eq!(
-            host_filter_chain(
+            decode_filter_chain(
                 &decode_filters(&PictureFilters::Given(""), &SourceColour::DisplayRgb),
                 PipeFormat::PackedRgb(SampleOrder::Little),
                 "yuv420p"
@@ -2928,10 +2686,8 @@ mod tests {
         .unwrap()
     }
 
-    /// The chains here are the ones the geometry ran through before it moved to
-    /// the source's own planes, byte for byte, minus the second
-    /// `format=gbrp16le` an 8-bit YUV source used to get from the plan on top of
-    /// the one at the head.
+    /// One `format=gbrp16le` in each chain: the head conversion an 8-bit YUV
+    /// source gets covers its geometry as well.
     #[test]
     fn the_packed_rgb_pipe_converts_where_the_geometry_starts() {
         let detectors = ",split=2[picture][detect];[detect]blackdetect=black_min_duration=2:\
@@ -2944,14 +2700,14 @@ mod tests {
             None,
         );
         assert_eq!(
-            host_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "yuv420p"),
+            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "yuv420p"),
             format!(
                 "format=gbrp16le,fps=24,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
                  pad=w=2048:h=1080:x=0:y=112:color=black{detectors}"
             )
         );
         assert_eq!(
-            host_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "rgb24"),
+            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "rgb24"),
             format!(
                 "fps=24,format=gbrp16le,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
                  pad=w=2048:h=1080:x=0:y=112:color=black{detectors}"
@@ -2970,7 +2726,7 @@ mod tests {
             Some(window),
         );
         assert_eq!(
-            host_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "yuv420p"),
+            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "yuv420p"),
             format!(
                 "format=gbrp16le,yadif,fps=24,trim=start_frame=10:end_frame=15,\
                  setpts=PTS-STARTPTS,hqdn3d,crop=1920:804:0:138,\
@@ -2979,7 +2735,7 @@ mod tests {
             )
         );
         assert_eq!(
-            host_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "rgb24"),
+            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "rgb24"),
             format!(
                 "yadif,fps=24,trim=start_frame=10:end_frame=15,setpts=PTS-STARTPTS,hqdn3d,\
                  format=gbrp16le,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
@@ -2992,196 +2748,11 @@ mod tests {
             matrix: YuvMatrix::Bt601,
             full_range: false,
         });
-        let on_the_planes = host_filter_chain(&picture, planar_yuv, "yuv420p");
+        let on_the_planes = decode_filter_chain(&picture, planar_yuv, "yuv420p");
         assert!(
             !on_the_planes.contains("format="),
             "the geometry runs on the source's own planes: {on_the_planes}"
         );
-    }
-
-    /// The pipe grok's accelerator plugin takes an 8-bit yuv420p source's planes
-    /// on.
-    fn planar_yuv_pipe(pixel_format: PlanarYuvPixelFormat) -> PipeFormat {
-        PipeFormat::PlanarYuv(YuvFrameFormat {
-            pixel_format,
-            matrix: YuvMatrix::Bt601,
-            full_range: false,
-        })
-    }
-
-    /// One accelerated run's inputs, at 24 fps over the whole source.
-    fn accelerated_inputs<'a>(
-        plan: &'a crate::picture_processing::PicturePlan,
-        source: &'a crate::probe::PixelFormatInfo,
-        source_colour: &'a SourceColour,
-        decode_source: DecodeSource,
-    ) -> DecodeChainInputs<'a> {
-        DecodeChainInputs {
-            decode_source,
-            read_source_at: None,
-            picture: PictureFilters::Planned {
-                plan,
-                fps: FrameRate::whole(24),
-                frame_range: None,
-            },
-            source_colour,
-            source,
-            accelerator_active: true,
-            quality_psnr: None,
-            postkit_prepares_the_frame: false,
-        }
-    }
-
-    /// A plan that scales the source into a box and pads it onto a wider raster.
-    fn scale_and_pad_plan() -> crate::picture_processing::PicturePlan {
-        crate::picture_processing::PictureProcessing {
-            fit: Some(crate::picture_processing::Fit {
-                box_width: 1998,
-                box_height: 858,
-                raster_width: 2048,
-                raster_height: 1080,
-            }),
-            ..crate::picture_processing::PictureProcessing::default()
-        }
-        .plan(1920, 1080)
-        .unwrap()
-    }
-
-    #[test]
-    fn a_scale_and_a_pad_on_yuv420p_run_on_the_device() {
-        let plan = scale_and_pad_plan();
-        let source = source_pixel_format("yuv420p");
-        let display_rgb = SourceColour::DisplayRgb;
-        let inputs = accelerated_inputs(&plan, &source, &display_rgb, DecodeSource::Video);
-        let chain = decode_chain(
-            &inputs,
-            planar_yuv_pipe(PlanarYuvPixelFormat::Yuv420p),
-            true,
-        )
-        .unwrap();
-
-        assert!(chain.device_geometry);
-        assert_eq!(chain.host_geometry_reason, None);
-        assert_eq!(
-            chain.filters,
-            crate::picture_findings::with_detection_branch(
-                "fps=24,scale_cuda=1524:858:interp_algo=lanczos,\
-                 pad_cuda=2048:1080:262:110:color=black,hwdownload,format=nv12,format=yuv420p"
-            )
-        );
-        assert_eq!(
-            chain.input_args,
-            vec!["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
-        );
-    }
-
-    #[test]
-    fn everything_the_cuda_filters_cannot_run_stays_on_the_host() {
-        let scale_and_pad = scale_and_pad_plan();
-        let cropped = crate::picture_processing::PictureProcessing {
-            crop: crate::picture_processing::Crop {
-                left: 0,
-                right: 0,
-                top: 138,
-                bottom: 138,
-            },
-            fit: Some(crate::picture_processing::Fit {
-                box_width: 1998,
-                box_height: 858,
-                raster_width: 2048,
-                raster_height: 1080,
-            }),
-            ..crate::picture_processing::PictureProcessing::default()
-        }
-        .plan(1920, 1080)
-        .unwrap();
-        let identity = crate::picture_processing::PictureProcessing::default()
-            .plan(1920, 1080)
-            .unwrap();
-        let eight_bit = source_pixel_format("yuv420p");
-        let ten_bit = source_pixel_format("yuv420p10le");
-        let display_rgb = SourceColour::DisplayRgb;
-
-        let refused = [
-            (
-                "a failed probe",
-                &scale_and_pad,
-                &eight_bit,
-                planar_yuv_pipe(PlanarYuvPixelFormat::Yuv420p),
-                DecodeSource::Video,
-                false,
-                Some(NVDEC_REFUSAL.to_string()),
-            ),
-            (
-                "a crop",
-                &cropped,
-                &eight_bit,
-                planar_yuv_pipe(PlanarYuvPixelFormat::Yuv420p),
-                DecodeSource::Video,
-                true,
-                Some(
-                    "the plan does more than a scale and a pad, and only those two have CUDA \
-                     filters"
-                        .to_string(),
-                ),
-            ),
-            (
-                "a 10-bit source",
-                &scale_and_pad,
-                &ten_bit,
-                planar_yuv_pipe(PlanarYuvPixelFormat::Yuv420p10le),
-                DecodeSource::Video,
-                true,
-                Some("the source is yuv420p10le and the CUDA filters take yuv420p".to_string()),
-            ),
-            (
-                "an image sequence",
-                &scale_and_pad,
-                &eight_bit,
-                planar_yuv_pipe(PlanarYuvPixelFormat::Yuv420p),
-                DecodeSource::ImageList,
-                true,
-                Some("a concat list of stills decodes on the host".to_string()),
-            ),
-            (
-                "the packed RGB pipe",
-                &scale_and_pad,
-                &eight_bit,
-                PipeFormat::PackedRgb(SampleOrder::Big),
-                DecodeSource::Video,
-                true,
-                Some(
-                    "the frames reach postkit as rgb48be rather than the source's own planes"
-                        .to_string(),
-                ),
-            ),
-            (
-                "an identity plan",
-                &identity,
-                &eight_bit,
-                planar_yuv_pipe(PlanarYuvPixelFormat::Yuv420p),
-                DecodeSource::Video,
-                true,
-                None,
-            ),
-        ];
-
-        for (name, plan, source, pipe_format, decode_source, probed, reason) in refused {
-            let inputs = accelerated_inputs(plan, source, &display_rgb, decode_source);
-            let chain = decode_chain(&inputs, pipe_format, probed).unwrap();
-            assert!(!chain.device_geometry, "{name}");
-            assert_eq!(chain.host_geometry_reason, reason, "{name}");
-            assert!(
-                !chain.filters.contains("_cuda"),
-                "{name}: {}",
-                chain.filters
-            );
-            assert_eq!(
-                chain.input_args,
-                decode_input_args(decode_source, None, HardwareDecode::ToSystemMemory).unwrap(),
-                "{name}: the frames come back to system memory right after the decode"
-            );
-        }
     }
 
     /// The BT.601 luma coefficients and the studio range an 8-bit YUV source's
@@ -3281,7 +2852,7 @@ mod tests {
         let pipe_format = PipeFormat::PackedRgb(SampleOrder::Big);
         let run = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-y"])
-            .args(decode_input_args(DecodeSource::Video, None, HardwareDecode::Off).unwrap())
+            .args(decode_input_args(DecodeSource::Video, None, false).unwrap())
             .arg("-i")
             .arg(clip)
             .args(decode_output_args(filters, pipe_format, None))
@@ -3363,7 +2934,7 @@ mod tests {
             ),
         ];
         for (name, picture_filters) in chains {
-            let filters = host_filter_chain(&picture_filters, packed_rgb, &source.pix_fmt);
+            let filters = decode_filter_chain(&picture_filters, packed_rgb, &source.pix_fmt);
             assert!(
                 filters.starts_with("format=gbrp16le,"),
                 "{name}: the conversion has to run before everything else: {filters}"

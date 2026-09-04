@@ -15,12 +15,9 @@
 
 #![cfg(feature = "grok-gpu")]
 
-use postkit::encode::{
-    DecodeChainInputs, DecodeSource, PictureFilters, StreamEncodeOptions, compress_params,
-    decode_chain_for_run, stream_encode_inprocess,
-};
+use postkit::encode::{StreamEncodeOptions, stream_encode_inprocess};
 use postkit::grok_decoder::DecodedFrame;
-use postkit::picture_processing::{Crop, Fit, PictureProcessing};
+use postkit::picture_processing::{Crop, PictureProcessing};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -34,10 +31,6 @@ const PSNR_FLOOR_DB: f64 = 50.0;
 /// What the crop case takes off each side, which leaves an even raster on the
 /// chroma grid.
 const CROP_EDGE: u32 = 16;
-/// The box the geometry case fits the source into, and the raster it pads that
-/// back onto. Both offsets land on the chroma grid, which is what `pad_cuda`
-/// and ffmpeg's own `pad` both need.
-const GEOMETRY_BOX: (u32, u32) = (192, 108);
 /// What the packed RGB path writes to the pipe.
 const PACKED_RGB: &str = "rgb48be";
 
@@ -49,11 +42,6 @@ struct Case {
     pipe_pixel_format: &'static str,
     /// the raster both paths encode, which is the plan's output
     raster: (u32, u32),
-    /// what the two paths agree to, `None` for a case that is measured and
-    /// printed without a floor
-    psnr_floor_db: Option<f64>,
-    /// whether the CUDA filters run this case's geometry
-    device_geometry: bool,
 }
 
 /// A clip of a smooth two-colour gradient, encoded by `codec_args` so the
@@ -175,7 +163,7 @@ fn samples_under_the_floor(
                 host_frame.precision,
             );
             worst = worst.min(psnr);
-            if case.psnr_floor_db.is_some_and(|floor| psnr < floor) {
+            if psnr < PSNR_FLOOR_DB {
                 under_the_floor.push(format!(
                     "{} frame {index} component {component}: {psnr:.2} dB",
                     case.name
@@ -183,64 +171,11 @@ fn samples_under_the_floor(
             }
         }
     }
-    match case.psnr_floor_db {
-        Some(floor) => println!(
-            "{}: the worst component of the run is {worst:.2} dB, floor {floor:.0}",
-            case.name
-        ),
-        None => println!(
-            "{}: the worst component of the run is {worst:.2} dB, measured only",
-            case.name
-        ),
-    }
-    under_the_floor
-}
-
-/// Whether the geometry of one case runs on the device, asked of the same
-/// function the encode decides with. The plugin has to be on already: this asks
-/// it about the frames, and it probes the source's device decode.
-fn device_geometry_of(case: &Case) -> bool {
-    let options = &case.options;
-    let plan = options.picture.plan(WIDTH, HEIGHT).unwrap();
-    let source = postkit::probe::probe_pixel_format(&options.input);
-    let params = compress_params(options).unwrap();
-    let chain = decode_chain_for_run(
-        &DecodeChainInputs {
-            decode_source: DecodeSource::Video,
-            read_source_at: None,
-            picture: PictureFilters::Planned {
-                plan: &plan,
-                fps: options.fps,
-                frame_range: None,
-            },
-            source_colour: &options.source_colour,
-            source: &source,
-            accelerator_active: true,
-            quality_psnr: options.quality_psnr,
-            postkit_prepares_the_frame: false,
-        },
-        &options.input,
-        plan.output_width,
-        plan.output_height,
-        &params,
-    )
-    .unwrap();
-    assert_eq!(
-        (plan.output_width, plan.output_height),
-        case.raster,
-        "{}: the raster the frames decode at is the plan's output",
+    println!(
+        "{}: the worst component of the run is {worst:.2} dB, floor {PSNR_FLOOR_DB:.0}",
         case.name
     );
-    println!("{}: {}", case.name, chain.describe());
-    if chain.device_geometry {
-        assert!(
-            chain.filters.contains("scale_cuda") && chain.filters.contains("pad_cuda"),
-            "{}: {}",
-            case.name,
-            chain.filters
-        );
-    }
-    chain.device_geometry
+    under_the_floor
 }
 
 /// One test, because the plugin is a switch for the whole process and two
@@ -285,8 +220,6 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
             },
             pipe_pixel_format: "yuv420p",
             raster: (WIDTH, HEIGHT),
-            psnr_floor_db: Some(PSNR_FLOOR_DB),
-            device_geometry: false,
         },
         // the same clip as a DCP frame, which is the path dcpwizard takes: the
         // device converts to X'Y'Z' and grok's host transform is what it has to
@@ -301,8 +234,6 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
             },
             pipe_pixel_format: "yuv420p",
             raster: (WIDTH, HEIGHT),
-            psnr_floor_db: Some(PSNR_FLOOR_DB),
-            device_geometry: false,
         },
         // a crop on the source's own planes on its way to the plugin, against
         // the same crop run on 16-bit RGB
@@ -327,36 +258,6 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
             },
             pipe_pixel_format: "yuv420p",
             raster: (WIDTH - 2 * CROP_EDGE, HEIGHT - 2 * CROP_EDGE),
-            psnr_floor_db: Some(PSNR_FLOOR_DB),
-            device_geometry: false,
-        },
-        // the scale and the pad the CUDA filters run before the frames are
-        // downloaded, against swscale running the same plan on 16-bit RGB
-        Case {
-            name: "yuv420p scaled and padded",
-            options: StreamEncodeOptions {
-                input: yuv420p,
-                output_dir: dir.path().join("geometry"),
-                compression_ratio: 1.0,
-                rsiz: 0,
-                num_resolutions: 3,
-                picture: PictureProcessing {
-                    fit: Some(Fit {
-                        box_width: GEOMETRY_BOX.0,
-                        box_height: GEOMETRY_BOX.1,
-                        raster_width: WIDTH,
-                        raster_height: HEIGHT,
-                    }),
-                    ..PictureProcessing::default()
-                },
-                ..StreamEncodeOptions::default()
-            },
-            pipe_pixel_format: "yuv420p",
-            raster: (WIDTH, HEIGHT),
-            // scale_cuda's lanczos differs from swscale's by up to 2 codes of
-            // 255 on the planes, which no floor here holds
-            psnr_floor_db: None,
-            device_geometry: true,
         },
         Case {
             name: "yuv422p10le",
@@ -370,8 +271,6 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
             },
             pipe_pixel_format: "yuv422p10le",
             raster: (WIDTH, HEIGHT),
-            psnr_floor_db: Some(PSNR_FLOOR_DB),
-            device_geometry: false,
         },
     ];
 
@@ -379,14 +278,6 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
     // a second batch segfaults inside grk_plugin_decompress
     if let Err(reason) = postkit::grok_encoder::use_gpu() {
         panic!("{reason}");
-    }
-    for case in &cases {
-        assert_eq!(
-            device_geometry_of(case),
-            case.device_geometry,
-            "{}: the chain the encode runs is what the fidelity is measured on",
-            case.name
-        );
     }
     let device_runs: Vec<PathBuf> = cases
         .iter()
@@ -412,7 +303,7 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
     }
     assert!(
         under_the_floor.is_empty(),
-        "the device and the cpu run disagree by more than each case's floor: {}",
+        "the device and the cpu run disagree by more than the {PSNR_FLOOR_DB} dB floor: {}",
         under_the_floor.join(", ")
     );
 }

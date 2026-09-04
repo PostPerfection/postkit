@@ -17,12 +17,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::encode::DecodeSource;
 
-/// Algorithm for the fit scale, spelled the same way by swscale's `flags` and
-/// by `scale_cuda`'s `interp_algo`.
-pub(crate) const SCALE_ALGORITHM: &str = "lanczos";
+/// swscale algorithm for the fit scale.
+const SCALE_ALGORITHM: &str = "lanczos";
 
 /// Colour of the padding around a fitted picture.
-pub(crate) const PAD_COLOUR: &str = "black";
+const PAD_COLOUR: &str = "black";
 
 /// ffmpeg filter that turns fields into progressive frames.
 const DEINTERLACE_FILTER: &str = "yadif";
@@ -273,12 +272,12 @@ impl PictureProcessing {
 
         let scales = (scaled_width, scaled_height) != (rotated_width, rotated_height);
         let pads = (output_width, output_height) != (scaled_width, scaled_height);
-        let crops_rotates_or_flips = !crop.is_none()
+        let changes_geometry = !crop.is_none()
             || self.rotation != Rotation::None
             || self.flip_horizontal
-            || self.flip_vertical;
-        let changes_geometry = crops_rotates_or_flips || scales || pads;
-        let only_scales_and_pads = !crops_rotates_or_flips && !self.deinterlace && !self.denoise;
+            || self.flip_vertical
+            || scales
+            || pads;
 
         let mut filters = Vec::new();
         if self.deinterlace {
@@ -326,10 +325,7 @@ impl PictureProcessing {
             output_height,
             pad_left,
             pad_top,
-            scales,
-            pads,
             changes_geometry,
-            only_scales_and_pads,
             filters,
             fps_position,
             geometry_format_position,
@@ -355,14 +351,9 @@ pub struct PicturePlan {
     /// Where the scaled picture sits on the output raster, on the chroma grid.
     pub pad_left: u32,
     pub pad_top: u32,
-    pub scales: bool,
-    pub pads: bool,
     /// Whether a crop, a rotation, a flip, a scale or a pad moves the picture
     /// around. A deinterlace, a denoise and the frame rate are not that.
     pub changes_geometry: bool,
-    /// Whether a scale and a pad are the whole plan: nothing else it can do has
-    /// a CUDA filter, so this is what lets the geometry run on the device.
-    pub only_scales_and_pads: bool,
     /// The `-vf` items in order, ready to join with ','.
     pub filters: Vec<String>,
     /// Where the frame rate filter belongs in `filters`: deinterlacing turns
@@ -843,9 +834,7 @@ mod tests {
                 "pad=w=2048:h=1080:x=262:y=110:color=black".to_string(),
             ]
         );
-        assert!(plan.only_scales_and_pads);
-        assert!(plan.scales);
-        assert!(plan.pads);
+        assert!(plan.changes_geometry);
     }
 
     #[test]
@@ -860,7 +849,6 @@ mod tests {
         assert_eq!(plan.filters, vec!["transpose=clock"]);
         assert_eq!(plan.geometry_format_position, 0);
         assert!(plan.changes_geometry);
-        assert!(!plan.only_scales_and_pads, "a turn has no CUDA filter");
 
         let half = PictureProcessing {
             rotation: Rotation::Half,
