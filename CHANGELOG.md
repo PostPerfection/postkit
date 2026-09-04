@@ -139,6 +139,11 @@
   six channel 24 bit WAV: 1.0 s and 10 MB against loudnorm's 107.7 s and 177 MB,
   same -0.20 dBTP.
 
+### Changed
+
+- **grok is pinned at the v20.4.3 release**: `grokj2k-sys` and CI both build the
+  tag instead of a commit on master.
+
 ### Removed
 
 - **Every grok command line path**: `encode::encode` (which passed a bitrate

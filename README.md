@@ -74,7 +74,7 @@ Cargo features: `grok-ffi` (J2K encoder), `async` (tokio), `icc`
 (monitor-ICC display path in `preview`/`colour`, needs liblcms2). All off by
 default.
 
-`grok-ffi` links libgrokj2k (grok >= 20.4.2) found via pkg-config, so build and
+`grok-ffi` links libgrokj2k (grok >= 20.4.3) found via pkg-config, so build and
 install grok first (cmake, e.g. to `~/bin/grok`), then put its `lib/pkgconfig` on
 `PKG_CONFIG_PATH` and its `lib` on `LD_LIBRARY_PATH`. CI does this in a cached
 "Setup grok" step; see `.github/workflows/ci.yml`.
@@ -112,7 +112,7 @@ about two codes of 255 off the exact colour.
 `cargo test --features grok-gpu` runs the device round trip and needs a machine
 with the plugin, CI has no GPU: `tests/grok_gpu.rs` for the round trip,
 `tests/grok_gpu_yuv.rs` for the planar YUV source and
-`tests/grok_gpu_rgb48le.rs` for the interleaved one. This needs grok v20.4.2 or
+`tests/grok_gpu_rgb48le.rs` for the interleaved one. This needs grok v20.4.3 or
 newer, which has `grk_plugin_set_enabled`.
 
 ## Usage
