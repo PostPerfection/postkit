@@ -157,6 +157,13 @@
 
 ### Fixed
 
+- **A cancelled encode never returned**: the producer blocks pushing into the
+  full frame queue while the encoder threads compress, and a cancel made those
+  threads leave without draining or closing it, so the producer waited forever
+  and a GUI that cancelled a build then hung on exit behind the blocked job. An
+  encoder thread that leaves on cancel now closes the queue, which is what wakes
+  the producer. A unit test cancels a run from inside the producer once the
+  queue is full and requires the pipeline to return.
 - **The encode aimed at a compression ratio and missed the bitrate**: a caller
   with a bitrate divided the source raster's bytes by it, but the picture is
   padded to its container before grok sees it, and grok computes its own budget

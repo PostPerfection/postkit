@@ -814,6 +814,10 @@ fn encoder_thread_fn(
             }
         }
     }
+    // a producer blocked on the full queue only wakes when the queue closes
+    if cancel.load(Ordering::Relaxed) {
+        input_queue.close();
+    }
 }
 
 // ─── Grok FFI compression ──────────────────────────────────────────────────
@@ -2539,6 +2543,60 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// The producer blocks pushing into the full queue while the encoder
+    /// threads compress, and a cancel makes those threads leave without
+    /// draining it.
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_cancel_releases_a_producer_blocked_on_the_full_queue() {
+        // well past the queue capacity plus one frame per encoder thread
+        const CANCEL_AT_FRAME: u64 = 200;
+        const RETURN_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+        const FRAME_BYTES: usize = 2048 * 1080 * 6;
+        let dir = tempfile::tempdir().unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let produced = Arc::new(AtomicU64::new(0));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        initialize(0);
+        let output_dir = dir.path().to_path_buf();
+        let pipeline_cancel = cancel.clone();
+        let pipeline_produced = produced.clone();
+        std::thread::spawn(move || {
+            let phase_clocks = Arc::new(PhaseClocks::default());
+            let result = encode_pipeline(
+                &output_dir,
+                &CompressParams::default(),
+                u64::MAX,
+                &pipeline_cancel,
+                &phase_clocks,
+                || {
+                    let index = pipeline_produced.fetch_add(1, Ordering::Relaxed);
+                    if index == CANCEL_AT_FRAME {
+                        pipeline_cancel.store(true, Ordering::Relaxed);
+                    }
+                    Some(RawFrame::Packed {
+                        data: vec![0u8; FRAME_BYTES],
+                        order: SampleOrder::Big,
+                        width: 2048,
+                        height: 1080,
+                        precision: 16,
+                        index,
+                    })
+                },
+                |_| {},
+            );
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx
+            .recv_timeout(RETURN_WITHIN)
+            .expect("the pipeline never returned after the cancel");
+        assert_eq!(result.error, "Cancelled");
+        assert!(
+            produced.load(Ordering::Relaxed) > result.frames_encoded,
+            "the queue held no frames when the cancel came, so nothing was blocked"
+        );
     }
 
     /// One 128x128 frame of noise, incompressible enough that every frame lands
