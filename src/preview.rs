@@ -18,9 +18,10 @@
 //! showing garbage.
 //!
 //! IMF App 2E picture ([`render_imf_frame`]) shares the resolve and decrypt
-//! steps and then takes the RGB samples grok returns straight to 8-bit sRGB,
-//! because the essence descriptor's ColorPrimaries and TransferCharacteristic
-//! say Rec.709. Any other colour is refused by name.
+//! steps and then hands the decoded samples to
+//! [`crate::preview_colour::render_display_rgb8`], which reads the essence
+//! descriptor's ColorPrimaries and TransferCharacteristic and tone maps, matrixes
+//! and upsamples whatever they say into 8-bit Rec.709.
 //!
 //! This is a correct decoded-and-colour-managed preview, not a real-time
 //! projector-grade player: each frame decodes on the CPU and a range plays
@@ -112,7 +113,7 @@ pub fn read_frame_rate(input: &Path) -> f64 {
 /// DCP picture essence goes through the grok decoder and the DCDM inverse
 /// transform, which decodes a 2K frame in 68 ms against ffmpeg's 302 ms and does
 /// not decode every earlier frame to reach a late one. IMF App 2E picture takes
-/// the same decoder and the Rec.709 transform in [`render_imf_frame`].
+/// the same decoder and the display transform in [`render_imf_frame`].
 /// Everything else, broadcast and unrestricted codestreams included, goes
 /// through ffmpeg.
 ///
@@ -380,10 +381,6 @@ pub fn render_to_sequence(input: &Path, output_dir: &Path, format: Option<&str>)
 
 use crate::colour::{RenderingIntent, XyzToSrgb};
 use asdcplib::crypto::AesDecContext;
-use asdcplib::jp2k::{
-    COLOR_PRIMARIES_BT709, COLOR_PRIMARIES_BT2020, COLOR_PRIMARIES_P3D65,
-    TRANSFER_CHARACTERISTIC_BT709, TRANSFER_CHARACTERISTIC_BT2020, TRANSFER_CHARACTERISTIC_ST2084,
-};
 use std::io::Write as _;
 
 /// Largest picture frame we read into. DCI caps a 4K frame at 500 Mbps / 24 fps
@@ -442,6 +439,9 @@ pub struct ResolvedPicture {
     pub color_primaries: Option<[u8; 16]>,
     /// TransferCharacteristic UL from the essence descriptor.
     pub transfer_characteristic: Option<[u8; 16]>,
+    /// ST 2086 MasteringDisplayMaximumLuminance in 0.0001 cd/m² steps, the peak
+    /// the HDR tone map maps down from.
+    pub mastering_display_max_luminance: Option<u32>,
 }
 
 /// A JPEG 2000 picture reader, one variant per MXF flavour.
@@ -613,6 +613,7 @@ pub fn resolve_picture(source: &Path) -> Result<ResolvedPicture, PreviewError> {
         as02,
         color_primaries: colour.color_primaries,
         transfer_characteristic: colour.transfer_characteristic,
+        mastering_display_max_luminance: colour.mastering_display_max_luminance,
     })
 }
 
@@ -751,10 +752,11 @@ fn read_picture_codestream(
 }
 
 /// A decoded, colour-managed frame as packed 8-bit RGB.
-struct Rgb8Frame {
-    width: u32,
-    height: u32,
-    data: Vec<u8>,
+#[derive(Debug)]
+pub struct Rgb8Frame {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
 }
 
 /// One display transform, chosen from the options: built-in sRGB, or an ICC
@@ -830,10 +832,9 @@ pub fn render_dcp_frame(
 /// Decode a single IMF App 2E picture frame and write it to an image file,
 /// format from the extension.
 ///
-/// The samples are RGB, and the essence descriptor's ColorPrimaries and
-/// TransferCharacteristic say which RGB. Rec.709 shares its primaries and white
-/// point with sRGB, so the 12-bit code values reach the screen with their low
-/// bits dropped and nothing else. Any other signalled colour is refused by name.
+/// The essence descriptor's ColorPrimaries and TransferCharacteristic say what
+/// the samples are, and [`crate::preview_colour`] turns that into Rec.709 for a
+/// monitor. Only a UL it has no reading for is refused.
 pub fn render_imf_frame(
     opts: &DcpPreviewOptions,
     frame: u32,
@@ -845,115 +846,11 @@ pub fn render_imf_frame(
         ));
     }
     let resolved = resolve_picture(&opts.source)?;
-    check_rec709_colour(&resolved)?;
+    let colour = crate::preview_colour::resolve_picture_colour(&resolved)?;
     let j2c = read_picture_codestream(&resolved, opts.key, frame)?;
     let decoded = crate::grok_decoder::decode(j2c, 0).map_err(PreviewError::Decode)?;
-    let img = rec709_frame_to_srgb8(&decoded, &resolved.mxf)?;
+    let img = crate::preview_colour::render_display_rgb8(&decoded, &colour, &resolved.mxf)?;
     write_rgb8_image(&img, out_image)
-}
-
-/// Refuse any picture colour the pass-through transform would show wrong,
-/// treating unsignalled colour as Rec.709: packages exist that signal nothing.
-fn check_rec709_colour(resolved: &ResolvedPicture) -> Result<(), PreviewError> {
-    const NO_TONE_MAPPING: &str = "the preview has no tone mapping for it yet";
-    const REC709_ONLY: &str = "the preview has a display transform only for Rec.709";
-    let file = resolved.mxf.display();
-
-    match resolved.transfer_characteristic {
-        None => tracing::warn!(
-            "{file} signals no transfer characteristic, so the preview assumes Rec.709"
-        ),
-        Some(ul) if ul == TRANSFER_CHARACTERISTIC_BT709 => {}
-        Some(ul) if ul == TRANSFER_CHARACTERISTIC_ST2084 => {
-            return Err(PreviewError::Display(format!(
-                "{file} signals the ST 2084 (PQ) transfer characteristic, and {NO_TONE_MAPPING}"
-            )));
-        }
-        Some(ul) if ul == TRANSFER_CHARACTERISTIC_BT2020 => {
-            return Err(PreviewError::Display(format!(
-                "{file} signals the BT.2020 transfer characteristic, and {NO_TONE_MAPPING}"
-            )));
-        }
-        Some(ul) => {
-            return Err(PreviewError::Display(format!(
-                "{file} signals the unrecognised transfer characteristic {ul:02x?}, and {REC709_ONLY}"
-            )));
-        }
-    }
-
-    match resolved.color_primaries {
-        None => {
-            tracing::warn!("{file} signals no colour primaries, so the preview assumes Rec.709")
-        }
-        Some(ul) if ul == COLOR_PRIMARIES_BT709 => {}
-        Some(ul) if ul == COLOR_PRIMARIES_P3D65 => {
-            return Err(PreviewError::Display(format!(
-                "{file} signals P3-D65 colour primaries, and {NO_TONE_MAPPING}"
-            )));
-        }
-        Some(ul) if ul == COLOR_PRIMARIES_BT2020 => {
-            return Err(PreviewError::Display(format!(
-                "{file} signals BT.2020 colour primaries, and {NO_TONE_MAPPING}"
-            )));
-        }
-        Some(ul) => {
-            return Err(PreviewError::Display(format!(
-                "{file} signals the unrecognised colour primaries {ul:02x?}, and {REC709_ONLY}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Rec.709 RGB code values as packed 8-bit sRGB.
-fn rec709_frame_to_srgb8(
-    decoded: &crate::grok_decoder::DecodedFrame,
-    mxf: &Path,
-) -> Result<Rgb8Frame, PreviewError> {
-    /// What an App 2E picture carries, and the only depth this shift is right for.
-    const IMF_PRECISION_BITS: u8 = 12;
-    const IMF_COMPONENT_COUNT: usize = 3;
-    const TWELVE_TO_EIGHT_BIT_SHIFT: u32 = 4;
-    const EIGHT_BIT_MAX: i32 = 255;
-
-    if decoded.components.len() != IMF_COMPONENT_COUNT {
-        return Err(PreviewError::Display(format!(
-            "{} decodes to {} components, and the preview shows only 3-component RGB picture",
-            mxf.display(),
-            decoded.components.len()
-        )));
-    }
-    if decoded.precision != IMF_PRECISION_BITS {
-        return Err(PreviewError::Display(format!(
-            "{} decodes at {} bits a sample, and the preview shows only {IMF_PRECISION_BITS}-bit \
-             IMF picture",
-            mxf.display(),
-            decoded.precision
-        )));
-    }
-    let samples = decoded.width as usize * decoded.height as usize;
-    for (index, component) in decoded.components.iter().enumerate() {
-        if component.len() != samples {
-            return Err(PreviewError::Display(format!(
-                "component {index} of {} holds {} samples, not the {samples} the frame is",
-                mxf.display(),
-                component.len()
-            )));
-        }
-    }
-
-    let mut data = Vec::with_capacity(samples * IMF_COMPONENT_COUNT);
-    for sample in 0..samples {
-        for component in &decoded.components {
-            let value = component[sample] >> TWELVE_TO_EIGHT_BIT_SHIFT;
-            data.push(value.clamp(0, EIGHT_BIT_MAX) as u8);
-        }
-    }
-    Ok(Rgb8Frame {
-        width: decoded.width,
-        height: decoded.height,
-        data,
-    })
 }
 
 /// Write a raw RGB frame to an image file, format from the extension.

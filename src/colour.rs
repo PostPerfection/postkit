@@ -505,7 +505,7 @@ impl Rec709Transform {
 
 // f64, because an f32 identity sits 1e-7 off the diagonal and the encode gamma
 // lifts that leak into a dark channel to several code values
-fn linear_rgb_to_rec709(
+pub(crate) fn linear_rgb_to_rec709(
     rec709_to_xyz: &[[f32; 3]; 3],
     source_to_xyz: &[[f32; 3]; 3],
 ) -> [[f32; 3]; 3] {
@@ -612,7 +612,7 @@ pub enum RenderingIntent {
 /// DCDM encoding gamma (SMPTE 428-1), used in both directions.
 const DCDM_GAMMA: f32 = 2.6;
 /// Display-referred Rec.709 gamma, used in both directions.
-const REC709_GAMMA: f32 = 2.2;
+pub(crate) const REC709_GAMMA: f32 = 2.2;
 const MAX_CODE_12BIT: f32 = 4095.0;
 /// SMPTE 428-1 peak luminance the encoding normalises against (cd/m²).
 const DCI_PEAK_LUMINANCE: f32 = 52.37;
@@ -643,7 +643,7 @@ const XYZ_D65_TO_SRGB: [[f32; 3]; 3] = [
 #[cfg(any(feature = "icc", test))]
 const D65_WHITE_XYZ: [f32; 3] = [0.950_456, 1.0, 1.088_754];
 
-fn mat_vec(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
+pub(crate) fn mat_vec(m: &[[f32; 3]; 3], v: [f32; 3]) -> [f32; 3] {
     [
         m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
         m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],

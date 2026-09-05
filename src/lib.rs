@@ -46,6 +46,7 @@ pub mod plugin;
 pub mod preferences;
 pub mod preflight;
 pub mod preview;
+pub mod preview_colour;
 pub mod probe;
 pub mod profiles;
 pub mod prores;
