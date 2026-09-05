@@ -157,10 +157,11 @@ pub struct SourcePreparation {
     /// X'Y'Z', where display-RGB text would land in the wrong space.
     pub subtitle_burn: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
     /// Colour transform postkit runs over each frame, for a source space the
-    /// compressor's own transform does not model (P3, Rec.2020). Setting it
+    /// compressor's own transform does not model (P3, Rec.2020), or for a
+    /// source that has to reach Rec.709 RGB rather than X'Y'Z'. Setting it
     /// together with `apply_xyz_transform` converts the frame twice and is
     /// refused.
-    pub colour_transform: Option<Arc<crate::colour::DcdmTransform>>,
+    pub colour_transform: Option<Arc<crate::colour::FrameColourTransform>>,
 }
 
 impl SourcePreparation {
@@ -2186,7 +2187,7 @@ mod tests {
     fn a_frame_transform_converts_packed_frames_and_refuses_the_rest() {
         let transform = crate::colour::DcdmTransform::to_xyz(crate::colour::ColourSpace::P3)
             .expect("P3 transform");
-        let transform = Arc::new(transform);
+        let transform = Arc::new(crate::colour::FrameColourTransform::ToXyz(transform));
         let prep = SourcePreparation {
             subtitle_burn: None,
             colour_transform: Some(Arc::clone(&transform)),
@@ -2242,7 +2243,7 @@ mod tests {
 
         let transform = crate::colour::DcdmTransform::to_xyz(crate::colour::ColourSpace::P3)
             .expect("P3 transform");
-        let transform = Arc::new(transform);
+        let transform = Arc::new(crate::colour::FrameColourTransform::ToXyz(transform));
         let prep = SourcePreparation {
             subtitle_burn: Some(Arc::new(burn)),
             colour_transform: Some(Arc::clone(&transform)),

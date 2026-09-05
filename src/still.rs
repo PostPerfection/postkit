@@ -92,7 +92,7 @@ pub struct StillHold<'a> {
     pub rsiz: u16,
     /// Per-frame matrix for a source space the compressor's own transform does
     /// not model.
-    pub colour_transform: Option<Arc<crate::colour::DcdmTransform>>,
+    pub colour_transform: Option<Arc<crate::colour::FrameColourTransform>>,
     /// Subtitles burnt into the held frames.
     pub burn: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
     pub out_dir: &'a Path,

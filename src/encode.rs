@@ -222,6 +222,10 @@ pub enum SourceColour {
     /// Display RGB compressed as it is, for IMF picture whose descriptor names
     /// the colour the samples are already in.
     KeepRgb,
+    // postkit converts these frames to the Rec.709 RGB an App 2E picture carries
+    KeepRgbFrom(crate::colour::ColourSpace),
+    // the LUT runs in ffmpeg's decode and its output is Rec.709 RGB
+    KeepRgbAfterLut(PathBuf),
 }
 
 impl SourceColour {
@@ -231,13 +235,27 @@ impl SourceColour {
     }
 
     /// The transform postkit runs over each frame before compression, built once
-    /// for the whole run. Errs for a space no 3x3 matrix reaches X'Y'Z' from.
-    pub fn frame_transform(&self) -> Result<Option<Arc<crate::colour::DcdmTransform>>, String> {
-        match self {
-            SourceColour::DisplayRgbIn(space) => Ok(Some(Arc::new(
+    /// for the whole run. Errs for a space no 3x3 matrix reaches the output
+    /// space from.
+    pub fn frame_transform(
+        &self,
+    ) -> Result<Option<Arc<crate::colour::FrameColourTransform>>, String> {
+        let transform = match self {
+            SourceColour::DisplayRgbIn(space) => crate::colour::FrameColourTransform::ToXyz(
                 crate::colour::DcdmTransform::to_xyz(*space)?,
-            ))),
-            _ => Ok(None),
+            ),
+            SourceColour::KeepRgbFrom(space) => crate::colour::FrameColourTransform::ToRec709(
+                crate::colour::Rec709Transform::from_space(*space)?,
+            ),
+            _ => return Ok(None),
+        };
+        Ok(Some(Arc::new(transform)))
+    }
+
+    pub fn decode_lut(&self) -> Option<&Path> {
+        match self {
+            SourceColour::DciLut(lut) | SourceColour::KeepRgbAfterLut(lut) => Some(lut),
+            _ => None,
         }
     }
 }
@@ -383,7 +401,7 @@ fn decode_filters(picture: &PictureFilters, source_colour: &SourceColour) -> Dec
     }
     let geometry_position = plan.geometry_format_position + inserted;
 
-    if let SourceColour::DciLut(lut) = source_colour {
+    if let Some(lut) = source_colour.decode_lut() {
         items.push(format!(
             "lut3d={}",
             crate::burnin::filter_argument(&lut.to_string_lossy())
@@ -720,8 +738,9 @@ pub(crate) fn choose_pipe_format(
     let postkit_reads_the_samples = inputs.postkit_prepares_the_frame
         || matches!(
             inputs.source_colour,
-            SourceColour::DisplayRgbIn(_) | SourceColour::DciLut(_)
-        );
+            SourceColour::DisplayRgbIn(_) | SourceColour::KeepRgbFrom(_)
+        )
+        || inputs.source_colour.decode_lut().is_some();
     let Some(pixel_format) = PlanarYuvPixelFormat::from_ffmpeg_name(&inputs.source.pix_fmt) else {
         return PipeFormat::PackedRgb(SampleOrder::Big);
     };
@@ -1208,12 +1227,12 @@ where
 {
     use crate::grok_encoder::{self, RawFrame};
 
-    if let SourceColour::DciLut(lut) = &opts.source_colour
+    if let Some(lut) = opts.source_colour.decode_lut()
         && !lut.is_file()
     {
         return EncodeResult {
             success: false,
-            error: format!("HDR-to-DCI LUT not found: {}", lut.display()),
+            error: format!("decode LUT not found: {}", lut.display()),
             ..Default::default()
         };
     }
@@ -1503,8 +1522,8 @@ pub type FrameLoader<'a> =
 /// numbered from zero by the index the frame was loaded at.
 ///
 /// `opts.input`, `read_source_at`, `picture` and `decode_source` are ffmpeg's
-/// and are not read: the loaded frames are the input. A `DciLut` source is
-/// refused, since that LUT runs inside ffmpeg's decode.
+/// and are not read: the loaded frames are the input. A source colour carrying
+/// a decode LUT is refused, since that LUT runs inside ffmpeg's decode.
 pub fn encode_loaded_frames<'a, O, F>(
     frame_count: u64,
     open_loader: O,
@@ -1531,9 +1550,9 @@ where
     if frame_count == 0 {
         return failure("No frames to encode".to_string());
     }
-    if let SourceColour::DciLut(lut) = &opts.source_colour {
+    if let Some(lut) = opts.source_colour.decode_lut() {
         return failure(format!(
-            "the HDR-to-DCI LUT {} runs inside ffmpeg's decode, which these frames never pass \
+            "the 3D LUT {} runs inside ffmpeg's decode, which these frames never pass \
              through: encode from a video instead",
             lut.display()
         ));
@@ -2160,6 +2179,62 @@ mod tests {
     }
 
     #[test]
+    fn an_imf_source_converted_to_rec709_leaves_the_compressor_transform_off() {
+        let rsiz = crate::j2k::imf_rsiz(
+            crate::j2k::ImfProfile::Imf4k,
+            crate::j2k::ImfLevels {
+                main_level: 6,
+                sub_level: 5,
+            },
+        );
+        let params = compress_params(&StreamEncodeOptions {
+            source_colour: SourceColour::KeepRgbFrom(crate::colour::ColourSpace::P3),
+            rsiz,
+            ..StreamEncodeOptions::default()
+        })
+        .unwrap();
+        assert!(
+            !params.apply_xyz_transform,
+            "an App 2E picture is RGB, so grok must not convert it"
+        );
+        assert_eq!(params.profile, rsiz, "the IMF Rsiz reaches the codestreams");
+        assert!(
+            matches!(
+                params.source_preparation.colour_transform.as_deref(),
+                Some(crate::colour::FrameColourTransform::ToRec709(_))
+            ),
+            "postkit converts the frames to Rec.709 itself"
+        );
+
+        let kept = compress_params(&StreamEncodeOptions {
+            source_colour: SourceColour::KeepRgb,
+            rsiz,
+            ..StreamEncodeOptions::default()
+        })
+        .unwrap();
+        assert!(!kept.apply_xyz_transform);
+        assert!(kept.source_preparation.colour_transform.is_none());
+    }
+
+    #[test]
+    fn loaded_frames_refuse_a_lut_that_runs_in_the_decode() {
+        let result = encode_loaded_frames(
+            1,
+            || Err::<FrameLoader, String>("no loader is opened".to_string()),
+            &StreamEncodeOptions {
+                source_colour: SourceColour::KeepRgbAfterLut(PathBuf::from("/luts/to_rec709.cube")),
+                ..StreamEncodeOptions::default()
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            None,
+            |_| {},
+        );
+        assert!(!result.success);
+        assert!(result.error.contains("to_rec709.cube"), "{}", result.error);
+    }
+
+    #[test]
     fn the_lut_source_decodes_through_lut3d() {
         let plain = crate::picture_processing::PictureProcessing::default()
             .plan(1920, 1080)
@@ -2374,18 +2449,34 @@ mod tests {
             PipeFormat::PackedRgb(SampleOrder::Big),
             "postkit converts this source itself and needs RGB"
         );
-        let lut = SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube"));
+        let to_rec709 = SourceColour::KeepRgbFrom(crate::colour::ColourSpace::P3);
         assert_eq!(
             choose_pipe_format(
                 &PipeFormatInputs {
-                    source_colour: &lut,
+                    source_colour: &to_rec709,
                     ..accelerated
                 },
                 true
             ),
             PipeFormat::PackedRgb(SampleOrder::Big),
-            "lut3d puts RGB on the pipe"
+            "postkit converts this source to Rec.709 itself and needs RGB"
         );
+        for lut in [
+            SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+            SourceColour::KeepRgbAfterLut(PathBuf::from("/luts/to_rec709.cube")),
+        ] {
+            assert_eq!(
+                choose_pipe_format(
+                    &PipeFormatInputs {
+                        source_colour: &lut,
+                        ..accelerated
+                    },
+                    true
+                ),
+                PipeFormat::PackedRgb(SampleOrder::Big),
+                "lut3d puts RGB on the pipe"
+            );
+        }
 
         for already_transformed in [SourceColour::AlreadyPq, SourceColour::KeepRgb] {
             assert!(

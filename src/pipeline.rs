@@ -548,9 +548,9 @@ fn first_frame_format(input: &Path) -> Result<ImageFormat, String> {
     Ok(crate::encode::detect_image_format(&first))
 }
 
-/// Refuse a source colour the chosen input branch cannot honour: the HDR-to-DCI
-/// LUT runs inside ffmpeg's decode, so a TIFF sequence postkit reads itself
-/// cannot take it, and nothing can be converted once the frames are compressed.
+/// Refuse a source colour the chosen input branch cannot honour: a decode LUT
+/// runs inside ffmpeg's decode, so a TIFF sequence postkit reads itself cannot
+/// take it, and nothing can be converted once the frames are compressed.
 ///
 /// `decodes_through_ffmpeg` is what the sequence limit hangs on rather than the
 /// input type: a sequence that a picture change routes through ffmpeg reaches
@@ -560,21 +560,29 @@ fn reject_unsupported_colour_path(
     source_colour: &SourceColour,
     decodes_through_ffmpeg: bool,
 ) -> Result<(), String> {
-    match (input_type, source_colour) {
-        (InputType::ImageSequence, SourceColour::DciLut(lut)) if !decodes_through_ffmpeg => {
-            Err(format!(
-                "the HDR-to-DCI LUT {} runs inside ffmpeg's decode, and TIFF stills are read by \
+    if let Some(lut) = source_colour.decode_lut() {
+        if input_type == InputType::ImageSequence && !decodes_through_ffmpeg {
+            return Err(format!(
+                "the 3D LUT {} runs inside ffmpeg's decode, and TIFF stills are read by \
                  postkit itself: encode from a video instead",
                 lut.display()
-            ))
+            ));
         }
-        (InputType::J2kSequence, SourceColour::DciLut(lut)) => Err(format!(
-            "J2K input is already compressed, so the HDR-to-DCI LUT {} cannot be applied",
-            lut.display()
-        )),
+        if input_type == InputType::J2kSequence {
+            return Err(format!(
+                "J2K input is already compressed, so the 3D LUT {} cannot be applied",
+                lut.display()
+            ));
+        }
+    }
+    match (input_type, source_colour) {
         (InputType::J2kSequence, SourceColour::DisplayRgbIn(space)) => Err(format!(
             "J2K input is already compressed, so a {space:?} source cannot be converted to \
              X'Y'Z' any more"
+        )),
+        (InputType::J2kSequence, SourceColour::KeepRgbFrom(space)) => Err(format!(
+            "J2K input is already compressed, so a {space:?} source cannot be converted to \
+             Rec.709 RGB any more"
         )),
         _ => Ok(()),
     }
@@ -718,6 +726,7 @@ mod tests {
             SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3),
             SourceColour::AlreadyPq,
             SourceColour::KeepRgb,
+            SourceColour::KeepRgbFrom(crate::colour::ColourSpace::P3),
         ] {
             assert!(
                 reject_unsupported_colour_path(InputType::ImageSequence, &colour, READ_BY_POSTKIT)
@@ -725,25 +734,34 @@ mod tests {
                 "{colour:?} is applied on the frames postkit reads"
             );
         }
-        let lut = SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube"));
-        let refused =
-            reject_unsupported_colour_path(InputType::ImageSequence, &lut, READ_BY_POSTKIT)
-                .unwrap_err();
-        assert!(refused.contains("hdr_to_dci.cube"), "{refused}");
-        assert!(
-            reject_unsupported_colour_path(InputType::ImageSequence, &lut, THROUGH_FFMPEG).is_ok(),
-            "a picture change decodes the sequence through ffmpeg, where the LUT runs"
-        );
+        for lut in [
+            SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+            SourceColour::KeepRgbAfterLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+        ] {
+            let refused =
+                reject_unsupported_colour_path(InputType::ImageSequence, &lut, READ_BY_POSTKIT)
+                    .unwrap_err();
+            assert!(refused.contains("hdr_to_dci.cube"), "{refused}");
+            assert!(
+                reject_unsupported_colour_path(InputType::ImageSequence, &lut, THROUGH_FFMPEG)
+                    .is_ok(),
+                "a picture change decodes the sequence through ffmpeg, where the LUT runs"
+            );
+        }
     }
 
     #[test]
     fn compressed_input_refuses_a_wide_gamut_source() {
-        let p3 = SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3);
-        assert!(reject_unsupported_colour_path(InputType::Video, &p3, THROUGH_FFMPEG).is_ok());
-        let compressed =
-            reject_unsupported_colour_path(InputType::J2kSequence, &p3, READ_BY_POSTKIT)
-                .unwrap_err();
-        assert!(compressed.contains("already compressed"), "{compressed}");
+        for p3 in [
+            SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3),
+            SourceColour::KeepRgbFrom(crate::colour::ColourSpace::P3),
+        ] {
+            assert!(reject_unsupported_colour_path(InputType::Video, &p3, THROUGH_FFMPEG).is_ok());
+            let compressed =
+                reject_unsupported_colour_path(InputType::J2kSequence, &p3, READ_BY_POSTKIT)
+                    .unwrap_err();
+            assert!(compressed.contains("already compressed"), "{compressed}");
+        }
     }
 
     #[test]

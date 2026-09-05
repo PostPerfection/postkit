@@ -4,6 +4,23 @@
 
 ### Added
 
+- **`colour::Rec709Transform` and `SourceColour::KeepRgbFrom(space)`**: a P3,
+  Rec.2020 or LogC source converted to Rec.709 RGB before compression, which is
+  the colour an App 2E picture carries. Per pixel it linearises the source's
+  code values with that space's own curve, matrices them into linear Rec.709
+  with the inverse of the Rec.709 matrix, clips each channel to the gamut and
+  encodes at gamma 2.2, so a Rec.709 source comes back code for code and P3 red
+  lands on Rec.709 red with green and blue at zero. An X'Y'Z' source is refused,
+  since that is DCI picture rather than RGB, and ACES and ACEScg are refused the
+  way the X'Y'Z' transform already refuses them.
+  **`SourceColour::KeepRgbAfterLut(path)`** is the same Rec.709 RGB reached by a
+  3D LUT that ffmpeg applies during the decode, the way `DciLut` reaches X'Y'Z'.
+  Both keep grok's own X'Y'Z' transform off and the code streams RGB, both keep
+  the run on packed RGB, and `encode_loaded_frames` refuses the LUT one because
+  that filter runs inside ffmpeg's decode.
+  `CompressParams.source_preparation.colour_transform` and
+  `StillHold.colour_transform` now carry a `colour::FrameColourTransform`, which
+  is either the X'Y'Z' transform or this one.
 - **`gui_job_queue::GuiJobQueue::stop_for_exit`**: cancels the running job,
   records the queued ones cancelled and waits for the worker to stop, for a
   wizard to call when its window closes. A process that exits with encoder
