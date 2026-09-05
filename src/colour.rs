@@ -231,7 +231,7 @@ pub(crate) fn source_space(space: ColourSpace) -> Result<SourceSpace, String> {
             ],
             // gamma 2.2 for display-referred Rec.709, matching libdcp rec709_to_xyz,
             // DoM and grok. Was 2.4 (Rec.1886); harmonized 2026-07-23.
-            linearisation: Linearisation::Gamma(2.2),
+            linearisation: Linearisation::Gamma(REC709_GAMMA),
             scale: dci_scale,
         },
         ColourSpace::P3 => SourceSpace {
@@ -336,17 +336,14 @@ impl DcdmTransform {
     /// One pixel of 16-bit source code values to output code values, quantised
     /// to `max_code` (4095 for 12-bit DCDM, 65535 for 16-bit).
     pub fn pixel(&self, rgb: [u16; 3], max_code: u16) -> [u16; 3] {
-        let r = self.linear[rgb[0] as usize];
-        let g = self.linear[rgb[1] as usize];
-        let b = self.linear[rgb[2] as usize];
-        let inv_gamma = 1.0 / DCDM_GAMMA;
-        let max = max_code as f32;
-        let mut out = [0u16; 3];
-        for (row, slot) in self.matrix.iter().zip(out.iter_mut()) {
-            let v = (row[0] * r + row[1] * g + row[2] * b) * self.scale;
-            *slot = (v.clamp(0.0, 1.0).powf(inv_gamma) * max).round() as u16;
-        }
-        out
+        transformed_pixel(
+            &self.linear,
+            &self.matrix,
+            self.scale,
+            DCDM_GAMMA,
+            rgb,
+            max_code,
+        )
     }
 
     /// Convert one rgb48le frame into `out`, three code values per pixel.
@@ -373,27 +370,161 @@ impl DcdmTransform {
     /// same layout and byte order. This is ffmpeg's rawvideo format and what the
     /// J2K encoder reads.
     pub fn frame_rgb48_inplace(&self, buf: &mut [u8], order: SampleOrder) {
-        for px in buf.as_chunks_mut::<6>().0 {
-            let read = |bytes: [u8; 2]| match order {
-                SampleOrder::Big => u16::from_be_bytes(bytes),
-                SampleOrder::Little => u16::from_le_bytes(bytes),
+        map_rgb48_inplace(buf, order, |rgb| self.pixel(rgb, u16::MAX));
+    }
+}
+
+fn transformed_pixel(
+    linear: &[f32],
+    matrix: &[[f32; 3]; 3],
+    scale: f32,
+    output_gamma: f32,
+    rgb: [u16; 3],
+    max_code: u16,
+) -> [u16; 3] {
+    let source = [
+        linear[rgb[0] as usize],
+        linear[rgb[1] as usize],
+        linear[rgb[2] as usize],
+    ];
+    let inverse_gamma = 1.0 / output_gamma;
+    let max = max_code as f32;
+    let mut out = [0u16; 3];
+    for (row, slot) in matrix.iter().zip(out.iter_mut()) {
+        let value = (row[0] * source[0] + row[1] * source[1] + row[2] * source[2]) * scale;
+        *slot = (value.clamp(0.0, 1.0).powf(inverse_gamma) * max).round() as u16;
+    }
+    out
+}
+
+fn map_rgb48_inplace(buf: &mut [u8], order: SampleOrder, pixel: impl Fn([u16; 3]) -> [u16; 3]) {
+    for px in buf.as_chunks_mut::<6>().0 {
+        let read = |bytes: [u8; 2]| match order {
+            SampleOrder::Big => u16::from_be_bytes(bytes),
+            SampleOrder::Little => u16::from_le_bytes(bytes),
+        };
+        let codes = pixel([
+            read([px[0], px[1]]),
+            read([px[2], px[3]]),
+            read([px[4], px[5]]),
+        ]);
+        for (i, code) in codes.iter().enumerate() {
+            let bytes = match order {
+                SampleOrder::Big => code.to_be_bytes(),
+                SampleOrder::Little => code.to_le_bytes(),
             };
-            let codes = self.pixel(
-                [
-                    read([px[0], px[1]]),
-                    read([px[2], px[3]]),
-                    read([px[4], px[5]]),
-                ],
-                u16::MAX,
+            px[i * 2] = bytes[0];
+            px[i * 2 + 1] = bytes[1];
+        }
+    }
+}
+
+pub struct Rec709Transform {
+    space: ColourSpace,
+    matrix: [[f32; 3]; 3],
+    linear: Vec<f32>,
+}
+
+impl std::fmt::Debug for Rec709Transform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Rec709Transform")
+            .field("space", &self.space)
+            .finish()
+    }
+}
+
+impl Rec709Transform {
+    pub fn from_space(space: ColourSpace) -> Result<Self, String> {
+        if space == ColourSpace::Xyz {
+            return Err(
+                "an X'Y'Z' source is DCI picture, not RGB, so it has no place in an App 2E picture"
+                    .to_string(),
             );
-            for (i, code) in codes.iter().enumerate() {
-                let bytes = match order {
-                    SampleOrder::Big => code.to_be_bytes(),
-                    SampleOrder::Little => code.to_le_bytes(),
-                };
-                px[i * 2] = bytes[0];
-                px[i * 2 + 1] = bytes[1];
-            }
+        }
+        let source = source_space(space)?;
+        let rec709 = source_space(ColourSpace::Rec709).expect("Rec.709 has a matrix");
+        Ok(Self {
+            space,
+            matrix: linear_rgb_to_rec709(&rec709.to_xyz, &source.to_xyz),
+            linear: (0..=u16::MAX)
+                .map(|v| source.linearisation.to_linear(v as f32 / 65535.0))
+                .collect(),
+        })
+    }
+
+    pub fn pixel(&self, rgb: [u16; 3], max_code: u16) -> [u16; 3] {
+        transformed_pixel(&self.linear, &self.matrix, 1.0, REC709_GAMMA, rgb, max_code)
+    }
+
+    pub fn frame_rgb48_inplace(&self, buf: &mut [u8], order: SampleOrder) {
+        map_rgb48_inplace(buf, order, |rgb| self.pixel(rgb, u16::MAX));
+    }
+}
+
+// f64, because an f32 identity sits 1e-7 off the diagonal and the encode gamma
+// lifts that leak into a dark channel to several code values
+fn linear_rgb_to_rec709(
+    rec709_to_xyz: &[[f32; 3]; 3],
+    source_to_xyz: &[[f32; 3]; 3],
+) -> [[f32; 3]; 3] {
+    let xyz_to_rec709 = inverse_matrix(&as_f64(rec709_to_xyz));
+    let source = as_f64(source_to_xyz);
+    let mut out = [[0.0f32; 3]; 3];
+    for (row, slots) in out.iter_mut().enumerate() {
+        for (column, slot) in slots.iter_mut().enumerate() {
+            *slot = (0..3)
+                .map(|inner| xyz_to_rec709[row][inner] * source[inner][column])
+                .sum::<f64>() as f32;
+        }
+    }
+    out
+}
+
+fn as_f64(m: &[[f32; 3]; 3]) -> [[f64; 3]; 3] {
+    m.map(|row| row.map(f64::from))
+}
+
+fn inverse_matrix(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let adjugate = [
+        [
+            m[1][1] * m[2][2] - m[1][2] * m[2][1],
+            m[0][2] * m[2][1] - m[0][1] * m[2][2],
+            m[0][1] * m[1][2] - m[0][2] * m[1][1],
+        ],
+        [
+            m[1][2] * m[2][0] - m[1][0] * m[2][2],
+            m[0][0] * m[2][2] - m[0][2] * m[2][0],
+            m[0][2] * m[1][0] - m[0][0] * m[1][2],
+        ],
+        [
+            m[1][0] * m[2][1] - m[1][1] * m[2][0],
+            m[0][1] * m[2][0] - m[0][0] * m[2][1],
+            m[0][0] * m[1][1] - m[0][1] * m[1][0],
+        ],
+    ];
+    let determinant =
+        m[0][0] * adjugate[0][0] + m[0][1] * adjugate[1][0] + m[0][2] * adjugate[2][0];
+    adjugate.map(|row| row.map(|value| value / determinant))
+}
+
+#[derive(Debug)]
+pub enum FrameColourTransform {
+    ToXyz(DcdmTransform),
+    ToRec709(Rec709Transform),
+}
+
+impl FrameColourTransform {
+    pub fn pixel(&self, rgb: [u16; 3], max_code: u16) -> [u16; 3] {
+        match self {
+            Self::ToXyz(transform) => transform.pixel(rgb, max_code),
+            Self::ToRec709(transform) => transform.pixel(rgb, max_code),
+        }
+    }
+
+    pub fn frame_rgb48_inplace(&self, buf: &mut [u8], order: SampleOrder) {
+        match self {
+            Self::ToXyz(transform) => transform.frame_rgb48_inplace(buf, order),
+            Self::ToRec709(transform) => transform.frame_rgb48_inplace(buf, order),
         }
     }
 }
@@ -438,6 +569,8 @@ pub enum RenderingIntent {
 
 /// DCDM encoding gamma (SMPTE 428-1), used in both directions.
 const DCDM_GAMMA: f32 = 2.6;
+/// Display-referred Rec.709 gamma, used in both directions.
+const REC709_GAMMA: f32 = 2.2;
 const MAX_CODE_12BIT: f32 = 4095.0;
 /// SMPTE 428-1 peak luminance the encoding normalises against (cd/m²).
 const DCI_PEAK_LUMINANCE: f32 = 52.37;
@@ -1074,6 +1207,167 @@ mod tests_xyz {
                     *want_channel,
                     "in place rgb48le pixel {i} channel {c}"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_rec709 {
+    use super::*;
+
+    const TWELVE_BIT_MAX: u16 = 4095;
+
+    fn twelve_bit_as_sixteen(code: u16) -> u16 {
+        let max = u32::from(TWELVE_BIT_MAX);
+        ((u32::from(code) * u32::from(u16::MAX) + max / 2) / max) as u16
+    }
+
+    #[test]
+    fn a_rec709_source_comes_back_unchanged() {
+        let transform = Rec709Transform::from_space(ColourSpace::Rec709).unwrap();
+        for codes in [
+            [0u16, 0, 0],
+            [1, 2, 3],
+            [255, 512, 1023],
+            [2048, 2048, 2048],
+            [4095, 0, 4095],
+            [3000, 1500, 750],
+            [4095, 4095, 4095],
+        ] {
+            let source = codes.map(twelve_bit_as_sixteen);
+            assert_eq!(
+                transform.pixel(source, TWELVE_BIT_MAX),
+                codes,
+                "{codes:?} has to survive the identity exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn p3_red_clips_to_the_rec709_gamut() {
+        let transform = Rec709Transform::from_space(ColourSpace::P3).unwrap();
+        let red = transform.pixel([u16::MAX, 0, 0], TWELVE_BIT_MAX);
+        assert!(red[0] > 4000, "P3 red stays red: {red:?}");
+        assert_eq!(
+            [red[1], red[2]],
+            [0, 0],
+            "P3 red is outside Rec.709, so green and blue clip: {red:?}"
+        );
+    }
+
+    #[test]
+    fn a_rec2020_grey_ramp_stays_grey() {
+        let transform = Rec709Transform::from_space(ColourSpace::Rec2020).unwrap();
+        for grey in [0u16, 1024, 2048, 3072, 4095] {
+            let source = twelve_bit_as_sixteen(grey);
+            let converted = transform.pixel([source; 3], TWELVE_BIT_MAX);
+            let spread = converted.iter().max().unwrap() - converted.iter().min().unwrap();
+            assert!(spread <= 1, "grey {grey} came out {converted:?}");
+        }
+        assert_eq!(
+            transform.pixel([u16::MAX; 3], TWELVE_BIT_MAX),
+            [TWELVE_BIT_MAX; 3],
+            "Rec.2020 white and Rec.709 white are the same white"
+        );
+    }
+
+    // SMPTE RP 431-2 P3-DCI primaries with the DCI white point, gamma 2.6.
+    const P3_DCI_TO_XYZ: [[f64; 3]; 3] = [
+        [0.4451698, 0.2771344, 0.1722827],
+        [0.2094917, 0.7215952, 0.0689131],
+        [0.0, 0.0470606, 0.9073747],
+    ];
+    // ITU-R BT.2020 primaries with D65, gamma 2.4.
+    const REC2020_TO_XYZ: [[f64; 3]; 3] = [
+        [0.6369580, 0.1446169, 0.1688810],
+        [0.2627002, 0.6779981, 0.0593017],
+        [0.0, 0.0280727, 1.0609851],
+    ];
+    // The published sRGB inverse, against the one the transform computes itself.
+    const XYZ_TO_LINEAR_REC709: [[f64; 3]; 3] = [
+        [3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0556434, -0.2040259, 1.0572252],
+    ];
+
+    fn expected_rec709_12bit(rgb: [u16; 3], source_to_xyz: [[f64; 3]; 3], gamma: f64) -> [u16; 3] {
+        let linear: Vec<f64> = rgb
+            .iter()
+            .map(|&v| (v as f64 / 65535.0).powf(gamma))
+            .collect();
+        let xyz: Vec<f64> = source_to_xyz
+            .iter()
+            .map(|row| row[0] * linear[0] + row[1] * linear[1] + row[2] * linear[2])
+            .collect();
+        let mut out = [0u16; 3];
+        for (i, row) in XYZ_TO_LINEAR_REC709.iter().enumerate() {
+            let value = row[0] * xyz[0] + row[1] * xyz[1] + row[2] * xyz[2];
+            out[i] =
+                (value.clamp(0.0, 1.0).powf(1.0 / 2.2) * f64::from(TWELVE_BIT_MAX)).round() as u16;
+        }
+        out
+    }
+
+    #[test]
+    fn a_wide_gamut_source_matches_the_published_matrices() {
+        for (space, source_to_xyz, gamma) in [
+            (ColourSpace::P3, P3_DCI_TO_XYZ, 2.6),
+            (ColourSpace::Rec2020, REC2020_TO_XYZ, 2.4),
+        ] {
+            let transform = Rec709Transform::from_space(space).unwrap();
+            for rgb in [
+                [32768u16, 32768, 32768],
+                [20000, 40000, 30000],
+                [50000, 30000, 10000],
+                [65535, 65535, 65535],
+            ] {
+                let got = transform.pixel(rgb, TWELVE_BIT_MAX);
+                let want = expected_rec709_12bit(rgb, source_to_xyz, gamma);
+                for i in 0..3 {
+                    let off = (i32::from(got[i]) - i32::from(want[i])).abs();
+                    assert!(off <= 2, "{space:?} {rgb:?}: got {got:?} want {want:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_source_with_no_rec709_matrix_is_refused_by_name() {
+        let xyz = Rec709Transform::from_space(ColourSpace::Xyz).unwrap_err();
+        assert!(xyz.contains("X'Y'Z'"), "{xyz}");
+        for space in [ColourSpace::Aces, ColourSpace::AcesCg] {
+            let refused = Rec709Transform::from_space(space).unwrap_err();
+            assert!(refused.contains(&format!("{space:?}")), "{refused}");
+        }
+    }
+
+    #[test]
+    fn a_frame_converts_pixel_by_pixel_in_either_byte_order() {
+        let transform = Rec709Transform::from_space(ColourSpace::P3).unwrap();
+        let pixels = [[60000u16, 12000, 3000], [140, 65535, 20000]];
+        for order in [SampleOrder::Little, SampleOrder::Big] {
+            let mut buf = Vec::new();
+            for pixel in pixels {
+                for channel in pixel {
+                    let bytes = match order {
+                        SampleOrder::Big => channel.to_be_bytes(),
+                        SampleOrder::Little => channel.to_le_bytes(),
+                    };
+                    buf.extend_from_slice(&bytes);
+                }
+            }
+            transform.frame_rgb48_inplace(&mut buf, order);
+            for (index, pixel) in pixels.iter().enumerate() {
+                let want = transform.pixel(*pixel, u16::MAX);
+                for (channel, want_code) in want.iter().enumerate() {
+                    let at = index * 6 + channel * 2;
+                    let got = match order {
+                        SampleOrder::Big => u16::from_be_bytes([buf[at], buf[at + 1]]),
+                        SampleOrder::Little => u16::from_le_bytes([buf[at], buf[at + 1]]),
+                    };
+                    assert_eq!(got, *want_code, "{order:?} pixel {index} channel {channel}");
+                }
             }
         }
     }
