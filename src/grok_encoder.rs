@@ -1775,19 +1775,41 @@ const ACCELERATOR_DEVICE_ID: i32 = 0;
 /// call rather than falling back.
 #[cfg(feature = "grok-ffi")]
 pub fn use_gpu() -> Result<(), String> {
+    use_gpu_with_authentication(None, None)
+}
+
+#[cfg(feature = "grok-ffi")]
+pub fn use_gpu_with_authentication(
+    license: Option<&str>,
+    registration_url: Option<&str>,
+) -> Result<(), String> {
+    let license = license
+        .filter(|value| !value.is_empty())
+        .map(std::ffi::CString::new)
+        .transpose()
+        .map_err(|_| "the Grok license contains a null byte".to_string())?;
+    let registration_url = registration_url
+        .filter(|value| !value.is_empty())
+        .map(std::ffi::CString::new)
+        .transpose()
+        .map_err(|_| "the Grok registration URL contains a null byte".to_string())?;
     let init_info = grokj2k_sys::grk_plugin_init_info {
         device_id: ACCELERATOR_DEVICE_ID,
         verbose: false,
-        license: std::ptr::null(),
-        server: std::ptr::null(),
+        license: license
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr()),
+        server: registration_url
+            .as_ref()
+            .map_or(std::ptr::null(), |value| value.as_ptr()),
     };
     if !unsafe { grokj2k_sys::grk_plugin_init(init_info) } {
         return Err(
             "grok's accelerator plugin did not initialise. initialize() \
              looks for libgrokj2k_plugin under GRK_PLUGIN_PATH, then in the working \
              directory, then next to the executable, and searches nowhere at all when \
-             GRK_NO_PLUGIN is set. A plugin that did load refuses here when the device \
-             is unavailable."
+             GRK_NO_PLUGIN is set. A plugin that did load refuses here when authentication \
+             or device initialization fails."
                 .to_string(),
         );
     }
@@ -1822,6 +1844,14 @@ pub fn accelerated_frames() -> u64 {
 /// Stub when grok-ffi is not enabled.
 #[cfg(not(feature = "grok-ffi"))]
 pub fn use_gpu() -> Result<(), String> {
+    Err("postkit was built without the grok-ffi feature".to_string())
+}
+
+#[cfg(not(feature = "grok-ffi"))]
+pub fn use_gpu_with_authentication(
+    _license: Option<&str>,
+    _registration_url: Option<&str>,
+) -> Result<(), String> {
     Err("postkit was built without the grok-ffi feature".to_string())
 }
 
