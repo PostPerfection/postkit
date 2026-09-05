@@ -1764,6 +1764,7 @@ where
         total_frames,
         width,
         height,
+        &crate::probe::probe_pixel_format(input_video),
         cancel,
         false,
         None,
@@ -1816,6 +1817,7 @@ pub fn encode_video_pipeline_resumable<P>(
     total_frames: u64,
     width: u32,
     height: u32,
+    source: &crate::probe::PixelFormatInfo,
     cancel: &Arc<AtomicBool>,
     resume: bool,
     video_filter: Option<&str>,
@@ -1832,6 +1834,7 @@ where
         total_frames,
         width,
         height,
+        source,
         cancel,
         resume,
         video_filter,
@@ -1853,6 +1856,7 @@ pub fn encode_video_pipeline_resumable_with_mxf_feed<P>(
     total_frames: u64,
     width: u32,
     height: u32,
+    source: &crate::probe::PixelFormatInfo,
     cancel: &Arc<AtomicBool>,
     resume: bool,
     // ffmpeg -vf chain applied while decoding, for fades and the like. It must
@@ -1911,7 +1915,6 @@ where
     }
 
     let picture_filters = window_filter_chain(video_filter, frame_range).unwrap_or_default();
-    let source = crate::probe::probe_pixel_format(input_video);
     let accelerator_active = gpu_active();
     let chain = match crate::encode::decode_chain(
         &crate::encode::DecodeChainInputs {
@@ -1921,7 +1924,7 @@ where
             // the colour this path can convert is the compressor's own
             // transform, and a caller's colour filter is caught by the chain
             source_colour: &crate::encode::SourceColour::DisplayRgb,
-            source: &source,
+            source,
             accelerator_active,
             quality_psnr: params.quality_psnr,
             postkit_prepares_the_frame: !params.source_preparation.is_empty(),

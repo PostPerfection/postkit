@@ -141,6 +141,12 @@
 
 ### Changed
 
+- **`encode_video_pipeline_resumable` takes the source's pixel format**: the
+  resumable encode ran ffprobe on the source for its pixel format and colour
+  tags, a probe every caller had already made for the raster and frame rate.
+  Both resumable entry points take a `probe::PixelFormatInfo`, and
+  `probe::VideoInfo::pixel_format` hands one over from that first probe.
+  `encode_video_pipeline` still probes for itself.
 - **A plan's geometry runs on the picture the pipe carries**: `PicturePlan` no
   longer spells `format=gbrp16le` for its geometry, so a planar YUV pipe crops,
   scales and pads the source's own planes on their way to grok's accelerator

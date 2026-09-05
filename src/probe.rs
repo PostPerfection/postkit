@@ -21,6 +21,16 @@ pub struct VideoInfo {
     pub color_range: String,
 }
 
+impl VideoInfo {
+    pub fn pixel_format(&self) -> PixelFormatInfo {
+        PixelFormatInfo {
+            pix_fmt: self.pix_fmt.clone(),
+            color_space: self.color_space.clone(),
+            color_range: self.color_range.clone(),
+        }
+    }
+}
+
 /// What ffprobe prints for a field the stream carries no tag for.
 const UNTAGGED: &str = "unknown";
 
