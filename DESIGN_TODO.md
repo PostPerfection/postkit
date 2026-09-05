@@ -1,14 +1,17 @@
 # Planned
 
-- The preview shows only Rec.709 App 2E picture. `render_imf_frame` refuses
-  ST 2084, HLG, BT.2020 and P3-D65 by name, which is most of what a real IMP
-  carries: the display transform for them is a tone map plus a gamut conversion
-  into sRGB, and neither exists in `colour` yet. 4:2:2 essence would also need
-  chroma upsampling, which `grok_decoder` refuses by name today. The App 2E
-  codestream in `tests/fixtures/imf4k_black_3840x2160.j2c` is P3D65 PQ per its
-  CPL, so it pins the refusal, but it is a black leader frame and will prove
-  nothing about a tone map. A frame with picture in it is wanted before that
-  work starts. Same entry in imfwizard's DESIGN_TODO.
+- A 4:4:4 App 2E codestream cannot be told from RGB. `grok_decoder` reads a
+  subsampled codestream as YCbCr, which ST 2067-21 allows only as CDCI, but a
+  4:4:4 one could be either and the only thing that says which is the CDCI
+  descriptor, which the AS-02 reader binding does not expose. So the preview
+  reads every 4:4:4 App 2E frame as RGB, and a 4:4:4 CDCI master would show with
+  its chroma planes taken for green and blue. Needs a descriptor accessor in
+  asdcplib-rs before it can be decided. Same entry in imfwizard's DESIGN_TODO.
+- The live player is still libmpv. `render_imf_frame` tone maps PQ and HLG and
+  converts P3-D65 and BT.2020 into Rec.709, but that transform is postkit's own
+  and the embedded player in guikit hands the file to libmpv, which applies its
+  own. A frame stepped in the preview and the same frame played back therefore
+  need not match.
 - Verify the non-blocking render live (2026-08-17). `render_opengl` now passes
   `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0` with `video-timing-offset` 0,
   because the default wait parked the app's main thread for most of each frame

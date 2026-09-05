@@ -4,6 +4,39 @@
 
 ### Added
 
+- **`preview_colour`**: the IMF App 2E display transform, which the preview used
+  to have only for Rec.709. `resolve_picture_colour` reads the essence
+  descriptor's ColorPrimaries and TransferCharacteristic into a `PictureColour`
+  and refuses only a UL it has no reading for; unsignalled colour still warns and
+  reads as Rec.709. `render_display_rgb8` then linearises with that transfer
+  curve, tone maps, matrices into Rec.709 and encodes at gamma 2.2. ST 2084 is
+  the PQ EOTF in absolute cd/m², and the BT.2020 transfer UL is read as HLG,
+  which is what an App 2E HLG master signals: its inverse OETF followed by the
+  BT.2100 OOTF at system gamma 1.2 for a 1000 cd/m² nominal peak. Both are tone
+  mapped with the ITU-R BT.2390 EETF from the mastering display's peak
+  (`ResolvedPicture::mastering_display_max_luminance`, ST 2086's 0.0001 cd/m²
+  steps, 1000 cd/m² when the descriptor signals none) down to a 100 cd/m² SDR
+  peak. That EETF maps the source peak onto the SDR peak, so BT.2408 reference
+  white at 203 cd/m² renders at 241 of 255 rather than at diffuse white, which is
+  the curve working and not a defect. P3-D65 and BT.2020 primaries are matrixed
+  into linear Rec.709 through XYZ with `colour::linear_rgb_to_rec709` and each
+  channel clipped, and a subsampled frame's narrow-range YCbCr is converted to
+  RGB first with the luma coefficients of the signalled primaries (BT.709's for
+  P3-D65, which has none of its own). Every curve is a 4096-entry table and the
+  8-bit encode a 256-entry threshold search, so no pixel pays for a `powf`, and a
+  Rec.709 SDR frame comes out of the general path code for code identical to the
+  shift by four it used to take.
+- **`grok_decoder` reads 4:2:2 picture**: a component subsampled 2x horizontally
+  or vertically is upsampled to the frame's own size by linear interpolation
+  (output sample 2i is input i, 2i+1 the rounded mean of i and i+1, and the last
+  one repeats its own sample), and `DecodedFrame::chroma_subsampled` says it
+  happened. ST 2067-21 allows 4:2:2 only as CDCI, so that flag is also what tells
+  the preview the samples are YCbCr rather than RGB. A component subsampled by
+  anything other than 1 or 2 is still refused by name.
+- **`grok_encoder::compress_yuv422_frame`**: one codestream from three planes
+  with the chroma pair at half width, which nothing in the encode pipeline emits
+  and the tests need to write a 4:2:2 track file to read back.
+
 - **`colour::Rec709Transform` and `SourceColour::KeepRgbFrom(space)`**: a P3,
   Rec.2020 or LogC source converted to Rec.709 RGB before compression, which is
   the colour an App 2E picture carries. Per pixel it linearises the source's
