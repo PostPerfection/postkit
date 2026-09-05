@@ -1803,19 +1803,70 @@ pub fn use_gpu_with_authentication(
             .as_ref()
             .map_or(std::ptr::null(), |value| value.as_ptr()),
     };
-    if !unsafe { grokj2k_sys::grk_plugin_init(init_info) } {
-        return Err(
-            "grok's accelerator plugin did not initialise. initialize() \
-             looks for libgrokj2k_plugin under GRK_PLUGIN_PATH, then in the working \
-             directory, then next to the executable, and searches nowhere at all when \
-             GRK_NO_PLUGIN is set. A plugin that did load refuses here when authentication \
-             or device initialization fails."
-                .to_string(),
-        );
+    let (initialised, plugin_messages) =
+        capture_grok_warnings(|| unsafe { grokj2k_sys::grk_plugin_init(init_info) });
+    if !initialised {
+        if plugin_messages.is_empty() {
+            return Err(
+                "grok's accelerator plugin did not initialise. initialize() \
+                 looks for libgrokj2k_plugin under GRK_PLUGIN_PATH, then in the working \
+                 directory, then next to the executable, and searches nowhere at all when \
+                 GRK_NO_PLUGIN is set."
+                    .to_string(),
+            );
+        }
+        return Err(format!(
+            "grok's accelerator plugin refused to initialise: {}",
+            plugin_messages.join(". ")
+        ));
     }
     unsafe { grokj2k_sys::grk_plugin_set_enabled(true) };
     ACCELERATOR_ENABLED.store(true, Ordering::Relaxed);
     Ok(())
+}
+
+#[cfg(feature = "grok-ffi")]
+static CAPTURED_GROK_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "grok-ffi")]
+unsafe extern "C" fn capture_grok_warning(
+    message: *const std::os::raw::c_char,
+    _: *mut std::ffi::c_void,
+) {
+    if message.is_null() {
+        return;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(message) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return;
+    }
+    CAPTURED_GROK_WARNINGS
+        .lock()
+        .expect("grok warning capture lock")
+        .push(text);
+}
+
+#[cfg(feature = "grok-ffi")]
+fn capture_grok_warnings<T>(action: impl FnOnce() -> T) -> (T, Vec<String>) {
+    CAPTURED_GROK_WARNINGS
+        .lock()
+        .expect("grok warning capture lock")
+        .clear();
+    let mut handlers: grokj2k_sys::grk_msg_handlers = unsafe { std::mem::zeroed() };
+    handlers.warn_callback = Some(capture_grok_warning);
+    handlers.error_callback = Some(capture_grok_warning);
+    unsafe { grokj2k_sys::grk_set_msg_handlers(handlers) };
+    let result = action();
+    unsafe { grokj2k_sys::grk_set_msg_handlers(std::mem::zeroed()) };
+    let messages = std::mem::take(
+        &mut *CAPTURED_GROK_WARNINGS
+            .lock()
+            .expect("grok warning capture lock"),
+    );
+    (result, messages)
 }
 
 /// Send every frame back to the CPU. The plugin stays loaded and [`use_gpu`]
