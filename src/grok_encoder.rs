@@ -1058,6 +1058,112 @@ unsafe fn build_grok_image(
     }
 }
 
+/// How many luma samples wide one chroma sample is in 4:2:2.
+#[cfg(feature = "grok-ffi")]
+pub const CHROMA_HORIZONTAL_SUBSAMPLING: u32 = 2;
+
+/// One codestream from a 4:2:2 YCbCr frame: three planes at `precision` bits
+/// with the chroma pair at half width, the shape ST 2067-21 allows for App 2E
+/// CDCI picture.
+///
+/// Separate from [`encode_pipeline`], whose grok image is always 4:4:4, because
+/// nothing in postkit converts a source to 4:2:2. It reads such essence back.
+#[cfg(feature = "grok-ffi")]
+pub fn compress_yuv422_frame(
+    planes: [&[i32]; 3],
+    width: u32,
+    height: u32,
+    precision: u8,
+    params: &CompressParams,
+) -> Result<Vec<u8>, String> {
+    use grokj2k_sys::*;
+    use std::ptr;
+
+    let chroma_width = width.div_ceil(CHROMA_HORIZONTAL_SUBSAMPLING);
+    let shape = [
+        (width, height, 1u8, 1u8),
+        (chroma_width, height, CHROMA_HORIZONTAL_SUBSAMPLING as u8, 1),
+        (chroma_width, height, CHROMA_HORIZONTAL_SUBSAMPLING as u8, 1),
+    ];
+    for (index, (plane, (plane_width, plane_height, _, _))) in planes.iter().zip(shape).enumerate()
+    {
+        let samples = plane_width as usize * plane_height as usize;
+        if plane.len() != samples {
+            return Err(format!(
+                "plane {index} holds {} samples, not the {samples} a {width}x{height} 4:2:2 \
+                 frame is",
+                plane.len()
+            ));
+        }
+    }
+
+    let rsiz = crate::j2k::rsiz_for_raster(params.profile, width, height)?;
+    let allocation = Allocation::Ratio {
+        ratio: params.compression_ratio,
+        max_bytes: params.codestream_byte_cap.unwrap_or(0),
+    };
+    let mut output_buf = vec![0u8; width as usize * height as usize * 3 * 2];
+
+    unsafe {
+        let mut comps: [grk_image_comp; 3] = std::mem::zeroed();
+        for (comp, (plane_width, plane_height, dx, dy)) in comps.iter_mut().zip(shape) {
+            comp.w = plane_width;
+            comp.h = plane_height;
+            comp.dx = dx;
+            comp.dy = dy;
+            comp.prec = precision;
+            comp.sgnd = false;
+        }
+        let image = grk_image_new(
+            3,
+            comps.as_mut_ptr(),
+            _GRK_COLOR_SPACE_GRK_CLRSPC_SYCC,
+            true,
+        );
+        if image.is_null() {
+            return Err("Failed to create Grok image".to_string());
+        }
+        for (index, (plane, (plane_width, plane_height, _, _))) in
+            planes.iter().zip(shape).enumerate()
+        {
+            let comp = &*(*image).comps.add(index);
+            let data = comp.data as *mut i32;
+            if data.is_null() {
+                grk_object_unref(&mut (*image).obj);
+                return Err(format!("Null component data for component {index}"));
+            }
+            let stride = comp.stride as usize;
+            let plane_width = plane_width as usize;
+            for row in 0..plane_height as usize {
+                ptr::copy_nonoverlapping(
+                    plane[row * plane_width..].as_ptr(),
+                    data.add(row * stride),
+                    plane_width,
+                );
+            }
+        }
+
+        let mut cparams = build_cparameters(params, rsiz, allocation);
+        let mut stream_params: grk_stream_params = std::mem::zeroed();
+        stream_params.buf = output_buf.as_mut_ptr();
+        stream_params.buf_len = output_buf.len();
+
+        let codec = grk_compress_init(&mut stream_params, &mut cparams, image);
+        if codec.is_null() {
+            grk_object_unref(&mut (*image).obj);
+            return Err("Failed to initialize Grok compressor".to_string());
+        }
+        let compressed_len = grk_compress(codec, ptr::null_mut());
+        grk_object_unref(codec);
+        grk_object_unref(&mut (*image).obj);
+        if compressed_len == 0 {
+            return Err("Grok compression returned 0 bytes".to_string());
+        }
+        output_buf.truncate(compressed_len as usize);
+        Ok(output_buf)
+    }
+}
+
 /// The compression settings one codestream is written with.
 #[cfg(feature = "grok-ffi")]
 fn build_cparameters(

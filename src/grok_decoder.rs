@@ -23,6 +23,10 @@ pub struct DecodedFrame {
     /// Bits per sample, as the codestream declares them.
     pub precision: u8,
     pub components: Vec<Vec<i32>>,
+    /// A component came back subsampled and was upsampled to the frame size.
+    /// ST 2067-21 allows 4:2:2 only as CDCI, so such a frame is YCbCr and a
+    /// 4:4:4 one is RGB.
+    pub chroma_subsampled: bool,
 }
 
 /// The picture components a DCP frame carries, X'Y'Z'.
@@ -182,13 +186,15 @@ unsafe fn read_image(image: &grokj2k_sys::grk_image) -> Result<DecodedFrame, Str
         return Err("grok reported components but the array is null".to_string());
     }
 
-    let mut components = Vec::with_capacity(DCI_COMPONENT_COUNT);
-    let mut size = None;
-    for index in 0..DCI_COMPONENT_COUNT {
-        let comp = unsafe { &*image.comps.add(index) };
-        if comp.dx != 1 || comp.dy != 1 {
+    let picture = unsafe {
+        std::slice::from_raw_parts(image.comps as *const grokj2k_sys::grk_image_comp, count)
+    };
+    let picture = &picture[..DCI_COMPONENT_COUNT];
+    for (index, comp) in picture.iter().enumerate() {
+        if !matches!(comp.dx, 1 | SUBSAMPLING_FACTOR) || !matches!(comp.dy, 1 | SUBSAMPLING_FACTOR)
+        {
             return Err(format!(
-                "component {index} is subsampled {}x{}, and a DCP picture is 4:4:4",
+                "component {index} is subsampled {}x{}, and a picture is 4:4:4, 4:2:2 or 4:2:0",
                 comp.dx, comp.dy
             ));
         }
@@ -200,33 +206,115 @@ unsafe fn read_image(image: &grokj2k_sys::grk_image) -> Result<DecodedFrame, Str
         if comp.data.is_null() {
             return Err(format!("component {index} carries no samples"));
         }
-        match size {
-            None => size = Some((comp.w, comp.h, comp.prec)),
-            Some(first) if first != (comp.w, comp.h, comp.prec) => {
-                return Err(
-                    "the components disagree on size or precision, so they cannot be one picture"
-                        .to_string(),
-                );
-            }
-            Some(_) => {}
+        if comp.prec != picture[0].prec {
+            return Err(
+                "the components disagree on size or precision, so they cannot be one picture"
+                    .to_string(),
+            );
+        }
+    }
+
+    let width = picture.iter().map(|comp| comp.w).max().unwrap_or(0);
+    let height = picture.iter().map(|comp| comp.h).max().unwrap_or(0);
+    let mut components = Vec::with_capacity(DCI_COMPONENT_COUNT);
+    let mut chroma_subsampled = false;
+    for (index, comp) in picture.iter().enumerate() {
+        let covers_frame = comp.w * u32::from(comp.dx) >= width
+            && comp.h * u32::from(comp.dy) >= height
+            && comp.w <= width
+            && comp.h <= height;
+        if !covers_frame {
+            return Err(
+                "the components disagree on size or precision, so they cannot be one picture"
+                    .to_string(),
+            );
         }
 
-        let (width, height, stride) = (comp.w as usize, comp.h as usize, comp.stride as usize);
-        let mut plane = Vec::with_capacity(width * height);
-        for row in 0..height {
-            unsafe { extend_row(&mut plane, comp, row * stride, width) }
+        let (plane_width, plane_height) = (comp.w as usize, comp.h as usize);
+        let stride = comp.stride as usize;
+        let mut plane = Vec::with_capacity(plane_width * plane_height);
+        for row in 0..plane_height {
+            unsafe { extend_row(&mut plane, comp, row * stride, plane_width) }
                 .map_err(|e| format!("component {index}: {e}"))?;
+        }
+
+        if plane_width < width as usize {
+            plane = upsample_columns(&plane, plane_width, plane_height, width as usize);
+            chroma_subsampled = true;
+        }
+        if plane_height < height as usize {
+            plane = upsample_rows(&plane, width as usize, plane_height, height as usize);
+            chroma_subsampled = true;
         }
         components.push(plane);
     }
 
-    let (width, height, precision) = size.expect("three components were read");
     Ok(DecodedFrame {
         width,
         height,
-        precision,
+        precision: picture[0].prec,
         components,
+        chroma_subsampled,
     })
+}
+
+/// The only subsampling factor read here, horizontally or vertically.
+#[cfg(any(feature = "grok-ffi", test))]
+const SUBSAMPLING_FACTOR: u8 = 2;
+
+/// The mean of two samples, rounded up at the half.
+#[cfg(any(feature = "grok-ffi", test))]
+fn rounded_mean(left: i32, right: i32) -> i32 {
+    (left + right + 1) / 2
+}
+
+/// A plane at double width: output sample 2i is input i, 2i+1 the mean of i and
+/// i+1, and the last one repeats its own sample.
+#[cfg(any(feature = "grok-ffi", test))]
+fn upsample_columns(plane: &[i32], width: usize, height: usize, out_width: usize) -> Vec<i32> {
+    let mut out = vec![0i32; out_width * height];
+    let step = usize::from(SUBSAMPLING_FACTOR);
+    for row in 0..height {
+        let source = &plane[row * width..(row + 1) * width];
+        let target = &mut out[row * out_width..(row + 1) * out_width];
+        for (index, &sample) in source.iter().enumerate() {
+            let left = index * step;
+            if left >= out_width {
+                break;
+            }
+            target[left] = sample;
+            if left + 1 >= out_width {
+                break;
+            }
+            let next = source.get(index + 1).copied().unwrap_or(sample);
+            target[left + 1] = rounded_mean(sample, next);
+        }
+    }
+    out
+}
+
+/// [`upsample_columns`] down the rows instead.
+#[cfg(any(feature = "grok-ffi", test))]
+fn upsample_rows(plane: &[i32], width: usize, height: usize, out_height: usize) -> Vec<i32> {
+    let mut out = vec![0i32; width * out_height];
+    let step = usize::from(SUBSAMPLING_FACTOR);
+    for index in 0..height {
+        let source = &plane[index * width..(index + 1) * width];
+        let top = index * step;
+        if top >= out_height {
+            break;
+        }
+        out[top * width..(top + 1) * width].copy_from_slice(source);
+        if top + 1 >= out_height {
+            break;
+        }
+        let next = if index + 1 < height { index + 1 } else { index };
+        for column in 0..width {
+            out[(top + 1) * width + column] =
+                rounded_mean(source[column], plane[next * width + column]);
+        }
+    }
+    out
 }
 
 /// Copy `width` samples starting `offset` samples into `comp.data` onto `plane`.
@@ -334,6 +422,7 @@ mod tests {
             height: 1,
             precision: 12,
             components: vec![vec![4095, 0], vec![1, 2], vec![16, 32]],
+            chroma_subsampled: false,
         };
         let packed = frame.to_xyz12le().unwrap();
         assert_eq!(packed.len(), 2 * 3 * 2, "two pixels of three 16-bit words");
@@ -353,6 +442,7 @@ mod tests {
             height: 1,
             precision: 12,
             components: vec![vec![0]],
+            chroma_subsampled: false,
         };
         let error = frame.to_xyz12le().unwrap_err();
         assert!(error.contains("3 components"), "{error}");
@@ -365,6 +455,7 @@ mod tests {
             height: 4,
             precision: 12,
             components: vec![vec![0; 16], vec![0; 16], vec![0; 3]],
+            chroma_subsampled: false,
         };
         let error = frame.to_xyz12le().unwrap_err();
         assert!(error.contains("component 2"), "{error}");
@@ -374,5 +465,118 @@ mod tests {
     fn an_empty_codestream_is_refused() {
         let error = decode(Vec::new(), 0).unwrap_err();
         assert!(!error.is_empty());
+    }
+
+    #[test]
+    fn doubling_a_row_lands_the_new_sample_between_its_neighbours() {
+        let doubled = upsample_columns(&[100, 200, 300], 3, 1, 6);
+        assert_eq!(doubled, vec![100, 150, 200, 250, 300, 300]);
+    }
+
+    #[test]
+    fn doubling_rows_lands_the_new_row_between_its_neighbours() {
+        let doubled = upsample_rows(&[10, 20, 50, 60], 2, 2, 4);
+        assert_eq!(doubled, vec![10, 20, 30, 40, 50, 60, 50, 60]);
+    }
+
+    /// Where the chroma planes step from one flat side to the other.
+    #[cfg(feature = "grok-ffi")]
+    const CHROMA_EDGE_COLUMN: usize = 32;
+    #[cfg(feature = "grok-ffi")]
+    const YCBCR_FRAME: (u32, u32) = (128, 72);
+    #[cfg(feature = "grok-ffi")]
+    const MID_GREY_12BIT: i32 = 2048;
+    #[cfg(feature = "grok-ffi")]
+    const CHROMA_LOW_12BIT: i32 = 1024;
+    #[cfg(feature = "grok-ffi")]
+    const CHROMA_HIGH_12BIT: i32 = 3072;
+
+    /// A losslessly encoded 4:2:2 codestream: flat mid-grey luma, and chroma
+    /// planes that step from low to high halfway across.
+    #[cfg(feature = "grok-ffi")]
+    fn encode_ycbcr422_frame() -> Vec<u8> {
+        let (width, height) = YCBCR_FRAME;
+        let chroma_width = width as usize / 2;
+        let luma = vec![MID_GREY_12BIT; (width * height) as usize];
+        let mut chroma = Vec::with_capacity(chroma_width * height as usize);
+        for _ in 0..height {
+            for column in 0..chroma_width {
+                chroma.push(if column < CHROMA_EDGE_COLUMN {
+                    CHROMA_LOW_12BIT
+                } else {
+                    CHROMA_HIGH_12BIT
+                });
+            }
+        }
+        let profile = crate::j2k::ImfProfile::for_raster(width, height).unwrap();
+        let levels = crate::j2k::imf_levels(width, height, 24.0, 200_000_000).unwrap();
+        let params = crate::grok_encoder::CompressParams {
+            irreversible: false,
+            compression_ratio: 1.0,
+            mct: false,
+            apply_xyz_transform: false,
+            profile: crate::j2k::imf_rsiz(profile, levels),
+            num_resolutions: 3,
+            ..Default::default()
+        };
+        crate::grok_encoder::initialize(0);
+        crate::grok_encoder::compress_yuv422_frame(
+            [&luma, &chroma, &chroma],
+            width,
+            height,
+            12,
+            &params,
+        )
+        .expect("a 4:2:2 frame compresses")
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_422_codestream_decodes_with_its_chroma_upsampled() {
+        let (width, height) = YCBCR_FRAME;
+        let frame = decode(encode_ycbcr422_frame(), 0).expect("4:2:2 fixture decodes");
+        assert_eq!((frame.width, frame.height), (width, height));
+        assert!(
+            frame.chroma_subsampled,
+            "a 4:2:2 codestream has to read back as subsampled, or the preview would take its \
+             YCbCr samples for RGB"
+        );
+        let samples = (width * height) as usize;
+        for (index, component) in frame.components.iter().enumerate() {
+            assert_eq!(
+                component.len(),
+                samples,
+                "component {index} came back at the wrong size"
+            );
+        }
+
+        assert!(
+            frame.components[0].iter().all(|&y| y == MID_GREY_12BIT),
+            "the flat luma plane did not survive a lossless round trip"
+        );
+
+        let edge = CHROMA_EDGE_COLUMN * 2;
+        for plane in &frame.components[1..] {
+            assert_eq!(
+                plane[0], CHROMA_LOW_12BIT,
+                "the left side of the chroma edge"
+            );
+            assert_eq!(
+                plane[edge - 2],
+                CHROMA_LOW_12BIT,
+                "the last chroma sample before the edge"
+            );
+            assert_eq!(
+                plane[edge - 1],
+                (CHROMA_LOW_12BIT + CHROMA_HIGH_12BIT) / 2,
+                "the interpolated sample has to land between the two sides"
+            );
+            assert_eq!(plane[edge], CHROMA_HIGH_12BIT, "the right side of the edge");
+            assert_eq!(
+                plane[width as usize - 1],
+                CHROMA_HIGH_12BIT,
+                "the last column repeats its own chroma sample"
+            );
+        }
     }
 }
