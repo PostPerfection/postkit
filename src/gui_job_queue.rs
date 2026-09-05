@@ -9,12 +9,15 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// What a job left running when the window closed reports on the next launch.
 pub const INTERRUPTED_MESSAGE: &str = "the app closed while this job was running";
 
 const GUI_JOBS_FILE_NAME: &str = "gui-jobs.jsonl";
+
+const STOP_FOR_EXIT_WAIT: Duration = Duration::from_secs(30);
 
 /// What the queue reads from a wizard's job config to list it and record it.
 pub trait GuiJob: Serialize + DeserializeOwned + Clone {
@@ -231,6 +234,8 @@ pub struct GuiJobQueue<C> {
     /// loading the file rewrites it.
     history: Mutex<Vec<JobInfo>>,
     jobs_file: PathBuf,
+    closing: AtomicBool,
+    worker_idle: (Mutex<()>, Condvar),
 }
 
 impl<C: GuiJob> GuiJobQueue<C> {
@@ -246,6 +251,8 @@ impl<C: GuiJob> GuiJobQueue<C> {
             current_output: Mutex::new(None),
             history: Mutex::new(Vec::new()),
             jobs_file,
+            closing: AtomicBool::new(false),
+            worker_idle: (Mutex::new(()), Condvar::new()),
         }
     }
 
@@ -325,16 +332,21 @@ impl<C: GuiJob> GuiJobQueue<C> {
     }
 
     pub fn take_next(&self) -> Option<C> {
+        if self.closing.load(Ordering::Relaxed) {
+            return None;
+        }
         self.queue.lock().unwrap().pop_front()
     }
 
-    /// Mark the job running and record it, with the cancel and pause flags clear.
+    /// Mark the job running and record it.
     pub fn start(&self, job: &C) {
         self.current_id.store(job.id(), Ordering::Relaxed);
         *self.current_title.lock().unwrap() = job.title().to_string();
         *self.current_output.lock().unwrap() = Some(job.output_dir().to_path_buf());
         *self.current_status.lock().unwrap() = STATUS_RUNNING.to_string();
-        self.cancel.store(false, Ordering::Relaxed);
+        // a job taken as the app closes starts cancelled
+        let closing = self.closing.load(Ordering::Relaxed);
+        self.cancel.store(closing, Ordering::Relaxed);
         self.pause.store(false, Ordering::Relaxed);
         self.record(StoredJobState::Running, "", job);
     }
@@ -347,8 +359,35 @@ impl<C: GuiJob> GuiJobQueue<C> {
 
     /// Leave no job running, so the next build starts a worker.
     pub fn clear_current(&self) {
+        let (lock, idle) = &self.worker_idle;
+        let _guard = lock.lock().unwrap();
         self.current_id.store(0, Ordering::Relaxed);
         *self.current_output.lock().unwrap() = None;
+        idle.notify_all();
+    }
+
+    // exiting with encoder threads still compressing crashes in grok's teardown
+    pub fn stop_for_exit(&self) {
+        self.closing.store(true, Ordering::Relaxed);
+        let queued: Vec<C> = self.queue.lock().unwrap().drain(..).collect();
+        for job in &queued {
+            self.record(StoredJobState::Cancelled, "", job);
+        }
+        self.cancel.store(true, Ordering::Relaxed);
+
+        let (lock, idle) = &self.worker_idle;
+        let mut guard = lock.lock().unwrap();
+        let deadline = Instant::now() + STOP_FOR_EXIT_WAIT;
+        while self.has_running_job() {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                report(&format!(
+                    "the running job did not stop within {} s, exiting anyway",
+                    STOP_FOR_EXIT_WAIT.as_secs()
+                ));
+                return;
+            };
+            guard = idle.wait_timeout(guard, left).unwrap().0;
+        }
     }
 
     /// What the Jobs panel lists: the running job, then the queued ones, then
@@ -569,5 +608,74 @@ mod tests {
             data_dir.join("gui-jobs.jsonl")
         );
         unsafe { std::env::remove_var(VARIABLE) };
+    }
+
+    fn worker_that_stops_on_cancel(
+        queue: Arc<GuiJobQueue<TestJob>>,
+        job: TestJob,
+    ) -> std::thread::JoinHandle<()> {
+        let cancel = queue.cancel_flag();
+        std::thread::spawn(move || {
+            while !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            queue.finish(&job, StoredJobState::Cancelled, "Cancelled");
+            assert!(
+                queue.take_next().is_none(),
+                "the worker was handed a job after the close"
+            );
+            queue.clear_current();
+        })
+    }
+
+    #[test]
+    fn a_close_cancels_the_running_job_and_the_queued_ones_and_waits_for_the_worker() {
+        const RETURN_WITHIN: Duration = Duration::from_secs(5);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gui-jobs.jsonl");
+        let queue = Arc::new(GuiJobQueue::new(path.clone()));
+        let running = test_job();
+        let mut queued = test_job();
+        queued.id = 2;
+        queue.submit(running);
+        queue.submit(queued);
+        let job = queue.take_next().unwrap();
+        queue.start(&job);
+        let worker = worker_that_stops_on_cancel(queue.clone(), job);
+
+        let started = Instant::now();
+        queue.stop_for_exit();
+        assert!(
+            started.elapsed() < RETURN_WITHIN,
+            "the close waited on the timeout, not the worker"
+        );
+        assert!(!queue.has_running_job());
+        worker.join().unwrap();
+
+        let loaded = load::<TestJob>(&path);
+        let states: Vec<(u64, StoredJobState)> = loaded
+            .jobs
+            .iter()
+            .map(|job| (job.config.id, job.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![
+                (1, StoredJobState::Cancelled),
+                (2, StoredJobState::Cancelled)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_job_taken_as_the_app_closes_starts_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = GuiJobQueue::new(dir.path().join("gui-jobs.jsonl"));
+        queue.submit(test_job());
+        let job = queue.take_next().unwrap();
+        queue.stop_for_exit();
+        queue.start(&job);
+        assert!(queue.is_cancelled());
+        assert!(queue.take_next().is_none());
     }
 }

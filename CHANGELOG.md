@@ -4,6 +4,11 @@
 
 ### Added
 
+- **`gui_job_queue::GuiJobQueue::stop_for_exit`**: cancels the running job,
+  records the queued ones cancelled and waits for the worker to stop, for a
+  wizard to call when its window closes. A process that exits with encoder
+  threads still compressing crashes in grok's teardown and spends the next
+  seconds writing a core dump.
 - **`mxf_wrap::MxfTrackFile::hash_base64`**: the wrap's SHA-1 in the form a CPL
   or PKL declares, so a packager handed a wrapped picture can write its hash
   without reading the file a second time.
