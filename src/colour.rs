@@ -9,6 +9,8 @@ pub enum ColourSpace {
     Rec709,
     /// DCI-P3
     P3,
+    /// P3 primaries with the D65 white, the space an App 2E picture is mastered in
+    P3D65,
     /// CIE XYZ (digital cinema)
     Xyz,
     /// Rec. 2020
@@ -28,6 +30,7 @@ pub fn parse_colour_space(name: &str) -> Option<ColourSpace> {
     match name.trim().to_lowercase().as_str() {
         "rec709" | "bt709" => Some(ColourSpace::Rec709),
         "p3" | "dcip3" | "dci-p3" => Some(ColourSpace::P3),
+        "p3d65" | "p3-d65" | "displayp3" => Some(ColourSpace::P3D65),
         "xyz" | "ciexyz" => Some(ColourSpace::Xyz),
         "rec2020" | "bt2020" | "2020" => Some(ColourSpace::Rec2020),
         "aces" | "ap0" => Some(ColourSpace::Aces),
@@ -101,6 +104,7 @@ fn ffmpeg_color_params(cs: ColourSpace) -> Option<(&'static str, &'static str, &
     match cs {
         ColourSpace::Rec709 => Some(("bt709", "bt709", "bt709")),
         ColourSpace::P3 => Some(("bt709", "smpte431", "bt709")),
+        ColourSpace::P3D65 => Some(("bt709", "smpte432", "bt709")),
         ColourSpace::Rec2020 => Some(("bt2020ncl", "bt2020", "bt2020-10")),
         // XYZ/ACES/ACEScg/LogC are not colorspace-filter expressible.
         ColourSpace::Xyz | ColourSpace::Aces | ColourSpace::AcesCg | ColourSpace::LogC => None,
@@ -120,6 +124,9 @@ mod tests {
             ("BT709", ColourSpace::Rec709),
             ("dcip3", ColourSpace::P3),
             ("dci-p3", ColourSpace::P3),
+            ("p3d65", ColourSpace::P3D65),
+            ("P3-D65", ColourSpace::P3D65),
+            ("displayp3", ColourSpace::P3D65),
             ("ciexyz", ColourSpace::Xyz),
             ("2020", ColourSpace::Rec2020),
             ("bt2020", ColourSpace::Rec2020),
@@ -205,6 +212,36 @@ impl Linearisation {
     }
 }
 
+/// SMPTE RP 431-2 P3 primaries, red, green then blue as CIE xy.
+const P3_PRIMARIES: [[f64; 2]; 3] = [[0.680, 0.320], [0.265, 0.690], [0.150, 0.060]];
+/// D65 as CIE xy.
+const D65_CHROMATICITY: [f64; 2] = [0.3127, 0.3290];
+
+fn rgb_to_xyz_matrix(primaries: [[f64; 2]; 3], white: [f64; 2]) -> [[f32; 3]; 3] {
+    let tristimulus = |chromaticity: [f64; 2]| {
+        let [x, y] = chromaticity;
+        [x / y, 1.0, (1.0 - x - y) / y]
+    };
+    let mut columns = [[0.0f64; 3]; 3];
+    for (index, primary) in primaries.iter().enumerate() {
+        let xyz = tristimulus(*primary);
+        for (row, value) in columns.iter_mut().zip(xyz) {
+            row[index] = value;
+        }
+    }
+    let white_xyz = tristimulus(white);
+    let to_primary_weights = inverse_matrix(&columns);
+    let weights = to_primary_weights
+        .map(|row| row[0] * white_xyz[0] + row[1] * white_xyz[1] + row[2] * white_xyz[2]);
+    let mut out = [[0.0f32; 3]; 3];
+    for (row, source) in out.iter_mut().zip(columns) {
+        for ((slot, value), weight) in row.iter_mut().zip(source).zip(weights) {
+            *slot = (value * weight) as f32;
+        }
+    }
+    out
+}
+
 /// Source colour space description for the DCDM transform: the linear RGB to
 /// CIE XYZ matrix, the curve that linearises its code values, and the scale that
 /// lands source white on the DCI reference white.
@@ -241,6 +278,11 @@ pub(crate) fn source_space(space: ColourSpace) -> Result<SourceSpace, String> {
                 [0.0, 0.047_060_6, 0.907_378_4],
             ],
             linearisation: Linearisation::Gamma(DCDM_GAMMA),
+            scale: dci_scale,
+        },
+        ColourSpace::P3D65 => SourceSpace {
+            to_xyz: rgb_to_xyz_matrix(P3_PRIMARIES, D65_CHROMATICITY),
+            linearisation: Linearisation::Gamma(REC709_GAMMA),
             scale: dci_scale,
         },
         ColourSpace::Rec2020 => SourceSpace {
@@ -1284,6 +1326,12 @@ mod tests_rec709 {
         [0.2627002, 0.6779981, 0.0593017],
         [0.0, 0.0280727, 1.0609851],
     ];
+    // The published Display P3 matrix: the same P3 primaries with D65, gamma 2.2.
+    const P3_D65_TO_XYZ: [[f64; 3]; 3] = [
+        [0.4865709, 0.2656677, 0.1982173],
+        [0.2289746, 0.6917385, 0.0792869],
+        [0.0, 0.0451134, 1.0439444],
+    ];
     // The published sRGB inverse, against the one the transform computes itself.
     const XYZ_TO_LINEAR_REC709: [[f64; 3]; 3] = [
         [3.2404542, -1.5371385, -0.4985314],
@@ -1313,6 +1361,7 @@ mod tests_rec709 {
     fn a_wide_gamut_source_matches_the_published_matrices() {
         for (space, source_to_xyz, gamma) in [
             (ColourSpace::P3, P3_DCI_TO_XYZ, 2.6),
+            (ColourSpace::P3D65, P3_D65_TO_XYZ, 2.2),
             (ColourSpace::Rec2020, REC2020_TO_XYZ, 2.4),
         ] {
             let transform = Rec709Transform::from_space(space).unwrap();
@@ -1330,6 +1379,31 @@ mod tests_rec709 {
                 }
             }
         }
+    }
+
+    #[test]
+    fn p3_d65_white_lands_on_rec709_white_and_its_red_clips() {
+        let transform = Rec709Transform::from_space(ColourSpace::P3D65).unwrap();
+        let white = transform.pixel([u16::MAX; 3], TWELVE_BIT_MAX);
+        for code in white {
+            let off = i32::from(TWELVE_BIT_MAX) - i32::from(code);
+            assert!(off.abs() <= 1, "P3-D65 white came out {white:?}");
+        }
+        let dci_white = Rec709Transform::from_space(ColourSpace::P3)
+            .unwrap()
+            .pixel([u16::MAX; 3], TWELVE_BIT_MAX);
+        assert_ne!(
+            dci_white, white,
+            "the DCI white point is not D65, so P3 white must not be neutral"
+        );
+
+        let red = transform.pixel([u16::MAX, 0, 0], TWELVE_BIT_MAX);
+        assert!(red[0] > 4000, "P3-D65 red stays red: {red:?}");
+        assert_eq!(
+            [red[1], red[2]],
+            [0, 0],
+            "P3 red is outside Rec.709, so green and blue clip: {red:?}"
+        );
     }
 
     #[test]

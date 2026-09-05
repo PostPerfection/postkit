@@ -21,6 +21,13 @@
   `CompressParams.source_preparation.colour_transform` and
   `StillHold.colour_transform` now carry a `colour::FrameColourTransform`, which
   is either the X'Y'Z' transform or this one.
+- **`colour::ColourSpace::P3D65`**: the P3 primaries with the D65 white, which
+  is what a ST 2067-21 App 2E picture is mastered in, spelled `p3d65`, `p3-d65`
+  or `displayp3`. Its matrix is computed from the SMPTE RP 431-2 chromaticities
+  rather than stored rounded, so P3-D65 white reaches Rec.709 white exactly and
+  a P3-D65 master needs no chromatic adaptation. Display-referred gamma 2.2 and
+  the DCI scale the other display spaces use, so the X'Y'Z' path takes it too.
+  `P3` is still P3-DCI, whose white is not D65.
 - **`gui_job_queue::GuiJobQueue::stop_for_exit`**: cancels the running job,
   records the queued ones cancelled and waits for the worker to stop, for a
   wizard to call when its window closes. A process that exits with encoder
