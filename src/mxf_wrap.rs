@@ -754,21 +754,23 @@ impl Drop for IncrementalJ2kWrap {
 /// The in-process encoder hands frames to its writer in completion order off a
 /// FIFO work queue, so arrival order runs ahead of index order by roughly the
 /// queue depth plus the thread count.
-/// `capacity` caps how far ahead: past that the wrap fails rather than holding an
-/// unbounded number of frames, which is also what a frame that is never coming
-/// looks like.
+/// `held_bytes_limit` caps the memory the held frames take: past that the wrap
+/// fails rather than holding an unbounded number of frames, which is what a frame
+/// that is never coming looks like.
 struct FrameReorderBuffer {
     next_index: u64,
     pending: std::collections::BTreeMap<u64, Vec<u8>>,
-    capacity: usize,
+    held_bytes: usize,
+    held_bytes_limit: usize,
 }
 
 impl FrameReorderBuffer {
-    fn new(capacity: usize) -> Self {
+    fn new(held_bytes_limit: usize) -> Self {
         Self {
             next_index: 0,
             pending: std::collections::BTreeMap::new(),
-            capacity,
+            held_bytes: 0,
+            held_bytes_limit,
         }
     }
 
@@ -783,13 +785,15 @@ impl FrameReorderBuffer {
         if self.pending.contains_key(&index) {
             return Err(format!("frame {index} arrived twice"));
         }
-        if self.pending.len() >= self.capacity {
+        if self.held_bytes + data.len() > self.held_bytes_limit {
             return Err(format!(
-                "{} frames are held waiting for frame {}, which is not coming",
+                "{} frames ({} MiB) are held waiting for frame {}, which is not coming",
                 self.pending.len(),
+                self.held_bytes >> 20,
                 self.next_index
             ));
         }
+        self.held_bytes += data.len();
         self.pending.insert(index, data);
         Ok(())
     }
@@ -797,6 +801,7 @@ impl FrameReorderBuffer {
     /// The next frame in order, once it has arrived.
     fn take_next(&mut self) -> Option<Vec<u8>> {
         let data = self.pending.remove(&self.next_index)?;
+        self.held_bytes -= data.len();
         self.next_index += 1;
         Some(data)
     }
@@ -811,20 +816,8 @@ impl FrameReorderBuffer {
 /// slower than the encoder cannot let the queue grow without limit.
 const WRAP_QUEUE_FRAMES: usize = 8;
 
-/// Frames the reorder buffer may hold while waiting for the next one in order.
-///
-/// How far arrival order really runs ahead is the encoder's queue depth plus its
-/// thread count, and both follow the core count. This only has to be past that,
-/// so that reaching it means a frame is never coming rather than that the machine
-/// is a wide one.
-fn wrap_reorder_capacity() -> usize {
-    const PER_CORE: usize = 4;
-    const MINIMUM: usize = 64;
-    std::thread::available_parallelism()
-        .map(|cores| cores.get() * PER_CORE)
-        .unwrap_or(MINIMUM)
-        .max(MINIMUM)
-}
+// the accelerator's reorder depth is unknown, so the guard is memory
+const REORDER_HELD_BYTES_LIMIT: usize = 1 << 30;
 
 /// One frame for a wrap running alongside the encoder, or the request to finish.
 enum WrapMessage {
@@ -864,7 +857,7 @@ impl OverlappedJ2kWrap {
         let mut wrap = IncrementalJ2kWrap::new(options)?;
         let (sender, receiver) = std::sync::mpsc::sync_channel(WRAP_QUEUE_FRAMES);
         let thread = std::thread::spawn(move || {
-            let mut buffer = FrameReorderBuffer::new(wrap_reorder_capacity());
+            let mut buffer = FrameReorderBuffer::new(REORDER_HELD_BYTES_LIMIT);
             let mut expected_frames = None;
             for message in receiver {
                 match message {
@@ -2002,7 +1995,7 @@ mod tests {
 
     #[test]
     fn the_reorder_buffer_holds_a_frame_until_the_ones_before_it_arrive() {
-        let mut buffer = FrameReorderBuffer::new(8);
+        let mut buffer = FrameReorderBuffer::new(1024);
 
         buffer.accept(2, vec![2]).unwrap();
         buffer.accept(1, vec![1]).unwrap();
@@ -2028,6 +2021,7 @@ mod tests {
     #[test]
     fn the_reorder_buffer_refuses_more_frames_than_it_can_hold_behind_a_gap() {
         let mut buffer = FrameReorderBuffer::new(3);
+        // one byte a frame
         for index in 1..=3 {
             buffer.accept(index, vec![index as u8]).unwrap();
         }
@@ -2040,7 +2034,7 @@ mod tests {
 
     #[test]
     fn the_reorder_buffer_refuses_a_frame_it_cannot_place() {
-        let mut buffer = FrameReorderBuffer::new(8);
+        let mut buffer = FrameReorderBuffer::new(1024);
         buffer.accept(0, vec![0]).unwrap();
         let error = buffer
             .accept(0, vec![0])

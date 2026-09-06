@@ -277,6 +277,11 @@
 
 ### Fixed
 
+- **A late frame no longer fails the wrap**: the frames a wrap holds while waiting
+  for the next one in order were capped at four per core, and a GPU encode on a
+  loaded machine ran 66 frames ahead of one late frame and failed with "64 frames
+  are held waiting for frame 6509, which is not coming". The cap is memory now,
+  1 GiB of held codestreams, so only a frame that never arrives trips it.
 - `grok_decoder::decode_with_threads` had no refusal stub for a build without
   the `grok-ffi` feature, so anything calling it failed to compile there.
 - `preview::read_j2c_frame` kept the whole `MAX_FRAME_BYTES` allocation after
