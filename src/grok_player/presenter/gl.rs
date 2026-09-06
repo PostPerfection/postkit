@@ -35,7 +35,7 @@ const COMPONENTS_PER_ATTRIBUTE: i32 = 2;
 const FLOATS_PER_VERTEX: i32 = 4;
 const PICTURE_TEXTURE_UNIT: i32 = 0;
 
-// the first texture row is the top of the picture
+// flip_y follows mpv: true puts the first texture row, the picture's top, at gl's top
 const QUAD: [f32; 16] = [
     -1.0, 1.0, 0.0, 0.0, // top left
     -1.0, -1.0, 0.0, 1.0, // bottom left
@@ -50,7 +50,7 @@ layout(location = 1) in vec2 corner;\n\
 uniform int flip_y;\n\
 out vec2 texture_coordinate;\n\
 void main() {\n\
-    texture_coordinate = vec2(corner.x, flip_y != 0 ? 1.0 - corner.y : corner.y);\n\
+    texture_coordinate = vec2(corner.x, flip_y != 0 ? corner.y : 1.0 - corner.y);\n\
     gl_Position = vec4(position, 0.0, 1.0);\n\
 }\n";
 
