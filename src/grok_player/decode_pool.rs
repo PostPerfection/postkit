@@ -402,6 +402,97 @@ mod tests {
         std::fs::read(directory.path().join("frame_00000000.j2c")).expect("fixture codestream")
     }
 
+    // POSTKIT_BENCH_SOURCE names a DCP directory, a picture MXF or a codestream directory
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn one_frame_of_the_bench_source_costs_on_the_host_and_the_device() {
+        const RUNS: u32 = 10;
+        let source = std::env::var("POSTKIT_BENCH_SOURCE").expect("POSTKIT_BENCH_SOURCE");
+        let mut timeline =
+            super::super::timeline::Timeline::open(std::path::Path::new(&source)).expect("open");
+        let (codestream, render, mxf) = timeline.codestream(0).expect("frame 0");
+        crate::grok_encoder::initialize(0);
+        println!(
+            "{}x{}, {} frames, frame 0 is {} bytes",
+            timeline.width,
+            timeline.height,
+            timeline.frame_count,
+            codestream.len()
+        );
+        let display = Display::Srgb(XyzToSrgb::new());
+        let milliseconds = |label: &str, step: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            for _ in 0..RUNS {
+                step();
+            }
+            println!(
+                "{label}: {:.1} ms",
+                start.elapsed().as_secs_f64() * 1000.0 / f64::from(RUNS)
+            );
+        };
+
+        milliseconds("decode, one grok thread", &mut || {
+            let decoded = crate::grok_decoder::decode_with_threads(
+                codestream.clone(),
+                0,
+                SINGLE_DECODE_THREAD,
+            )
+            .expect("decode");
+            std::hint::black_box(decoded);
+        });
+        milliseconds("decode, grok's pool", &mut || {
+            let decoded = crate::grok_decoder::decode_with_threads(
+                codestream.clone(),
+                0,
+                preview::GROK_SHARED_THREAD_POOL,
+            )
+            .expect("decode");
+            std::hint::black_box(decoded);
+        });
+        let decoded =
+            crate::grok_decoder::decode_with_threads(codestream.clone(), 0, SINGLE_DECODE_THREAD)
+                .expect("decode");
+        milliseconds("pack to xyz12le", &mut || {
+            std::hint::black_box(decoded.to_xyz12le().expect("pack"));
+        });
+        let raw = decoded.to_xyz12le().expect("pack");
+        let mut rgb8 = Vec::new();
+        milliseconds("display transform, xyz12le to rgb8", &mut || {
+            display.apply(&raw, &mut rgb8);
+            std::hint::black_box(&rgb8);
+        });
+        milliseconds("decode_job, decode and colour on one thread", &mut || {
+            let frame = decode_job(codestream.clone(), 0, render, &mxf, &display).expect("decode");
+            std::hint::black_box(frame);
+        });
+
+        #[cfg(feature = "grok-gpu")]
+        match crate::grok_encoder::use_gpu_from_environment() {
+            Ok(()) => {
+                let before = crate::grok_encoder::accelerated_frames();
+                milliseconds("decode on the device, one grok thread", &mut || {
+                    let decoded = crate::grok_decoder::decode_with_threads(
+                        codestream.clone(),
+                        0,
+                        SINGLE_DECODE_THREAD,
+                    )
+                    .expect("decode");
+                    std::hint::black_box(decoded);
+                });
+                let device_frames = crate::grok_encoder::accelerated_frames() - before;
+                println!("the device took {device_frames} of {RUNS} decodes");
+                milliseconds("decode_job on the device, decode and colour", &mut || {
+                    let frame =
+                        decode_job(codestream.clone(), 0, render, &mxf, &display).expect("decode");
+                    std::hint::black_box(frame);
+                });
+                crate::grok_encoder::use_cpu();
+            }
+            Err(reason) => println!("no device numbers: {reason}"),
+        }
+    }
+
     #[cfg(feature = "grok-ffi")]
     #[test]
     #[ignore = "a measurement, not a check"]
@@ -460,7 +551,15 @@ mod tests {
     #[ignore = "a measurement, not a check"]
     fn the_pool_sustains_frames_a_second_at_full_resolution() {
         const FRAMES: u64 = 96;
-        let codestream = cinema_2k_codestream();
+        let codestream = match std::env::var("POSTKIT_BENCH_SOURCE") {
+            Ok(source) => {
+                let mut timeline =
+                    super::super::timeline::Timeline::open(std::path::Path::new(&source))
+                        .expect("open");
+                timeline.codestream(0).expect("frame 0").0
+            }
+            Err(_) => cinema_2k_codestream(),
+        };
         let (finished, _drain) = std::sync::mpsc::channel();
         let pool = DecodePool::start(finished);
         println!("{} workers", pool.worker_count);

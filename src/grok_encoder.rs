@@ -1778,6 +1778,16 @@ pub fn use_gpu() -> Result<(), String> {
     use_gpu_with_authentication(None, None)
 }
 
+pub const GPU_LICENSE_VARIABLE: &str = "POSTKIT_GPU_LICENSE";
+pub const GPU_REGISTRATION_URL_VARIABLE: &str = "POSTKIT_GPU_REGISTRATION_URL";
+
+// the GPU tests and benches run where no preferences file holds the licence
+pub fn use_gpu_from_environment() -> Result<(), String> {
+    let license = std::env::var(GPU_LICENSE_VARIABLE).ok();
+    let registration_url = std::env::var(GPU_REGISTRATION_URL_VARIABLE).ok();
+    use_gpu_with_authentication(license.as_deref(), registration_url.as_deref())
+}
+
 #[cfg(feature = "grok-ffi")]
 pub fn use_gpu_with_authentication(
     license: Option<&str>,

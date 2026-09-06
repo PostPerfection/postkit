@@ -18,7 +18,7 @@
 use postkit::grok_decoder;
 use postkit::grok_encoder::{
     CompressParams, PhaseClocks, ProgressionOrder, RawFrame, accelerated_frames, gpu_active,
-    initialize, use_cpu, use_gpu,
+    initialize, use_cpu, use_gpu_from_environment,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -207,7 +207,7 @@ fn a_device_encode_holds_the_byte_target() {
 #[test]
 fn the_device_takes_every_call_after_use_gpu_and_none_after_use_cpu() {
     initialize(0);
-    if let Err(reason) = use_gpu() {
+    if let Err(reason) = use_gpu_from_environment() {
         panic!("{reason}");
     }
     assert!(gpu_active(), "use_gpu returned Ok without recording it");

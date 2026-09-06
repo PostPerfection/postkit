@@ -785,7 +785,7 @@ impl Display {
         }
     }
 
-    fn apply(&self, raw: &[u8], out: &mut Vec<u8>) {
+    pub(crate) fn apply(&self, raw: &[u8], out: &mut Vec<u8>) {
         match self {
             Display::Srgb(t) => t.frame_xyz12le_to_srgb8(raw, out),
             #[cfg(feature = "icc")]

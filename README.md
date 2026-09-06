@@ -118,7 +118,9 @@ on 1442 frames of 2048x872 yuv420p, against 73.0 for the same plan converted to
 with the plugin, CI has no GPU: `tests/grok_gpu.rs` for the round trip,
 `tests/grok_gpu_yuv.rs` for the planar YUV source and
 `tests/grok_gpu_rgb48le.rs` for the interleaved one. This needs grok v20.4.3 or
-newer, which has `grk_plugin_set_enabled`.
+newer, which has `grk_plugin_set_enabled`. A plugin built with licence checking
+takes the licence from `POSTKIT_GPU_LICENSE` and the registration server from
+`POSTKIT_GPU_REGISTRATION_URL`, through `grok_encoder::use_gpu_from_environment`.
 
 ## Usage
 

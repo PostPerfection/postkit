@@ -14,7 +14,7 @@ use postkit::encode::{
     EncodeResult, SourceColour, StreamEncodeOptions, default_rsiz, encode_tiff_sequence_inprocess,
     stream_encode_inprocess,
 };
-use postkit::grok_encoder::{accelerated_frames, initialize, use_cpu, use_gpu};
+use postkit::grok_encoder::{accelerated_frames, initialize, use_cpu, use_gpu_from_environment};
 use postkit::j2k::{ImfProfile, imf_levels, imf_rsiz};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -230,7 +230,7 @@ fn assert_same_picture(device: &[Frame], host: &[Frame], label: &str) -> f64 {
 #[test]
 fn an_interleaved_rgb_source_reaches_the_plugin_as_one_buffer() {
     initialize(0);
-    if let Err(reason) = use_gpu() {
+    if let Err(reason) = use_gpu_from_environment() {
         panic!("{reason}");
     }
 
