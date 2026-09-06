@@ -22,6 +22,8 @@ pub mod fs;
 pub mod grok;
 pub mod grok_decoder;
 pub mod grok_encoder;
+#[cfg(feature = "grok-ffi")]
+pub mod grok_player;
 pub mod gui_job_queue;
 pub mod hash;
 pub mod hints;

@@ -420,6 +420,37 @@ pub fn composite_rgb48(
     }
 }
 
+pub fn composite_rgb8(frame: &mut [u8], width: u32, height: u32, bitmaps: &[PositionedBitmap]) {
+    const BYTES_PER_PIXEL: usize = 3;
+    let stride = width as usize * BYTES_PER_PIXEL;
+    for bitmap in bitmaps {
+        for row in 0..bitmap.height as i32 {
+            let frame_y = bitmap.y + row;
+            if frame_y < 0 || frame_y >= height as i32 {
+                continue;
+            }
+            for column in 0..bitmap.width as i32 {
+                let frame_x = bitmap.x + column;
+                if frame_x < 0 || frame_x >= width as i32 {
+                    continue;
+                }
+                let source = ((row as usize) * (bitmap.width as usize) + column as usize) * 4;
+                let alpha = bitmap.pixels[source + 3] as u32;
+                if alpha == 0 {
+                    continue;
+                }
+                let at = frame_y as usize * stride + frame_x as usize * BYTES_PER_PIXEL;
+                for channel in 0..BYTES_PER_PIXEL {
+                    let destination = frame[at + channel] as u32;
+                    let source_sample = bitmap.pixels[source + channel] as u32;
+                    let mixed = (source_sample * alpha + destination * (255 - alpha) + 127) / 255;
+                    frame[at + channel] = mixed.min(u8::MAX as u32) as u8;
+                }
+            }
+        }
+    }
+}
+
 /// A cue list ready to be burnt onto frames, addressed by frame number.
 ///
 /// Holds the rasterizer behind a lock because the encoder threads share one

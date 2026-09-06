@@ -19,17 +19,17 @@ pub struct CompositionSource {
 /// A picture track file as the composition plays it: the whole file, or only
 /// the span the reel enters and leaves at.
 #[derive(Debug, PartialEq)]
-struct PictureSegment {
-    path: PathBuf,
-    trim: Option<SegmentTrim>,
+pub struct PictureSegment {
+    pub path: PathBuf,
+    pub trim: Option<SegmentTrim>,
 }
 
 /// Seconds into the file and seconds of it. Length is None when the CPL states
 /// an entry point without a duration.
 #[derive(Debug, PartialEq)]
-struct SegmentTrim {
-    start_seconds: f64,
-    length_seconds: Option<f64>,
+pub struct SegmentTrim {
+    pub start_seconds: f64,
+    pub length_seconds: Option<f64>,
 }
 
 /// A picture the CPL names, as the id to look up and the span to play.
@@ -56,19 +56,44 @@ pub fn mpv_source(package_dir: &Path) -> Option<CompositionSource> {
 
 /// Every picture track file the composition names, in composition order, with
 /// the composition title.
-fn read_composition(package_dir: &Path) -> (Vec<PictureSegment>, Option<String>) {
-    let Some(assetmap) = crate::assetmap::find(package_dir) else {
+pub fn read_composition(package_dir: &Path) -> (Vec<PictureSegment>, Option<String>) {
+    let Some(assets) = package_assets(package_dir) else {
         return (Vec::new(), None);
     };
-    let assets = crate::assetmap::parse_ordered(&assetmap);
     let Some(cpl) = first_cpl(package_dir, &assets) else {
         return (Vec::new(), None);
     };
+    (
+        segments_of(package_dir, &assets, &cpl),
+        composition_title(&cpl),
+    )
+}
+
+pub fn read_composition_from_cpl(cpl_path: &Path) -> (Vec<PictureSegment>, Option<String>) {
+    let package_dir = cpl_path.parent().unwrap_or(Path::new("."));
+    let Some(assets) = package_assets(package_dir) else {
+        return (Vec::new(), None);
+    };
+    let Ok(cpl) = std::fs::read_to_string(cpl_path) else {
+        return (Vec::new(), None);
+    };
+    (
+        segments_of(package_dir, &assets, &cpl),
+        composition_title(&cpl),
+    )
+}
+
+fn package_assets(package_dir: &Path) -> Option<Vec<(String, String)>> {
+    let assetmap = crate::assetmap::find(package_dir)?;
+    Some(crate::assetmap::parse_ordered(&assetmap))
+}
+
+fn segments_of(package_dir: &Path, assets: &[(String, String)], cpl: &str) -> Vec<PictureSegment> {
     let path_by_id: HashMap<&str, &str> = assets
         .iter()
         .map(|(id, relative)| (id.as_str(), relative.as_str()))
         .collect();
-    let segments = picture_references(&cpl)
+    picture_references(cpl)
         .into_iter()
         .filter_map(|picture| {
             let relative = path_by_id.get(picture.asset_id.as_str())?;
@@ -77,8 +102,7 @@ fn read_composition(package_dir: &Path) -> (Vec<PictureSegment>, Option<String>)
                 trim: picture.trim,
             })
         })
-        .collect();
-    (segments, composition_title(&cpl))
+        .collect()
 }
 
 /// The text of the first CPL in ASSETMAP order. ASSETMAP order is the only

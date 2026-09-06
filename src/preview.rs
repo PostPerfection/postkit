@@ -222,7 +222,7 @@ fn frame_route(input: &Path, frame: u32, key: Option<[u8; 16]>) -> FrameRoute {
 ///
 /// Stereoscopic essence needs asdcplib's stereo reader, which the DCP-native
 /// path does not use.
-fn is_jpeg2000_mxf(input: &Path) -> bool {
+pub fn is_jpeg2000_mxf(input: &Path) -> bool {
     matches!(
         asdcplib::essence_type(&input.to_string_lossy()),
         Ok(asdcplib::EssenceType::Jpeg2000 | asdcplib::EssenceType::As02Jpeg2000)
@@ -448,13 +448,13 @@ pub struct ResolvedPicture {
 ///
 /// The AS-DCP reader opens an AS-02 file and then fails every `read_frame`, so
 /// the flavour has to be settled before the first read.
-enum PictureReader {
+pub(crate) enum PictureReader {
     AsDcp(asdcplib::jp2k::MxfReader),
     As02(asdcplib::as02::jp2k::MxfReader),
 }
 
 impl PictureReader {
-    fn open(mxf: &Path, as02: bool) -> Result<Self, PreviewError> {
+    pub(crate) fn open(mxf: &Path, as02: bool) -> Result<Self, PreviewError> {
         let path = mxf.to_string_lossy().to_string();
         let mut reader = if as02 {
             PictureReader::As02(asdcplib::as02::jp2k::MxfReader::new())
@@ -493,7 +493,7 @@ impl PictureReader {
         .map_err(|e| PreviewError::Mxf(format!("hdr metadata: {e}")))
     }
 
-    fn read_frame(
+    pub(crate) fn read_frame(
         &mut self,
         frame: u32,
         buf: &mut [u8],
@@ -506,7 +506,7 @@ impl PictureReader {
         .map_err(|e| PreviewError::Mxf(format!("read frame {frame}: {e}")))
     }
 
-    fn close(&mut self) {
+    pub(crate) fn close(&mut self) {
         let _ = match self {
             PictureReader::AsDcp(r) => r.close(),
             PictureReader::As02(r) => r.close(),
@@ -723,7 +723,7 @@ fn dec_context(
 }
 
 /// Read one picture frame's JPEG 2000 codestream, decrypting if a context is set.
-fn read_j2c_frame(
+pub(crate) fn read_j2c_frame(
     reader: &mut PictureReader,
     frame: u32,
     dec: Option<&mut AesDecContext>,
@@ -731,6 +731,8 @@ fn read_j2c_frame(
     let mut buf = vec![0u8; MAX_FRAME_BYTES];
     let size = reader.read_frame(frame, &mut buf, dec)?;
     buf.truncate(size);
+    // truncate keeps the whole MAX_FRAME_BYTES allocation
+    buf.shrink_to_fit();
     Ok(buf)
 }
 
@@ -761,7 +763,7 @@ pub struct Rgb8Frame {
 
 /// One display transform, chosen from the options: built-in sRGB, or an ICC
 /// monitor profile when one is set (and the `icc` feature is on).
-enum Display {
+pub(crate) enum Display {
     Srgb(XyzToSrgb),
     #[cfg(feature = "icc")]
     Icc(crate::colour::XyzToIcc),
@@ -792,23 +794,56 @@ impl Display {
     }
 }
 
+pub(crate) enum FrameRender<'a> {
+    Dcp(&'a Display),
+    Imf(&'a crate::preview_colour::PictureColour),
+}
+
+pub(crate) const GROK_SHARED_THREAD_POOL: u32 = 0;
+
+// the one decode and colour path, so a stepped still and a played frame match
+pub(crate) fn display_frame_from_codestream(
+    codestream: Vec<u8>,
+    reduce: u8,
+    decode_threads: u32,
+    render: FrameRender<'_>,
+    mxf: &Path,
+) -> Result<Rgb8Frame, PreviewError> {
+    let decoded = crate::grok_decoder::decode_with_threads(codestream, reduce, decode_threads)
+        .map_err(PreviewError::Decode)?;
+    match render {
+        FrameRender::Dcp(display) => {
+            let raw = decoded.to_xyz12le().map_err(PreviewError::Decode)?;
+            let mut data = Vec::new();
+            display.apply(&raw, &mut data);
+            Ok(Rgb8Frame {
+                width: decoded.width,
+                height: decoded.height,
+                data,
+            })
+        }
+        FrameRender::Imf(colour) => {
+            crate::preview_colour::render_display_rgb8(&decoded, colour, mxf)
+        }
+    }
+}
+
 /// Decode + colour-manage a single picture frame.
 fn decode_dcp_frame(
     reader: &mut PictureReader,
     dec: Option<&mut AesDecContext>,
     frame: u32,
     display: &Display,
+    mxf: &Path,
 ) -> Result<Rgb8Frame, PreviewError> {
     let j2c = read_j2c_frame(reader, frame, dec)?;
-    let decoded = crate::grok_decoder::decode(j2c, 0).map_err(PreviewError::Decode)?;
-    let raw = decoded.to_xyz12le().map_err(PreviewError::Decode)?;
-    let mut data = Vec::new();
-    display.apply(&raw, &mut data);
-    Ok(Rgb8Frame {
-        width: decoded.width,
-        height: decoded.height,
-        data,
-    })
+    display_frame_from_codestream(
+        j2c,
+        0,
+        GROK_SHARED_THREAD_POOL,
+        FrameRender::Dcp(display),
+        mxf,
+    )
 }
 
 /// Decode a single DCP picture frame, colour-manage it, and write it to an
@@ -823,7 +858,7 @@ pub fn render_dcp_frame(
     let mut dec = dec_context(&resolved, opts.key)?;
 
     let mut reader = PictureReader::open(&resolved.mxf, resolved.as02)?;
-    let img = decode_dcp_frame(&mut reader, dec.as_mut(), frame, &display)?;
+    let img = decode_dcp_frame(&mut reader, dec.as_mut(), frame, &display, &resolved.mxf)?;
     reader.close();
 
     write_rgb8_image(&img, out_image)
@@ -848,8 +883,13 @@ pub fn render_imf_frame(
     let resolved = resolve_picture(&opts.source)?;
     let colour = crate::preview_colour::resolve_picture_colour(&resolved)?;
     let j2c = read_picture_codestream(&resolved, opts.key, frame)?;
-    let decoded = crate::grok_decoder::decode(j2c, 0).map_err(PreviewError::Decode)?;
-    let img = crate::preview_colour::render_display_rgb8(&decoded, &colour, &resolved.mxf)?;
+    let img = display_frame_from_codestream(
+        j2c,
+        0,
+        GROK_SHARED_THREAD_POOL,
+        FrameRender::Imf(&colour),
+        &resolved.mxf,
+    )?;
     write_rgb8_image(&img, out_image)
 }
 
@@ -941,7 +981,7 @@ pub fn play_dcp(opts: &DcpPreviewOptions) -> Result<(), PreviewError> {
     let mut reader = PictureReader::open(&resolved.mxf, resolved.as02)?;
 
     // decode the first frame to learn the dimensions, then start the encoder
-    let first = decode_dcp_frame(&mut reader, dec.as_mut(), start, &display)?;
+    let first = decode_dcp_frame(&mut reader, dec.as_mut(), start, &display, &resolved.mxf)?;
     let size = format!("{}x{}", first.width, first.height);
 
     let mut enc = std::process::Command::new("ffmpeg")
@@ -976,7 +1016,7 @@ pub fn play_dcp(opts: &DcpPreviewOptions) -> Result<(), PreviewError> {
     };
     feed(&first)?;
     for frame in (start + 1)..end {
-        let img = decode_dcp_frame(&mut reader, dec.as_mut(), frame, &display)?;
+        let img = decode_dcp_frame(&mut reader, dec.as_mut(), frame, &display, &resolved.mxf)?;
         feed(&img)?;
     }
     drop(enc_stdin);

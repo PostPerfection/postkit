@@ -7,11 +7,19 @@
   reads every 4:4:4 App 2E frame as RGB, and a 4:4:4 CDCI master would show with
   its chroma planes taken for green and blue. Needs a descriptor accessor in
   asdcplib-rs before it can be decided. Same entry in imfwizard's DESIGN_TODO.
-- The live player is still libmpv. `render_imf_frame` tone maps PQ and HLG and
-  converts P3-D65 and BT.2020 into Rec.709, but that transform is postkit's own
-  and the embedded player in guikit hands the file to libmpv, which applies its
-  own. A frame stepped in the preview and the same frame played back therefore
-  need not match.
+- guikit still routes every source through libmpv. `grok_player::GrokPlayer`
+  plays J2K sources through grok with postkit's own colour transform, so a frame
+  stepped in the preview and the same frame played back are the same pixels, but
+  nothing selects it yet: the embedded preview in guikit hands every file to
+  libmpv, which applies its own transform. Picking the backend on
+  `GrokPlayer::accepts` is the guikit slice.
+- 4K does not play in real time. One 2048x1080 cinema frame costs 179 ms to
+  decode and compose on one grok thread, and a 16-worker pool sustains 49 frames
+  a second at 2K, so 2K has headroom and 4K (four times the samples) does not.
+  Waits on GPU decode.
+- Stereoscopic JPEG 2000 stays on libmpv. `GrokPlayer::accepts` returns false for
+  `EssenceType::Jpeg2000Stereo` and `load` refuses it by name, because the mono
+  AS-DCP reader cannot read it. Needs asdcplib's stereo reader.
 - Verify the non-blocking render live (2026-08-17). `render_opengl` now passes
   `MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 0` with `video-timing-offset` 0,
   because the default wait parked the app's main thread for most of each frame

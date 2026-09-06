@@ -4,6 +4,41 @@
 
 ### Added
 
+- **`grok_player::GrokPlayer`** (feature `grok-ffi`): a second playback backend
+  that plays JPEG 2000 sources through grok instead of handing them to libmpv,
+  so a frame stepped in the preview and the same frame played back are the same
+  pixels. It mirrors `MpvRenderPlayer`'s render-thread contract, and
+  `GrokPlayer::accepts` says which sources it takes without decoding anything: a
+  mono JPEG 2000 MXF, a DCP or IMP directory, a CPL, or a directory of `.j2c` /
+  `.j2k` / `.jp2` files at 24 fps. Stereoscopic essence and encrypted essence are
+  refused by name. A package plays as one timeline, every reel on its own reader
+  with the trim its CPL states, converted from seconds at that reel's own rate.
+  The stages are separate types with narrow interfaces: a timeline that reads
+  codestreams, a decode pool, a compositor and a presenter, with one scheduler
+  thread the only place that knows all four. It owns the readers and the clock,
+  and the pool of one worker per core decodes ahead of it, each on a single grok
+  thread, into a cache keyed by frame index; a seek, a stop, a load and a
+  decode-scale change bump a generation number so results from before them are
+  dropped. The clock never waits on a late decode: at each display time it shows
+  the newest cached frame at or before the target and counts what it skipped in
+  `dropped_frames`, what came late in `delayed_frames`. `set_decode_scale` picks
+  the grok reduce level, `set_overlay` takes rectangles in full-resolution source
+  pixels whatever the scale is, `set_subtitle_file` reads `.srt`, `.ass` and
+  `.ssa` into a bottom slot and a top caption slot, `render_opengl` and
+  `render_software` letterbox the picture identically and `picture_rectangle`
+  says where it landed. A 2048x1080 cinema frame costs 179 ms on one grok thread
+  and a 16-worker pool sustains 48 frames a second, so 2K plays in real time.
+- **`preview::display_frame_from_codestream`**: the one function that turns a
+  codestream into a display frame at a given grok reduce level, for DCP X'Y'Z'
+  or App 2E picture. `render_dcp_frame`, `render_imf_frame`, `play_dcp` and the
+  player all call it, so no colour code is written twice.
+- **`composition_timeline::read_composition`** and
+  **`read_composition_from_cpl`**: the picture segments of a composition, path
+  plus trim in seconds, which `mpv_source` used to keep to itself. The second
+  reads one named CPL rather than whichever the ASSETMAP lists first.
+- **`subtitle_raster::composite_rgb8`**: `composite_rgb48`'s alpha math against a
+  packed 8-bit RGB frame, which is what a display preview holds.
+
 - **`preview_colour`**: the IMF App 2E display transform, which the preview used
   to have only for Rec.709. `resolve_picture_colour` reads the essence
   descriptor's ColorPrimaries and TransferCharacteristic into a `PictureColour`
@@ -242,6 +277,11 @@
 
 ### Fixed
 
+- `grok_decoder::decode_with_threads` had no refusal stub for a build without
+  the `grok-ffi` feature, so anything calling it failed to compile there.
+- `preview::read_j2c_frame` kept the whole `MAX_FRAME_BYTES` allocation after
+  truncating to the frame's real size, so holding a window of codestreams cost
+  8 MB each.
 - **A cancelled encode never returned**: the producer blocks pushing into the
   full frame queue while the encoder threads compress, and a cancel made those
   threads leave without draining or closing it, so the producer waited forever

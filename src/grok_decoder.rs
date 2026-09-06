@@ -358,7 +358,16 @@ unsafe fn extend_row(
 
 /// Refusal when postkit was built without the `grok-ffi` feature.
 #[cfg(not(feature = "grok-ffi"))]
-pub fn decode(_codestream: Vec<u8>, _reduce: u8) -> Result<DecodedFrame, String> {
+pub fn decode(codestream: Vec<u8>, reduce: u8) -> Result<DecodedFrame, String> {
+    decode_with_threads(codestream, reduce, 0)
+}
+
+#[cfg(not(feature = "grok-ffi"))]
+pub fn decode_with_threads(
+    _codestream: Vec<u8>,
+    _reduce: u8,
+    _num_threads: u32,
+) -> Result<DecodedFrame, String> {
     Err("postkit was built without the `grok-ffi` feature, so it cannot decode JPEG 2000".into())
 }
 
