@@ -1307,10 +1307,16 @@ struct BatchCollector {
     input_queue: Arc<BoundedQueue<RawFrame>>,
 }
 
-/// How many frames the plugin's batch has handed back with a codestream.
+/// How many frames the plugin's batches have handed back, a codestream from an
+/// encode batch or decoded planes from the player's decode batch.
 /// `grk_plugin_accelerated_frames` counts only the per-call routed path.
 #[cfg(feature = "grok-ffi")]
 static BATCH_ACCELERATED_FRAMES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "grok-ffi")]
+pub(crate) fn count_batch_accelerated_frame() {
+    BATCH_ACCELERATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+}
 
 /// Runs on the plugin's threads, concurrently with itself and with the encoder
 /// threads still submitting.
@@ -1335,7 +1341,7 @@ unsafe extern "C" fn batch_frame_callback(
     }
 
     let data = unsafe { std::slice::from_raw_parts(codestream, length) }.to_vec();
-    BATCH_ACCELERATED_FRAMES.fetch_add(1, Ordering::Relaxed);
+    count_batch_accelerated_frame();
     let _ = collector.writer_tx.send(EncodedFrame { data, index });
 }
 
@@ -1348,6 +1354,8 @@ struct Batch {
     /// the plugin reads both of these until `end` returns
     _parameters: Box<grokj2k_sys::grk_cparameters>,
     _collector: Box<BatchCollector>,
+    /// held until `end`, so the player stays on the CPU while this batch runs
+    _lease: crate::device_lease::EncodeLease<'static>,
 }
 
 #[cfg(not(feature = "grok-ffi"))]
@@ -1414,6 +1422,8 @@ impl Batch {
         info.callback = Some(batch_frame_callback);
         info.user = collector.as_ref() as *const BatchCollector as *mut std::ffi::c_void;
 
+        // the player ends its decode batch when it sees this waiting
+        let lease = crate::device_lease::DEVICE_LEASE.acquire_for_encode();
         match unsafe { grokj2k_sys::grk_plugin_batch_memory_begin(info) } {
             0 => {
                 tracing::info!(
@@ -1429,6 +1439,7 @@ impl Batch {
                     },
                     _parameters: parameters,
                     _collector: collector,
+                    _lease: lease,
                 }))
             }
             1 => {

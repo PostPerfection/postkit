@@ -11,6 +11,7 @@ pub mod cpl_xml;
 pub mod crossfade;
 pub mod dashboard;
 pub mod dcdm;
+pub mod device_lease;
 pub mod dolby_vision;
 pub mod edl_import;
 pub mod encode;

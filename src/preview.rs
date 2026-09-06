@@ -811,6 +811,15 @@ pub(crate) fn display_frame_from_codestream(
 ) -> Result<Rgb8Frame, PreviewError> {
     let decoded = crate::grok_decoder::decode_with_threads(codestream, reduce, decode_threads)
         .map_err(PreviewError::Decode)?;
+    display_frame_from_decoded(&decoded, render, mxf)
+}
+
+// the colour half on its own, for a frame the device decoded
+pub(crate) fn display_frame_from_decoded(
+    decoded: &crate::grok_decoder::DecodedFrame,
+    render: FrameRender<'_>,
+    mxf: &Path,
+) -> Result<Rgb8Frame, PreviewError> {
     match render {
         FrameRender::Dcp(display) => {
             let raw = decoded.to_xyz12le().map_err(PreviewError::Decode)?;
@@ -823,7 +832,7 @@ pub(crate) fn display_frame_from_codestream(
             })
         }
         FrameRender::Imf(colour) => {
-            crate::preview_colour::render_display_rgb8(&decoded, colour, mxf)
+            crate::preview_colour::render_display_rgb8(decoded, colour, mxf)
         }
     }
 }

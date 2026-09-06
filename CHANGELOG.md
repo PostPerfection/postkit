@@ -28,6 +28,22 @@
   `render_software` letterbox the picture identically and `picture_rectangle`
   says where it landed. A 2048x1080 cinema frame costs 179 ms on one grok thread
   and a 16-worker pool sustains 48 frames a second, so 2K plays in real time.
+- **Device decode in `grok_player`** (feature `grok-gpu`): with grok's
+  accelerator plugin switched on, the decode pool sends full-resolution frames
+  to the device as one in-memory batch (`grk_plugin_batch_decompress_memory_begin`)
+  and the plugin's own threads pull codestreams from the pool's queue, so the
+  device pipeline stays full without the player handing over one frame at a
+  time. A DCP batch asks for 8-bit sRGB and the device runs the X'Y'Z' to sRGB
+  transform and packs the frame, so the host copies 21 MB a frame and does no
+  colour work. A reduced decode, a frame the device declines and a frame in
+  another colour than the batch's stay on the CPU pool, a batch ends when an
+  encode wants the device or when its tail has stalled for half a second, and
+  begins again on the next frame. `device_lease::DEVICE_LEASE` is the one
+  accelerator: an encode waits for it and holds it, the player takes it only
+  while no encode holds or waits. On a 4096x1716 DCP and an RTX 3060 laptop the
+  device sustains 32.7 frames a second after a 1.35 s batch start, against 20.5
+  for the 16-worker CPU pool, so 4K plays in real time; the MQ decoder kernel is
+  24 of the 28 ms of device time a frame.
 - **`preview::display_frame_from_codestream`**: the one function that turns a
   codestream into a display frame at a given grok reduce level, for DCP X'Y'Z'
   or App 2E picture. `render_dcp_frame`, `render_imf_frame`, `play_dcp` and the

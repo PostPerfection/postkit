@@ -7,16 +7,6 @@
   reads every 4:4:4 App 2E frame as RGB, and a 4:4:4 CDCI master would show with
   its chroma planes taken for green and blue. Needs a descriptor accessor in
   asdcplib-rs before it can be decided. Same entry in imfwizard's DESIGN_TODO.
-- guikit still routes every source through libmpv. `grok_player::GrokPlayer`
-  plays J2K sources through grok with postkit's own colour transform, so a frame
-  stepped in the preview and the same frame played back are the same pixels, but
-  nothing selects it yet: the embedded preview in guikit hands every file to
-  libmpv, which applies its own transform. Picking the backend on
-  `GrokPlayer::accepts` is the guikit slice.
-- 4K does not play in real time. One 2048x1080 cinema frame costs 179 ms to
-  decode and compose on one grok thread, and a 16-worker pool sustains 49 frames
-  a second at 2K, so 2K has headroom and 4K (four times the samples) does not.
-  Waits on GPU decode.
 - Stereoscopic JPEG 2000 stays on libmpv. `GrokPlayer::accepts` returns false for
   `EssenceType::Jpeg2000Stereo` and `load` refuses it by name, because the mono
   AS-DCP reader cannot read it. Needs asdcplib's stereo reader.
@@ -43,18 +33,10 @@
   black, so eyeball after any render change. Off linux nothing about linking
   (mpv.lib or libmpv.dll.a in MPV_LIB_DIR on windows, homebrew's mpv.pc on
   macos) or running is verified.
-- GPU J2K decode at speed. A full resolution single tile frame decodes on the
-  accelerator once `grok_encoder::use_gpu` has run, a `reduce` decode stays on
-  the CPU, and the device is only level with the CPU at 2K, 55 ms against 63 ms
-  a frame on an RTX 3060. What CPU grok manages in process, measured on 2048x1080
-  frames at 125 Mb/s: 68 ms a frame at full resolution (14.6 fps), 19 ms at
-  `reduce` 1 and 5 ms at `reduce` 2. So 2K at 24 fps needs either two decode
-  threads or a reduce, and 4K, four times the samples, is out of reach at full
-  resolution however it is threaded. That is what the GPU path is for, and what
-  the features gating on it wait for: SDI output, and the dcpdoctor/wizard player
-  controls (loop dom#2700, speed dom#2917, markers dom#2893, waveform dom#3091,
-  3D view modes dom#1974/dom#3165, A/V sync offset dom#3083). The plugin already
-  carries the decode, the speed is what is left.
+- Player controls the wizards lack, easyDCP Player parity: loop (dom#2700),
+  speed (dom#2917), markers (dom#2893), waveform (dom#3091), 3D view modes
+  (dom#1974, dom#3165), A/V sync offset (dom#3083). They waited on real-time 4K
+  decode, which the device backend now gives.
 - SDI output via Blackmagic DeckLink (easyDCP Player+ parity). A playback sink
   pushing decoded, colour-managed frames to an SDI board for reference monitoring.
   FFI to the DeckLink SDK (COM-style C++, likely a C shim) in a separate crate,

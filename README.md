@@ -94,6 +94,17 @@ declines puts the whole run back on the CPU. A decode still routes per call,
 and an encode with a PSNR target stays on the CPU, because a frame over the
 byte cap is compressed again by rate.
 
+The player is the exception to per-call decode routing: `grok_player` runs its
+full-resolution decodes as one in-memory batch, the plugin's threads pull
+codestreams from the player's queue, and a DCP batch comes back as 8-bit sRGB
+transformed and packed on the device. A reduced decode stays on the CPU. One
+process shares one device through `device_lease::DEVICE_LEASE`: an encode waits
+for the player to end its batch, and the player stays on the CPU while an encode
+holds or waits for the device. The player prints
+`grok player decode backend: device, colour on the device` (or `cpu`) on stderr
+when a batch begins. A 4096x1716 DCP sustains 32.7 frames a second on an RTX
+3060 laptop after a 1.35 s batch start, against 20.5 on the 16-worker CPU pool.
+
 With the plugin on, ffmpeg decodes with `-hwaccel cuda` and the frames reach
 the batch in the layout the plugin takes rather than the one postkit converts
 itself. A yuv420p, yuv422p, yuv420p10le or yuv422p10le source goes to the pipe
