@@ -1547,7 +1547,7 @@ where
         },
     );
 
-    let picture_findings = crate::picture_findings::finish_detection(
+    let decode = crate::picture_findings::finish_detection(
         &mut ffmpeg,
         detection_reader,
         decode_read_to_end,
@@ -1555,14 +1555,41 @@ where
         result.frames_encoded,
     );
 
+    let mut success = result.success;
+    let mut error = result.error;
+    if success && let Some(failure) = decode_failure(&decode, result.frames_encoded, total_frames) {
+        success = false;
+        error = failure;
+    }
+
     EncodeResult {
-        success: result.success,
-        error: result.error,
+        success,
+        error,
         frames_encoded: result.frames_encoded,
         output_dir: opts.output_dir.clone(),
-        picture_findings,
+        picture_findings: decode.findings,
         pipe_pixel_format: Some(pipe_format.ffmpeg_pixel_format().to_string()),
     }
+}
+
+// ffmpeg's exit status only means something when it exited on its own: postkit kills a run it stopped early
+fn decode_failure(
+    decode: &crate::picture_findings::FinishedDecode,
+    frames_encoded: u64,
+    expected_frames: u64,
+) -> Option<String> {
+    let reason = match decode.exit_status.filter(|status| !status.success()) {
+        Some(status) => format!("ffmpeg failed ({status})"),
+        // a zero expected_frames is a probe that read no count, not an empty source
+        None if frames_encoded == 0 && expected_frames > 0 => {
+            "ffmpeg decoded no frames".to_string()
+        }
+        None => return None,
+    };
+    Some(match decode.stderr_tail.trim() {
+        "" => reason,
+        tail => format!("{reason}: {tail}"),
+    })
 }
 
 /// The compressor settings a stream encode asks for, with the source's frame

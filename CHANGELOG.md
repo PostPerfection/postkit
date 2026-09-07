@@ -382,6 +382,17 @@
 
 ### Fixed
 
+- **A stream encode reported success when ffmpeg failed**: `finish_detection`
+  killed ffmpeg and threw its exit status away, and the stderr reader kept only
+  the detection lines, so an unreadable source or a filter chain ffmpeg rejects
+  gave `EncodeResult { success: true, frames_encoded: 0 }` and no output. The
+  reader now also keeps the last 24 other stderr lines, `finish_detection`
+  reports the status ffmpeg exited with on its own before the kill, and a stream
+  encode fails with that status and those lines. A decode that produced no frames
+  where frames were expected fails the same way. A run postkit stopped early,
+  cancelled or windowed to a frame range, is unchanged: it killed ffmpeg itself,
+  so the exit status says nothing.
+
 - **A packaged trailer dropped its content**: `package_trailer` rendered the
   ratings card and the countdown leader at a fixed 1920x1080 and joined them to
   the content with `-c copy`, which the mp4 muxer cannot do with a ProRes `.mov`,

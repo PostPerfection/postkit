@@ -2364,7 +2364,7 @@ where
 
     // the detection timestamps are on ffmpeg's whole output, which after a
     // resume is longer than the frames this run encoded
-    let picture_findings = crate::picture_findings::finish_detection(
+    let decode = crate::picture_findings::finish_detection(
         &mut child,
         detection_reader,
         decode_read_to_end,
@@ -2373,7 +2373,7 @@ where
     );
 
     PipelineResult {
-        picture_findings,
+        picture_findings: decode.findings,
         ..result
     }
 }

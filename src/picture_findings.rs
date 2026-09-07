@@ -7,9 +7,10 @@
 
 use crate::timecode::Timecode;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, ChildStderr};
+use std::process::{Child, ChildStderr, ExitStatus};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,9 @@ const FREEZE_MINIMUM_DURATION_SECONDS: f64 = 2.0;
 /// How long ffmpeg gets to exit on its own after the decode read to the end.
 const DETECTION_FLUSH_GRACE: Duration = Duration::from_millis(500);
 const DETECTION_FLUSH_POLL: Duration = Duration::from_millis(10);
+
+// ffmpeg writes a dozen lines about the output file after a decode that failed
+const STDERR_TAIL_LINES: usize = 24;
 
 const BLACK_START: &str = "black_start:";
 const BLACK_END: &str = "black_end:";
@@ -154,16 +158,37 @@ fn is_detection_line(line: &str) -> bool {
     line.contains(BLACK_START) || line.contains(FREEZE_START) || line.contains(FREEZE_END)
 }
 
-/// Drain ffmpeg's stderr on its own thread, keeping the detection lines.
-/// Without a reader the decode stalls once the stderr pipe fills.
-pub(crate) fn read_detection_lines(stderr: ChildStderr) -> JoinHandle<Vec<String>> {
+// the detection lines, and the last few other lines a failure is named with
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DecodeStderr {
+    detection: Vec<String>,
+    tail: VecDeque<String>,
+}
+
+/// Drain ffmpeg's stderr on its own thread. Without a reader the decode stalls
+/// once the stderr pipe fills.
+pub(crate) fn read_detection_lines(stderr: ChildStderr) -> JoinHandle<DecodeStderr> {
     std::thread::spawn(move || {
-        BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-            .filter(|line| is_detection_line(line))
-            .collect()
+        let mut read = DecodeStderr::default();
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if is_detection_line(&line) {
+                read.detection.push(line);
+            } else if !line.trim().is_empty() {
+                if read.tail.len() == STDERR_TAIL_LINES {
+                    read.tail.pop_front();
+                }
+                read.tail.push_back(line);
+            }
+        }
+        read
     })
+}
+
+pub(crate) struct FinishedDecode {
+    pub findings: PictureFindings,
+    // the status ffmpeg exited with on its own, None when postkit killed it first
+    pub exit_status: Option<ExitStatus>,
+    pub stderr_tail: String,
 }
 
 /// Stop ffmpeg and parse what it reported.
@@ -173,23 +198,35 @@ pub(crate) fn read_detection_lines(stderr: ChildStderr) -> JoinHandle<Vec<String
 /// gets a moment to exit before it is killed.
 pub(crate) fn finish_detection(
     ffmpeg: &mut Child,
-    reader: Option<JoinHandle<Vec<String>>>,
+    reader: Option<JoinHandle<DecodeStderr>>,
     decode_read_to_end: bool,
     fps: f64,
     frame_count: u64,
-) -> PictureFindings {
+) -> FinishedDecode {
+    let mut exit_status = None;
     if decode_read_to_end {
         let deadline = Instant::now() + DETECTION_FLUSH_GRACE;
-        while Instant::now() < deadline && matches!(ffmpeg.try_wait(), Ok(None)) {
-            std::thread::sleep(DETECTION_FLUSH_POLL);
+        while Instant::now() < deadline {
+            match ffmpeg.try_wait() {
+                Ok(None) => std::thread::sleep(DETECTION_FLUSH_POLL),
+                Ok(Some(status)) => {
+                    exit_status = Some(status);
+                    break;
+                }
+                Err(_) => break,
+            }
         }
     }
     let _ = ffmpeg.kill();
     let _ = ffmpeg.wait();
-    let lines = reader
+    let read = reader
         .and_then(|reader| reader.join().ok())
         .unwrap_or_default();
-    parse_ffmpeg_stderr(&lines, fps, frame_count)
+    FinishedDecode {
+        findings: parse_ffmpeg_stderr(&read.detection, fps, frame_count),
+        exit_status,
+        stderr_tail: Vec::from(read.tail).join("\n"),
+    }
 }
 
 fn tagged_seconds(line: &str, tag: &str) -> Option<f64> {
