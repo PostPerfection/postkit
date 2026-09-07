@@ -35,7 +35,12 @@
   device pipeline stays full without the player handing over one frame at a
   time. A DCP batch asks for 8-bit sRGB and the device runs the X'Y'Z' to sRGB
   transform and packs the frame, so the host copies 21 MB a frame and does no
-  colour work. A reduced decode, a frame the device declines and a frame in
+  colour work. An App 2E batch hands the device its own transform instead, the
+  `preview_colour::DisplayTransform` the host would have run: the 4096-entry
+  transfer table, tone map included, and the gamut matrix. It comes back packed
+  the same way, within 16 codes of the host render on 12 frames of 12-bit PQ
+  Rec.2020 noise and identical on all but 1.7 samples in a thousand. A reduced
+  decode, a frame the device declines and a frame in
   another colour than the batch's stay on the CPU pool, a batch ends when an
   encode wants the device or when its tail has stalled for half a second, and
   begins again on the next frame. `device_lease::DEVICE_LEASE` is the one
@@ -43,7 +48,10 @@
   while no encode holds or waits. On a 4096x1716 DCP and an RTX 3060 laptop the
   device sustains 32.7 frames a second after a 1.35 s batch start, against 20.5
   for the 16-worker CPU pool, so 4K plays in real time; the MQ decoder kernel is
-  24 of the 28 ms of device time a frame.
+  24 of the 28 ms of device time a frame. On a 4096x2160 12-bit App 2E IMP it
+  sustains 21.0 frames a second with the transform on the device, against 11.8
+  with the planes coming back and the host tone mapping them, and 8.5 on the CPU
+  pool.
 - **`preview::display_frame_from_codestream`**: the one function that turns a
   codestream into a display frame at a given grok reduce level, for DCP X'Y'Z'
   or App 2E picture. `render_dcp_frame`, `render_imf_frame`, `play_dcp` and the

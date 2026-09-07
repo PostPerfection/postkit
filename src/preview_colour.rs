@@ -83,7 +83,7 @@ pub enum DisplayTransfer {
 }
 
 /// What the picture's samples are, resolved from the descriptor's ULs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PictureColour {
     pub primaries: DisplayPrimaries,
     pub transfer: DisplayTransfer,
@@ -139,6 +139,25 @@ pub fn resolve_picture_colour(resolved: &ResolvedPicture) -> Result<PictureColou
     })
 }
 
+/// What turns an App 2E frame's 12-bit codes into display linear Rec.709: the
+/// host renders through this and so does the device, from the same tables.
+pub(crate) struct DisplayTransform {
+    /// every 12-bit code as display linear light, 1.0 at the 100 cd/m² SDR peak
+    pub(crate) transfer: Vec<f32>,
+    /// the source's linear RGB into linear Rec.709, `None` when the source
+    /// already is Rec.709 and the identity would only leak rounding
+    pub(crate) matrix: Option<[[f32; 3]; 3]>,
+}
+
+impl DisplayTransform {
+    pub(crate) fn new(colour: &PictureColour) -> Self {
+        DisplayTransform {
+            transfer: transfer_lookup(colour),
+            matrix: rec709_matrix(colour.primaries),
+        }
+    }
+}
+
 /// A decoded App 2E frame as packed 8-bit Rec.709 RGB.
 pub fn render_display_rgb8(
     decoded: &DecodedFrame,
@@ -171,8 +190,7 @@ pub fn render_display_rgb8(
         }
     }
 
-    let to_display_linear = transfer_lookup(colour);
-    let to_rec709 = rec709_matrix(colour.primaries);
+    let transform = DisplayTransform::new(colour);
     let ycbcr = decoded
         .chroma_subsampled
         .then(|| ycbcr_to_rgb_matrix(colour.primaries));
@@ -189,8 +207,8 @@ pub fn render_display_rgb8(
             codes = ycbcr_codes_to_rgb_codes(matrix, codes);
         }
         let mut rgb =
-            codes.map(|code| to_display_linear[(code.clamp(0, TWELVE_BIT_MAX as i32)) as usize]);
-        if let Some(matrix) = &to_rec709 {
+            codes.map(|code| transform.transfer[(code.clamp(0, TWELVE_BIT_MAX as i32)) as usize]);
+        if let Some(matrix) = &transform.matrix {
             rgb = mat_vec(matrix, rgb);
         }
         for channel in rgb {
@@ -530,6 +548,22 @@ mod tests {
             ),
             [255, 255, 255]
         );
+    }
+
+    #[test]
+    fn the_display_transform_matrixes_only_a_wide_gamut_source() {
+        let rec709 =
+            DisplayTransform::new(&colour(DisplayPrimaries::Bt709, DisplayTransfer::Bt709));
+        assert_eq!(rec709.transfer.len(), TWELVE_BIT_LEVELS);
+        assert!(
+            rec709.matrix.is_none(),
+            "a Rec.709 source needs no gamut matrix"
+        );
+        for primaries in [DisplayPrimaries::P3D65, DisplayPrimaries::Bt2020] {
+            let wide = DisplayTransform::new(&colour(primaries, DisplayTransfer::Bt709));
+            assert_eq!(wide.transfer.len(), TWELVE_BIT_LEVELS);
+            assert!(wide.matrix.is_some(), "{primaries:?} needs a gamut matrix");
+        }
     }
 
     #[test]

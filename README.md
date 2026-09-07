@@ -97,13 +97,17 @@ byte cap is compressed again by rate.
 The player is the exception to per-call decode routing: `grok_player` runs its
 full-resolution decodes as one in-memory batch, the plugin's threads pull
 codestreams from the player's queue, and a DCP batch comes back as 8-bit sRGB
-transformed and packed on the device. A reduced decode stays on the CPU. One
+transformed and packed on the device. An App 2E batch comes back the same way,
+through the transfer table and gamut matrix the player hands the plugin, so the
+host tone maps no played frame either. A reduced decode stays on the CPU. One
 process shares one device through `device_lease::DEVICE_LEASE`: an encode waits
 for the player to end its batch, and the player stays on the CPU while an encode
 holds or waits for the device. The player prints
 `grok player decode backend: device, colour on the device` (or `cpu`) on stderr
 when a batch begins. A 4096x1716 DCP sustains 32.7 frames a second on an RTX
 3060 laptop after a 1.35 s batch start, against 20.5 on the 16-worker CPU pool.
+A 4096x2160 12-bit App 2E IMP sustains 21.0 frames a second with its transform
+on the device, against 11.8 with the host running it.
 
 With the plugin on, ffmpeg decodes with `-hwaccel cuda` and the frames reach
 the batch in the layout the plugin takes rather than the one postkit converts
@@ -129,7 +133,9 @@ on 1442 frames of 2048x872 yuv420p, against 73.0 for the same plan converted to
 with the plugin, CI has no GPU: `tests/grok_gpu.rs` for the round trip,
 `tests/grok_gpu_yuv.rs` for the planar YUV source and
 `tests/grok_gpu_rgb48le.rs` for the interleaved one. This needs grok v20.4.3 or
-newer, which has `grk_plugin_set_enabled`. A plugin built with licence checking
+newer, which has `grk_plugin_set_enabled`, and the player's App 2E device
+transform needs `grk_plugin_batch_decompress_memory_info::display_transform`,
+which is newer than v20.4.5. A plugin built with licence checking
 takes the licence from `POSTKIT_GPU_LICENSE` and the registration server from
 `POSTKIT_GPU_REGISTRATION_URL`, through `grok_encoder::use_gpu_from_environment`.
 

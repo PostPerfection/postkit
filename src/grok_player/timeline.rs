@@ -11,7 +11,7 @@ const CODESTREAM_EXTENSIONS: [&str; 3] = ["j2c", "j2k", "jp2"];
 const MXF_EXTENSION: &str = "mxf";
 const CPL_EXTENSION: &str = "xml";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum DisplayRender {
     DcpXyz,
     Imf(PictureColour),

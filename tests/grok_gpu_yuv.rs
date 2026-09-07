@@ -274,8 +274,6 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
         },
     ];
 
-    // every device encode runs before the switch: the first plugin decode after
-    // a second batch segfaults inside grk_plugin_decompress
     if let Err(reason) = postkit::grok_encoder::use_gpu_from_environment() {
         panic!("{reason}");
     }

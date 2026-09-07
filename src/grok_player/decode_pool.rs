@@ -420,6 +420,7 @@ fn to_eight_bits(code: i32, precision: u8) -> u8 {
 mod device {
     use super::*;
     use crate::device_lease::{DEVICE_LEASE, PlaybackLease};
+    use crate::preview_colour::DisplayTransform;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -443,7 +444,8 @@ mod device {
                 finished: finished.clone(),
                 display: Display::Srgb(XyzToSrgb::new()),
                 pull_open: AtomicBool::new(false),
-                srgb8_on_device: AtomicBool::new(false),
+                rgb8_on_device: AtomicBool::new(false),
+                batch_render: Mutex::new(None),
                 in_flight: AtomicUsize::new(0),
                 returned: AtomicUsize::new(0),
             }),
@@ -465,8 +467,10 @@ mod device {
         display: Display,
         // false makes every pull return false, which ends the plugin's workers
         pull_open: AtomicBool,
-        // the device hands back 8 bit sRGB frames instead of X'Y'Z' planes
-        srgb8_on_device: AtomicBool,
+        // the device hands back packed 8 bit RGB frames instead of the codestream's planes
+        rgb8_on_device: AtomicBool,
+        // the render the running batch began with
+        batch_render: Mutex<Option<DisplayRender>>,
         in_flight: AtomicUsize,
         returned: AtomicUsize,
     }
@@ -576,25 +580,48 @@ mod device {
                 return Begin::DeviceBusy;
             };
             self.state.pull_open.store(true, Ordering::Release);
-            // only a DCP frame is X'Y'Z', the other renders keep their planes
-            let mut srgb8_on_device = false;
+            // an App 2E batch hands the device the transform the host would run
+            let app2e = match shape.render {
+                DisplayRender::Imf(ref colour) => Some(DisplayTransform::new(colour)),
+                DisplayRender::DcpXyz | DisplayRender::PlainRgb => None,
+            };
+            let gamut_matrix = app2e
+                .as_ref()
+                .and_then(|transform| transform.matrix)
+                .map(row_major);
+            let display_transform =
+                app2e
+                    .as_ref()
+                    .map(|transform| grokj2k_sys::grk_plugin_display_transform {
+                        transfer: transform.transfer.as_ptr(),
+                        matrix: gamut_matrix
+                            .as_ref()
+                            .map_or(std::ptr::null(), |matrix| matrix.as_ptr()),
+                    });
+            // the plugin's workers pull inside begin, so the render is on record first
+            *self.state.batch_render.lock().unwrap() = Some(shape.render);
+            let mut rgb8_on_device = false;
             let info = grokj2k_sys::grk_plugin_batch_decompress_memory_info {
                 codestream: shape.codestream.as_ptr(),
                 codestream_length: shape.codestream.len(),
                 pull: Some(pull_frame),
                 callback: Some(frame_callback),
                 user: self.state.as_ref() as *const CallbackState as *mut c_void,
+                // only a DCP frame is X'Y'Z', which the device transforms out of its own tables
                 srgb8_output: matches!(shape.render, DisplayRender::DcpXyz),
-                srgb8_on_device: &mut srgb8_on_device,
+                display_transform: display_transform
+                    .as_ref()
+                    .map_or(std::ptr::null(), |transform| transform as *const _),
+                rgb8_on_device: &mut rgb8_on_device,
             };
             match unsafe { grokj2k_sys::grk_plugin_batch_decompress_memory_begin(info) } {
                 0 => {
                     self.state
-                        .srgb8_on_device
-                        .store(srgb8_on_device, Ordering::Release);
+                        .rgb8_on_device
+                        .store(rgb8_on_device, Ordering::Release);
                     eprintln!(
                         "grok player decode backend: device, colour on the {}",
-                        if srgb8_on_device { "device" } else { "cpu" }
+                        if rgb8_on_device { "device" } else { "cpu" }
                     );
                     self.batch = Some(RunningBatch { _lease: lease });
                     self.returned_at_last_poll = self.state.returned.load(Ordering::Acquire);
@@ -603,10 +630,12 @@ mod device {
                 }
                 1 => {
                     self.state.pull_open.store(false, Ordering::Release);
+                    *self.state.batch_render.lock().unwrap() = None;
                     Begin::Declined
                 }
                 code => {
                     self.state.pull_open.store(false, Ordering::Release);
+                    *self.state.batch_render.lock().unwrap() = None;
                     tracing::warn!(
                         "grok's accelerator plugin failed to start a decode batch: \
                          grk_plugin_batch_decompress_memory_begin returned {code}"
@@ -623,6 +652,7 @@ mod device {
                 return;
             }
             self.state.pull_open.store(false, Ordering::Release);
+            *self.state.batch_render.lock().unwrap() = None;
             self.state.queue.wake_all();
             if !unsafe { grokj2k_sys::grk_plugin_batch_decompress_memory_end() } {
                 tracing::warn!("grok's accelerator plugin failed to drain the decode batch");
@@ -634,6 +664,14 @@ mod device {
                 }
             }
         }
+    }
+
+    fn row_major(matrix: [[f32; 3]; 3]) -> [f32; 9] {
+        let [first, second, third] = matrix;
+        [
+            first[0], first[1], first[2], second[0], second[1], second[2], third[0], third[1],
+            third[2],
+        ]
     }
 
     impl FrameContext {
@@ -661,9 +699,9 @@ mod device {
             let Some(job) = state.queue.pop_while_open(&state.pull_open) else {
                 return false;
             };
-            // an srgb8 batch transforms every frame, so a frame in another colour goes to the cpu
-            let transformed_on_device = state.srgb8_on_device.load(Ordering::Acquire);
-            if transformed_on_device && !matches!(job.render, DisplayRender::DcpXyz) {
+            // the batch holds one render's transform
+            let batch_render = *state.batch_render.lock().unwrap();
+            if batch_render.is_some_and(|render| render != job.render) {
                 state.cpu_queue.push(job);
                 continue;
             }
@@ -700,7 +738,7 @@ mod device {
             // colour runs here, on the plugin's thread: a queued copy of the planes is
             // 84 MB a 4K frame and the pipeline runs ahead of the colour workers
             let image = unsafe { &*image };
-            let rendered = if state.srgb8_on_device.load(Ordering::Acquire) {
+            let rendered = if state.rgb8_on_device.load(Ordering::Acquire) {
                 read_device_rgb8(image)
             } else {
                 read_device_image(image).and_then(|decoded| {
@@ -725,15 +763,17 @@ mod device {
         state.returned.fetch_add(1, Ordering::AcqRel);
     }
 
-    // the device's interleaved 8 bit sRGB frame: comps[0] carries the whole buffer
+    // the device's interleaved 8 bit RGB frame: comps[0] carries the whole buffer
     fn read_device_rgb8(image: &grokj2k_sys::grk_image) -> Result<Rgb8Frame, String> {
         if image.comps.is_null() || image.numcomps < RGB_COMPONENT_COUNT as u16 {
-            return Err("the device returned an sRGB frame without three components".to_string());
+            return Err(
+                "the device returned an 8 bit RGB frame without three components".to_string(),
+            );
         }
         let first = unsafe { &*image.comps };
         if first.data.is_null() || first.prec != DISPLAY_PRECISION_BITS {
             return Err(format!(
-                "the device returned an sRGB frame at {} bits without a buffer",
+                "the device returned an 8 bit RGB frame at {} bits without a buffer",
                 first.prec
             ));
         }
@@ -869,18 +909,59 @@ mod tests {
     fn cinema_2k_codestream_of_frame(frame_index: u32) -> Vec<u8> {
         const WIDTH: u32 = 2048;
         const HEIGHT: u32 = 1080;
-        const TWELVE_BIT_MAX: i32 = 4095;
         const CINEMA_2K_PROFILE: u16 = 0x0003;
-        const DCI_COMPRESSION_RATIO: f64 = 12.0;
         const DCI_RESOLUTIONS: u8 = 6;
+        fixture_codestream(
+            WIDTH,
+            HEIGHT,
+            CINEMA_2K_PROFILE,
+            DCI_RESOLUTIONS,
+            frame_index,
+        )
+    }
 
-        let samples = (WIDTH * HEIGHT) as usize;
+    #[cfg(feature = "grok-gpu")]
+    fn imf_2k_codestream_of_frame(frame_index: u32) -> Vec<u8> {
+        const WIDTH: u32 = 1920;
+        const HEIGHT: u32 = 1080;
+        const IMF_FRAME_RATE: f64 = 24.0;
+        const IMF_BITS_PER_SECOND: u64 = 200_000_000;
+        const IMF_RESOLUTIONS: u8 = 6;
+        let profile = crate::j2k::imf_rsiz(
+            crate::j2k::ImfProfile::for_raster(WIDTH, HEIGHT).expect("an IMF profile"),
+            crate::j2k::imf_levels(WIDTH, HEIGHT, IMF_FRAME_RATE, IMF_BITS_PER_SECOND)
+                .expect("IMF levels"),
+        );
+        let codestream = fixture_codestream(WIDTH, HEIGHT, profile, IMF_RESOLUTIONS, frame_index);
+        let header = crate::j2k::parse_j2k_header(&codestream).expect("codestream header");
+        assert_eq!(
+            crate::j2k::J2kProfile::from(header.profile),
+            crate::j2k::J2kProfile::Imf,
+            "rsiz {:#06x} is not an IMF profile",
+            header.profile
+        );
+        codestream
+    }
+
+    // noise, so the device's inverse wavelet and the cpu's disagree somewhere
+    #[cfg(feature = "grok-ffi")]
+    fn fixture_codestream(
+        width: u32,
+        height: u32,
+        profile: u16,
+        num_resolutions: u8,
+        frame_index: u32,
+    ) -> Vec<u8> {
+        const TWELVE_BIT_MAX: i32 = 4095;
+        const DCI_COMPRESSION_RATIO: f64 = 12.0;
+
+        let samples = (width * height) as usize;
         let plane = |seed: u32| -> Vec<i32> {
             let seed = seed.wrapping_add(frame_index.wrapping_mul(31));
             (0..samples)
                 .map(|index| {
-                    let x = (index as u32 % WIDTH).wrapping_mul(seed.wrapping_add(7));
-                    let y = (index as u32 / WIDTH).wrapping_mul(seed.wrapping_add(13));
+                    let x = (index as u32 % width).wrapping_mul(seed.wrapping_add(7));
+                    let y = (index as u32 / width).wrapping_mul(seed.wrapping_add(13));
                     ((x ^ y).wrapping_mul(2_654_435_761) >> 20) as i32 & TWELVE_BIT_MAX
                 })
                 .collect()
@@ -890,16 +971,16 @@ mod tests {
             compression_ratio: DCI_COMPRESSION_RATIO,
             mct: false,
             apply_xyz_transform: false,
-            profile: CINEMA_2K_PROFILE,
-            num_resolutions: DCI_RESOLUTIONS,
+            profile,
+            num_resolutions,
             ..crate::grok_encoder::CompressParams::default()
         };
         crate::grok_encoder::initialize(0);
         let directory = tempfile::tempdir().unwrap();
         let mut frame = Some(crate::grok_encoder::RawFrame::Planar {
             components: [plane(1), plane(2), plane(3)],
-            width: WIDTH,
-            height: HEIGHT,
+            width,
+            height,
             precision: 12,
             index: 0,
         });
@@ -929,7 +1010,10 @@ mod tests {
 
     // every frame of a run through a pool, in frame order
     #[cfg(feature = "grok-gpu")]
-    fn decode_run_through_a_pool(codestreams: &[Vec<u8>]) -> Vec<Arc<Rgb8Frame>> {
+    fn decode_run_through_a_pool(
+        codestreams: &[Vec<u8>],
+        render: DisplayRender,
+    ) -> Vec<Arc<Rgb8Frame>> {
         let (finished, done) = std::sync::mpsc::channel();
         let pool = DecodePool::start(finished);
         pool.restart(1);
@@ -939,7 +1023,7 @@ mod tests {
                 frame_index: index as u64,
                 codestream: codestream.clone(),
                 reduce: 0,
-                render: DisplayRender::DcpXyz,
+                render,
                 mxf: PathBuf::from("run.j2c"),
             });
         }
@@ -959,31 +1043,28 @@ mod tests {
     #[cfg(feature = "grok-gpu")]
     static DEVICE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    // the device's inverse wavelet rounds differently from the cpu's on noisy content:
-    // 99.6 percent of samples identical here, and near black the sRGB curve turns a
-    // code of X'Y'Z' into several of 255
+    // one 12 bit code of wavelet rounding on the device becomes several codes of 255 near black
     #[cfg(feature = "grok-gpu")]
-    #[test]
-    fn the_device_pool_shows_the_frames_the_cpu_pool_shows() {
-        let _device = DEVICE_TESTS.lock().unwrap();
-        const FRAMES: u32 = 12;
-        const EIGHT_BIT_TOLERANCE: i32 = 8;
+    fn the_device_pool_shows_what_the_cpu_pool_shows(
+        codestreams: &[Vec<u8>],
+        render: DisplayRender,
+        tolerance: usize,
+    ) {
         const SAMPLES_OVER_ONE_CODE_PER_MILLION: usize = 1000;
-        let codestreams: Vec<Vec<u8>> = (0..FRAMES).map(cinema_2k_codestream_of_frame).collect();
+        let frames = codestreams.len();
         crate::grok_encoder::use_cpu();
-        let on_cpu = decode_run_through_a_pool(&codestreams);
+        let on_cpu = decode_run_through_a_pool(codestreams, render);
 
         if let Err(reason) = crate::grok_encoder::use_gpu_from_environment() {
             panic!("{reason}");
         }
         let before = crate::grok_encoder::accelerated_frames();
-        let on_device = decode_run_through_a_pool(&codestreams);
+        let on_device = decode_run_through_a_pool(codestreams, render);
         let device_frames = crate::grok_encoder::accelerated_frames() - before;
         crate::grok_encoder::use_cpu();
         assert_eq!(
-            device_frames,
-            u64::from(FRAMES),
-            "the device decoded {device_frames} of {FRAMES} frames"
+            device_frames, frames as u64,
+            "the device decoded {device_frames} of {frames} frames"
         );
 
         for (index, (device, cpu)) in on_device.iter().zip(&on_cpu).enumerate() {
@@ -997,7 +1078,7 @@ mod tests {
             for (position, (a, b)) in device.data.iter().zip(&cpu.data).enumerate() {
                 let difference = (i32::from(*a) - i32::from(*b)).unsigned_abs() as usize;
                 histogram[difference] += 1;
-                if difference > EIGHT_BIT_TOLERANCE as usize && first_large.is_none() {
+                if difference > tolerance && first_large.is_none() {
                     first_large = Some((position, *a, *b));
                 }
             }
@@ -1013,7 +1094,7 @@ mod tests {
                 first_large
             );
             assert!(
-                worst <= EIGHT_BIT_TOLERANCE as usize,
+                worst <= tolerance,
                 "frame {index}: device and cpu renders differ by {worst} of 255"
             );
             assert!(
@@ -1022,6 +1103,40 @@ mod tests {
                 device.data.len()
             );
         }
+    }
+
+    #[cfg(feature = "grok-gpu")]
+    #[test]
+    fn a_dcp_batch_renders_on_the_device_as_the_cpu_pool_does() {
+        let _device = DEVICE_TESTS.lock().unwrap();
+        const FRAMES: u32 = 12;
+        const EIGHT_BIT_TOLERANCE: usize = 8;
+        let codestreams: Vec<Vec<u8>> = (0..FRAMES).map(cinema_2k_codestream_of_frame).collect();
+        the_device_pool_shows_what_the_cpu_pool_shows(
+            &codestreams,
+            DisplayRender::DcpXyz,
+            EIGHT_BIT_TOLERANCE,
+        );
+    }
+
+    // one 12 bit code through the Rec.2020 red row's 1.66 gain is 13 codes out of black
+    #[cfg(feature = "grok-gpu")]
+    #[test]
+    fn an_imf_batch_renders_on_the_device_as_the_cpu_pool_does() {
+        let _device = DEVICE_TESTS.lock().unwrap();
+        const FRAMES: u32 = 12;
+        const EIGHT_BIT_TOLERANCE: usize = 16;
+        let colour = crate::preview_colour::PictureColour {
+            primaries: crate::preview_colour::DisplayPrimaries::Bt2020,
+            transfer: crate::preview_colour::DisplayTransfer::Pq,
+            mastering_display_max_luminance: Some(10_000_000),
+        };
+        let codestreams: Vec<Vec<u8>> = (0..FRAMES).map(imf_2k_codestream_of_frame).collect();
+        the_device_pool_shows_what_the_cpu_pool_shows(
+            &codestreams,
+            DisplayRender::Imf(colour),
+            EIGHT_BIT_TOLERANCE,
+        );
     }
 
     // POSTKIT_BENCH_SOURCE names a DCP directory, a picture MXF or a codestream directory
@@ -1213,14 +1328,15 @@ mod tests {
             .ok()
             .and_then(|count| count.parse().ok())
             .unwrap_or(96);
-        let codestream = match std::env::var("POSTKIT_BENCH_SOURCE") {
+        let (codestream, render) = match std::env::var("POSTKIT_BENCH_SOURCE") {
             Ok(source) => {
                 let mut timeline =
                     super::super::timeline::Timeline::open(std::path::Path::new(&source))
                         .expect("open");
-                timeline.codestream(0).expect("frame 0").0
+                let (codestream, render, _mxf) = timeline.codestream(0).expect("frame 0");
+                (codestream, render)
             }
-            Err(_) => cinema_2k_codestream(),
+            Err(_) => (cinema_2k_codestream(), DisplayRender::DcpXyz),
         };
         let sustain = |label: &str| {
             let (finished, _drain) = std::sync::mpsc::channel();
@@ -1232,7 +1348,7 @@ mod tests {
                     frame_index,
                     codestream: codestream.clone(),
                     reduce: 0,
-                    render: DisplayRender::DcpXyz,
+                    render,
                     mxf: std::path::PathBuf::from("bench.j2c"),
                 });
             }
