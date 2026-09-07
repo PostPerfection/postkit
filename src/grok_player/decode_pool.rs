@@ -5,8 +5,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::Command;
 use super::timeline::DisplayRender;
+use super::{Command, OPAQUE_ALPHA, RGBA_BYTES_PER_PIXEL, Rgba8Frame};
 use crate::colour::XyzToSrgb;
 use crate::grok_decoder::DecodedFrame;
 use crate::preview::{self, Display, FrameRender, Rgb8Frame};
@@ -28,7 +28,7 @@ pub(super) struct DecodeJob {
 }
 
 pub(super) enum CachedFrame {
-    Decoded(Arc<Rgb8Frame>),
+    Decoded(Arc<Rgba8Frame>),
     Failed(String),
 }
 
@@ -63,7 +63,7 @@ impl FrameCache {
         self.frames.contains_key(&frame_index)
     }
 
-    pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgb8Frame>> {
+    pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgba8Frame>> {
         match self.frames.get(&frame_index) {
             Some(CachedFrame::Decoded(frame)) => Some(frame.clone()),
             _ => None,
@@ -292,7 +292,7 @@ impl DecodePool {
         self.cache.lock().unwrap().holds(frame_index)
     }
 
-    pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgb8Frame>> {
+    pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgba8Frame>> {
         self.cache.lock().unwrap().decoded(frame_index)
     }
 
@@ -341,7 +341,7 @@ fn run_worker(queue: &JobQueue<DecodeJob>, cache: &Mutex<FrameCache>, finished: 
             continue;
         }
         let decoded = match decode_job(job.codestream, job.reduce, job.render, &job.mxf, &display) {
-            Ok(frame) => CachedFrame::Decoded(Arc::new(frame)),
+            Ok(frame) => CachedFrame::Decoded(Arc::new(Rgba8Frame::from_rgb8(&frame))),
             Err(reason) => CachedFrame::Failed(reason),
         };
         cache
@@ -739,11 +739,13 @@ mod device {
             // 84 MB a 4K frame and the pipeline runs ahead of the colour workers
             let image = unsafe { &*image };
             let rendered = if state.rgb8_on_device.load(Ordering::Acquire) {
-                read_device_rgb8(image)
+                read_device_rgba8(image)
             } else {
-                read_device_image(image).and_then(|decoded| {
-                    render_decoded(&decoded, context.render, &context.mxf, &state.display)
-                })
+                read_device_image(image)
+                    .and_then(|decoded| {
+                        render_decoded(&decoded, context.render, &context.mxf, &state.display)
+                    })
+                    .map(|frame| Rgba8Frame::from_rgb8(&frame))
             };
             let cached = match rendered {
                 Ok(frame) => {
@@ -764,7 +766,7 @@ mod device {
     }
 
     // the device's interleaved 8 bit RGB frame: comps[0] carries the whole buffer
-    fn read_device_rgb8(image: &grokj2k_sys::grk_image) -> Result<Rgb8Frame, String> {
+    fn read_device_rgba8(image: &grokj2k_sys::grk_image) -> Result<Rgba8Frame, String> {
         if image.comps.is_null() || image.numcomps < RGB_COMPONENT_COUNT as u16 {
             return Err(
                 "the device returned an 8 bit RGB frame without three components".to_string(),
@@ -784,12 +786,16 @@ mod device {
         } else {
             first.stride as usize
         };
-        let mut data = Vec::with_capacity(row_bytes * height);
-        for row in 0..height {
-            let start = unsafe { (first.data as *const u8).add(row * stride) };
-            data.extend_from_slice(unsafe { std::slice::from_raw_parts(start, row_bytes) });
+        let mut data = Vec::with_capacity(width * height * RGBA_BYTES_PER_PIXEL);
+        for row_index in 0..height {
+            let start = unsafe { (first.data as *const u8).add(row_index * stride) };
+            let row = unsafe { std::slice::from_raw_parts(start, row_bytes) };
+            for colour in row.as_chunks::<RGB_COMPONENT_COUNT>().0 {
+                data.extend_from_slice(colour);
+                data.push(OPAQUE_ALPHA);
+            }
         }
-        Ok(Rgb8Frame {
+        Ok(Rgba8Frame {
             width: first.w,
             height: first.h,
             data,
@@ -854,10 +860,10 @@ mod tests {
     use super::*;
 
     fn frame(width: u32) -> CachedFrame {
-        CachedFrame::Decoded(Arc::new(Rgb8Frame {
+        CachedFrame::Decoded(Arc::new(Rgba8Frame {
             width,
             height: 1,
-            data: vec![0; width as usize * 3],
+            data: vec![0; width as usize * RGBA_BYTES_PER_PIXEL],
         }))
     }
 
@@ -1013,7 +1019,7 @@ mod tests {
     fn decode_run_through_a_pool(
         codestreams: &[Vec<u8>],
         render: DisplayRender,
-    ) -> Vec<Arc<Rgb8Frame>> {
+    ) -> Vec<Arc<Rgba8Frame>> {
         let (finished, done) = std::sync::mpsc::channel();
         let pool = DecodePool::start(finished);
         pool.restart(1);
@@ -1073,15 +1079,33 @@ mod tests {
                 (cpu.width, cpu.height),
                 "frame {index}"
             );
+            assert!(
+                device.data[RGB_COMPONENT_COUNT..]
+                    .iter()
+                    .step_by(RGBA_BYTES_PER_PIXEL)
+                    .all(|alpha| *alpha == OPAQUE_ALPHA),
+                "frame {index}: the device left a frame with a transparent pixel"
+            );
             let mut histogram = [0usize; 256];
             let mut first_large = None;
-            for (position, (a, b)) in device.data.iter().zip(&cpu.data).enumerate() {
-                let difference = (i32::from(*a) - i32::from(*b)).unsigned_abs() as usize;
-                histogram[difference] += 1;
-                if difference > tolerance && first_large.is_none() {
-                    first_large = Some((position, *a, *b));
+            // alpha is 255 on both sides and would flatter the statistics
+            let pixels = device
+                .data
+                .as_chunks::<RGBA_BYTES_PER_PIXEL>()
+                .0
+                .iter()
+                .zip(cpu.data.as_chunks::<RGBA_BYTES_PER_PIXEL>().0);
+            for (pixel_index, (device_pixel, cpu_pixel)) in pixels.enumerate() {
+                for channel in 0..RGB_COMPONENT_COUNT {
+                    let (a, b) = (device_pixel[channel], cpu_pixel[channel]);
+                    let difference = (i32::from(a) - i32::from(b)).unsigned_abs() as usize;
+                    histogram[difference] += 1;
+                    if difference > tolerance && first_large.is_none() {
+                        first_large = Some((pixel_index * RGBA_BYTES_PER_PIXEL + channel, a, b));
+                    }
                 }
             }
+            let colour_samples: usize = histogram.iter().sum();
             let worst = histogram.iter().rposition(|count| *count > 0).unwrap_or(0);
             let over_one: usize = histogram[2..].iter().sum();
             println!(
@@ -1098,9 +1122,8 @@ mod tests {
                 "frame {index}: device and cpu renders differ by {worst} of 255"
             );
             assert!(
-                over_one * 1_000_000 <= device.data.len() * SAMPLES_OVER_ONE_CODE_PER_MILLION,
-                "frame {index}: {over_one} of {} samples differ by more than one code",
-                device.data.len()
+                over_one * 1_000_000 <= colour_samples * SAMPLES_OVER_ONE_CODE_PER_MILLION,
+                "frame {index}: {over_one} of {colour_samples} samples differ by more than one code"
             );
         }
     }
@@ -1251,10 +1274,8 @@ mod tests {
                     &display,
                 )
                 .expect("decode");
-                // composing an overlay-free frame is the copy the scheduler makes
-                let composed = frame.data.clone();
-                std::hint::black_box(composed);
                 size = (frame.width, frame.height);
+                std::hint::black_box(Rgba8Frame::from_rgb8(&frame));
             }
             println!(
                 "reduce {reduce}: {:.1} ms a frame at {}x{}",

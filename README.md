@@ -139,6 +139,10 @@ transform needs v20.4.6, which adds
 takes the licence from `POSTKIT_GPU_LICENSE` and the registration server from
 `POSTKIT_GPU_REGISTRATION_URL`, through `grok_encoder::use_gpu_from_environment`.
 
+`POSTKIT_RENDER_TIMING` set to anything makes the grok player print one line to
+stderr every 96 uploaded frames, `grok player render:` and the mean, median and
+max milliseconds of the texture upload and of the whole `render_opengl` call.
+
 ## Usage
 
 Add to your `Cargo.toml`:

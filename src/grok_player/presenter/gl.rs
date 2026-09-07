@@ -1,11 +1,12 @@
 use std::ffi::{CString, c_char, c_void};
+use std::time::{Duration, Instant};
 
-use super::super::{ComposedFrame, GetProcAddressFn};
+use super::super::{ComposedFrame, GetProcAddressFn, RGBA_BYTES_PER_PIXEL};
 use super::picture_rectangle;
 
 const GL_TEXTURE_2D: u32 = 0x0DE1;
-const GL_RGB: u32 = 0x1907;
-const GL_RGB8: i32 = 0x8051;
+const GL_RGBA: u32 = 0x1908;
+const GL_RGBA8: i32 = 0x8058;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
@@ -266,6 +267,7 @@ impl GlPresenter {
         })
     }
 
+    // the duration is the texture upload, None when this serial was already uploaded
     pub fn draw(
         &mut self,
         framebuffer: i32,
@@ -274,7 +276,7 @@ impl GlPresenter {
         flip_y: bool,
         frame: Option<&ComposedFrame>,
         serial: u64,
-    ) -> Result<(), String> {
+    ) -> Result<Option<Duration>, String> {
         unsafe {
             let entries = &self.entries;
             (entries.bind_framebuffer)(GL_FRAMEBUFFER, framebuffer as u32);
@@ -283,18 +285,18 @@ impl GlPresenter {
             (entries.clear)(GL_COLOR_BUFFER_BIT);
         }
         let Some(frame) = frame else {
-            return Ok(());
+            return Ok(None);
         };
         if width <= 0 || height <= 0 {
-            return Ok(());
+            return Ok(None);
         }
         let Some(rectangle) =
             picture_rectangle(width as u32, height as u32, frame.width, frame.height)
         else {
-            return Ok(());
+            return Ok(None);
         };
 
-        self.upload(frame, serial);
+        let uploaded = self.upload(frame, serial);
         let entries = &self.entries;
         unsafe {
             // gl counts rows from the bottom of the framebuffer
@@ -313,19 +315,19 @@ impl GlPresenter {
             (entries.draw_arrays)(GL_TRIANGLE_STRIP, 0, QUAD_VERTICES);
             (entries.bind_vertex_array)(0);
         }
-        Ok(())
+        Ok(uploaded)
     }
 
-    fn upload(&mut self, frame: &ComposedFrame, serial: u64) {
+    fn upload(&mut self, frame: &ComposedFrame, serial: u64) -> Option<Duration> {
         let size = (frame.width, frame.height);
         if serial == self.uploaded_serial && size == self.texture_size {
-            return;
+            return None;
         }
+        let started = Instant::now();
         let entries = &self.entries;
         unsafe {
             (entries.bind_texture)(GL_TEXTURE_2D, self.texture);
-            // rgb8 rows are not four-aligned
-            (entries.pixel_storei)(GL_UNPACK_ALIGNMENT, 1);
+            (entries.pixel_storei)(GL_UNPACK_ALIGNMENT, RGBA_BYTES_PER_PIXEL as i32);
             if size == self.texture_size {
                 (entries.tex_sub_image_2d)(
                     GL_TEXTURE_2D,
@@ -334,26 +336,27 @@ impl GlPresenter {
                     0,
                     frame.width as i32,
                     frame.height as i32,
-                    GL_RGB,
+                    GL_RGBA,
                     GL_UNSIGNED_BYTE,
-                    frame.data.as_ptr() as *const c_void,
+                    frame.data().as_ptr() as *const c_void,
                 );
             } else {
                 (entries.tex_image_2d)(
                     GL_TEXTURE_2D,
                     0,
-                    GL_RGB8,
+                    GL_RGBA8,
                     frame.width as i32,
                     frame.height as i32,
                     0,
-                    GL_RGB,
+                    GL_RGBA,
                     GL_UNSIGNED_BYTE,
-                    frame.data.as_ptr() as *const c_void,
+                    frame.data().as_ptr() as *const c_void,
                 );
             }
         }
         self.texture_size = size;
         self.uploaded_serial = serial;
+        Some(started.elapsed())
     }
 }
 

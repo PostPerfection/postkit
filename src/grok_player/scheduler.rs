@@ -7,14 +7,15 @@ use std::time::{Duration, Instant};
 use super::compositor::{Compositor, Layers};
 use super::decode_pool::{DecodeJob, DecodePool};
 use super::timeline::Timeline;
-use super::{Command, DecodeScale, OverlayRectangle, Shared, Status, SubtitleSlot};
-use crate::preview::Rgb8Frame;
+use super::{
+    Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, Rgba8Frame, Shared, Status,
+    SubtitleSlot,
+};
 use crate::subtitle_formats::{StyledCue, StyledRun, VAlign};
 
 // a worker finishing a frame wakes the scheduler sooner than this
 const IDLE_WAIT: Duration = Duration::from_millis(100);
 const PRESENTATION_WINDOW_FRAMES: usize = 24;
-const MILLISECONDS_PER_SECOND: f64 = 1000.0;
 const SRT_EXTENSION: &str = "srt";
 const ASS_EXTENSIONS: [&str; 2] = ["ass", "ssa"];
 
@@ -97,7 +98,7 @@ struct Scheduler {
     eof: bool,
     reduce: u8,
     clock: Option<Clock>,
-    last_plain: Option<Arc<Rgb8Frame>>,
+    last_plain: Option<Arc<Rgba8Frame>>,
     overlays: Vec<OverlayRectangle>,
     subtitle: SubtitleTrack,
     caption: SubtitleTrack,
@@ -207,7 +208,7 @@ impl Scheduler {
         self.shared.fire_update();
     }
 
-    fn present(&mut self, index: u64, plain: Arc<Rgb8Frame>) {
+    fn present(&mut self, index: u64, plain: Arc<Rgba8Frame>) {
         self.current_frame = index;
         self.last_plain = Some(plain.clone());
         self.compose_and_publish(&plain);
@@ -218,7 +219,7 @@ impl Scheduler {
         }
     }
 
-    fn compose_and_publish(&mut self, picture: &Rgb8Frame) {
+    fn compose_and_publish(&mut self, picture: &Arc<Rgba8Frame>) {
         let Some(timeline) = self.timeline.as_ref() else {
             return;
         };

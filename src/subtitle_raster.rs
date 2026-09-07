@@ -420,9 +420,18 @@ pub fn composite_rgb48(
     }
 }
 
-pub fn composite_rgb8(frame: &mut [u8], width: u32, height: u32, bitmaps: &[PositionedBitmap]) {
-    const BYTES_PER_PIXEL: usize = 3;
-    let stride = width as usize * BYTES_PER_PIXEL;
+/// Alpha-blend `bitmaps` onto an 8-bit frame whose pixels start with RGB and are
+/// `bytes_per_pixel` wide, in order, clipping each to the frame. A fourth byte
+/// is left as it is.
+pub fn composite_rgb8(
+    frame: &mut [u8],
+    width: u32,
+    height: u32,
+    bytes_per_pixel: usize,
+    bitmaps: &[PositionedBitmap],
+) {
+    const COLOUR_BYTES_PER_PIXEL: usize = 3;
+    let stride = width as usize * bytes_per_pixel;
     for bitmap in bitmaps {
         for row in 0..bitmap.height as i32 {
             let frame_y = bitmap.y + row;
@@ -439,8 +448,8 @@ pub fn composite_rgb8(frame: &mut [u8], width: u32, height: u32, bitmaps: &[Posi
                 if alpha == 0 {
                     continue;
                 }
-                let at = frame_y as usize * stride + frame_x as usize * BYTES_PER_PIXEL;
-                for channel in 0..BYTES_PER_PIXEL {
+                let at = frame_y as usize * stride + frame_x as usize * bytes_per_pixel;
+                for channel in 0..COLOUR_BYTES_PER_PIXEL {
                     let destination = frame[at + channel] as u32;
                     let source_sample = bitmap.pixels[source + channel] as u32;
                     let mixed = (source_sample * alpha + destination * (255 - alpha) + 127) / 255;

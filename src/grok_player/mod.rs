@@ -4,12 +4,14 @@ mod presenter;
 mod scheduler;
 mod timeline;
 
+use std::cell::RefCell;
 use std::ffi::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub use presenter::PictureRectangle;
 
@@ -50,10 +52,99 @@ pub struct OverlayRectangle {
     pub alpha: u8,
 }
 
-struct ComposedFrame {
+const RGBA_BYTES_PER_PIXEL: usize = 4;
+const OPAQUE_ALPHA: u8 = 255;
+
+// a 4K gl upload costs 12.3 ms as rgb8 against 2.3 ms as rgba8 on the amd display gpu
+struct Rgba8Frame {
     width: u32,
     height: u32,
     data: Vec<u8>,
+}
+
+impl Rgba8Frame {
+    fn from_rgb8(picture: &crate::preview::Rgb8Frame) -> Self {
+        const RGB_BYTES_PER_PIXEL: usize = 3;
+        let pixels = picture.width as usize * picture.height as usize;
+        let mut data = Vec::with_capacity(pixels * RGBA_BYTES_PER_PIXEL);
+        for colour in picture.data.as_chunks::<RGB_BYTES_PER_PIXEL>().0 {
+            data.extend_from_slice(colour);
+            data.push(OPAQUE_ALPHA);
+        }
+        Rgba8Frame {
+            width: picture.width,
+            height: picture.height,
+            data,
+        }
+    }
+}
+
+enum ComposedPixels {
+    // nothing drawn, so the decoded frame is shared
+    Picture(Arc<Rgba8Frame>),
+    Drawn(Vec<u8>),
+}
+
+struct ComposedFrame {
+    width: u32,
+    height: u32,
+    pixels: ComposedPixels,
+}
+
+impl ComposedFrame {
+    fn data(&self) -> &[u8] {
+        match &self.pixels {
+            ComposedPixels::Picture(picture) => &picture.data,
+            ComposedPixels::Drawn(data) => data,
+        }
+    }
+}
+
+const RENDER_TIMING_VARIABLE: &str = "POSTKIT_RENDER_TIMING";
+const RENDER_TIMING_WINDOW_FRAMES: usize = 96;
+const MILLISECONDS_PER_SECOND: f64 = 1000.0;
+
+thread_local! {
+    static RENDER_TIMINGS: RefCell<Vec<(Duration, Duration)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn render_timing_wanted() -> bool {
+    static WANTED: OnceLock<bool> = OnceLock::new();
+    *WANTED.get_or_init(|| std::env::var_os(RENDER_TIMING_VARIABLE).is_some())
+}
+
+fn record_render_timing(upload: Duration, call: Duration) {
+    if !render_timing_wanted() {
+        return;
+    }
+    let window = RENDER_TIMINGS.with_borrow_mut(|timings| {
+        timings.push((upload, call));
+        if timings.len() < RENDER_TIMING_WINDOW_FRAMES {
+            return None;
+        }
+        Some(std::mem::take(timings))
+    });
+    let Some(window) = window else {
+        return;
+    };
+    let (uploads, calls): (Vec<Duration>, Vec<Duration>) = window.into_iter().unzip();
+    eprintln!(
+        "grok player render: {RENDER_TIMING_WINDOW_FRAMES} frames, upload {}, whole call {}",
+        milliseconds_spread(uploads),
+        milliseconds_spread(calls)
+    );
+}
+
+fn milliseconds_spread(mut costs: Vec<Duration>) -> String {
+    costs.sort_unstable();
+    let milliseconds = |cost: Duration| cost.as_secs_f64() * MILLISECONDS_PER_SECOND;
+    let total: Duration = costs.iter().sum();
+    format!(
+        "mean {:.1} median {:.1} max {:.1} ms",
+        milliseconds(total) / costs.len() as f64,
+        milliseconds(costs[costs.len() / 2]),
+        milliseconds(costs[costs.len() - 1])
+    )
 }
 
 #[derive(Default, Clone)]
@@ -234,7 +325,13 @@ impl GrokPlayer {
             .ok_or_else(|| "no GL presenter".to_string())?;
         let frame = self.shared.current_frame();
         let serial = self.shared.serial.load(Ordering::Acquire);
-        presenter.draw(framebuffer, width, height, flip_y, frame.as_deref(), serial)
+        let started = Instant::now();
+        let upload =
+            presenter.draw(framebuffer, width, height, flip_y, frame.as_deref(), serial)?;
+        if let Some(upload) = upload {
+            record_render_timing(upload, started.elapsed());
+        }
+        Ok(())
     }
 
     pub fn render_software(

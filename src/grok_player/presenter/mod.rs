@@ -1,10 +1,11 @@
 mod gl;
 
-use super::ComposedFrame;
+use super::{ComposedFrame, RGBA_BYTES_PER_PIXEL};
 pub(super) use gl::GlPresenter;
 
+// the software surface is rgb0, mpv's format, so the fourth byte stays zero
 pub(super) const SOFTWARE_BYTES_PER_PIXEL: usize = 4;
-const RGB_BYTES_PER_PIXEL: usize = 3;
+const COLOUR_BYTES_PER_PIXEL: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PictureRectangle {
@@ -61,11 +62,11 @@ pub(super) fn draw_software(
         for column in 0..rectangle.width as usize {
             let source_column = column * frame.width as usize / rectangle.width as usize;
             let source_column = source_column.min(frame.width as usize - 1);
-            let source = (source_row * frame.width as usize + source_column) * RGB_BYTES_PER_PIXEL;
+            let source = (source_row * frame.width as usize + source_column) * RGBA_BYTES_PER_PIXEL;
             let at = ((rectangle.y as usize + row) * width + rectangle.x as usize + column)
                 * SOFTWARE_BYTES_PER_PIXEL;
-            target[at..at + RGB_BYTES_PER_PIXEL]
-                .copy_from_slice(&frame.data[source..source + RGB_BYTES_PER_PIXEL]);
+            target[at..at + COLOUR_BYTES_PER_PIXEL]
+                .copy_from_slice(&frame.data()[source..source + COLOUR_BYTES_PER_PIXEL]);
         }
     }
     Ok(())
@@ -74,6 +75,15 @@ pub(super) fn draw_software(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grok_player::ComposedPixels;
+
+    fn drawn_frame(sample: u8) -> ComposedFrame {
+        ComposedFrame {
+            width: 2,
+            height: 2,
+            pixels: ComposedPixels::Drawn(vec![sample; 2 * 2 * RGBA_BYTES_PER_PIXEL]),
+        }
+    }
 
     #[test]
     fn a_square_picture_gets_bars_either_side_of_a_wide_surface() {
@@ -112,11 +122,7 @@ mod tests {
     #[test]
     fn a_frame_lands_centred_in_the_target_with_black_bars() {
         const SURFACE: usize = 8;
-        let frame = ComposedFrame {
-            width: 2,
-            height: 2,
-            data: vec![9u8; 2 * 2 * RGB_BYTES_PER_PIXEL],
-        };
+        let frame = drawn_frame(9);
         let mut target = vec![0xffu8; SURFACE * 4 * SOFTWARE_BYTES_PER_PIXEL];
         draw_software(&frame, SURFACE, 4, &mut target).unwrap();
         let pixel = |x: usize, y: usize| target[(y * SURFACE + x) * SOFTWARE_BYTES_PER_PIXEL];
@@ -129,11 +135,7 @@ mod tests {
 
     #[test]
     fn a_target_too_small_for_the_surface_is_refused() {
-        let frame = ComposedFrame {
-            width: 2,
-            height: 2,
-            data: vec![0u8; 2 * 2 * RGB_BYTES_PER_PIXEL],
-        };
+        let frame = drawn_frame(0);
         let mut target = vec![0u8; 4];
         assert!(draw_software(&frame, 8, 4, &mut target).is_err());
     }

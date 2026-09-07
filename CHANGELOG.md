@@ -34,8 +34,8 @@
   and the plugin's own threads pull codestreams from the pool's queue, so the
   device pipeline stays full without the player handing over one frame at a
   time. A DCP batch asks for 8-bit sRGB and the device runs the X'Y'Z' to sRGB
-  transform and packs the frame, so the host copies 21 MB a frame and does no
-  colour work. An App 2E batch hands the device its own transform instead, the
+  transform and packs the frame, so the host reads 21 MB a frame, expanding it
+  to RGBA as it copies, and does no colour work. An App 2E batch hands the device its own transform instead, the
   `preview_colour::DisplayTransform` the host would have run: the 4096-entry
   transfer table, tone map included, and the gamut matrix. It comes back packed
   the same way, within 16 codes of the host render on 12 frames of 12-bit PQ
@@ -259,9 +259,26 @@
   thread, bit identical to a single meter over the whole file. On a 15 minute
   six channel 24 bit WAV: 1.0 s and 10 MB against loudnorm's 107.7 s and 177 MB,
   same -0.20 dBTP.
+- **`POSTKIT_RENDER_TIMING`**: set to anything, the grok player prints one line
+  to stderr every 96 uploaded frames with the mean, median and max milliseconds
+  of the texture upload and of the whole `render_opengl` call, prefixed
+  `grok player render:`. Unset, the player still takes the two `Instant`
+  readings and prints nothing.
 
 ### Changed
 
+- **The grok player carries RGBA frames**: the decode pool expands every frame
+  to four bytes a pixel with an opaque alpha, on the worker thread that decoded
+  it or while it copies the device's rows, so the presenter uploads `GL_RGBA`
+  into `GL_RGBA8` at unpack alignment 4. A 4096x2160 `glTexSubImage2D` costs
+  2.3 ms as RGBA8 against 12.3 ms as RGB8 on this laptop's AMD display GPU
+  (radeonsi, Mesa 25.3.6), 6.9 against 12.4 on llvmpipe and 5.4 against 6.6 on
+  the NVIDIA card, so the render thread no longer spends half a 24 fps frame
+  period in the driver's swizzle. Composing a frame with no overlay and no cue
+  to draw hands the presenter the decoded buffer itself instead of the copy it
+  made every frame. A cached 4K frame is 35 MB rather than 26, so the lookahead
+  cache grows by a third. `subtitle_raster::composite_rgb8` takes the pixel
+  pitch and leaves the fourth byte as it is.
 - **`encode_video_pipeline_resumable` takes the source's pixel format**: the
   resumable encode ran ffprobe on the source for its pixel format and colour
   tags, a probe every caller had already made for the raster and frame rate.
@@ -285,8 +302,9 @@
   `scale_cuda` and `pad_cuda`, was measured and left out: it saves 3.6 ms of CPU
   a frame and `scale_cuda`'s lanczos differs from swscale's by up to two codes
   of 255 with a mean bias of 0.6 code, 36.85 dB against the CPU run.
-- **grok is pinned at the v20.4.3 release**: `grokj2k-sys` and CI both build the
-  tag instead of a commit on master.
+- **grok is pinned at the v20.4.6 release**: `grokj2k-sys` and CI both build a
+  tag instead of a commit on master. 20.4.6 carries the display transform request
+  the player's App 2E device decode uses.
 
 ### Removed
 
