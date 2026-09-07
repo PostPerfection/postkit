@@ -134,8 +134,8 @@ with the plugin, CI has no GPU: `tests/grok_gpu.rs` for the round trip,
 `tests/grok_gpu_yuv.rs` for the planar YUV source and
 `tests/grok_gpu_rgb48le.rs` for the interleaved one. This needs grok v20.4.3 or
 newer, which has `grk_plugin_set_enabled`, and the player's App 2E device
-transform needs `grk_plugin_batch_decompress_memory_info::display_transform`,
-which is newer than v20.4.5. A plugin built with licence checking
+transform needs v20.4.6, which adds
+`grk_plugin_batch_decompress_memory_info::display_transform`. A plugin built with licence checking
 takes the licence from `POSTKIT_GPU_LICENSE` and the registration server from
 `POSTKIT_GPU_REGISTRATION_URL`, through `grok_encoder::use_gpu_from_environment`.
 
