@@ -15,6 +15,11 @@
   being read into memory. `refuse_undecodable_dolby_vision` refuses profile 5 by
   name, since only the RPU can turn its IPT PQ c2 colour back into RGB.
 
+- **An IMF CPL can claim ST 2067-21:2020**: `ImfCpl::app2e_edition` picks the
+  ApplicationIdentification and the MaxCLL/MaxFALL namespace, 2016 by default
+  and 2020 for a package whose colour (HLG, COLOR.8) the 2016 edition does not
+  define.
+
 - **HDR sources encode to the DCI HDR Addendum**: `SourceColour::HdrDcdm` takes
   an HDR10, HLG or PQ P3-D65 master, linearises it with its own transfer
   function into absolute cd/m², rolls luminance above the DCI HDR colour volume

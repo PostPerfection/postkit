@@ -25,6 +25,7 @@ pub mod ns {
     pub const CPL_IMF_CC: &str = "http://www.smpte-ra.org/schemas/2067-2/2016";
     pub const PKL_IMF: &str = "http://www.smpte-ra.org/schemas/2067-2/2016/PKL";
     pub const APP2E: &str = "http://www.smpte-ra.org/schemas/2067-21/2016";
+    pub const APP2E_2020: &str = "http://www.smpte-ra.org/ns/2067-21/2020";
 }
 
 /// Escape XML special characters in element text or attribute values.
@@ -491,6 +492,25 @@ pub struct ImfCpl {
     pub max_cll: Option<u16>,
     /// Maximum frame-average light level in cd/m^2, same placement as `max_cll`.
     pub max_fall: Option<u16>,
+    pub app2e_edition: App2eEdition,
+}
+
+/// The ST 2067-21 edition the CPL claims in its ApplicationIdentification.
+/// HLG (COLOR.8) only exists from the 2020 edition on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum App2eEdition {
+    #[default]
+    Edition2016,
+    Edition2020,
+}
+
+impl App2eEdition {
+    pub fn namespace(self) -> &'static str {
+        match self {
+            App2eEdition::Edition2016 => ns::APP2E,
+            App2eEdition::Edition2020 => ns::APP2E_2020,
+        }
+    }
 }
 
 impl ImfCpl {
@@ -547,7 +567,7 @@ impl ImfCpl {
         let _ = writeln!(
             xml,
             "    <cc:ApplicationIdentification>{}</cc:ApplicationIdentification>",
-            ns::APP2E
+            self.app2e_edition.namespace()
         );
         // ST 2067-21 puts content light levels here, each carrying its own
         // namespace declaration so an absent pair leaves the CPL untouched.
@@ -556,7 +576,7 @@ impl ImfCpl {
                 let _ = writeln!(
                     xml,
                     "    <app2e:{element} xmlns:app2e=\"{}\">{nits}</app2e:{element}>",
-                    ns::APP2E
+                    self.app2e_edition.namespace()
                 );
             }
         }
@@ -1221,6 +1241,7 @@ mod tests {
             essence_descriptors: vec![],
             max_cll: None,
             max_fall: None,
+            app2e_edition: App2eEdition::Edition2016,
         };
         let xml = cpl.to_xml();
         assert!(xml.contains(ns::APP2E));
@@ -1244,6 +1265,21 @@ mod tests {
     /// ST 2067-21 carries MaxCLL/MaxFALL as CPL ExtensionProperties, siblings of
     /// ApplicationIdentification. Photon only schema-validates them (unsignedShort),
     /// it never compares them against the essence.
+    #[test]
+    fn a_2020_edition_cpl_claims_the_2020_namespace() {
+        let cpl = ImfCpl {
+            app2e_edition: App2eEdition::Edition2020,
+            max_cll: Some(1000),
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        assert!(xml.contains(
+            "<cc:ApplicationIdentification>http://www.smpte-ra.org/ns/2067-21/2020</cc:ApplicationIdentification>"
+        ));
+        assert!(xml.contains("xmlns:app2e=\"http://www.smpte-ra.org/ns/2067-21/2020\""));
+        assert!(!xml.contains(ns::APP2E));
+    }
+
     #[test]
     fn imf_cpl_writes_content_light_levels() {
         let cpl = ImfCpl {
