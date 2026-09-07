@@ -955,12 +955,17 @@ mod tests {
             .collect()
     }
 
+    // one device, one playback lease: two device tests at once would put one on the cpu
+    #[cfg(feature = "grok-gpu")]
+    static DEVICE_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     // the device's inverse wavelet rounds differently from the cpu's on noisy content:
     // 99.6 percent of samples identical here, and near black the sRGB curve turns a
     // code of X'Y'Z' into several of 255
     #[cfg(feature = "grok-gpu")]
     #[test]
     fn the_device_pool_shows_the_frames_the_cpu_pool_shows() {
+        let _device = DEVICE_TESTS.lock().unwrap();
         const FRAMES: u32 = 12;
         const EIGHT_BIT_TOLERANCE: i32 = 8;
         const SAMPLES_OVER_ONE_CODE_PER_MILLION: usize = 1000;
@@ -1161,6 +1166,43 @@ mod tests {
             "reduce 0 on grok's shared pool: {:.1} ms a frame",
             start.elapsed().as_secs_f64() * 1000.0 / f64::from(RUNS)
         );
+    }
+
+    // the app drops the pool on exit while frames are in flight, and the plugin's tail
+    // has to drain then instead of holding the process's cuda teardown
+    #[cfg(feature = "grok-gpu")]
+    #[test]
+    fn dropping_the_pool_ends_a_running_device_batch_promptly() {
+        let _device = DEVICE_TESTS.lock().unwrap();
+        const FRAMES: u32 = 24;
+        const DROP_BUDGET: Duration = Duration::from_secs(5);
+        let codestreams: Vec<Vec<u8>> = (0..FRAMES).map(cinema_2k_codestream_of_frame).collect();
+        if let Err(reason) = crate::grok_encoder::use_gpu_from_environment() {
+            panic!("{reason}");
+        }
+        let before = crate::grok_encoder::accelerated_frames();
+        let (finished, done) = std::sync::mpsc::channel();
+        let pool = DecodePool::start(finished);
+        pool.restart(1);
+        for (index, codestream) in codestreams.iter().enumerate() {
+            pool.submit(DecodeJob {
+                generation: 1,
+                frame_index: index as u64,
+                codestream: codestream.clone(),
+                reduce: 0,
+                render: DisplayRender::DcpXyz,
+                mxf: PathBuf::from("run.j2c"),
+            });
+        }
+        done.recv_timeout(Duration::from_secs(60))
+            .expect("the batch delivers a first frame");
+        let dropped_at = std::time::Instant::now();
+        drop(pool);
+        let took = dropped_at.elapsed();
+        let device_frames = crate::grok_encoder::accelerated_frames() - before;
+        crate::grok_encoder::use_cpu();
+        assert!(device_frames > 0, "the batch never ran on the device");
+        assert!(took < DROP_BUDGET, "dropping the pool took {took:?}");
     }
 
     #[cfg(feature = "grok-ffi")]

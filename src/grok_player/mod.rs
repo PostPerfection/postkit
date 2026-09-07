@@ -406,12 +406,21 @@ impl GrokPlayer {
     }
 }
 
-impl Drop for GrokPlayer {
-    fn drop(&mut self) {
+impl GrokPlayer {
+    /// Stops the scheduler and with it the decode pool, which ends a running device batch.
+    /// An app calls this before it exits: a batch left open holds the plugin's host callbacks,
+    /// and the CUDA teardown at process exit waits on them for a long time.
+    pub fn shutdown(&self) {
         let _ = self.commands.send(Command::Shutdown);
         if let Some(scheduler) = self.scheduler.lock().unwrap().take() {
             let _ = scheduler.join();
         }
+    }
+}
+
+impl Drop for GrokPlayer {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
