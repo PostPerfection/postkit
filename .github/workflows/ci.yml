@@ -106,7 +106,7 @@ jobs:
       - name: Setup grok
         uses: PostPerfection/setup-grok@v1
         with:
-          grok-ref: b8e34239
+          grok-ref: b8e342399bdf0425ea8c4cb680a0d1506f880cef
 
       - name: Setup libmpv
         uses: PostPerfection/setup-libmpv@v1
