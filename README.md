@@ -78,6 +78,11 @@ install grok first (cmake, e.g. to `~/bin/grok`), then put its `lib/pkgconfig` o
 `PKG_CONFIG_PATH` and its `lib` on `LD_LIBRARY_PATH`. CI does this in a cached
 "Setup grok" step; see `.github/workflows/ci.yml`.
 
+The stream encode runs ffmpeg 8 or later from `PATH`, built with libzimg: the
+HDR decode chain uses its `zscale` filter. Homebrew and conda-forge build
+without it, so macOS takes a static build such as martin-riedl.de's, which is
+what CI installs.
+
 grok's accelerator plugin runs the wavelet and T1 on a device. grok looks for
 `libgrokj2k_plugin` under `GRK_PLUGIN_PATH`, then in the working directory, then
 next to the executable, and searches nowhere at all when `GRK_NO_PLUGIN` is set,
