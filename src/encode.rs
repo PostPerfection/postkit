@@ -204,7 +204,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// The compressor's own DCDM X'Y'Z' transform is applied if and only if this is
 /// `DisplayRgb`, so essence that a caller later labels ST 2084 PQ or RGB can
 /// never hold frames the encoder transformed itself.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum SourceColour {
     /// Display RGB. The compressor runs the DCDM X'Y'Z' transform.
     #[default]
@@ -226,6 +226,12 @@ pub enum SourceColour {
     KeepRgbFrom(crate::colour::ColourSpace),
     // the LUT runs in ffmpeg's decode and its output is Rec.709 RGB
     KeepRgbAfterLut(PathBuf),
+    // postkit writes the addendum's X"Y"Z" itself, so the compressor transform stays off
+    HdrDcdm {
+        source: crate::colour::HdrSource,
+        // the grade's peak luminance, e.g. MaxCLL
+        source_peak_nits: f32,
+    },
 }
 
 impl SourceColour {
@@ -247,7 +253,17 @@ impl SourceColour {
             SourceColour::KeepRgbFrom(space) => crate::colour::FrameColourTransform::ToRec709(
                 crate::colour::Rec709Transform::from_space(*space)?,
             ),
-            _ => return Ok(None),
+            SourceColour::HdrDcdm {
+                source,
+                source_peak_nits,
+            } => crate::colour::FrameColourTransform::ToHdrXyz(Box::new(
+                crate::colour::HdrDcdmTransform::new(*source, *source_peak_nits)?,
+            )),
+            SourceColour::DisplayRgb
+            | SourceColour::DciLut(_)
+            | SourceColour::AlreadyPq
+            | SourceColour::KeepRgb
+            | SourceColour::KeepRgbAfterLut(_) => return Ok(None),
         };
         Ok(Some(Arc::new(transform)))
     }
@@ -255,7 +271,25 @@ impl SourceColour {
     pub fn decode_lut(&self) -> Option<&Path> {
         match self {
             SourceColour::DciLut(lut) | SourceColour::KeepRgbAfterLut(lut) => Some(lut),
-            _ => None,
+            SourceColour::DisplayRgb
+            | SourceColour::DisplayRgbIn(_)
+            | SourceColour::AlreadyPq
+            | SourceColour::KeepRgb
+            | SourceColour::KeepRgbFrom(_)
+            | SourceColour::HdrDcdm { .. } => None,
+        }
+    }
+
+    pub fn hdr_source(&self) -> Option<crate::colour::HdrSource> {
+        match self {
+            SourceColour::HdrDcdm { source, .. } => Some(*source),
+            SourceColour::DisplayRgb
+            | SourceColour::DisplayRgbIn(_)
+            | SourceColour::DciLut(_)
+            | SourceColour::AlreadyPq
+            | SourceColour::KeepRgb
+            | SourceColour::KeepRgbFrom(_)
+            | SourceColour::KeepRgbAfterLut(_) => None,
         }
     }
 }
@@ -355,10 +389,10 @@ impl DecodeFilters {
         self.items.join(",")
     }
 
-    /// The chain with a pixel format filter at `position`.
-    fn with_format_filter_at(&self, position: usize) -> String {
+    /// The chain with a conversion to 16-bit RGB at `position`.
+    fn with_format_filter_at(&self, position: usize, filter: &str) -> String {
         let mut items = self.items.clone();
-        items.insert(position, SIXTEEN_BIT_RGB_FILTER.to_string());
+        items.insert(position, filter.to_string());
         items.join(",")
     }
 }
@@ -738,7 +772,9 @@ pub(crate) fn choose_pipe_format(
     let postkit_reads_the_samples = inputs.postkit_prepares_the_frame
         || matches!(
             inputs.source_colour,
-            SourceColour::DisplayRgbIn(_) | SourceColour::KeepRgbFrom(_)
+            SourceColour::DisplayRgbIn(_)
+                | SourceColour::KeepRgbFrom(_)
+                | SourceColour::HdrDcdm { .. }
         )
         || inputs.source_colour.decode_lut().is_some();
     let Some(pixel_format) = PlanarYuvPixelFormat::from_ffmpeg_name(&inputs.source.pix_fmt) else {
@@ -826,19 +862,76 @@ pub(crate) fn pipe_format_for_run(
 fn decode_filter_chain(
     picture: &DecodeFilters,
     pipe_format: PipeFormat,
-    source_pix_fmt: &str,
+    source: &crate::probe::PixelFormatInfo,
+    source_colour: &SourceColour,
 ) -> String {
+    let hdr = hdr_yuv_to_rgb_filter(source, source_colour);
+    let filter = hdr.as_deref().unwrap_or(SIXTEEN_BIT_RGB_FILTER);
     let chain = match pipe_format {
         PipeFormat::PlanarYuv(_) => picture.joined(),
-        PipeFormat::PackedRgb(_) if is_eight_bit_yuv_pixel_format(source_pix_fmt) => {
-            picture.with_format_filter_at(0)
+        PipeFormat::PackedRgb(_)
+            if hdr.is_some() || is_eight_bit_yuv_pixel_format(&source.pix_fmt) =>
+        {
+            picture.with_format_filter_at(0, filter)
         }
         PipeFormat::PackedRgb(_) => match picture.geometry_format_position {
-            Some(position) => picture.with_format_filter_at(position),
+            Some(position) => picture.with_format_filter_at(position, filter),
             None => picture.joined(),
         },
     };
     crate::picture_findings::with_detection_branch(&chain)
+}
+
+const YUV_PIXEL_FORMAT_PREFIXES: [&str; 4] = ["yuv", "nv", "p0", "p2"];
+
+fn is_yuv_pixel_format(pix_fmt: &str) -> bool {
+    YUV_PIXEL_FORMAT_PREFIXES
+        .iter()
+        .any(|prefix| pix_fmt.starts_with(prefix))
+}
+
+// an hdr grade is never bt.601, so an untagged one takes its own matrix
+fn hdr_yuv_matrix(hdr_source: crate::colour::HdrSource, color_space: &str) -> YuvMatrix {
+    let tagged = YuvMatrix::for_ffprobe_color_space(color_space);
+    if tagged != YuvMatrix::Bt601 {
+        return tagged;
+    }
+    match hdr_source {
+        crate::colour::HdrSource::Hdr10 | crate::colour::HdrSource::Hlg => YuvMatrix::Bt2020,
+        crate::colour::HdrSource::PqP3D65 => YuvMatrix::Bt709,
+    }
+}
+
+fn zscale_matrix_name(matrix: YuvMatrix) -> &'static str {
+    match matrix {
+        YuvMatrix::Bt601 => "170m",
+        YuvMatrix::Bt709 => "709",
+        YuvMatrix::Bt2020 => "2020_ncl",
+    }
+}
+
+// zscale spells rgb output "gbr"
+const ZSCALE_RGB_MATRIX: &str = "gbr";
+
+// swscale infers the matrix, which lands a bt.2020 grade on bt.601 or bt.709
+fn hdr_yuv_to_rgb_filter(
+    source: &crate::probe::PixelFormatInfo,
+    source_colour: &SourceColour,
+) -> Option<String> {
+    let hdr_source = source_colour.hdr_source()?;
+    if !is_yuv_pixel_format(&source.pix_fmt) {
+        return None;
+    }
+    let range = if source.color_range == FULL_RANGE_TAG {
+        "full"
+    } else {
+        "limited"
+    };
+    let matrix = zscale_matrix_name(hdr_yuv_matrix(hdr_source, &source.color_space));
+    Some(format!(
+        "zscale=matrixin={matrix}:rangein={range}:matrix={ZSCALE_RGB_MATRIX}:range=full,\
+         {SIXTEEN_BIT_RGB_FILTER}"
+    ))
 }
 
 /// Every ffmpeg argument that goes before `-i` for a stream decode: what the
@@ -936,7 +1029,7 @@ pub(crate) fn decode_chain(
             inputs.accelerator_active,
         )?,
         pipe_format,
-        filters: decode_filter_chain(&picture, pipe_format, &inputs.source.pix_fmt),
+        filters: decode_filter_chain(&picture, pipe_format, inputs.source, inputs.source_colour),
     })
 }
 
@@ -2348,6 +2441,114 @@ mod tests {
         }
     }
 
+    fn hdr10_source() -> SourceColour {
+        SourceColour::HdrDcdm {
+            source: crate::colour::HdrSource::Hdr10,
+            source_peak_nits: crate::colour::HdrSource::DEFAULT_PEAK_NITS,
+        }
+    }
+
+    fn hdr10_pixel_format(pix_fmt: &str, color_range: &str) -> crate::probe::PixelFormatInfo {
+        crate::probe::PixelFormatInfo {
+            pix_fmt: pix_fmt.to_string(),
+            color_space: "bt2020nc".to_string(),
+            color_range: color_range.to_string(),
+        }
+    }
+
+    #[test]
+    fn an_hdr_master_converts_to_the_addendum_xyz_before_compression() {
+        let source = hdr10_source();
+        assert!(
+            !source.applies_xyz_transform(),
+            "postkit writes the X\"Y\"Z\" itself, so the compressor must not"
+        );
+        assert!(source.decode_lut().is_none());
+        assert!(
+            matches!(
+                source.frame_transform().unwrap().as_deref(),
+                Some(crate::colour::FrameColourTransform::ToHdrXyz(_))
+            ),
+            "an HDR master carries the addendum transform"
+        );
+        assert!(
+            SourceColour::HdrDcdm {
+                source: crate::colour::HdrSource::Hlg,
+                source_peak_nits: 0.0,
+            }
+            .frame_transform()
+            .is_err(),
+            "a peak below the volume floor has nothing to roll off from"
+        );
+    }
+
+    #[test]
+    fn an_hdr_master_decodes_through_its_own_matrix_and_range() {
+        let picture = decode_filters(&PictureFilters::Given(""), &SourceColour::DisplayRgb);
+        let packed_rgb = PipeFormat::PackedRgb(SampleOrder::Big);
+        let hdr = hdr10_source();
+        let chain = |source: &crate::probe::PixelFormatInfo| {
+            decode_filter_chain(&picture, packed_rgb, source, &hdr)
+        };
+
+        let studio = chain(&hdr10_pixel_format("yuv420p10le", "tv"));
+        assert!(
+            studio.starts_with(
+                "zscale=matrixin=2020_ncl:rangein=limited:matrix=gbr:range=full,format=gbrp16le"
+            ),
+            "{studio}"
+        );
+        assert!(
+            !studio.contains("tonemap")
+                && !studio.contains("transfer")
+                && !studio.contains("primaries"),
+            "the transform reads the transfer function itself, so ffmpeg must leave it: {studio}"
+        );
+        assert!(
+            chain(&hdr10_pixel_format("yuv422p10le", "pc")).contains("rangein=full"),
+            "a full range master is not read as studio range"
+        );
+        assert!(
+            chain(&source_pixel_format("yuv420p10le")).contains("matrixin=2020_ncl"),
+            "an untagged HDR10 master is BT.2020, not the BT.601 an untagged SDR one is"
+        );
+        assert!(
+            !chain(&hdr10_pixel_format("gbrp16le", "pc")).contains("zscale"),
+            "an RGB master has no matrix to undo"
+        );
+        assert!(
+            !decode_filter_chain(
+                &picture,
+                packed_rgb,
+                &hdr10_pixel_format("yuv420p10le", "tv"),
+                &SourceColour::DisplayRgb
+            )
+            .contains("zscale"),
+            "only an HDR master takes the explicit matrix"
+        );
+    }
+
+    #[test]
+    fn an_hdr_master_never_reaches_the_plugin_as_planar_yuv() {
+        let source = hdr10_pixel_format("yuv420p10le", "tv");
+        let hdr = hdr10_source();
+        assert_eq!(
+            choose_pipe_format(
+                &PipeFormatInputs {
+                    accelerator_active: true,
+                    quality_psnr: None,
+                    postkit_prepares_the_frame: false,
+                    source_colour: &hdr,
+                    filters: "fps=24",
+                    source: &source,
+                },
+                true
+            ),
+            PipeFormat::PackedRgb(SampleOrder::Big),
+            "postkit reads every sample of an HDR master, so the planes cannot go to the plugin"
+        );
+    }
+
     #[test]
     fn the_yuv_pipe_needs_every_condition_at_once() {
         let source = source_pixel_format("yuv420p");
@@ -2736,7 +2937,12 @@ mod tests {
             full_range: false,
         });
         assert_eq!(
-            decode_filter_chain(&picture, planar_yuv, "yuv420p"),
+            decode_filter_chain(
+                &picture,
+                planar_yuv,
+                &source_pixel_format("yuv420p"),
+                &SourceColour::DisplayRgb
+            ),
             untouched,
             "the plugin converts the planes itself"
         );
@@ -2744,13 +2950,19 @@ mod tests {
             decode_filter_chain(
                 &picture,
                 PipeFormat::PackedRgb(SampleOrder::Big),
-                "yuv420p10le"
+                &source_pixel_format("yuv420p10le"),
+                &SourceColour::DisplayRgb
             ),
             untouched,
             "a 10-bit source with no geometry already converts at full precision"
         );
         assert_eq!(
-            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "gbrp"),
+            decode_filter_chain(
+                &picture,
+                PipeFormat::PackedRgb(SampleOrder::Big),
+                &source_pixel_format("gbrp"),
+                &SourceColour::DisplayRgb
+            ),
             untouched,
             "an RGB source has no matrix to apply"
         );
@@ -2758,7 +2970,8 @@ mod tests {
             decode_filter_chain(
                 &decode_filters(&PictureFilters::Given(""), &SourceColour::DisplayRgb),
                 PipeFormat::PackedRgb(SampleOrder::Little),
-                "yuv420p"
+                &source_pixel_format("yuv420p"),
+                &SourceColour::DisplayRgb
             ),
             crate::picture_findings::with_detection_branch("format=gbrp16le"),
             "a decode with no picture filters of its own still converts"
@@ -2798,14 +3011,24 @@ mod tests {
             None,
         );
         assert_eq!(
-            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "yuv420p"),
+            decode_filter_chain(
+                &picture,
+                PipeFormat::PackedRgb(SampleOrder::Big),
+                &source_pixel_format("yuv420p"),
+                &SourceColour::DisplayRgb
+            ),
             format!(
                 "format=gbrp16le,fps=24,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
                  pad=w=2048:h=1080:x=0:y=112:color=black{detectors}"
             )
         );
         assert_eq!(
-            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "rgb24"),
+            decode_filter_chain(
+                &picture,
+                PipeFormat::PackedRgb(SampleOrder::Big),
+                &source_pixel_format("rgb24"),
+                &SourceColour::DisplayRgb
+            ),
             format!(
                 "fps=24,format=gbrp16le,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
                  pad=w=2048:h=1080:x=0:y=112:color=black{detectors}"
@@ -2824,7 +3047,12 @@ mod tests {
             Some(window),
         );
         assert_eq!(
-            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "yuv420p"),
+            decode_filter_chain(
+                &picture,
+                PipeFormat::PackedRgb(SampleOrder::Big),
+                &source_pixel_format("yuv420p"),
+                &SourceColour::DisplayRgb
+            ),
             format!(
                 "format=gbrp16le,yadif,fps=24,trim=start_frame=10:end_frame=15,\
                  setpts=PTS-STARTPTS,hqdn3d,crop=1920:804:0:138,\
@@ -2833,7 +3061,12 @@ mod tests {
             )
         );
         assert_eq!(
-            decode_filter_chain(&picture, PipeFormat::PackedRgb(SampleOrder::Big), "rgb24"),
+            decode_filter_chain(
+                &picture,
+                PipeFormat::PackedRgb(SampleOrder::Big),
+                &source_pixel_format("rgb24"),
+                &SourceColour::DisplayRgb
+            ),
             format!(
                 "yadif,fps=24,trim=start_frame=10:end_frame=15,setpts=PTS-STARTPTS,hqdn3d,\
                  format=gbrp16le,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
@@ -2846,7 +3079,12 @@ mod tests {
             matrix: YuvMatrix::Bt601,
             full_range: false,
         });
-        let on_the_planes = decode_filter_chain(&picture, planar_yuv, "yuv420p");
+        let on_the_planes = decode_filter_chain(
+            &picture,
+            planar_yuv,
+            &source_pixel_format("yuv420p"),
+            &SourceColour::DisplayRgb,
+        );
         assert!(
             !on_the_planes.contains("format="),
             "the geometry runs on the source's own planes: {on_the_planes}"
@@ -3032,7 +3270,12 @@ mod tests {
             ),
         ];
         for (name, picture_filters) in chains {
-            let filters = decode_filter_chain(&picture_filters, packed_rgb, &source.pix_fmt);
+            let filters = decode_filter_chain(
+                &picture_filters,
+                packed_rgb,
+                &source,
+                &SourceColour::DisplayRgb,
+            );
             assert!(
                 filters.starts_with("format=gbrp16le,"),
                 "{name}: the conversion has to run before everything else: {filters}"

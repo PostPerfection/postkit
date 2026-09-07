@@ -15,6 +15,24 @@
   being read into memory. `refuse_undecodable_dolby_vision` refuses profile 5 by
   name, since only the RPU can turn its IPT PQ c2 colour back into RGB.
 
+- **HDR sources encode to the DCI HDR Addendum**: `SourceColour::HdrDcdm` takes
+  an HDR10, HLG or PQ P3-D65 master, linearises it with its own transfer
+  function into absolute cd/m², rolls luminance above the DCI HDR colour volume
+  off to 299.6 cd/m² with the BT.2390 knee while keeping chromaticity, clips the
+  gamut to P3-D65 and writes the addendum's PQ X"Y"Z" code values, landing D65
+  white at 299.6 cd/m² on the (2524, 2546, 2583) the addendum publishes and
+  black at 0.005 cd/m² on its (60, 62, 65). `HdrSource::parse` reads `hdr10`,
+  `hlg`, `pq-p3d65` and the aliases `pq-bt2020` and `hlg-bt2020`, and
+  `HdrDcdmTransform::new` takes the grade's peak luminance, e.g. MaxCLL, which
+  the roll-off starts from. The transform arrives as
+  `FrameColourTransform::ToHdrXyz`, so the compressor's own X'Y'Z' transform
+  stays off and the frames reach it already converted. The yuv to rgb step of
+  the decode uses the source's BT.2020 matrix and range rather than the one
+  swscale infers, and touches neither the transfer function nor the primaries,
+  so ffmpeg never tone maps the grade away. A J2K sequence refuses the variant,
+  as does a subtitle burn: an HDR master reaches the burn as PQ samples, where
+  a display RGB bitmap would be the wrong colour.
+
 - **A dashboard page at `/`**: the dashboard answered every path with JSON, so
   the port served the data and nothing drew it. `/` now returns a self-contained
   HTML page, no external assets and no framework, that fetches `/api/summary`,

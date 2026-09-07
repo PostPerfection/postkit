@@ -584,6 +584,10 @@ fn reject_unsupported_colour_path(
             "J2K input is already compressed, so a {space:?} source cannot be converted to \
              Rec.709 RGB any more"
         )),
+        (InputType::J2kSequence, SourceColour::HdrDcdm { source, .. }) => Err(format!(
+            "J2K input is already compressed, so a {source:?} master cannot be converted to \
+             the DCI HDR Addendum's X\"Y\"Z\" any more"
+        )),
         _ => Ok(()),
     }
 }
@@ -610,6 +614,10 @@ fn reject_unsupported_burn(
              would be drawn in the wrong one"
                 .to_string(),
         ),
+        (_, SourceColour::HdrDcdm { source, .. }) => Err(format!(
+            "a {source:?} master reaches the burn as PQ-encoded HDR samples, so burnt-in text \
+             would be drawn in the wrong colour space"
+        )),
         _ => Ok(()),
     }
 }
@@ -708,11 +716,43 @@ mod tests {
                 "wrong colour space",
             ),
             (InputType::Video, SourceColour::AlreadyPq, "wrong one"),
+            (InputType::Video, hdr10_source(), "wrong colour space"),
         ] {
             let err = reject_unsupported_burn(input, &colour)
                 .expect_err("this combination has to refuse a burn");
             assert!(err.contains(expected), "got: {err}");
         }
+    }
+
+    fn hdr10_source() -> SourceColour {
+        SourceColour::HdrDcdm {
+            source: crate::colour::HdrSource::Hdr10,
+            source_peak_nits: crate::colour::HdrSource::DEFAULT_PEAK_NITS,
+        }
+    }
+
+    #[test]
+    fn compressed_input_refuses_an_hdr_master() {
+        assert!(
+            reject_unsupported_colour_path(InputType::Video, &hdr10_source(), THROUGH_FFMPEG)
+                .is_ok()
+        );
+        assert!(
+            reject_unsupported_colour_path(
+                InputType::ImageSequence,
+                &hdr10_source(),
+                READ_BY_POSTKIT
+            )
+            .is_ok(),
+            "postkit reads the stills and converts them itself"
+        );
+        let compressed = reject_unsupported_colour_path(
+            InputType::J2kSequence,
+            &hdr10_source(),
+            READ_BY_POSTKIT,
+        )
+        .unwrap_err();
+        assert!(compressed.contains("already compressed"), "{compressed}");
     }
 
     /// The branch an input takes, as `reject_unsupported_colour_path` sees it.

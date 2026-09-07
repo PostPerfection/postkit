@@ -218,6 +218,10 @@ const P3_PRIMARIES: [[f64; 2]; 3] = [[0.680, 0.320], [0.265, 0.690], [0.150, 0.0
 const D65_CHROMATICITY: [f64; 2] = [0.3127, 0.3290];
 
 fn rgb_to_xyz_matrix(primaries: [[f64; 2]; 3], white: [f64; 2]) -> [[f32; 3]; 3] {
+    rgb_to_xyz_matrix_f64(primaries, white).map(|row| row.map(|value| value as f32))
+}
+
+fn rgb_to_xyz_matrix_f64(primaries: [[f64; 2]; 3], white: [f64; 2]) -> [[f64; 3]; 3] {
     let tristimulus = |chromaticity: [f64; 2]| {
         let [x, y] = chromaticity;
         [x / y, 1.0, (1.0 - x - y) / y]
@@ -233,10 +237,10 @@ fn rgb_to_xyz_matrix(primaries: [[f64; 2]; 3], white: [f64; 2]) -> [[f32; 3]; 3]
     let to_primary_weights = inverse_matrix(&columns);
     let weights = to_primary_weights
         .map(|row| row[0] * white_xyz[0] + row[1] * white_xyz[1] + row[2] * white_xyz[2]);
-    let mut out = [[0.0f32; 3]; 3];
+    let mut out = [[0.0f64; 3]; 3];
     for (row, source) in out.iter_mut().zip(columns) {
         for ((slot, value), weight) in row.iter_mut().zip(source).zip(weights) {
-            *slot = (value * weight) as f32;
+            *slot = value * weight;
         }
     }
     out
@@ -390,22 +394,7 @@ impl DcdmTransform {
 
     /// Convert one rgb48le frame into `out`, three code values per pixel.
     pub fn frame_rgb48le(&self, rgb: &[u8], max_code: u16, out: &mut [u16]) {
-        for (px, xyz) in rgb
-            .as_chunks::<6>()
-            .0
-            .iter()
-            .zip(out.as_chunks_mut::<3>().0)
-        {
-            let codes = self.pixel(
-                [
-                    u16::from_le_bytes([px[0], px[1]]),
-                    u16::from_le_bytes([px[2], px[3]]),
-                    u16::from_le_bytes([px[4], px[5]]),
-                ],
-                max_code,
-            );
-            xyz.copy_from_slice(&codes);
-        }
+        map_rgb48le_into(rgb, out, |codes| self.pixel(codes, max_code));
     }
 
     /// Convert one packed rgb48 frame in place, to 16-bit code values in the
@@ -437,6 +426,21 @@ fn transformed_pixel(
         *slot = (value.clamp(0.0, 1.0).powf(inverse_gamma) * max).round() as u16;
     }
     out
+}
+
+fn map_rgb48le_into(rgb: &[u8], out: &mut [u16], pixel: impl Fn([u16; 3]) -> [u16; 3]) {
+    for (px, codes) in rgb
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .zip(out.as_chunks_mut::<3>().0)
+    {
+        codes.copy_from_slice(&pixel([
+            u16::from_le_bytes([px[0], px[1]]),
+            u16::from_le_bytes([px[2], px[3]]),
+            u16::from_le_bytes([px[4], px[5]]),
+        ]));
+    }
 }
 
 fn map_rgb48_inplace(buf: &mut [u8], order: SampleOrder, pixel: impl Fn([u16; 3]) -> [u16; 3]) {
@@ -549,10 +553,220 @@ fn inverse_matrix(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
     adjugate.map(|row| row.map(|value| value / determinant))
 }
 
+// ─── HDR source → DCI HDR Addendum X"Y"Z" ─────────────────────────────────
+
+const PQ_M1: f64 = 2610.0 / 16384.0;
+const PQ_M2: f64 = 2523.0 / 4096.0 * 128.0;
+const PQ_C2: f64 = 2413.0 / 4096.0 * 32.0;
+const PQ_C3: f64 = 2392.0 / 4096.0 * 32.0;
+const PQ_C1: f64 = PQ_C3 - PQ_C2 + 1.0;
+const PQ_PEAK_NITS: f64 = 10_000.0;
+
+// not the volume's 300 limit: 299.6 is what the addendum's reference codes decode to
+const DCI_HDR_REFERENCE_WHITE_NITS: f64 = 299.6;
+const DCI_HDR_MINIMUM_BLACK_NITS: f64 = 0.005;
+
+const HLG_A: f64 = 0.178_832_77;
+const HLG_B: f64 = 0.284_668_92;
+const HLG_C: f64 = 0.559_910_73;
+const HLG_OETF_BREAKPOINT: f64 = 0.5;
+const HLG_LINEAR_SCALE: f64 = 12.0;
+const HLG_TOE_DIVISOR: f64 = 3.0;
+const HLG_LUMINANCE_WEIGHTS: [f64; 3] = [0.2627, 0.6780, 0.0593];
+const HLG_NOMINAL_PEAK_NITS: f64 = 1000.0;
+const HLG_GAMMA_AT_NOMINAL_PEAK: f64 = 1.2;
+const HLG_GAMMA_PER_DECADE_OF_PEAK: f64 = 0.42;
+
+const BT2020_PRIMARIES: [[f64; 2]; 3] = [[0.708, 0.292], [0.170, 0.797], [0.131, 0.046]];
+
+const BT2390_KNEE_SLOPE: f64 = 1.5;
+const BT2390_KNEE_OFFSET: f64 = 0.5;
+
+pub(crate) fn pq_signal_from_nits(nits: f64) -> f64 {
+    let ratio = (nits / PQ_PEAK_NITS).max(0.0).powf(PQ_M1);
+    ((PQ_C1 + PQ_C2 * ratio) / (1.0 + PQ_C3 * ratio)).powf(PQ_M2)
+}
+
+pub(crate) fn nits_from_pq_signal(signal: f64) -> f64 {
+    let encoded = signal.max(0.0).powf(1.0 / PQ_M2);
+    ((encoded - PQ_C1).max(0.0) / (PQ_C2 - PQ_C3 * encoded)).powf(1.0 / PQ_M1) * PQ_PEAK_NITS
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HdrSource {
+    Hdr10,
+    Hlg,
+    PqP3D65,
+}
+
+impl HdrSource {
+    // also the nominal hlg peak bt.2100's system gamma of 1.2 belongs to
+    pub const DEFAULT_PEAK_NITS: f32 = 1000.0;
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_lowercase().as_str() {
+            "hdr10" | "pq-bt2020" => Some(Self::Hdr10),
+            "hlg" | "hlg-bt2020" => Some(Self::Hlg),
+            "pq-p3d65" => Some(Self::PqP3D65),
+            _ => None,
+        }
+    }
+
+    fn primaries(self) -> [[f64; 2]; 3] {
+        match self {
+            Self::Hdr10 | Self::Hlg => BT2020_PRIMARIES,
+            Self::PqP3D65 => P3_PRIMARIES,
+        }
+    }
+
+    // absolute cd/m² for pq, scene linear for hlg
+    fn to_source_linear(self, signal: f64) -> f64 {
+        match self {
+            Self::Hdr10 | Self::PqP3D65 => nits_from_pq_signal(signal),
+            Self::Hlg if signal <= HLG_OETF_BREAKPOINT => signal * signal / HLG_TOE_DIVISOR,
+            Self::Hlg => (((signal - HLG_C) / HLG_A).exp() + HLG_B) / HLG_LINEAR_SCALE,
+        }
+    }
+}
+
+pub struct HdrDcdmTransform {
+    source: HdrSource,
+    source_peak_nits: f64,
+    hlg_system_gamma: f64,
+    // 16-bit source code value to the source's own linear light
+    linear: Vec<f32>,
+    source_to_xyz: [[f64; 3]; 3],
+    xyz_to_p3d65: [[f64; 3]; 3],
+    p3d65_to_xyz: [[f64; 3]; 3],
+    black_signal: f64,
+    signal_range: f64,
+    maximum_luminance: f64,
+    knee_start: f64,
+    knee_nits: f64,
+}
+
+impl std::fmt::Debug for HdrDcdmTransform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HdrDcdmTransform")
+            .field("source", &self.source)
+            .field("source_peak_nits", &self.source_peak_nits)
+            .finish()
+    }
+}
+
+impl HdrDcdmTransform {
+    pub fn new(source: HdrSource, source_peak_nits: f32) -> Result<Self, String> {
+        let peak = f64::from(source_peak_nits);
+        if !peak.is_finite() || peak <= DCI_HDR_MINIMUM_BLACK_NITS {
+            return Err(format!(
+                "an HDR source peak of {source_peak_nits} cd/m² is not a luminance to roll off \
+                 from: it has to be above the DCI HDR colour volume's {DCI_HDR_MINIMUM_BLACK_NITS} \
+                 cd/m² floor"
+            ));
+        }
+        let black_signal = pq_signal_from_nits(DCI_HDR_MINIMUM_BLACK_NITS);
+        let signal_range = pq_signal_from_nits(peak) - black_signal;
+        let maximum_luminance =
+            (pq_signal_from_nits(DCI_HDR_REFERENCE_WHITE_NITS) - black_signal) / signal_range;
+        let knee_start = BT2390_KNEE_SLOPE * maximum_luminance - BT2390_KNEE_OFFSET;
+        let p3d65_to_xyz = rgb_to_xyz_matrix_f64(P3_PRIMARIES, D65_CHROMATICITY);
+        Ok(Self {
+            source,
+            source_peak_nits: peak,
+            hlg_system_gamma: HLG_GAMMA_AT_NOMINAL_PEAK
+                + HLG_GAMMA_PER_DECADE_OF_PEAK * (peak / HLG_NOMINAL_PEAK_NITS).log10(),
+            linear: (0..=u16::MAX)
+                .map(|code| source.to_source_linear(f64::from(code) / f64::from(u16::MAX)) as f32)
+                .collect(),
+            source_to_xyz: rgb_to_xyz_matrix_f64(source.primaries(), D65_CHROMATICITY),
+            xyz_to_p3d65: inverse_matrix(&p3d65_to_xyz),
+            p3d65_to_xyz,
+            black_signal,
+            signal_range,
+            maximum_luminance,
+            knee_start,
+            knee_nits: nits_from_pq_signal(
+                knee_start.clamp(0.0, 1.0) * signal_range + black_signal,
+            ),
+        })
+    }
+
+    // display light in cd/m², before anything is fitted into the volume
+    pub(crate) fn display_linear(&self, rgb: [u16; 3]) -> [f64; 3] {
+        let scene = rgb.map(|code| f64::from(self.linear[code as usize]));
+        if self.source != HdrSource::Hlg {
+            return scene;
+        }
+        let luminance: f64 = HLG_LUMINANCE_WEIGHTS
+            .iter()
+            .zip(scene)
+            .map(|(weight, value)| weight * value)
+            .sum();
+        if luminance <= 0.0 {
+            return [0.0; 3];
+        }
+        let gain = self.source_peak_nits * luminance.powf(self.hlg_system_gamma - 1.0);
+        scene.map(|value| gain * value)
+    }
+
+    fn rolled_off_luminance(&self, nits: f64) -> f64 {
+        let normalised =
+            ((pq_signal_from_nits(nits) - self.black_signal) / self.signal_range).clamp(0.0, 1.0);
+        let rolled = if self.knee_start >= 1.0 || normalised < self.knee_start {
+            normalised
+        } else {
+            let along_the_knee = (normalised - self.knee_start) / (1.0 - self.knee_start);
+            let squared = along_the_knee * along_the_knee;
+            let cubed = squared * along_the_knee;
+            (2.0 * cubed - 3.0 * squared + 1.0) * self.knee_start
+                + (cubed - 2.0 * squared + along_the_knee) * (1.0 - self.knee_start)
+                + (-2.0 * cubed + 3.0 * squared) * self.maximum_luminance
+        };
+        nits_from_pq_signal(rolled * self.signal_range + self.black_signal)
+    }
+
+    fn fitted_into_the_volume(&self, xyz: [f64; 3]) -> [f64; 3] {
+        let luminance = xyz[1];
+        let rolled = if luminance >= DCI_HDR_MINIMUM_BLACK_NITS && luminance <= self.knee_nits {
+            xyz
+        } else {
+            let mapped = self.rolled_off_luminance(luminance);
+            if luminance > 0.0 {
+                xyz.map(|value| value * mapped / luminance)
+            } else {
+                multiply_matrix(&self.p3d65_to_xyz, [mapped; 3])
+            }
+        };
+        let clipped = multiply_matrix(&self.xyz_to_p3d65, rolled)
+            .map(|channel| channel.clamp(0.0, DCI_HDR_REFERENCE_WHITE_NITS));
+        multiply_matrix(&self.p3d65_to_xyz, clipped)
+    }
+
+    pub fn pixel(&self, rgb: [u16; 3], max_code: u16) -> [u16; 3] {
+        let xyz = multiply_matrix(&self.source_to_xyz, self.display_linear(rgb));
+        let max = f64::from(max_code);
+        self.fitted_into_the_volume(xyz)
+            .map(|value| (0.5 + max * pq_signal_from_nits(value)).floor() as u16)
+    }
+
+    pub fn frame_rgb48le(&self, rgb: &[u8], max_code: u16, out: &mut [u16]) {
+        map_rgb48le_into(rgb, out, |codes| self.pixel(codes, max_code));
+    }
+
+    pub fn frame_rgb48_inplace(&self, buf: &mut [u8], order: SampleOrder) {
+        map_rgb48_inplace(buf, order, |rgb| self.pixel(rgb, u16::MAX));
+    }
+}
+
+fn multiply_matrix(matrix: &[[f64; 3]; 3], vector: [f64; 3]) -> [f64; 3] {
+    matrix.map(|row| row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2])
+}
+
 #[derive(Debug)]
 pub enum FrameColourTransform {
     ToXyz(DcdmTransform),
     ToRec709(Rec709Transform),
+    ToHdrXyz(Box<HdrDcdmTransform>),
 }
 
 impl FrameColourTransform {
@@ -560,6 +774,7 @@ impl FrameColourTransform {
         match self {
             Self::ToXyz(transform) => transform.pixel(rgb, max_code),
             Self::ToRec709(transform) => transform.pixel(rgb, max_code),
+            Self::ToHdrXyz(transform) => transform.pixel(rgb, max_code),
         }
     }
 
@@ -567,6 +782,7 @@ impl FrameColourTransform {
         match self {
             Self::ToXyz(transform) => transform.frame_rgb48_inplace(buf, order),
             Self::ToRec709(transform) => transform.frame_rgb48_inplace(buf, order),
+            Self::ToHdrXyz(transform) => transform.frame_rgb48_inplace(buf, order),
         }
     }
 }
@@ -1444,5 +1660,135 @@ mod tests_rec709 {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_hdr_dcdm {
+    use super::*;
+
+    const ADDENDUM_REFERENCE_WHITE_CODES: [u16; 3] = [2524, 2546, 2583];
+    const ADDENDUM_MINIMUM_BLACK_CODES: [u16; 3] = [60, 62, 65];
+    const TWELVE_BIT_MAX_CODE: u16 = 4095;
+
+    fn pq_code(nits: f64) -> u16 {
+        (0.5 + f64::from(u16::MAX) * pq_signal_from_nits(nits)).floor() as u16
+    }
+
+    // no volume fitting, which is what the addendum publishes its reference values from
+    fn direct_encode(nits: f64) -> [u16; 3] {
+        let [x, y] = D65_CHROMATICITY;
+        [nits * x / y, nits, nits * (1.0 - x - y) / y].map(|value| {
+            (0.5 + f64::from(TWELVE_BIT_MAX_CODE) * pq_signal_from_nits(value)).floor() as u16
+        })
+    }
+
+    #[test]
+    fn hdr_dcdm_white_at_the_addendum_reference_is_2524_2546_2583() {
+        let code = pq_code(DCI_HDR_REFERENCE_WHITE_NITS);
+        for source in [HdrSource::PqP3D65, HdrSource::Hdr10] {
+            let transform =
+                HdrDcdmTransform::new(source, DCI_HDR_REFERENCE_WHITE_NITS as f32).unwrap();
+            assert_eq!(
+                transform.pixel([code; 3], TWELVE_BIT_MAX_CODE),
+                ADDENDUM_REFERENCE_WHITE_CODES,
+                "{source:?} white at {DCI_HDR_REFERENCE_WHITE_NITS} cd/m²"
+            );
+        }
+    }
+
+    #[test]
+    fn hdr_dcdm_black_at_the_addendum_floor_is_60_62_65() {
+        let code = pq_code(DCI_HDR_MINIMUM_BLACK_NITS);
+        for source in [HdrSource::PqP3D65, HdrSource::Hdr10] {
+            let transform =
+                HdrDcdmTransform::new(source, DCI_HDR_REFERENCE_WHITE_NITS as f32).unwrap();
+            assert_eq!(
+                transform.pixel([code; 3], TWELVE_BIT_MAX_CODE),
+                ADDENDUM_MINIMUM_BLACK_CODES,
+                "{source:?} white at {DCI_HDR_MINIMUM_BLACK_NITS} cd/m²"
+            );
+        }
+    }
+
+    #[test]
+    fn hdr10_white_above_the_volume_rolls_off_to_the_peak() {
+        let peak = f64::from(HdrSource::DEFAULT_PEAK_NITS);
+        let transform =
+            HdrDcdmTransform::new(HdrSource::Hdr10, HdrSource::DEFAULT_PEAK_NITS).unwrap();
+        assert_eq!(
+            transform.pixel([pq_code(peak); 3], TWELVE_BIT_MAX_CODE),
+            ADDENDUM_REFERENCE_WHITE_CODES,
+            "a {peak} cd/m² grade's own peak lands on the volume's reference white"
+        );
+    }
+
+    #[test]
+    fn content_under_the_knee_is_unchanged() {
+        const GRADED_NITS: f64 = 100.0;
+        let transform =
+            HdrDcdmTransform::new(HdrSource::Hdr10, HdrSource::DEFAULT_PEAK_NITS).unwrap();
+        assert_eq!(
+            transform.pixel([pq_code(GRADED_NITS); 3], TWELVE_BIT_MAX_CODE),
+            direct_encode(GRADED_NITS),
+            "{GRADED_NITS} cd/m² is inside the volume, so the roll-off must not move it"
+        );
+    }
+
+    #[test]
+    fn a_bt2020_green_outside_p3_is_clipped_into_the_volume() {
+        const GREEN_NITS: f64 = 100.0;
+        let transform =
+            HdrDcdmTransform::new(HdrSource::Hdr10, HdrSource::DEFAULT_PEAK_NITS).unwrap();
+        let bt2020_to_xyz = rgb_to_xyz_matrix_f64(BT2020_PRIMARIES, D65_CHROMATICITY);
+        let green = pq_code(GREEN_NITS / bt2020_to_xyz[1][1]);
+        let codes = transform.pixel([0, green, 0], TWELVE_BIT_MAX_CODE);
+
+        let xyz =
+            codes.map(|code| nits_from_pq_signal(f64::from(code) / f64::from(TWELVE_BIT_MAX_CODE)));
+        let p3d65_to_xyz = rgb_to_xyz_matrix_f64(P3_PRIMARIES, D65_CHROMATICITY);
+        let p3 = multiply_matrix(&inverse_matrix(&p3d65_to_xyz), xyz);
+        for (channel, value) in p3.iter().enumerate() {
+            assert!(
+                *value >= -0.5 && *value <= DCI_HDR_REFERENCE_WHITE_NITS + 0.5,
+                "channel {channel} of {p3:?} left the DCI HDR colour volume"
+            );
+        }
+    }
+
+    #[test]
+    fn hlg_reference_white_lands_near_203_nits() {
+        const HLG_REFERENCE_WHITE_SIGNAL: f64 = 0.75;
+        const BT2408_REFERENCE_WHITE_NITS: f64 = 203.0;
+        let transform =
+            HdrDcdmTransform::new(HdrSource::Hlg, HdrSource::DEFAULT_PEAK_NITS).unwrap();
+        let code = (f64::from(u16::MAX) * HLG_REFERENCE_WHITE_SIGNAL).round() as u16;
+        let display = transform.display_linear([code; 3]);
+        for value in display {
+            assert!(
+                (value - BT2408_REFERENCE_WHITE_NITS).abs() < 1.0,
+                "the 75% HLG signal decoded to {value} cd/m², not about \
+                 {BT2408_REFERENCE_WHITE_NITS}"
+            );
+        }
+    }
+
+    #[test]
+    fn hdr_source_parses_its_names_and_refuses_others() {
+        assert_eq!(HdrSource::parse("hdr10"), Some(HdrSource::Hdr10));
+        assert_eq!(HdrSource::parse("PQ-BT2020"), Some(HdrSource::Hdr10));
+        assert_eq!(HdrSource::parse("hlg"), Some(HdrSource::Hlg));
+        assert_eq!(HdrSource::parse(" hlg-bt2020 "), Some(HdrSource::Hlg));
+        assert_eq!(HdrSource::parse("pq-p3d65"), Some(HdrSource::PqP3D65));
+        for name in ["", "hdr", "pq", "rec709", "dolbyvision", "hlg2020"] {
+            assert_eq!(HdrSource::parse(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_source_peak_below_the_volume_floor_is_refused() {
+        let err = HdrDcdmTransform::new(HdrSource::Hdr10, 0.0).unwrap_err();
+        assert!(err.contains("cd/m²"), "{err}");
+        assert!(HdrDcdmTransform::new(HdrSource::Hdr10, f32::NAN).is_err());
     }
 }
