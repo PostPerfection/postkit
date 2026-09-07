@@ -1045,6 +1045,11 @@ pub struct StreamEncodeOptions {
     /// subtitle file and rebuilds it.
     #[serde(skip)]
     pub subtitle_burn: Option<std::sync::Arc<crate::subtitle_raster::SubtitleBurn>>,
+    /// A visible mark burnt over the subtitles on every frame. Not serialised
+    /// for the same reason the subtitle burn is not: a stored job names the
+    /// text and rebuilds it.
+    #[serde(skip)]
+    pub watermark: Option<std::sync::Arc<crate::subtitle_raster::SubtitleBurn>>,
     /// Per-codestream byte cap, e.g. the DCI HDR Addendum's raised cap. Each
     /// codestream is checked as it is written and the first one over the cap
     /// fails the encode there, so a bitrate set too high costs one frame rather
@@ -1078,6 +1083,7 @@ impl Default for StreamEncodeOptions {
             decode_source: DecodeSource::Video,
             picture: crate::picture_processing::PictureProcessing::default(),
             subtitle_burn: None,
+            watermark: None,
             codestream_byte_cap: None,
         }
     }
@@ -1305,7 +1311,7 @@ where
             source: &source,
             accelerator_active,
             quality_psnr: opts.quality_psnr,
-            postkit_prepares_the_frame: opts.subtitle_burn.is_some(),
+            postkit_prepares_the_frame: opts.subtitle_burn.is_some() || opts.watermark.is_some(),
         },
         width,
         height,
@@ -1485,6 +1491,7 @@ fn compress_params(
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         source_preparation: crate::grok_encoder::SourcePreparation {
             subtitle_burn: opts.subtitle_burn.clone(),
+            watermark: opts.watermark.clone(),
             colour_transform,
         },
         ..crate::grok_encoder::CompressParams::default()

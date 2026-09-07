@@ -4,6 +4,17 @@
 
 ### Added
 
+- **`SourcePreparation.watermark` and `StreamEncodeOptions.watermark`**: a
+  second burn the encoder threads composite after the subtitles and before any
+  colour conversion, for a visible mark held over a whole picture. It is the one
+  preparation step that also reads a planar frame: an existing codestream
+  decodes to planar components at its own precision, so `burn_planar` packs them
+  into the rgb48 layout the burns read and shifts the result back, leaving a
+  pixel nothing drew on exactly where it was. A planar frame with a source
+  colour transform set is still refused, since that transform reads the packed
+  frame. `StillHold.watermark` marks a held still the same way, and covering the
+  whole hold it never breaks the repeat a cue change does.
+
 - **`grok_player::GrokPlayer`** (feature `grok-ffi`): a second playback backend
   that plays JPEG 2000 sources through grok instead of handing them to libmpv,
   so a frame stepped in the preview and the same frame played back are the same

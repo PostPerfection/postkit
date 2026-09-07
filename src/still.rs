@@ -95,6 +95,9 @@ pub struct StillHold<'a> {
     pub colour_transform: Option<Arc<crate::colour::FrameColourTransform>>,
     /// Subtitles burnt into the held frames.
     pub burn: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
+    /// A visible mark burnt over the subtitles. It covers the whole hold, so it
+    /// never breaks the repeat the way a cue change does.
+    pub watermark: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
     pub out_dir: &'a Path,
 }
 
@@ -121,6 +124,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         rsiz,
         colour_transform,
         burn,
+        watermark,
         out_dir,
     } = hold;
     let (frames, fps, width, height) = (*frames, *fps, *width, *height);
@@ -142,6 +146,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         profile: *rsiz,
         source_preparation: SourcePreparation {
             subtitle_burn: burn.clone(),
+            watermark: watermark.clone(),
             colour_transform: colour_transform.clone(),
         },
         ..CompressParams::default()
@@ -271,6 +276,7 @@ mod tests {
             rsiz: crate::encode::default_rsiz(),
             colour_transform: None,
             burn: None,
+            watermark: None,
             out_dir: &dir.path().join("held"),
         })
         .unwrap_err();

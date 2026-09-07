@@ -234,6 +234,7 @@ fn a_held_still_is_encoded_under_the_imf_rsiz() {
         rsiz,
         colour_transform: None,
         burn: None,
+        watermark: None,
         out_dir: &held,
     };
     build_still_frames(&hold(false)).expect("IMF still encode");

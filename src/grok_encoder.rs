@@ -143,34 +143,48 @@ pub struct CompressParams {
     pub threads_per_codec: u32,
 }
 
+/// Bits a sample carries in the packed rgb48 layout the burns read.
+const BURN_SAMPLE_BITS: u8 = 16;
+
 /// The work each decoded frame gets on the encoder threads before it reaches
 /// the compressor.
 ///
-/// Both steps go through [`SourcePreparation::apply`], which fixes their order:
-/// subtitles are authored in display RGB, so the burn lands before any colour
-/// conversion, this struct's own or the compressor's later one. There is no
-/// knob for the other order.
+/// Every step goes through [`SourcePreparation::apply`], which fixes their
+/// order: subtitles are authored in display RGB, so the burns land before any
+/// colour conversion, this struct's own or the compressor's later one, and the
+/// watermark lands over the subtitles. There is no knob for another order.
 #[derive(Debug, Clone, Default)]
 pub struct SourcePreparation {
-    /// Subtitles composited into the picture, in display RGB. Needs a packed
-    /// 16-bit frame. The caller keeps it off for a source that is already
-    /// X'Y'Z', where display-RGB text would land in the wrong space.
+    /// Subtitles composited into the picture, in display RGB. The caller keeps
+    /// it off for a source that is already X'Y'Z', where display-RGB text would
+    /// land in the wrong space.
     pub subtitle_burn: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
+    /// A visible mark composited over the subtitles, held for the whole
+    /// picture. Drawn in the code values the frame carries, so a caller marking
+    /// X'Y'Z' essence gets the mark colour in X'Y'Z'.
+    pub watermark: Option<Arc<crate::subtitle_raster::SubtitleBurn>>,
     /// Colour transform postkit runs over each frame, for a source space the
     /// compressor's own transform does not model (P3, Rec.2020), or for a
     /// source that has to reach Rec.709 RGB rather than X'Y'Z'. Setting it
     /// together with `apply_xyz_transform` converts the frame twice and is
-    /// refused.
+    /// refused. Needs a packed 16-bit frame.
     pub colour_transform: Option<Arc<crate::colour::FrameColourTransform>>,
 }
 
 impl SourcePreparation {
     pub fn is_empty(&self) -> bool {
-        self.subtitle_burn.is_none() && self.colour_transform.is_none()
+        self.subtitle_burn.is_none() && self.watermark.is_none() && self.colour_transform.is_none()
     }
 
-    /// Burn subtitles in, then convert the colour. Both steps need a packed
-    /// 16-bit rgb48 frame, in either byte order.
+    /// The burns in the order they are composited: subtitles first, the
+    /// watermark over them.
+    fn burns(&self) -> impl Iterator<Item = &Arc<crate::subtitle_raster::SubtitleBurn>> {
+        self.subtitle_burn.iter().chain(self.watermark.iter())
+    }
+
+    /// Burn the subtitles in, then the watermark, then convert the colour. A
+    /// packed 16-bit rgb48 frame takes all three, in either byte order; planar
+    /// components take the burns alone.
     fn apply(&self, frame: &mut RawFrame, compressor_transform: bool) -> Result<(), String> {
         if self.is_empty() {
             return Ok(());
@@ -183,29 +197,97 @@ impl SourcePreparation {
             );
         }
         let index = frame.index();
-        let (data, order, width, height) = match frame {
+        match frame {
             RawFrame::Packed {
                 data,
                 order,
                 width,
                 height,
-                precision: 16,
+                precision: BURN_SAMPLE_BITS,
                 ..
-            } => (data, *order, *width, *height),
-            _ => {
-                return Err(
-                    "a subtitle burn or a source colour transform needs a packed 16-bit \
-                     RGB frame"
-                        .to_string(),
-                );
+            } => {
+                for burn in self.burns() {
+                    burn.burn_rgb48(data, *width, *height, *order, index)
+                        .map_err(|e| e.to_string())?;
+                }
+                if let Some(transform) = &self.colour_transform {
+                    transform.frame_rgb48_inplace(data, *order);
+                }
+                Ok(())
             }
-        };
-        if let Some(burn) = &self.subtitle_burn {
-            burn.burn_rgb48(data, width, height, order, index)
+            RawFrame::Planar {
+                components,
+                width,
+                height,
+                precision,
+                ..
+            } => {
+                if self.colour_transform.is_some() {
+                    return Err(
+                        "a source colour transform reads a packed 16-bit RGB frame, and this \
+                         one is planar"
+                            .to_string(),
+                    );
+                }
+                self.burn_planar(components, *width, *height, *precision, index)
+            }
+            _ => Err(
+                "a subtitle burn, a watermark or a source colour transform needs a packed \
+                 16-bit RGB frame or planar components"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Burn onto planar components by packing them into the rgb48 layout the
+    /// burns read, each sample in the high bits of its 16-bit word the way
+    /// [`crate::grok_decoder::DecodedFrame::to_xyz12le`] writes one, then
+    /// shifting the result back. Shifting is exact both ways, so a pixel the
+    /// burns leave alone comes back unchanged.
+    fn burn_planar(
+        &self,
+        components: &mut [Vec<i32>; 3],
+        width: u32,
+        height: u32,
+        precision: u8,
+        index: u64,
+    ) -> Result<(), String> {
+        if precision == 0 || precision > BURN_SAMPLE_BITS {
+            return Err(format!(
+                "a burn packs samples into {BURN_SAMPLE_BITS}-bit words, so it cannot take \
+                 {precision}-bit ones"
+            ));
+        }
+        let samples = (width as usize) * (height as usize);
+        for (at, component) in components.iter().enumerate() {
+            if component.len() != samples {
+                return Err(format!(
+                    "component {at} holds {} samples, not the {samples} a {width}x{height} \
+                     frame is",
+                    component.len()
+                ));
+            }
+        }
+        let shift = u32::from(BURN_SAMPLE_BITS - precision);
+        let highest = (1i32 << u32::from(precision)) - 1;
+        let mut packed = vec![0u8; samples * 6];
+        for sample in 0..samples {
+            for (at, component) in components.iter().enumerate() {
+                let value = (component[sample].clamp(0, highest) as u16) << shift;
+                let byte = sample * 6 + at * 2;
+                packed[byte..byte + 2].copy_from_slice(&value.to_be_bytes());
+            }
+        }
+        for burn in self.burns() {
+            burn.burn_rgb48(&mut packed, width, height, SampleOrder::Big, index)
                 .map_err(|e| e.to_string())?;
         }
-        if let Some(transform) = &self.colour_transform {
-            transform.frame_rgb48_inplace(data, order);
+        for sample in 0..samples {
+            for (at, component) in components.iter_mut().enumerate() {
+                let byte = sample * 6 + at * 2;
+                let value = u16::from_be_bytes([packed[byte], packed[byte + 1]]);
+                component[sample] = i32::from(value >> shift);
+            }
         }
         Ok(())
     }
@@ -2397,8 +2479,8 @@ mod tests {
             .expect("P3 transform");
         let transform = Arc::new(crate::colour::FrameColourTransform::ToXyz(transform));
         let prep = SourcePreparation {
-            subtitle_burn: None,
             colour_transform: Some(Arc::clone(&transform)),
+            ..SourcePreparation::default()
         };
         let mut packed = one_red_packed_frame();
         prep.apply(&mut packed, false).unwrap();
@@ -2441,7 +2523,7 @@ mod tests {
         // burn result is known without a font.
         let dir = tempfile::tempdir().unwrap();
         let png = dir.path().join("cue.png");
-        write_red_png(&png);
+        write_solid_png(&png, [255, 0, 0, 255]);
         let mut cue = StyledCue::text(0, 1000, vec![StyledRun::plain("")]);
         cue.runs.clear();
         cue.image = Some(png);
@@ -2455,6 +2537,7 @@ mod tests {
         let prep = SourcePreparation {
             subtitle_burn: Some(Arc::new(burn)),
             colour_transform: Some(Arc::clone(&transform)),
+            ..SourcePreparation::default()
         };
         let mut frame = RawFrame::Packed {
             data: vec![0u8; 6],
@@ -2484,7 +2567,7 @@ mod tests {
         // text is composited in display RGB and grok converts it with the rest.
         let burn_only = SourcePreparation {
             subtitle_burn: prep.subtitle_burn.clone(),
-            colour_transform: None,
+            ..SourcePreparation::default()
         };
         let mut frame = RawFrame::Packed {
             data: vec![0u8; 6],
@@ -2501,7 +2584,7 @@ mod tests {
         assert_eq!(u16::from_be_bytes([data[0], data[1]]), 65535);
     }
 
-    fn write_red_png(path: &Path) {
+    fn write_solid_png(path: &Path, colour: [u8; 4]) {
         let file = std::fs::File::create(path).unwrap();
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), 1, 1);
         encoder.set_color(png::ColorType::Rgba);
@@ -2509,8 +2592,189 @@ mod tests {
         encoder
             .write_header()
             .unwrap()
-            .write_image_data(&[255, 0, 0, 255])
+            .write_image_data(&colour)
             .unwrap();
+    }
+
+    /// A cue drawn from a one-pixel PNG stretched over the whole frame, so the
+    /// burnt result is a known colour without a font.
+    fn full_frame_bitmap_cue(path: &Path, colour: [u8; 4]) -> crate::subtitle_formats::StyledCue {
+        use crate::subtitle_formats::{StyledCue, VAlign};
+
+        write_solid_png(path, colour);
+        let mut cue = StyledCue::text(0, 1000, Vec::new());
+        cue.image = Some(path.to_path_buf());
+        cue.valign = Some(VAlign::Top);
+        cue.vposition = Some(0.0);
+        cue
+    }
+
+    fn one_pixel_black_frame() -> RawFrame {
+        RawFrame::Packed {
+            data: vec![0u8; 6],
+            order: SampleOrder::Big,
+            width: 1,
+            height: 1,
+            precision: 16,
+            index: 0,
+        }
+    }
+
+    fn packed_pixel(frame: &RawFrame) -> [u16; 3] {
+        let RawFrame::Packed { data, .. } = frame else {
+            panic!("frame changed shape");
+        };
+        [
+            u16::from_be_bytes([data[0], data[1]]),
+            u16::from_be_bytes([data[2], data[3]]),
+            u16::from_be_bytes([data[4], data[5]]),
+        ]
+    }
+
+    /// The mark goes on last, so where the two overlap the mark is what shows.
+    #[test]
+    fn a_watermark_lands_over_the_subtitles() {
+        use crate::subtitle_raster::{BurnStyle, SubtitleBurn};
+
+        let dir = tempfile::tempdir().unwrap();
+        let full_frame_burn = |name: &str, colour: [u8; 4]| {
+            let cue = full_frame_bitmap_cue(&dir.path().join(name), colour);
+            Arc::new(SubtitleBurn::new(vec![cue], None, BurnStyle::default(), 24.0).unwrap())
+        };
+        let red = full_frame_burn("subtitle.png", [255, 0, 0, 255]);
+        let green = full_frame_burn("watermark.png", [0, 255, 0, 255]);
+
+        let prep = SourcePreparation {
+            subtitle_burn: Some(Arc::clone(&red)),
+            watermark: Some(Arc::clone(&green)),
+            ..SourcePreparation::default()
+        };
+        let mut frame = one_pixel_black_frame();
+        prep.apply(&mut frame, false).unwrap();
+        assert_eq!(
+            packed_pixel(&frame),
+            [0, 65535, 0],
+            "the watermark has to be composited after the subtitles"
+        );
+
+        // the same two the other way round, so the assertion above is about the
+        // fields and not about which burn happens to be opaque
+        let reversed = SourcePreparation {
+            subtitle_burn: Some(green),
+            watermark: Some(red),
+            ..SourcePreparation::default()
+        };
+        let mut frame = one_pixel_black_frame();
+        reversed.apply(&mut frame, false).unwrap();
+        assert_eq!(packed_pixel(&frame), [65535, 0, 0]);
+    }
+
+    /// Frame the band assertions are made on: wide enough for a few glyphs,
+    /// short enough to stay cheap.
+    const MARK_FRAME_WIDTH: u32 = 320;
+    const MARK_FRAME_HEIGHT: u32 = 128;
+    /// Text height and distance from the bottom edge the mark is drawn at, as
+    /// fractions of the frame height, so the band below holds all of it.
+    const MARK_FONT_SIZE_RATIO: f32 = 0.1;
+    const MARK_MARGIN_RATIO: f32 = 0.05;
+
+    /// The first row the mark can reach: the text box is one line height tall
+    /// and sits `MARK_MARGIN_RATIO` above the bottom edge.
+    fn first_marked_row() -> usize {
+        let line = MARK_FONT_SIZE_RATIO * crate::subtitle_raster::DEFAULT_LINE_HEIGHT_RATIO;
+        ((1.0 - MARK_MARGIN_RATIO - line) * MARK_FRAME_HEIGHT as f32).floor() as usize
+    }
+
+    /// Rows in a planar component that differ between two frames.
+    fn changed_rows(before: &[i32], after: &[i32]) -> Vec<usize> {
+        (0..MARK_FRAME_HEIGHT as usize)
+            .filter(|row| {
+                let start = row * MARK_FRAME_WIDTH as usize;
+                let end = start + MARK_FRAME_WIDTH as usize;
+                before[start..end] != after[start..end]
+            })
+            .collect()
+    }
+
+    /// A planar 12-bit frame is what an existing DCP's picture decodes to, and
+    /// the mark has to reach it without touching the picture around it.
+    #[test]
+    fn a_watermark_draws_in_its_band_of_a_planar_frame_and_nowhere_else() {
+        use crate::subtitle_formats::{StyledCue, StyledRun, VAlign};
+        use crate::subtitle_raster::{BurnEffect, BurnStyle, SubtitleBurn};
+
+        const PRECISION: u8 = 12;
+        /// A mid-grey picture, so the mark can be brighter and the shift back
+        /// down has something to round.
+        const PICTURE_VALUE: i32 = 2048;
+
+        let mut cue = StyledCue::text(
+            0,
+            u64::MAX,
+            vec![StyledRun::plain("PROPERTY OF THE STUDIO")],
+        );
+        cue.valign = Some(VAlign::Bottom);
+        let style = BurnStyle {
+            font_size_ratio: MARK_FONT_SIZE_RATIO,
+            margin_ratio: MARK_MARGIN_RATIO,
+            effect: BurnEffect::None,
+            ..BurnStyle::default()
+        };
+        let mark = SubtitleBurn::new(vec![cue], None, style, 24.0).expect("a system font");
+        let prep = SourcePreparation {
+            watermark: Some(Arc::new(mark)),
+            ..SourcePreparation::default()
+        };
+
+        let samples = (MARK_FRAME_WIDTH as usize) * (MARK_FRAME_HEIGHT as usize);
+        let source = vec![PICTURE_VALUE; samples];
+        let mut frame = RawFrame::Planar {
+            components: [source.clone(), source.clone(), source.clone()],
+            width: MARK_FRAME_WIDTH,
+            height: MARK_FRAME_HEIGHT,
+            precision: PRECISION,
+            index: 0,
+        };
+        prep.apply(&mut frame, true).unwrap();
+        let RawFrame::Planar { components, .. } = &frame else {
+            panic!("frame changed shape");
+        };
+
+        // a packed frame is rgb48 by convention, so one calling itself 12-bit is
+        // refused rather than burnt at the wrong depth
+        let mut packed_12_bit = RawFrame::Packed {
+            data: vec![0u8; 6],
+            order: SampleOrder::Big,
+            width: 1,
+            height: 1,
+            precision: PRECISION,
+            index: 0,
+        };
+        let refused = prep.apply(&mut packed_12_bit, true).unwrap_err();
+        assert!(refused.contains("packed 16-bit"), "got: {refused}");
+
+        for component in components {
+            let rows = changed_rows(&source, component);
+            assert!(
+                !rows.is_empty(),
+                "the mark drew nothing: no row of the frame changed"
+            );
+            assert!(
+                rows.iter().all(|row| *row >= first_marked_row()),
+                "the mark drew on rows {rows:?}, above the band starting at {}",
+                first_marked_row()
+            );
+            let brightest = component.iter().max().copied().unwrap_or(0);
+            assert!(
+                brightest > PICTURE_VALUE,
+                "white text on mid-grey has to raise a sample above {PICTURE_VALUE}, got                  {brightest}"
+            );
+            let highest = (1i32 << PRECISION) - 1;
+            assert!(
+                brightest <= highest,
+                "a {PRECISION}-bit sample cannot exceed {highest}, got {brightest}"
+            );
+        }
     }
 
     #[test]
