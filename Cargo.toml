@@ -13,9 +13,10 @@ base64 = "0.22"
 chrono = "0.4"
 cosmic-text = { version = "0.17", default-features = false, features = ["std", "swash"] }
 dirs = "6"
-dolby_vision = { version = "3.3.2", features = ["xml"] }
+dolby_vision = { version = "3.4", features = ["xml"] }
 ebur128 = "0.1.10"
 grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", tag = "v20.4.3", optional = true }
+hevc_parser = "0.6"
 hex = "0.4"
 hound = "3.5.1"
 lcms2 = { version = "6", optional = true }

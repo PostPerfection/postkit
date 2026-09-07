@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Dolby Vision metadata is read in process**: `dolby_vision::read_dolby_vision`
+  demuxes the HEVC stream through ffmpeg, parses every RPU with the
+  `dolby_vision` and `hevc_parser` crates (MIT, from dovi_tool), and reports the
+  profile, frame and shot counts, the Level 6 mastering display and content light
+  levels, and the source peak an encoder should roll off from: MaxCLL when the
+  RPU carries one, otherwise the highest Level 1 `max_pq` over the stream through
+  the ST 2084 EOTF. A file that is not HEVC and a stream with no RPU both return
+  `None` rather than an error, and a stream over 512 MiB is refused instead of
+  being read into memory. `refuse_undecodable_dolby_vision` refuses profile 5 by
+  name, since only the RPU can turn its IPT PQ c2 colour back into RGB.
+
 - **A dashboard page at `/`**: the dashboard answered every path with JSON, so
   the port served the data and nothing drew it. `/` now returns a self-contained
   HTML page, no external assets and no framework, that fetches `/api/summary`,

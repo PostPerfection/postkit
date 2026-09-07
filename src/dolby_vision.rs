@@ -1,3 +1,8 @@
+use dolby_vision::rpu::dovi_rpu::DoviRpu;
+use dolby_vision::rpu::extension_metadata::blocks::{ExtMetadataBlock, ExtMetadataBlockLevel6};
+use dolby_vision::rpu::vdr_dm_data::VdrDmData;
+use hevc_parser::HevcParser;
+use hevc_parser::hevc::NAL_UNSPEC62;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -494,6 +499,245 @@ pub fn inject_rpu(hevc: &Path, rpu: &Path, output: &Path) -> Result<(), String> 
     Ok(())
 }
 
+const HEVC_CODEC_NAME: &str = "hevc";
+const BYTES_PER_MIB: usize = 1024 * 1024;
+const MAX_ANNEX_B_STREAM_MIB: usize = 512;
+const DOLBY_VISION_LEVEL_1: u8 = 1;
+const DOLBY_VISION_LEVEL_6: u8 = 6;
+const DOLBY_VISION_PROFILE_5: u8 = 5;
+
+// ST 2084 EOTF, the 12 bit code is the RPU's PQ signal
+const PQ_CODE_MAX: f32 = 4095.0;
+const PQ_M1: f32 = 2610.0 / 16384.0;
+const PQ_M2: f32 = 2523.0 * 128.0 / 4096.0;
+const PQ_C1: f32 = 3424.0 / 4096.0;
+const PQ_C2: f32 = 2413.0 * 32.0 / 4096.0;
+const PQ_C3: f32 = 2392.0 * 32.0 / 4096.0;
+const PQ_PEAK_NITS: f32 = 10000.0;
+
+// level 6 holds the mastering display minimum in 0.0001 cd/m² and the maximum in cd/m²
+const MASTERING_DISPLAY_MIN_LUMINANCE_STEP_NITS: f32 = 0.0001;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DolbyVisionSummary {
+    pub profile: u8,
+    pub frames: usize,
+    pub shots: usize,
+    pub max_content_light_level_nits: Option<f32>,
+    pub max_frame_average_light_level_nits: Option<f32>,
+    pub peak_luminance_nits: f32,
+    pub mastering_display_max_nits: Option<f32>,
+    pub mastering_display_min_nits: Option<f32>,
+}
+
+fn pq_code_to_nits(code: u16) -> f32 {
+    let signal = f32::from(code) / PQ_CODE_MAX;
+    let encoded = signal.powf(1.0 / PQ_M2);
+    let numerator = (encoded - PQ_C1).max(0.0);
+    let denominator = PQ_C2 - PQ_C3 * encoded;
+    PQ_PEAK_NITS * (numerator / denominator).powf(1.0 / PQ_M1)
+}
+
+fn video_codec_name(path: &Path) -> Result<String, String> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name",
+            "-of",
+            "default=nw=1:nk=1",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| format!("Failed to run ffprobe: {e}"))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "ffprobe failed on {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn demux_annex_b(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let cap = MAX_ANNEX_B_STREAM_MIB * BYTES_PER_MIB;
+
+    let mut child = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-bsf:v",
+            "hevc_mp4toannexb",
+            "-f",
+            "hevc",
+            "-",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
+
+    let mut stdout = child.stdout.take().expect("ffmpeg stdout is piped");
+    let mut stream = Vec::new();
+    let read = stdout
+        .by_ref()
+        .take(cap as u64 + 1)
+        .read_to_end(&mut stream);
+
+    if read.is_err() || stream.len() > cap {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    if let Err(e) = read {
+        return Err(format!("Failed to read the ffmpeg output: {e}"));
+    }
+    if stream.len() > cap {
+        return Err(format!(
+            "The video stream of {} is larger than the {MAX_ANNEX_B_STREAM_MIB} MiB Dolby Vision read cap",
+            path.display()
+        ));
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to wait for ffmpeg: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ffmpeg failed to demux {}: {}",
+            path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    Ok(stream)
+}
+
+fn parse_rpu_nalus(stream: &[u8]) -> Result<Vec<DoviRpu>, String> {
+    let mut parser = HevcParser::default();
+    let mut offsets = Vec::new();
+    parser.get_offsets(stream, &mut offsets);
+
+    let Some(last) = offsets.last().copied() else {
+        return Ok(Vec::new());
+    };
+
+    let nals = parser
+        .split_nals(stream, &offsets, last, false)
+        .map_err(|e| format!("Failed to split the HEVC stream into NAL units: {e}"))?;
+
+    nals.iter()
+        .filter(|nal| nal.nal_type == NAL_UNSPEC62)
+        .enumerate()
+        .map(|(index, nal)| {
+            DoviRpu::parse_unspec62_nalu(&stream[nal.start..nal.end])
+                .map_err(|e| format!("Failed to parse the Dolby Vision RPU of frame {index}: {e}"))
+        })
+        .collect()
+}
+
+fn level6_block(dm_data: &[&VdrDmData]) -> Option<ExtMetadataBlockLevel6> {
+    dm_data
+        .iter()
+        .find_map(|dm| match dm.get_block(DOLBY_VISION_LEVEL_6) {
+            Some(ExtMetadataBlock::Level6(block)) => Some(block.clone()),
+            _ => None,
+        })
+}
+
+fn peak_level1_pq_code(dm_data: &[&VdrDmData]) -> Option<u16> {
+    dm_data
+        .iter()
+        .filter_map(|dm| match dm.get_block(DOLBY_VISION_LEVEL_1) {
+            Some(ExtMetadataBlock::Level1(block)) => Some(block.max_pq),
+            _ => None,
+        })
+        .max()
+}
+
+fn light_level_nits(value: u16) -> Option<f32> {
+    (value > 0).then(|| f32::from(value))
+}
+
+fn summarise_rpus(first: &DoviRpu, rpus: &[DoviRpu]) -> Result<DolbyVisionSummary, String> {
+    let dm_data: Vec<&VdrDmData> = rpus
+        .iter()
+        .filter_map(|rpu| rpu.vdr_dm_data.as_ref())
+        .collect();
+    let Some(first_dm_data) = dm_data.first() else {
+        return Err(format!(
+            "The {} Dolby Vision RPUs carry no display management metadata",
+            rpus.len()
+        ));
+    };
+
+    let level6 = level6_block(&dm_data);
+    let max_content_light_level_nits = level6
+        .as_ref()
+        .and_then(|block| light_level_nits(block.max_content_light_level));
+
+    let peak_luminance_nits = match (max_content_light_level_nits, peak_level1_pq_code(&dm_data)) {
+        (Some(nits), _) => nits,
+        (None, Some(code)) => pq_code_to_nits(code),
+        (None, None) => pq_code_to_nits(first_dm_data.source_max_pq),
+    };
+
+    Ok(DolbyVisionSummary {
+        profile: first.dovi_profile,
+        frames: rpus.len(),
+        shots: dm_data
+            .iter()
+            .filter(|dm| dm.scene_refresh_flag > 0)
+            .count(),
+        max_content_light_level_nits,
+        max_frame_average_light_level_nits: level6
+            .as_ref()
+            .and_then(|block| light_level_nits(block.max_frame_average_light_level)),
+        peak_luminance_nits,
+        mastering_display_max_nits: level6
+            .as_ref()
+            .map(|block| f32::from(block.max_display_mastering_luminance)),
+        mastering_display_min_nits: level6.as_ref().map(|block| {
+            f32::from(block.min_display_mastering_luminance)
+                * MASTERING_DISPLAY_MIN_LUMINANCE_STEP_NITS
+        }),
+    })
+}
+
+pub fn read_dolby_vision(path: &Path) -> Result<Option<DolbyVisionSummary>, String> {
+    if video_codec_name(path)? != HEVC_CODEC_NAME {
+        return Ok(None);
+    }
+
+    let stream = demux_annex_b(path)?;
+    let rpus = parse_rpu_nalus(&stream)?;
+
+    let Some(first) = rpus.first() else {
+        return Ok(None);
+    };
+
+    Ok(Some(summarise_rpus(first, &rpus)?))
+}
+
+pub fn refuse_undecodable_dolby_vision(summary: &DolbyVisionSummary) -> Result<(), String> {
+    if summary.profile == DOLBY_VISION_PROFILE_5 {
+        return Err("Dolby Vision profile 5 carries IPT PQ c2 colour that only the RPU can turn back into RGB, export a profile 8.1 or an HDR10 master instead".to_string());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +766,32 @@ mod tests {
             "master-display=G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,50)"
         ));
         assert!(p.contains("max-cll=1000,400"));
+    }
+
+    #[test]
+    fn pq_codes_convert_to_nits() {
+        assert!((pq_code_to_nits(4095) - 10000.0).abs() < 0.5);
+        // 2546 is the 12 bit PQ code for 299.6 cd/m²
+        assert!((pq_code_to_nits(2546) - 299.6).abs() < 0.5);
+    }
+
+    #[test]
+    fn profile_5_is_the_only_refused_profile() {
+        let mut summary = DolbyVisionSummary {
+            profile: 5,
+            frames: 1,
+            shots: 1,
+            max_content_light_level_nits: None,
+            max_frame_average_light_level_nits: None,
+            peak_luminance_nits: 1000.0,
+            mastering_display_max_nits: None,
+            mastering_display_min_nits: None,
+        };
+        assert!(refuse_undecodable_dolby_vision(&summary).is_err());
+
+        for profile in [4, 7, 8] {
+            summary.profile = profile;
+            assert!(refuse_undecodable_dolby_vision(&summary).is_ok());
+        }
     }
 }
