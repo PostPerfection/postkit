@@ -319,6 +319,11 @@
 
 ### Removed
 
+- **`ingest` is gone**: it matched camera RAW (ARRIRAW, R3D, BRAW, Canon
+  Cinema RAW Light, Sony X-OCN) by file name or MXF header and refused every
+  match, and transcoded ProRes and DNxHR through ffmpeg, which the wizards' own
+  transcode paths already do.
+
 - **Every grok command line path**: `encode::encode` (which passed a bitrate
   as grk_compress's ratio flag and declared no profile, so `create` refused its
   output), `encode_parallel`, `stream_encode_subprocess`,

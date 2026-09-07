@@ -28,7 +28,6 @@ pub mod grok_player;
 pub mod gui_job_queue;
 pub mod hash;
 pub mod hints;
-pub mod ingest;
 pub mod j2k;
 pub mod job_queue;
 pub mod loudness;

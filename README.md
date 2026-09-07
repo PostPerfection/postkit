@@ -30,7 +30,6 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `grok` | Grok codec detection and configuration |
 | `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
 | `hash` | SHA-1 / SHA-256 file hashing |
-| `ingest` | Camera format detection (ARRI, RED, Canon Cinema RAW Light, BRAW, Sony RAW/X-OCN via MXF essence-UL parsing). Transcodes ffmpeg-decodable inputs (ProRes, DNxHR); camera RAW is rejected loudly (stock ffmpeg cannot decode it) |
 | `j2k` | JPEG 2000 codestream parsing, DCI validation, MXF frame extraction and bitrate analysis |
 | `job_queue` | Background job scheduling |
 | `loudness` | Audio loudness measurement (EBU R128, Leq(m)) and gain adjustment |
