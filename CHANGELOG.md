@@ -15,6 +15,13 @@
   being read into memory. `refuse_undecodable_dolby_vision` refuses profile 5 by
   name, since only the RPU can turn its IPT PQ c2 colour back into RGB.
 
+- **The resumable video encode takes the source colour**:
+  `encode_video_pipeline_resumable_with_mxf_feed` decoded every source as
+  display RGB, so a caller handing it an HDR master with the DCDM transform in
+  its parameters got swscale's yuv to rgb step instead of the explicit matrix
+  and range the HDR path needs, 8 codes of 4095 under the addendum's reference
+  white. It now takes a `SourceColour` like the stream encode does.
+
 - **An IMF CPL can claim ST 2067-21:2020**: `ImfCpl::app2e_edition` picks the
   ApplicationIdentification and the MaxCLL/MaxFALL namespace, 2016 by default
   and 2020 for a package whose colour (HLG, COLOR.8) the 2016 edition does not

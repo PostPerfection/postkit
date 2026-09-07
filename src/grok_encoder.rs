@@ -2126,6 +2126,7 @@ where
         width,
         height,
         source,
+        &crate::encode::SourceColour::DisplayRgb,
         cancel,
         resume,
         video_filter,
@@ -2148,6 +2149,8 @@ pub fn encode_video_pipeline_resumable_with_mxf_feed<P>(
     width: u32,
     height: u32,
     source: &crate::probe::PixelFormatInfo,
+    // decides the decode's own colour step, the transform itself rides in params
+    source_colour: &crate::encode::SourceColour,
     cancel: &Arc<AtomicBool>,
     resume: bool,
     // ffmpeg -vf chain applied while decoding, for fades and the like. It must
@@ -2212,9 +2215,7 @@ where
             decode_source: crate::encode::DecodeSource::Video,
             read_source_at: None,
             picture: crate::encode::PictureFilters::Given(&picture_filters),
-            // the colour this path can convert is the compressor's own
-            // transform, and a caller's colour filter is caught by the chain
-            source_colour: &crate::encode::SourceColour::DisplayRgb,
+            source_colour,
             source,
             accelerator_active,
             quality_psnr: params.quality_psnr,
