@@ -1,3 +1,4 @@
+use crate::rest_api::RouteResponse;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -253,13 +254,20 @@ pub fn update_status(uuid: &str, new_status: &str) -> i32 {
     }
 }
 
-/// Generate a distribution matrix (territory × version grid) as CSV.
-pub fn export_distribution_matrix(output_csv: &Path) -> i32 {
-    let versions = list_versions(None, None);
-    if versions.is_empty() {
-        tracing::warn!("No versions found");
-        return -1;
-    }
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DistributionRow {
+    pub territory: String,
+    pub cells: Vec<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DistributionMatrix {
+    pub titles: Vec<String>,
+    pub rows: Vec<DistributionRow>,
+}
+
+pub fn distribution_matrix_at(db_path: &Path) -> DistributionMatrix {
+    let versions = list_versions_at(db_path, None, None);
 
     let mut territories: Vec<String> = versions.iter().map(|v| v.territory.clone()).collect();
     territories.sort();
@@ -269,21 +277,48 @@ pub fn export_distribution_matrix(output_csv: &Path) -> i32 {
     titles.sort();
     titles.dedup();
 
+    let rows = territories
+        .into_iter()
+        .map(|territory| DistributionRow {
+            cells: titles
+                .iter()
+                .map(|title| {
+                    versions
+                        .iter()
+                        .any(|v| v.territory == territory && v.title == *title)
+                })
+                .collect(),
+            territory,
+        })
+        .collect();
+
+    DistributionMatrix { titles, rows }
+}
+
+/// Generate a distribution matrix (territory × version grid) as CSV.
+pub fn export_distribution_matrix(output_csv: &Path) -> i32 {
+    export_distribution_matrix_at(&default_db_path(), output_csv)
+}
+
+pub fn export_distribution_matrix_at(db_path: &Path, output_csv: &Path) -> i32 {
+    let matrix = distribution_matrix_at(db_path);
+    if matrix.rows.is_empty() {
+        tracing::warn!("No versions found");
+        return -1;
+    }
+
     let mut csv = String::from("Territory");
-    for title in &titles {
+    for title in &matrix.titles {
         csv.push(',');
         csv.push_str(title);
     }
     csv.push('\n');
 
-    for territory in &territories {
-        csv.push_str(territory);
-        for title in &titles {
-            let has = versions
-                .iter()
-                .any(|v| v.territory == *territory && v.title == *title);
+    for row in &matrix.rows {
+        csv.push_str(&row.territory);
+        for cell in &row.cells {
             csv.push(',');
-            csv.push_str(if has { "✓" } else { "" });
+            csv.push_str(if *cell { "✓" } else { "" });
         }
         csv.push('\n');
     }
@@ -304,34 +339,118 @@ const DASHBOARD_ENDPOINTS: &[&str] = &[
     "/api/versions",
     "/api/territories",
     "/api/summary",
+    // answers {"titles":["Feature A"],"rows":[{"territory":"US","cells":[true]}]}, one cell per title
+    "/api/matrix",
 ];
 
-/// Build the (status, json) response for a dashboard API path against `db_path`.
-///
-/// This is the handler the HTTP server dispatches to; kept separate so it can be
-/// tested directly against a real database without binding a socket.
-pub fn dashboard_response(db_path: &Path, path: &str) -> (u16, String) {
+const DASHBOARD_PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DCP version dashboard</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; color: #222; }
+h1 { font-size: 1.4rem; }
+h2 { font-size: 1.1rem; margin-top: 2rem; }
+table { border-collapse: collapse; }
+th, td { border: 1px solid #bbb; padding: 0.25rem 0.6rem; text-align: left; }
+th { background: #f0f0f0; }
+#summary { font-size: 1.1rem; }
+</style>
+</head>
+<body>
+<h1>DCP version dashboard</h1>
+<p id="summary">loading</p>
+<h2>Versions</h2>
+<table id="versions"></table>
+<h2>Territory by title</h2>
+<table id="matrix"></table>
+<script>
+function cell(tag, value) {
+  const element = document.createElement(tag);
+  element.textContent = value;
+  return element;
+}
+
+function fillTable(id, headers, rows) {
+  const table = document.getElementById(id);
+  table.replaceChildren();
+  const headerRow = table.insertRow();
+  headers.forEach(header => headerRow.append(cell('th', header)));
+  rows.forEach(values => {
+    const row = table.insertRow();
+    values.forEach(value => row.append(cell('td', value)));
+  });
+}
+
+async function load() {
+  const paths = ['/api/summary', '/api/versions', '/api/territories', '/api/matrix'];
+  const [summary, versions, territories, matrix] = await Promise.all(
+    paths.map(path => fetch(path).then(response => response.json()))
+  );
+
+  const statuses = Object.entries(summary.by_status)
+    .map(([status, count]) => status + ': ' + count)
+    .join(', ');
+  document.getElementById('summary').textContent =
+    summary.total_versions + ' versions in ' + summary.total_territories +
+    ' territories (' + statuses + ')';
+
+  fillTable(
+    'versions',
+    ['Title', 'Type', 'Territory', 'Language', 'Standard', 'Status', 'UUID', 'KDM recipients'],
+    versions.map(version => [
+      version.title, version.version_type, version.territory, version.language,
+      version.standard, version.status, version.uuid, version.kdm_recipients.length
+    ])
+  );
+
+  const names = new Map(territories.map(territory => [territory.code, territory.name]));
+  fillTable(
+    'matrix',
+    ['Territory'].concat(matrix.titles),
+    matrix.rows.map(row => [names.get(row.territory) || row.territory].concat(
+      row.cells.map(present => present ? 'yes' : '')
+    ))
+  );
+}
+
+load();
+</script>
+</body>
+</html>
+"#;
+
+const HTML_CONTENT_TYPE: &str = "text/html; charset=utf-8";
+
+pub fn dashboard_response(db_path: &Path, path: &str) -> RouteResponse {
+    let json = |body: String| RouteResponse::json(200, body);
     match path {
-        "/" | "/health" => (
-            200,
+        "/" => RouteResponse {
+            status: 200,
+            content_type: HTML_CONTENT_TYPE,
+            body: DASHBOARD_PAGE.to_string(),
+        },
+        "/health" => json(
             serde_json::json!({ "status": "ok", "endpoints": DASHBOARD_ENDPOINTS }).to_string(),
         ),
         "/api/versions" => {
             let versions = list_versions_at(db_path, None, None);
-            (
-                200,
-                serde_json::to_string(&versions).unwrap_or_else(|_| "[]".to_string()),
-            )
+            json(serde_json::to_string(&versions).unwrap_or_else(|_| "[]".to_string()))
         }
         "/api/territories" => {
             let territories = list_territories_at(db_path);
-            (
-                200,
-                serde_json::to_string(&territories).unwrap_or_else(|_| "[]".to_string()),
+            json(serde_json::to_string(&territories).unwrap_or_else(|_| "[]".to_string()))
+        }
+        "/api/summary" => json(summary_json(db_path)),
+        "/api/matrix" => {
+            let matrix = distribution_matrix_at(db_path);
+            json(
+                serde_json::to_string(&matrix)
+                    .unwrap_or_else(|_| r#"{"titles":[],"rows":[]}"#.to_string()),
             )
         }
-        "/api/summary" => (200, summary_json(db_path)),
-        _ => (404, r#"{"error":"not found"}"#.to_string()),
+        _ => RouteResponse::json(404, r#"{"error":"not found"}"#.to_string()),
     }
 }
 
@@ -353,8 +472,8 @@ fn summary_json(db_path: &Path) -> String {
     .to_string()
 }
 
-/// Start the web dashboard: a blocking HTTP server serving the version and
-/// distribution data as JSON, built on the shared rest_api server.
+/// Start the web dashboard: a blocking HTTP server serving the page at `/` and
+/// the version and distribution data as JSON.
 pub fn serve_dashboard(opts: &DashboardOptions) -> i32 {
     let db_path = if opts.database_path.as_os_str().is_empty() {
         default_db_path()
@@ -367,7 +486,7 @@ pub fn serve_dashboard(opts: &DashboardOptions) -> i32 {
 
     for path in DASHBOARD_ENDPOINTS {
         let db = db_path.clone();
-        server.route(
+        server.route_with_content_type(
             "GET",
             path,
             Box::new(move |_method, req_path| dashboard_response(&db, req_path)),
@@ -414,6 +533,7 @@ fn territory_name(code: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rest_api::JSON_CONTENT_TYPE;
 
     #[test]
     fn test_init_and_register() {
@@ -472,11 +592,12 @@ mod tests {
         let db = dir.path().join("d.db");
         seed_db(&db);
 
-        let (status, body) = dashboard_response(&db, "/api/versions");
-        assert_eq!(status, 200);
-        assert!(body.contains("Feature A"));
-        assert!(body.contains("\"territory\":\"US\""));
-        assert!(body.contains("\"territory\":\"FR\""));
+        let response = dashboard_response(&db, "/api/versions");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, JSON_CONTENT_TYPE);
+        assert!(response.body.contains("Feature A"));
+        assert!(response.body.contains("\"territory\":\"US\""));
+        assert!(response.body.contains("\"territory\":\"FR\""));
     }
 
     #[test]
@@ -485,10 +606,10 @@ mod tests {
         let db = dir.path().join("d.db");
         seed_db(&db);
 
-        let (status, body) = dashboard_response(&db, "/api/territories");
-        assert_eq!(status, 200);
-        assert!(body.contains("United States"));
-        assert!(body.contains("France"));
+        let response = dashboard_response(&db, "/api/territories");
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("United States"));
+        assert!(response.body.contains("France"));
     }
 
     #[test]
@@ -497,12 +618,12 @@ mod tests {
         let db = dir.path().join("d.db");
         seed_db(&db);
 
-        let (status, body) = dashboard_response(&db, "/api/summary");
-        assert_eq!(status, 200);
-        assert!(body.contains("\"total_versions\":2"));
-        assert!(body.contains("\"total_territories\":2"));
-        assert!(body.contains("\"released\":1"));
-        assert!(body.contains("\"draft\":1"));
+        let response = dashboard_response(&db, "/api/summary");
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("\"total_versions\":2"));
+        assert!(response.body.contains("\"total_territories\":2"));
+        assert!(response.body.contains("\"released\":1"));
+        assert!(response.body.contains("\"draft\":1"));
     }
 
     #[test]
@@ -511,11 +632,119 @@ mod tests {
         let db = dir.path().join("d.db");
         seed_db(&db);
 
-        let (status, body) = dashboard_response(&db, "/");
-        assert_eq!(status, 200);
-        assert!(body.contains("/api/versions"));
+        let response = dashboard_response(&db, "/health");
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains("/api/versions"));
 
-        let (status, _) = dashboard_response(&db, "/nope");
-        assert_eq!(status, 404);
+        let response = dashboard_response(&db, "/nope");
+        assert_eq!(response.status, 404);
+        assert_eq!(response.content_type, JSON_CONTENT_TYPE);
+    }
+
+    fn http_get(port: u16, path: &str) -> String {
+        use std::io::{Read, Write};
+        for _ in 0..100 {
+            let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            return response;
+        }
+        panic!("dashboard never answered on port {port}");
+    }
+
+    #[test]
+    fn test_serve_dashboard_answers_over_http() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        seed_db(&db);
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let opts = DashboardOptions {
+            database_path: db,
+            http_port: u32::from(port),
+            bind_address: "127.0.0.1".to_string(),
+        };
+        std::thread::spawn(move || serve_dashboard(&opts));
+
+        let index = http_get(port, "/");
+        assert!(index.starts_with("HTTP/1.1 200 OK"), "{index}");
+        assert!(
+            index.contains("Content-Type: text/html; charset=utf-8"),
+            "{index}"
+        );
+        assert!(index.contains("<table"), "{index}");
+
+        let matrix = http_get(port, "/api/matrix");
+        assert!(
+            matrix.contains("Content-Type: application/json"),
+            "{matrix}"
+        );
+        assert!(matrix.contains(r#""titles":["Feature A"]"#), "{matrix}");
+    }
+
+    #[test]
+    fn test_dashboard_index_is_an_html_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        seed_db(&db);
+
+        let response = dashboard_response(&db, "/");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/html; charset=utf-8");
+        assert!(response.body.contains("<table"));
+        assert!(response.body.contains("/api/matrix"));
+        assert!(response.body.contains("/api/summary"));
+        assert!(response.body.contains("/api/versions"));
+        assert!(response.body.contains("/api/territories"));
+    }
+
+    #[test]
+    fn test_matrix_endpoint_agrees_with_the_csv() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("d.db");
+        seed_db(&db);
+
+        let response = dashboard_response(&db, "/api/matrix");
+        assert_eq!(response.status, 200);
+        let matrix: DistributionMatrix = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(matrix.titles, vec!["Feature A"]);
+        assert_eq!(
+            matrix
+                .rows
+                .iter()
+                .map(|r| (r.territory.as_str(), r.cells.clone()))
+                .collect::<Vec<_>>(),
+            vec![("FR", vec![true]), ("US", vec![true])]
+        );
+
+        let csv_path = dir.path().join("matrix.csv");
+        assert_eq!(export_distribution_matrix_at(&db, &csv_path), 0);
+        let csv = std::fs::read_to_string(&csv_path).unwrap();
+
+        let mut lines = csv.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            format!("Territory,{}", matrix.titles.join(","))
+        );
+        for (line, row) in lines.zip(&matrix.rows) {
+            let expected: Vec<&str> = row
+                .cells
+                .iter()
+                .map(|c| if *c { "✓" } else { "" })
+                .collect();
+            assert_eq!(line, format!("{},{}", row.territory, expected.join(",")));
+        }
     }
 }

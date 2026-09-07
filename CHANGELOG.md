@@ -4,6 +4,24 @@
 
 ### Added
 
+- **A dashboard page at `/`**: the dashboard answered every path with JSON, so
+  the port served the data and nothing drew it. `/` now returns a self-contained
+  HTML page, no external assets and no framework, that fetches `/api/summary`,
+  `/api/versions`, `/api/territories` and the new `/api/matrix` on load and
+  renders the totals, a table of versions with title, type, territory, language,
+  standard, status, uuid and KDM recipient count, and the territory by title grid
+  as a table. `/api/matrix` answers
+  `{"titles":["Feature A"],"rows":[{"territory":"US","cells":[true]}]}`, one cell
+  per title in `titles` order, and both it and the `export_distribution_matrix`
+  CSV are built by `distribution_matrix_at`, so the page and the export cannot
+  disagree. `dashboard_response` returns a `rest_api::RouteResponse` carrying the
+  content type, `text/html; charset=utf-8` for the page and `application/json`
+  for the rest. `RestServer` labelled every response `application/json`, so it
+  takes a second kind of handler now: `route_with_content_type` registers one
+  that answers with a `RouteResponse` and `route` keeps taking the
+  `(status, body)` handler it always did, wrapping it as JSON. `/health` keeps
+  the endpoint list `/` used to answer with.
+
 - **`SourcePreparation.watermark` and `StreamEncodeOptions.watermark`**: a
   second burn the encoder threads composite after the subtitles and before any
   colour conversion, for a visible mark held over a whole picture. It is the one
@@ -334,6 +352,22 @@
   through the linked library, so a build needs libgrokj2k and no grok binary.
 
 ### Fixed
+
+- **A packaged trailer dropped its content**: `package_trailer` rendered the
+  ratings card and the countdown leader at a fixed 1920x1080 and joined them to
+  the content with `-c copy`, which the mp4 muxer cannot do with a ProRes `.mov`,
+  so ffmpeg left the content out and exited 0 and the result was 168 frames of
+  card and leader with `success: true`. The content is probed with ffprobe first
+  and the card and the leader are rendered at its width, height and frame rate,
+  so a 2048x1080 source no longer becomes a 1920x1080 DCP, and the card's title
+  and rating scale with the height instead of sitting at 72 and 36 pixels. The
+  three segments are re-encoded into `trailer_packaged.mp4` through the concat
+  filter at CRF 10 in `yuv444p10le` with `-fps_mode passthrough`, and the joined
+  file's frames are counted back with ffprobe and compared against the card,
+  leader and content counts, a mismatch failing with the four numbers rather than
+  reporting success. Where the content's frame rate and the requested
+  `fps_num`/`fps_den` disagree the content's wins and the other is logged as a
+  warning.
 
 - **A late frame no longer fails the wrap**: the frames a wrap holds while waiting
   for the next one in order were capped at four per core, and a GPU encode on a
