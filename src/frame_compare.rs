@@ -36,6 +36,14 @@ pub struct CompareResult {
 /// stats files. The pid alone does not cover two threads of one process.
 static COMPARISONS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+// a filter option value: a windows drive colon or a backslash would end the option
+fn filter_option_path(path: &Path) -> String {
+    path.display()
+        .to_string()
+        .replace('\\', "/")
+        .replace(':', "\\:")
+}
+
 /// A stats file only this comparison writes and reads.
 fn stats_log_path(metric: &str) -> PathBuf {
     let comparison = COMPARISONS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -65,8 +73,8 @@ pub fn compare_frames(reference: &Path, distorted: &Path) -> Result<CompareResul
                 "[0:v]split=2[r0][r1];[1:v]split=2[d0][d1];\
                  [r1][d1]ssim=stats_file={}[s];[s]nullsink;\
                  [r0][d0]psnr=stats_file={}",
-                ssim_log.display(),
-                psnr_log.display()
+                filter_option_path(&ssim_log),
+                filter_option_path(&psnr_log)
             ),
             "-f",
             "null",
@@ -74,11 +82,13 @@ pub fn compare_frames(reference: &Path, distorted: &Path) -> Result<CompareResul
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .status()
+        .output()
         .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
 
-    if !status.success() {
-        return Err("ffmpeg comparison failed".to_string());
+    if !status.status.success() {
+        let stderr = String::from_utf8_lossy(&status.stderr);
+        let last = stderr.lines().last().unwrap_or("no output");
+        return Err(format!("ffmpeg comparison failed: {last}"));
     }
 
     // Parse PSNR log
@@ -181,7 +191,10 @@ pub fn compute_vmaf(reference: &Path, distorted: &Path) -> Result<VmafScore, Str
     }
 
     let log = std::env::temp_dir().join(format!("imfwizard_vmaf_{}.json", std::process::id()));
-    let filter = format!("[1:v][0:v]libvmaf=log_path={}:log_fmt=json", log.display());
+    let filter = format!(
+        "[1:v][0:v]libvmaf=log_path={}:log_fmt=json",
+        filter_option_path(&log)
+    );
     let out = std::process::Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(reference)
@@ -446,6 +459,15 @@ n:2 R:0.763922 G:0.730375 B:0.672471 All:0.722256 (5.563553)
         assert!((rgb[0].1 - 0.718123).abs() < 1e-9, "All: {rgb:?}");
         assert!((rgb[0].0 - 0.760857).abs() < 1e-9, "R: {rgb:?}");
         assert!((yuv[0].0 - 0.959888).abs() < 1e-9, "Y: {yuv:?}");
+    }
+
+    #[test]
+    fn a_windows_stats_path_is_escaped_for_the_filter_graph() {
+        assert_eq!(
+            filter_option_path(Path::new("C:\\Users\\r\\Temp\\imfwizard_psnr_1_0.log")),
+            "C\\:/Users/r/Temp/imfwizard_psnr_1_0.log"
+        );
+        assert_eq!(filter_option_path(Path::new("/tmp/x.log")), "/tmp/x.log");
     }
 
     #[test]

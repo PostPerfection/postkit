@@ -499,6 +499,12 @@
 
 ### Fixed
 
+- **`compare_frames` and `compute_vmaf` run on Windows**: the stats file path
+  went into the ffmpeg filter graph as is, where a drive colon ends the option
+  and a backslash escapes the next character, so every comparison failed with
+  "ffmpeg comparison failed". The paths are escaped for the graph now, and a
+  failed ffmpeg run reports its last stderr line.
+
 - **`compare_frames` returned "No frames compared" for every RGB video**: both
   stats parsers required the luma component keys, `psnr_y`/`psnr_u`/`psnr_v` and
   `Y:`, and ffmpeg writes `psnr_r`/`psnr_g`/`psnr_b` and `R:`/`G:`/`B:` when the
