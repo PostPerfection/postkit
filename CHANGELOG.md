@@ -405,6 +405,12 @@
 
 ### Fixed
 
+- **The resumable video encode fails when ffmpeg fails**: the same hole on the
+  path the dcpwizard CLI takes, a decode that produced nothing came back as a
+  success with 0 frames and the wizard could only say no frames reached the
+  wrap. It now carries ffmpeg's exit status and stderr tail like the stream
+  encode does.
+
 - **A stream encode reported success when ffmpeg failed**: `finish_detection`
   killed ffmpeg and threw its exit status away, and the stderr reader kept only
   the detection lines, so an unreadable source or a filter chain ffmpeg rejects

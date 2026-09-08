@@ -1573,7 +1573,7 @@ where
 }
 
 // ffmpeg's exit status only means something when it exited on its own: postkit kills a run it stopped early
-fn decode_failure(
+pub(crate) fn decode_failure(
     decode: &crate::picture_findings::FinishedDecode,
     frames_encoded: u64,
     expected_frames: u64,

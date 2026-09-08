@@ -2373,7 +2373,19 @@ where
         frame_index,
     );
 
+    let expected_frames = total_frames.saturating_sub(start_frame);
+    let mut success = result.success;
+    let mut error = result.error;
+    if success
+        && let Some(failure) =
+            crate::encode::decode_failure(&decode, result.frames_encoded, expected_frames)
+    {
+        success = false;
+        error = failure;
+    }
     PipelineResult {
+        success,
+        error,
         picture_findings: decode.findings,
         ..result
     }
