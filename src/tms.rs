@@ -301,6 +301,7 @@ fn check_host_key(
         .host_key()
         .ok_or_else(|| format!("{host} offered no host key"))?;
     let fingerprint = host_key_fingerprint(session);
+    refuse_revoked_key(known_hosts_file, host, port, key, &fingerprint)?;
     let mut known_hosts = session
         .known_hosts()
         .map_err(|e| format!("cannot read known hosts: {e}"))?;
@@ -327,6 +328,52 @@ fn check_host_key(
         )),
         ssh2::CheckResult::Failure => Err(format!("the host key check for {host}:{port} failed")),
     }
+}
+
+const REVOKED_MARKER: &str = "@revoked";
+// the line is `@revoked <hosts> <keytype> <base64>`
+const REVOKED_LINE_FIELDS: usize = 4;
+const REVOKED_KEY_FIELD: usize = 3;
+
+// libssh2 reports a revoked key as a plain Match, it hands back no OpenSSH marker
+fn refuse_revoked_key(
+    known_hosts_file: &Path,
+    host: &str,
+    port: u16,
+    key: &[u8],
+    fingerprint: &str,
+) -> Result<(), String> {
+    use base64::Engine;
+    if !known_hosts_file.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read(known_hosts_file)
+        .map_err(|e| format!("cannot read {}: {e}", known_hosts_file.display()))?;
+    // a hand edited line may drop the padding, so neither side keeps it
+    let offered = base64::engine::general_purpose::STANDARD.encode(key);
+    let offered = offered.trim_end_matches('=');
+    for (index, line) in String::from_utf8_lossy(&text).lines().enumerate() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.first() != Some(&REVOKED_MARKER) {
+            continue;
+        }
+        if fields.len() < REVOKED_LINE_FIELDS {
+            return Err(format!(
+                "line {} of {} starts with {REVOKED_MARKER} but carries no host key. \
+                 refusing to upload: a known_hosts that cannot be read cannot be trusted",
+                index + 1,
+                known_hosts_file.display()
+            ));
+        }
+        if fields[REVOKED_KEY_FIELD].trim_end_matches('=') == offered {
+            return Err(format!(
+                "the host key of {host}:{port} ({fingerprint}) is marked {REVOKED_MARKER} in {}. \
+                 refusing to upload: that key is compromised, ask the cinema for the new one",
+                known_hosts_file.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn known_hosts_path() -> Result<PathBuf, String> {
@@ -646,7 +693,7 @@ mod tests {
 // unix only: an unprivileged sshd on a throwaway config is not a thing on windows
 #[cfg(all(test, unix))]
 mod host_key_tests {
-    use super::{SftpTransport, TmsConfig, TmsProtocol};
+    use super::{REVOKED_MARKER, SftpTransport, TmsConfig, TmsProtocol};
     use std::io::Read;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
@@ -868,6 +915,103 @@ mod host_key_tests {
         assert!(
             !log.contains(PASSWORD_ATTEMPT_LOG),
             "the password was sent to a host whose key does not match known_hosts. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_revoked_host_key_is_refused_even_when_a_plain_line_matches() {
+        let server = LocalSshServer::start();
+        let entry = format!("[{LOOPBACK}]:{} {}", server.port, server.host_key);
+        let revoked = format!(
+            "{REVOKED_MARKER} [{LOOPBACK}]:{} {}",
+            server.port, server.host_key
+        );
+        let known_hosts = server.known_hosts_with(&format!("{entry}\n{revoked}"));
+        let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
+            .err()
+            .expect("a revoked host key must not be uploaded to");
+        assert!(error.contains(REVOKED_MARKER), "{error}");
+        assert!(
+            error.contains(&known_hosts.display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("SHA256:"), "{error}");
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            !log.contains(PASSWORD_ATTEMPT_LOG),
+            "the password was sent to a host whose key is revoked. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_revoked_line_for_another_key_leaves_the_real_one_accepted() {
+        let server = LocalSshServer::start();
+        let entry = format!("[{LOOPBACK}]:{} {}", server.port, server.host_key);
+        let revoked = format!(
+            "{REVOKED_MARKER} [{LOOPBACK}]:{} {}",
+            server.port, server.other_host_key
+        );
+        let known_hosts = server.known_hosts_with(&format!("{revoked}\n{entry}"));
+        let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
+            .err()
+            .expect("no account exists for the probe user");
+        assert!(
+            error.contains("login as") && !error.contains(REVOKED_MARKER),
+            "a key that is not the revoked one must still pass the check: {error}"
+        );
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            log.contains(PASSWORD_ATTEMPT_LOG) && log.contains(PROBE_USER),
+            "sshd never saw a password attempt, so the check did not pass a known host. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_key_that_is_only_revoked_is_refused_as_revoked_not_as_unknown() {
+        let server = LocalSshServer::start();
+        let revoked = format!(
+            "{REVOKED_MARKER} * {}",
+            server.host_key.trim_end_matches('=')
+        );
+        let known_hosts = server.known_hosts_with(&revoked);
+        let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
+            .err()
+            .expect("a revoked host key must not be uploaded to");
+        assert!(error.contains(REVOKED_MARKER), "{error}");
+        assert!(
+            !error.contains("ssh-keyscan"),
+            "a revoked key must not be reported as a host nobody has seen yet: {error}"
+        );
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            !log.contains(PASSWORD_ATTEMPT_LOG),
+            "the password was sent to a host whose key is revoked. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_revoked_line_is_refused_with_the_file_and_the_line_number() {
+        let server = LocalSshServer::start();
+        let malformed = format!("{REVOKED_MARKER} tms.cinema.test");
+        let known_hosts = server.known_hosts_with(&malformed);
+        let text = std::fs::read_to_string(&known_hosts).unwrap();
+        let line_number = text.lines().position(|line| line == malformed).unwrap() + 1;
+        let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
+            .err()
+            .expect("a known_hosts that cannot be parsed must not be uploaded against");
+        assert!(error.contains(&format!("line {line_number}")), "{error}");
+        assert!(
+            error.contains(&known_hosts.display().to_string()),
+            "{error}"
+        );
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            !log.contains(PASSWORD_ATTEMPT_LOG),
+            "the password was sent while known_hosts could not be parsed. log: {log}"
         );
     }
 

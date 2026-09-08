@@ -469,6 +469,17 @@
   a declaration, and a prefix with no declaration in scope is still an error
   naming the attribute.
 
+- **An sftp upload refuses a revoked host key**: `@revoked` in known_hosts was
+  ignored, because libssh2 reports no OpenSSH marker: a file holding a plain
+  matching line and an `@revoked` line for the same key came back as a match and
+  the login went ahead with the password. The check now reads the file itself
+  before libssh2 sees it and refuses any key whose base64 blob a `@revoked` line
+  carries, naming the file and the SHA256 fingerprint. It matches on the blob
+  alone and ignores the hosts field, since a revoked host key is compromised on
+  every host. A `@revoked` line with fewer than four fields fails with the file
+  and the line number rather than being skipped. `@cert-authority` and every
+  other line stay with libssh2.
+
 - **The resumable video encode fails when ffmpeg fails**: the same hole on the
   path the dcpwizard CLI takes, a decode that produced nothing came back as a
   success with 0 frames and the wizard could only say no frames reached the
