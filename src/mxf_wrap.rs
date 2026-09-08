@@ -2588,6 +2588,11 @@ mod tests {
             )
         };
         assert!(xml.contains(&instance(&descriptor.instance_id)), "{xml}");
+        let locked = if descriptor.locked { "True" } else { "False" };
+        assert!(
+            xml.contains(&format!("<r1:Locked>{locked}</r1:Locked>")),
+            "smpte booleans are spelled True and False\n{xml}"
+        );
         // the labels appear in the order the reader reports them, ids and all
         let mut searched_from = 0;
         for label in &labels {

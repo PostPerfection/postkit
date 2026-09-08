@@ -456,6 +456,12 @@
 
 ### Fixed
 
+- **The sound descriptor RegXML spells `Locked` the SMPTE way**: the CPL entry
+  wrote `<r1:Locked>true</r1:Locked>` where the SMPTE boolean type's values are
+  `True` and `False`, so Photon reported every sound package's descriptor as not
+  matching the track file's, that one item apart. `sound_descriptor_regxml`
+  writes `True` and `False` now.
+
 - **Canonical XML renders a namespaced attribute instead of refusing it**:
   `c14n` returned `c14n does not support namespaced attribute '<name>'` for any
   attribute carrying a prefix, so signing an IMF CPL failed outright: ST 2067-3

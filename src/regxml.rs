@@ -243,7 +243,8 @@ pub fn sound_descriptor_regxml(
         &mut xml,
         INDENT,
         "Locked",
-        if descriptor.locked { "true" } else { "false" },
+        // the smpte boolean type spells its values True and False
+        if descriptor.locked { "True" } else { "False" },
     );
     if let Some(level) = descriptor.audio_ref_level {
         item(
