@@ -23,6 +23,8 @@ pub mod ns {
     // IMF (ST 2067)
     pub const CPL_IMF: &str = "http://www.smpte-ra.org/schemas/2067-3/2016";
     pub const CPL_IMF_CC: &str = "http://www.smpte-ra.org/schemas/2067-2/2016";
+    pub const CPL_IMF_CC_2020: &str = "http://www.smpte-ra.org/ns/2067-2/2020";
+    pub const XSI: &str = "http://www.w3.org/2001/XMLSchema-instance";
     pub const PKL_IMF: &str = "http://www.smpte-ra.org/schemas/2067-2/2016/PKL";
     pub const APP2E: &str = "http://www.smpte-ra.org/schemas/2067-21/2016";
     pub const APP2E_2020: &str = "http://www.smpte-ra.org/ns/2067-21/2020";
@@ -511,6 +513,14 @@ impl App2eEdition {
             App2eEdition::Edition2020 => ns::APP2E_2020,
         }
     }
+
+    // an application identification is read against the core constraints of its own edition
+    pub fn core_constraints_namespace(self) -> &'static str {
+        match self {
+            App2eEdition::Edition2016 => ns::CPL_IMF_CC,
+            App2eEdition::Edition2020 => ns::CPL_IMF_CC_2020,
+        }
+    }
 }
 
 impl ImfCpl {
@@ -527,9 +537,10 @@ impl ImfCpl {
         xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         let _ = writeln!(
             xml,
-            "<CompositionPlaylist xmlns=\"{}\" xmlns:cc=\"{}\">",
+            "<CompositionPlaylist xmlns=\"{}\" xmlns:cc=\"{}\" xmlns:xsi=\"{}\">",
             ns::CPL_IMF,
-            ns::CPL_IMF_CC
+            self.app2e_edition.core_constraints_namespace(),
+            ns::XSI
         );
         let _ = writeln!(xml, "  <Id>urn:uuid:{}</Id>", self.uuid);
         let _ = writeln!(xml, "  <IssueDate>{}</IssueDate>", self.issue_date);
@@ -606,33 +617,27 @@ impl ImfCpl {
 
     fn write_sequence(&self, xml: &mut String, r: &ImfResource, fps_num: u32, fps_den: u32) {
         let el = r.kind.sequence_element();
-        let _ = writeln!(xml, "        <cc:{el} xmlns:cc=\"{}\">", ns::CPL_IMF_CC);
+        let _ = writeln!(
+            xml,
+            "        <cc:{el} xmlns:cc=\"{}\">",
+            self.app2e_edition.core_constraints_namespace()
+        );
         let _ = writeln!(xml, "          <Id>urn:uuid:{}</Id>", uuid::Uuid::new_v4());
         let _ = writeln!(
             xml,
             "          <TrackId>urn:uuid:{}</TrackId>",
             uuid::Uuid::new_v4()
         );
-        let _ = writeln!(xml, "          <EditRate>{fps_num} {fps_den}</EditRate>");
+        // a SequenceType takes Id, TrackId and ResourceList, no edit rate of its own
         xml.push_str("          <ResourceList>\n");
-        xml.push_str("            <Resource>\n");
+        // BaseResourceType is abstract, so a track file resource names its type
+        xml.push_str("            <Resource xsi:type=\"TrackFileResourceType\">\n");
         let _ = writeln!(
             xml,
             "              <Id>urn:uuid:{}</Id>",
             uuid::Uuid::new_v4()
         );
-        // SourceEncoding precedes TrackFileId per ST 2067-2 TrackFileResourceType.
-        if let Some(se) = &r.source_encoding {
-            let _ = writeln!(
-                xml,
-                "              <SourceEncoding>urn:uuid:{se}</SourceEncoding>"
-            );
-        }
-        let _ = writeln!(
-            xml,
-            "              <TrackFileId>urn:uuid:{}</TrackFileId>",
-            r.track_file_uuid
-        );
+        // the BaseResourceType children come first, then what TrackFileResourceType adds
         let _ = writeln!(
             xml,
             "              <EditRate>{fps_num} {fps_den}</EditRate>"
@@ -646,6 +651,17 @@ impl ImfCpl {
             xml,
             "              <SourceDuration>{}</SourceDuration>",
             r.duration
+        );
+        if let Some(se) = &r.source_encoding {
+            let _ = writeln!(
+                xml,
+                "              <SourceEncoding>urn:uuid:{se}</SourceEncoding>"
+            );
+        }
+        let _ = writeln!(
+            xml,
+            "              <TrackFileId>urn:uuid:{}</TrackFileId>",
+            r.track_file_uuid
         );
         xml.push_str("            </Resource>\n");
         xml.push_str("          </ResourceList>\n");
@@ -1278,6 +1294,72 @@ mod tests {
         ));
         assert!(xml.contains("xmlns:app2e=\"http://www.smpte-ra.org/ns/2067-21/2020\""));
         assert!(!xml.contains(ns::APP2E));
+        // the identification is read against its own edition's core constraints
+        assert!(xml.contains(&format!("xmlns:cc=\"{}\"", ns::CPL_IMF_CC_2020)));
+        assert!(!xml.contains(ns::CPL_IMF_CC));
+
+        let cpl2016 = ImfCpl::default();
+        assert!(
+            cpl2016
+                .to_xml()
+                .contains(&format!("xmlns:cc=\"{}\"", ns::CPL_IMF_CC))
+        );
+    }
+
+    /// BaseResourceType is abstract and its children come before what
+    /// TrackFileResourceType adds, so a resource that names neither is one no
+    /// IMF reader can unmarshal.
+    #[test]
+    fn a_track_file_resource_names_its_type_and_orders_its_children() {
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            resources: vec![ImfResource {
+                track_file_uuid: "pic".into(),
+                duration: 240,
+                kind: ImfTrackKind::Image,
+                source_encoding: Some("desc".into()),
+            }],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        assert!(xml.contains(&format!("xmlns:xsi=\"{}\"", ns::XSI)));
+        assert!(xml.contains("<Resource xsi:type=\"TrackFileResourceType\">"));
+
+        let resource = xml.split("<Resource ").nth(1).expect("a resource");
+        let at = |element: &str| {
+            resource
+                .find(element)
+                .unwrap_or_else(|| panic!("no {element} in the resource"))
+        };
+        let order = [
+            "<Id>",
+            "<EditRate>",
+            "<IntrinsicDuration>",
+            "<SourceDuration>",
+            "<SourceEncoding>",
+            "<TrackFileId>",
+        ];
+        for pair in order.windows(2) {
+            assert!(
+                at(pair[0]) < at(pair[1]),
+                "{} must precede {}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // a sequence takes Id, TrackId and ResourceList only
+        let sequence = xml
+            .split("<cc:MainImageSequence")
+            .nth(1)
+            .expect("a sequence");
+        let head = &sequence[..sequence.find("<ResourceList>").expect("a resource list")];
+        assert!(
+            !head.contains("<EditRate>"),
+            "sequence carries an edit rate: {head}"
+        );
     }
 
     #[test]
@@ -1458,72 +1540,90 @@ mod tests {
                 xsd_dir.display()
             );
         };
+        let core_constraints_xsd = |edition: App2eEdition| {
+            let name = match edition {
+                App2eEdition::Edition2016 => "imf-core-constraints-20160411.xsd",
+                App2eEdition::Edition2020 => "imf-core-constraints-2020.xsd",
+            };
+            walk(root, name)
+                .unwrap_or_else(|| panic!("could not locate {name} under {}", xsd_dir.display()))
+        };
 
         let se = "12345678-1111-2222-3333-444444444444";
-        let cpl = ImfCpl {
-            uuid: "11111111-2222-3333-4444-555555555555".into(),
-            title: "Lang + MCA".into(),
-            issuer: "postkit".into(),
-            creator: "postkit".into(),
-            issue_date: "2024-01-01T00:00:00+00:00".into(),
-            fps_num: 24,
-            fps_den: 1,
-            resources: vec![ImfResource {
-                track_file_uuid: "aaaaaaaa-1111-2222-3333-444444444444".into(),
-                duration: 240,
-                kind: ImfTrackKind::Audio,
-                source_encoding: Some(se.into()),
-            }],
-            languages: vec!["de-DE".into(), "en-US".into()],
-            essence_descriptors: vec![ImfEssenceDescriptor {
-                id: se.into(),
-                body: sample_audio_descriptor_body("de-DE"),
-            }],
-            max_cll: Some(993),
-            max_fall: Some(362),
-            ..Default::default()
-        };
+        for edition in [App2eEdition::Edition2016, App2eEdition::Edition2020] {
+            let cpl = ImfCpl {
+                uuid: "11111111-2222-3333-4444-555555555555".into(),
+                title: "Lang + MCA".into(),
+                issuer: "postkit".into(),
+                creator: "postkit".into(),
+                issue_date: "2024-01-01T00:00:00+00:00".into(),
+                fps_num: 24,
+                fps_den: 1,
+                resources: vec![ImfResource {
+                    track_file_uuid: "aaaaaaaa-1111-2222-3333-444444444444".into(),
+                    duration: 240,
+                    kind: ImfTrackKind::Audio,
+                    source_encoding: Some(se.into()),
+                }],
+                languages: vec!["de-DE".into(), "en-US".into()],
+                essence_descriptors: vec![ImfEssenceDescriptor {
+                    id: se.into(),
+                    body: sample_audio_descriptor_body("de-DE"),
+                }],
+                max_cll: Some(993),
+                max_fall: Some(362),
+                app2e_edition: edition,
+                ..Default::default()
+            };
 
-        let dir = tempfile::tempdir().unwrap();
-        let cpl_path = dir.path().join("CPL_lang_mca.xml");
-        std::fs::write(&cpl_path, cpl.to_xml()).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let cpl_path = dir.path().join("CPL_lang_mca.xml");
+            std::fs::write(&cpl_path, cpl.to_xml()).unwrap();
 
-        // ExtensionProperties is xs:any processContents="lax", so MaxCLL/MaxFALL are
-        // only really checked when the app2e schema is among the imports.
-        let app2e_import = match walk(root, "app2e-2016.xsd") {
-            Some(p) => format!(
+            // ExtensionProperties is xs:any processContents="lax", so MaxCLL/MaxFALL are
+            // only really checked when the app2e schema is among the imports.
+            let app2e_import = match walk(root, "app2e-2016.xsd") {
+                Some(p) => format!(
+                    "\n  <xs:import namespace=\"{}\" schemaLocation=\"{}\"/>",
+                    ns::APP2E,
+                    crate::file_uri::file_uri(&p)
+                ),
+                None => String::new(),
+            };
+            // every sequence and every resource sits in the core constraints namespace,
+            // and without this import xmllint skips the whole SegmentList
+            let core_constraints_import = format!(
                 "\n  <xs:import namespace=\"{}\" schemaLocation=\"{}\"/>",
-                ns::APP2E,
-                crate::file_uri::file_uri(&p)
-            ),
-            None => String::new(),
-        };
-        let driver = dir.path().join("driver.xsd");
-        std::fs::write(
-            &driver,
-            format!(
-                r#"<?xml version="1.0"?>
+                edition.core_constraints_namespace(),
+                crate::file_uri::file_uri(&core_constraints_xsd(edition))
+            );
+            let driver = dir.path().join("driver.xsd");
+            std::fs::write(
+                &driver,
+                format!(
+                    r#"<?xml version="1.0"?>
 <xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
-  <xs:import namespace="http://www.smpte-ra.org/schemas/2067-3/2016" schemaLocation="{cpl}"/>
-  <xs:import namespace="http://www.w3.org/2000/09/xmldsig#" schemaLocation="{dsig}"/>{app2e_import}
+  <xs:import namespace="http://www.smpte-ra.org/schemas/2067-3/2016" schemaLocation="{cpl_xsd_uri}"/>
+  <xs:import namespace="http://www.w3.org/2000/09/xmldsig#" schemaLocation="{dsig}"/>{app2e_import}{core_constraints_import}
 </xs:schema>"#,
-                cpl = crate::file_uri::file_uri(&cpl_xsd),
-                dsig = crate::file_uri::file_uri(&dsig_xsd),
-            ),
-        )
-        .unwrap();
+                    cpl_xsd_uri = crate::file_uri::file_uri(&cpl_xsd),
+                    dsig = crate::file_uri::file_uri(&dsig_xsd),
+                ),
+            )
+            .unwrap();
 
-        let out = std::process::Command::new("xmllint")
-            .arg("--noout")
-            .arg("--schema")
-            .arg(&driver)
-            .arg(&cpl_path)
-            .output()
-            .expect("run xmllint");
-        assert!(
-            out.status.success(),
-            "CPL must pass ST 2067-3 XSD:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+            let out = std::process::Command::new("xmllint")
+                .arg("--noout")
+                .arg("--schema")
+                .arg(&driver)
+                .arg(&cpl_path)
+                .output()
+                .expect("run xmllint");
+            assert!(
+                out.status.success(),
+                "CPL must pass ST 2067-3 XSD ({edition:?}):\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
