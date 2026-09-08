@@ -2,6 +2,10 @@ use std::fmt::Write;
 
 use asdcplib::Rational;
 use asdcplib::as02::jp2k::{Jpeg2000PictureSubDescriptor, RgbaEssenceDescriptor};
+use asdcplib::as02::pcm::WaveAudioDescriptor;
+use asdcplib::pcm::{McaLabelKind, McaLabelSubDescriptor};
+
+use crate::packaging::escape_xml;
 
 // the three registry namespaces a picture essence descriptor is spelled in
 const AAF: &str = "http://www.smpte-ra.org/reg/395/2014/13/1/aaf";
@@ -29,6 +33,9 @@ const SCANNING_DIRECTION_SYMBOLS: [&str; 8] = [
 // the batch header the MXF puts before the SIZ triples
 const BATCH_HEADER_BYTES: usize = 8;
 const COMPONENT_SIZING_BYTES: usize = 3;
+
+// asdcplib writes SoundEssenceCoding without ever setting it, so all zeros means the MXF has no value
+const UNSET_UL: [u8; 16] = [0; 16];
 
 /// The RGBA picture essence descriptor of a wrapped AS-02 JPEG 2000 track file,
 /// as the RegXML an IMF CPL's EssenceDescriptorList carries. Every item comes
@@ -175,6 +182,220 @@ pub fn picture_descriptor_regxml(
 
 fn item(xml: &mut String, indent: &str, name: &str, value: &str) {
     let _ = writeln!(xml, "{indent}<r1:{name}>{value}</r1:{name}>");
+}
+
+/// The WAVE PCM essence descriptor of a wrapped AS-02 sound track file, as the
+/// RegXML an IMF CPL's EssenceDescriptorList carries. Every item comes off the
+/// MXF, the MCA label InstanceIDs included, so a validator comparing the two
+/// sees one descriptor twice.
+pub fn sound_descriptor_regxml(
+    descriptor: &WaveAudioDescriptor,
+    labels: &[McaLabelSubDescriptor],
+) -> String {
+    let mut xml = String::new();
+    let _ = writeln!(
+        xml,
+        r#"      <r0:WAVEPCMDescriptor xmlns:r0="{AAF}" xmlns:r1="{ITEMS}">"#
+    );
+    const INDENT: &str = "        ";
+    item(
+        &mut xml,
+        INDENT,
+        "InstanceID",
+        &urn_uuid(&descriptor.instance_id),
+    );
+    if let Some(generation) = &descriptor.generation_id {
+        item(
+            &mut xml,
+            INDENT,
+            "LinkedGenerationID",
+            &urn_uuid(generation),
+        );
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "SampleRate",
+        &rational(&descriptor.sample_rate),
+    );
+    if let Some(duration) = descriptor.container_duration {
+        item(&mut xml, INDENT, "EssenceLength", &duration.to_string());
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "ContainerFormat",
+        &urn_ul(&descriptor.essence_container),
+    );
+    if let Some(codec) = &descriptor.codec {
+        item(&mut xml, INDENT, "Codec", &urn_ul(codec));
+    }
+    if let Some(track) = descriptor.linked_track_id {
+        item(&mut xml, INDENT, "LinkedTrackID", &track.to_string());
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "AudioSampleRate",
+        &rational(&descriptor.audio_sampling_rate),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "Locked",
+        if descriptor.locked { "true" } else { "false" },
+    );
+    if let Some(level) = descriptor.audio_ref_level {
+        item(
+            &mut xml,
+            INDENT,
+            "AudioReferenceLevel",
+            &(level as i8).to_string(),
+        );
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "ChannelCount",
+        &descriptor.channel_count.to_string(),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "QuantizationBits",
+        &descriptor.quantization_bits.to_string(),
+    );
+    if let Some(dial_norm) = descriptor.dial_norm {
+        item(&mut xml, INDENT, "DialNorm", &(dial_norm as i8).to_string());
+    }
+    if descriptor.sound_essence_coding != UNSET_UL {
+        item(
+            &mut xml,
+            INDENT,
+            "SoundCompression",
+            &urn_ul(&descriptor.sound_essence_coding),
+        );
+    }
+    if let Some(level) = descriptor.reference_audio_alignment_level {
+        item(
+            &mut xml,
+            INDENT,
+            "ReferenceAudioAlignmentLevel",
+            &(level as i8).to_string(),
+        );
+    }
+    if let Some(edit_rate) = &descriptor.reference_image_edit_rate {
+        item(
+            &mut xml,
+            INDENT,
+            "ReferenceImageEditRate",
+            &rational(edit_rate),
+        );
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "BlockAlign",
+        &descriptor.block_align.to_string(),
+    );
+    if let Some(offset) = descriptor.sequence_offset {
+        item(&mut xml, INDENT, "SequenceOffset", &offset.to_string());
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "AverageBytesPerSecond",
+        &descriptor.avg_bps.to_string(),
+    );
+    if let Some(assignment) = &descriptor.channel_assignment {
+        item(&mut xml, INDENT, "ChannelAssignment", &urn_ul(assignment));
+    }
+
+    if !labels.is_empty() {
+        xml.push_str("        <r1:SubDescriptors>\n");
+        for label in labels {
+            xml.push_str(&mca_label_sub_descriptor_regxml(label));
+        }
+        xml.push_str("        </r1:SubDescriptors>\n");
+    }
+    xml.push_str("      </r0:WAVEPCMDescriptor>");
+    xml
+}
+
+fn mca_label_sub_descriptor_regxml(label: &McaLabelSubDescriptor) -> String {
+    const INDENT: &str = "            ";
+    let element = match label.kind {
+        McaLabelKind::AudioChannel => "AudioChannelLabelSubDescriptor",
+        McaLabelKind::SoundfieldGroup => "SoundfieldGroupLabelSubDescriptor",
+        McaLabelKind::GroupOfSoundfieldGroups => "GroupOfSoundfieldGroupsLabelSubDescriptor",
+    };
+    let mut xml = String::new();
+    let _ = writeln!(xml, "          <r0:{element}>");
+    item(
+        &mut xml,
+        INDENT,
+        "InstanceID",
+        &urn_uuid(&label.instance_id),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "MCALabelDictionaryID",
+        &urn_ul(&label.label_dictionary_id),
+    );
+    item(&mut xml, INDENT, "MCALinkID", &urn_uuid(&label.link_id));
+    item(
+        &mut xml,
+        INDENT,
+        "MCATagSymbol",
+        &escape_xml(&label.tag_symbol),
+    );
+    if let Some(tag_name) = &label.tag_name {
+        item(&mut xml, INDENT, "MCATagName", &escape_xml(tag_name));
+    }
+    if let Some(channel) = label.channel_id {
+        item(&mut xml, INDENT, "MCAChannelID", &channel.to_string());
+    }
+    if let Some(language) = &label.spoken_language {
+        item(
+            &mut xml,
+            INDENT,
+            "RFC5646SpokenLanguage",
+            &escape_xml(language),
+        );
+    }
+    if let Some(title) = &label.title {
+        item(&mut xml, INDENT, "MCATitle", &escape_xml(title));
+    }
+    if let Some(title_version) = &label.title_version {
+        item(
+            &mut xml,
+            INDENT,
+            "MCATitleVersion",
+            &escape_xml(title_version),
+        );
+    }
+    if let Some(content_kind) = &label.audio_content_kind {
+        item(
+            &mut xml,
+            INDENT,
+            "MCAAudioContentKind",
+            &escape_xml(content_kind),
+        );
+    }
+    if let Some(element_kind) = &label.audio_element_kind {
+        item(
+            &mut xml,
+            INDENT,
+            "MCAAudioElementKind",
+            &escape_xml(element_kind),
+        );
+    }
+    if let Some(group) = &label.soundfield_group_link_id {
+        item(&mut xml, INDENT, "SoundfieldGroupLinkID", &urn_uuid(group));
+    }
+    let _ = writeln!(xml, "          </r0:{element}>");
+    xml
 }
 
 fn jpeg2000_sub_descriptor_regxml(sub: &Jpeg2000PictureSubDescriptor) -> String {

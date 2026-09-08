@@ -25,6 +25,25 @@
   the urn spellings, a UL as `urn:smpte:ul:` in four dot-separated groups and an
   InstanceID as `urn:uuid:`.
 
+- **The wrapped sound MXF descriptor reads back as CPL RegXML**:
+  `regxml::sound_descriptor_regxml` takes the `WaveAudioDescriptor` and the
+  `McaLabelSubDescriptor` list that `asdcplib::as02::pcm::MxfReader` reads back
+  off a wrapped AS-02 PCM track file, and writes them as the RegXML an IMF CPL's
+  EssenceDescriptorList carries. The WAVEPCMDescriptor gets InstanceID,
+  LinkedGenerationID, SampleRate, EssenceLength, ContainerFormat, Codec,
+  LinkedTrackID, AudioSampleRate, Locked, AudioReferenceLevel, ChannelCount,
+  QuantizationBits, DialNorm, SoundCompression, ReferenceAudioAlignmentLevel,
+  ReferenceImageEditRate, BlockAlign, SequenceOffset, AverageBytesPerSecond and
+  ChannelAssignment. Each MCA label nested in SubDescriptors is written as the
+  SoundfieldGroupLabelSubDescriptor, AudioChannelLabelSubDescriptor or
+  GroupOfSoundfieldGroupsLabelSubDescriptor its kind names, in the order the
+  descriptor links them, and gets its own InstanceID, MCALabelDictionaryID,
+  MCALinkID, MCATagSymbol, MCATagName, MCAChannelID, RFC5646SpokenLanguage,
+  MCATitle, MCATitleVersion, MCAAudioContentKind, MCAAudioElementKind and
+  SoundfieldGroupLinkID. The optional items are written only when the descriptor
+  carries them, and SoundCompression is skipped while it is the all-zero UL
+  asdcplib leaves it at.
+
 - **A Dolby Vision test clip is built in process**:
   `dolby_vision::write_dolby_vision_fixture` encodes
   `DOLBY_VISION_FIXTURE_FRAMES` frames of 320x180 10 bit grey with ffmpeg's

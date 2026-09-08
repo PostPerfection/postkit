@@ -2524,6 +2524,108 @@ mod tests {
         assert_eq!(channels, vec![1, 2, 3, 4, 5, 6]);
     }
 
+    /// The sound CPL entry a validator compares with the track file has to
+    /// repeat what the wrap put in the MXF, every MCA InstanceID included.
+    #[test]
+    fn the_cpl_sound_descriptor_entry_repeats_the_wrapped_descriptor() {
+        const CHANNELS: u16 = 6;
+        const SAMPLE_RATE: u32 = 48000;
+        const BITS: u16 = 24;
+        const BLOCK_ALIGN: u32 = CHANNELS as u32 * (BITS / 8) as u32;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("51.wav");
+        std::fs::write(
+            &wav_path,
+            make_wav(CHANNELS, SAMPLE_RATE, BITS, SAMPLE_RATE),
+        )
+        .unwrap();
+        let out = dir.path().join("out.mxf");
+        let opts = MxfWrapOptions {
+            input_files: vec![wav_path],
+            output: out.clone(),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::As02,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: Some(McaConfig {
+                labels: "51(L,R,C,LFE,Ls,Rs)".to_string(),
+                spoken_language: Some("de-DE".to_string()),
+                soundfield_group: Some(SoundfieldGroup {
+                    title: "Test Feature".to_string(),
+                    title_version: "Original Version".to_string(),
+                    audio_content_kind: "PRM".to_string(),
+                    audio_element_kind: "FCMP".to_string(),
+                }),
+            }),
+            resource_ids: vec![],
+            hdr: None,
+            asset_uuid: None,
+            timed_text_duration_frames: None,
+        };
+        let result = wrap_pcm(&opts);
+        assert!(result.success, "wrap failed: {}", result.error);
+
+        let mut reader = asdcplib::as02::pcm::MxfReader::new();
+        reader
+            .open_read(&out.to_string_lossy(), asdcplib::Rational::new(24, 1))
+            .expect("the sound MXF opens");
+        let descriptor = reader
+            .wave_audio_descriptor()
+            .expect("the wave audio descriptor");
+        let labels = reader
+            .mca_label_subdescriptors()
+            .expect("the mca subdescriptors");
+
+        let xml = crate::regxml::sound_descriptor_regxml(&descriptor, &labels);
+
+        let instance = |bytes: &[u8; 16]| {
+            format!(
+                "<r1:InstanceID>{}</r1:InstanceID>",
+                crate::regxml::urn_uuid(bytes)
+            )
+        };
+        assert!(xml.contains(&instance(&descriptor.instance_id)), "{xml}");
+        // the labels appear in the order the reader reports them, ids and all
+        let mut searched_from = 0;
+        for label in &labels {
+            let found = xml[searched_from..]
+                .find(&instance(&label.instance_id))
+                .unwrap_or_else(|| panic!("missing mca instance id\n{xml}"));
+            searched_from += found + 1;
+        }
+        assert_eq!(
+            xml.matches("<r1:InstanceID>").count(),
+            labels.len() + 1,
+            "one id per subdescriptor plus the descriptor's own"
+        );
+        assert_eq!(descriptor.sub_descriptors.len(), labels.len());
+
+        for expected in [
+            format!("<r1:ChannelCount>{CHANNELS}</r1:ChannelCount>"),
+            format!("<r1:QuantizationBits>{BITS}</r1:QuantizationBits>"),
+            format!("<r1:BlockAlign>{BLOCK_ALIGN}</r1:BlockAlign>"),
+            format!(
+                "<r1:AverageBytesPerSecond>{}</r1:AverageBytesPerSecond>",
+                SAMPLE_RATE * BLOCK_ALIGN
+            ),
+            format!("<r1:AudioSampleRate>{SAMPLE_RATE}/1</r1:AudioSampleRate>"),
+        ] {
+            assert!(xml.contains(&expected), "missing {expected}\n{xml}");
+        }
+        assert_eq!(
+            xml.matches("<r0:AudioChannelLabelSubDescriptor>").count(),
+            CHANNELS as usize
+        );
+        assert_eq!(
+            xml.matches("<r0:SoundfieldGroupLabelSubDescriptor>")
+                .count(),
+            1
+        );
+    }
+
     /// Wrap a structurally valid but synthetic DCData/Atmos payload and confirm
     /// the container is a Dolby Atmos aux-data MXF the reader accepts. This does
     /// NOT validate real Atmos essence: the frames are filler, so only the MXF
