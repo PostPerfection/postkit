@@ -435,6 +435,180 @@ pub fn generate_profile84_rpu() -> Result<Vec<u8>, String> {
         .map_err(|e| format!("Failed to write RPU: {e}"))
 }
 
+pub const DOLBY_VISION_FIXTURE_FRAMES: usize = 6;
+
+const FIXTURE_SOURCE_FILTER: &str = "color=c=gray:s=320x180:r=25";
+const FIXTURE_PIXEL_FORMAT: &str = "yuv420p10le";
+const FIXTURE_LEVEL_1_AVG_PQ: u16 = 1229;
+const NAL_START_CODE: &[u8] = &[0, 0, 0, 1];
+const NAL_START_CODE_PREFIX: &[u8] = &[0, 0, 1];
+const LAST_VIDEO_CODING_NAL_TYPE: u8 = 21;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DolbyVisionFixtureProfile {
+    Profile5,
+    Profile81,
+    Profile84,
+}
+
+impl From<DolbyVisionFixtureProfile> for dolby_vision::rpu::generate::GenerateProfile {
+    fn from(profile: DolbyVisionFixtureProfile) -> Self {
+        use dolby_vision::rpu::generate::GenerateProfile;
+        match profile {
+            DolbyVisionFixtureProfile::Profile5 => GenerateProfile::Profile5,
+            DolbyVisionFixtureProfile::Profile81 => GenerateProfile::Profile81,
+            DolbyVisionFixtureProfile::Profile84 => GenerateProfile::Profile84,
+        }
+    }
+}
+
+fn encode_plain_hevc(output: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            FIXTURE_SOURCE_FILTER,
+            "-frames:v",
+        ])
+        .arg(DOLBY_VISION_FIXTURE_FRAMES.to_string())
+        .args([
+            "-pix_fmt",
+            FIXTURE_PIXEL_FORMAT,
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "log-level=none",
+            "-f",
+            "hevc",
+        ])
+        .arg(output)
+        .output()
+        .map_err(|e| format!("Failed to run ffmpeg: {e}"))?;
+
+    if !out.status.success() {
+        return Err(format!(
+            "ffmpeg failed to encode the Dolby Vision fixture base layer, which needs libx265: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn generate_rpu_nalus(
+    profile: DolbyVisionFixtureProfile,
+    level6: Option<ExtMetadataBlockLevel6>,
+    level1_max_pq: Option<u16>,
+) -> Result<Vec<Vec<u8>>, String> {
+    use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlockLevel1;
+    use dolby_vision::rpu::generate::{GenerateConfig, VideoShot};
+    use dolby_vision::rpu::vdr_dm_data::CmVersion;
+
+    let metadata_blocks = level1_max_pq
+        .map(|max_pq| {
+            vec![ExtMetadataBlock::Level1(ExtMetadataBlockLevel1::new(
+                0,
+                max_pq,
+                FIXTURE_LEVEL_1_AVG_PQ,
+            ))]
+        })
+        .unwrap_or_default();
+
+    let mut config = GenerateConfig {
+        cm_version: CmVersion::V40,
+        profile: profile.into(),
+        length: DOLBY_VISION_FIXTURE_FRAMES,
+        level6,
+        shots: vec![VideoShot {
+            start: 0,
+            duration: DOLBY_VISION_FIXTURE_FRAMES,
+            metadata_blocks,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    config.fixup_l1();
+
+    config
+        .generate_rpu_list()
+        .map_err(|e| format!("Failed to generate the Dolby Vision RPUs: {e}"))?
+        .iter()
+        .map(|rpu| {
+            rpu.write_hevc_unspec62_nalu()
+                .map_err(|e| format!("Failed to write a Dolby Vision RPU NALU: {e}"))
+        })
+        .collect()
+}
+
+fn nal_start_offsets(stream: &[u8]) -> Vec<usize> {
+    let mut offsets = Vec::new();
+    let mut index = 0;
+    while index + NAL_START_CODE_PREFIX.len() <= stream.len() {
+        if &stream[index..index + NAL_START_CODE_PREFIX.len()] == NAL_START_CODE_PREFIX {
+            offsets.push(index);
+            index += NAL_START_CODE_PREFIX.len();
+        } else {
+            index += 1;
+        }
+    }
+    offsets
+}
+
+// the rpu is suffixed to the slices of its access unit, so it lands after each slice nal
+fn insert_rpus_after_slices(stream: &[u8], rpus: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    let offsets = nal_start_offsets(stream);
+    let mut out = Vec::with_capacity(stream.len());
+    let mut next_rpu = 0;
+
+    for (index, offset) in offsets.iter().enumerate() {
+        let end = offsets.get(index + 1).copied().unwrap_or(stream.len());
+        out.extend_from_slice(&stream[*offset..end]);
+
+        let nal_type = stream[offset + NAL_START_CODE_PREFIX.len()] >> 1;
+        if nal_type <= LAST_VIDEO_CODING_NAL_TYPE {
+            let Some(rpu) = rpus.get(next_rpu) else {
+                return Err(format!(
+                    "The fixture base layer holds more than the {} coded pictures the RPUs cover",
+                    rpus.len()
+                ));
+            };
+            out.extend_from_slice(NAL_START_CODE);
+            out.extend_from_slice(rpu);
+            next_rpu += 1;
+        }
+    }
+
+    if next_rpu != rpus.len() {
+        return Err(format!(
+            "The fixture base layer holds {next_rpu} coded pictures for {} RPUs",
+            rpus.len()
+        ));
+    }
+    Ok(out)
+}
+
+pub fn write_dolby_vision_fixture(
+    directory: &Path,
+    name: &str,
+    profile: DolbyVisionFixtureProfile,
+    level6: Option<ExtMetadataBlockLevel6>,
+    level1_max_pq: Option<u16>,
+) -> Result<PathBuf, String> {
+    let base_layer = directory.join("plain.hevc");
+    encode_plain_hevc(&base_layer)?;
+    let stream = std::fs::read(&base_layer)
+        .map_err(|e| format!("Failed to read {}: {e}", base_layer.display()))?;
+
+    let rpus = generate_rpu_nalus(profile, level6, level1_max_pq)?;
+    let output = directory.join(name);
+    std::fs::write(&output, insert_rpus_after_slices(&stream, &rpus)?)
+        .map_err(|e| format!("Failed to write {}: {e}", output.display()))?;
+    Ok(output)
+}
+
 /// Parse a .bin RPU file into individual RPU NALUs.
 fn parse_rpu_bin_file(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let mut rpus = Vec::new();

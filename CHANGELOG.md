@@ -4,6 +4,17 @@
 
 ### Added
 
+- **A Dolby Vision test clip is built in process**:
+  `dolby_vision::write_dolby_vision_fixture` encodes
+  `DOLBY_VISION_FIXTURE_FRAMES` frames of 320x180 10 bit grey with ffmpeg's
+  libx265, generates one RPU per frame with the `dolby_vision` crate for
+  `DolbyVisionFixtureProfile::Profile5`, `Profile81` or `Profile84`, and
+  suffixes each RPU to the slices of its access unit, so a caller gets an annex
+  B HEVC file `read_dolby_vision` reports the profile of. The optional Level 6
+  block and Level 1 `max_pq` set the mastering display and the peak the summary
+  carries. dovi_tool is not involved, and a missing ffmpeg or libx265 comes back
+  as an error rather than a panic.
+
 - **Dolby Vision metadata is read in process**: `dolby_vision::read_dolby_vision`
   demuxes the HEVC stream through ffmpeg, parses every RPU with the
   `dolby_vision` and `hevc_parser` crates (MIT, from dovi_tool), and reports the
