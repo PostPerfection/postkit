@@ -36,12 +36,13 @@ pub struct CompareResult {
 /// stats files. The pid alone does not cover two threads of one process.
 static COMPARISONS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-// a filter option value: a windows drive colon or a backslash would end the option
+// a windows drive colon ends a filter option, and the graph parser strips one
+// backslash before the option parser sees the value
 fn filter_option_path(path: &Path) -> String {
     path.display()
         .to_string()
         .replace('\\', "/")
-        .replace(':', "\\:")
+        .replace(':', "\\\\:")
 }
 
 /// A stats file only this comparison writes and reads.
@@ -465,9 +466,47 @@ n:2 R:0.763922 G:0.730375 B:0.672471 All:0.722256 (5.563553)
     fn a_windows_stats_path_is_escaped_for_the_filter_graph() {
         assert_eq!(
             filter_option_path(Path::new("C:\\Users\\r\\Temp\\imfwizard_psnr_1_0.log")),
-            "C\\:/Users/r/Temp/imfwizard_psnr_1_0.log"
+            "C\\\\:/Users/r/Temp/imfwizard_psnr_1_0.log"
         );
         assert_eq!(filter_option_path(Path::new("/tmp/x.log")), "/tmp/x.log");
+    }
+
+    // a linux path with a colon goes through the same two parsers a windows
+    // drive letter does
+    #[test]
+    fn ffmpeg_writes_a_stats_file_on_a_path_with_a_colon() {
+        let dir = tempfile::tempdir().unwrap();
+        let colon_dir = dir.path().join("c:d");
+        std::fs::create_dir(&colon_dir).unwrap();
+        let stats = colon_dir.join("psnr.log");
+        let run = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=s=64x64:r=1",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=s=64x64:r=1",
+                "-frames:v",
+                "1",
+                "-lavfi",
+                &format!("[0:v][1:v]psnr=stats_file={}", filter_option_path(&stats)),
+                "-f",
+                "null",
+                "-",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(stats.is_file(), "no stats file at {}", stats.display());
     }
 
     #[test]

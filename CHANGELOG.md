@@ -503,7 +503,10 @@
   went into the ffmpeg filter graph as is, where a drive colon ends the option
   and a backslash escapes the next character, so every comparison failed with
   "ffmpeg comparison failed". The paths are escaped for the graph now, and a
-  failed ffmpeg run reports its last stderr line.
+  failed ffmpeg run reports its last stderr line. The first escape used one
+  backslash, which the graph parser consumed before the option parser split on
+  the colon, so Windows still failed with "Invalid argument"; the colon now
+  carries two, and a test runs ffmpeg on a path with a colon in it.
 
 - **`compare_frames` returned "No frames compared" for every RGB video**: both
   stats parsers required the luma component keys, `psnr_y`/`psnr_u`/`psnr_v` and
