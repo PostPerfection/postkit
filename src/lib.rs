@@ -52,6 +52,7 @@ pub mod preview_colour;
 pub mod probe;
 pub mod profiles;
 pub mod prores;
+pub mod regxml;
 pub mod report;
 pub mod rest_api;
 pub mod shell_completion;

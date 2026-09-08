@@ -68,6 +68,25 @@ impl std::fmt::Debug for MxfEncryption {
 pub struct McaConfig {
     pub labels: String,
     pub spoken_language: Option<String>,
+    /// What an IMF soundfield group says about itself beyond the language. The
+    /// AS-02 writer needs all of it and refuses an empty field; the AS-DCP
+    /// writer takes the language alone and ignores this.
+    #[serde(default)]
+    pub soundfield_group: Option<SoundfieldGroup>,
+}
+
+/// The MCA soundfield group properties ST 2067-2 asks an IMF sound track file
+/// to carry, beside the spoken language.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SoundfieldGroup {
+    /// MCATitle, the work this audio belongs to.
+    pub title: String,
+    /// MCATitleVersion, the version of that work.
+    pub title_version: String,
+    /// MCAAudioContentKind, "PRM" for a primary mix.
+    pub audio_content_kind: String,
+    /// MCAAudioElementKind, "FCMP" for a final complete mix.
+    pub audio_element_kind: String,
 }
 
 /// Options for MXF wrapping.
@@ -224,8 +243,8 @@ impl PcmWriter {
         }
     }
 
-    /// Open the writer, attaching MCA labels when `mca_config` is set (AS-DCP only;
-    /// the AS-02 path here never carries MCA labels).
+    /// Open the writer, attaching MCA labels when `mca_config` is set. The AS-02
+    /// writer needs the whole soundfield group, the AS-DCP one the language only.
     fn open_write(
         &mut self,
         filename: &str,
@@ -234,19 +253,38 @@ impl PcmWriter {
         mca_config: Option<&McaConfig>,
         header_size: u32,
     ) -> asdcplib::Result<()> {
-        match self {
-            Self::AsDcp(w) => match mca_config {
-                Some(m) => w.open_write_mca(
+        match (self, mca_config) {
+            (Self::AsDcp(w), Some(mca)) => w.open_write_mca(
+                filename,
+                info,
+                desc,
+                &mca.labels,
+                mca.spoken_language.as_deref(),
+                header_size,
+            ),
+            (Self::AsDcp(w), None) => w.open_write(filename, info, desc, header_size),
+            (Self::As02(w), Some(mca)) => {
+                let Some(group) = &mca.soundfield_group else {
+                    return Err(asdcplib::Error::InvalidArgument(
+                        "an AS-02 MCA wrap needs the soundfield group properties",
+                    ));
+                };
+                w.open_write_mca(
                     filename,
                     info,
                     desc,
-                    &m.labels,
-                    m.spoken_language.as_deref(),
+                    &mca.labels,
+                    &asdcplib::as02::pcm::SoundfieldGroupProperties {
+                        language: mca.spoken_language.as_deref().unwrap_or_default(),
+                        title: &group.title,
+                        title_version: &group.title_version,
+                        audio_content_kind: &group.audio_content_kind,
+                        audio_element_kind: &group.audio_element_kind,
+                    },
                     header_size,
-                ),
-                None => w.open_write(filename, info, desc, header_size),
-            },
-            Self::As02(w) => w.open_write(filename, info, desc, header_size),
+                )
+            }
+            (Self::As02(w), None) => w.open_write(filename, info, desc, header_size),
         }
     }
 
@@ -1078,13 +1116,6 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
     if opts.input_files.is_empty() {
         return MxfTrackFile {
             error: "no input files".to_string(),
-            ..Default::default()
-        };
-    }
-
-    if opts.mca_config.is_some() && opts.standard == MxfStandard::As02 {
-        return MxfTrackFile {
-            error: "MCA labels are only supported on the AS-DCP (DCP) PCM path".to_string(),
             ..Default::default()
         };
     }
@@ -1989,6 +2020,79 @@ mod tests {
         );
     }
 
+    /// The CPL entry a validator compares with the track file has to repeat what
+    /// the wrap put in the MXF, the two InstanceIDs included.
+    #[test]
+    fn the_cpl_descriptor_entry_repeats_the_wrapped_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let frame = dir.path().join("0001.j2c");
+        std::fs::write(&frame, synthetic_j2k_with_profile(IMF_2K_RSIZ)).unwrap();
+        let output = dir.path().join("picture.mxf");
+
+        let mut opts = j2k_opts(frame, output.clone(), None);
+        opts.standard = MxfStandard::As02;
+        opts.hdr = Some(asdcplib::jp2k::HdrMetadata {
+            transfer_characteristic: Some(asdcplib::jp2k::TRANSFER_CHARACTERISTIC_ST2084),
+            color_primaries: Some(asdcplib::jp2k::COLOR_PRIMARIES_BT2020),
+            ..Default::default()
+        });
+        let wrapped = mxf_wrap(&opts);
+        assert!(wrapped.success, "wrap failed: {}", wrapped.error);
+
+        let mut reader = asdcplib::as02::jp2k::MxfReader::new();
+        reader
+            .open_read(&output.to_string_lossy())
+            .expect("the picture MXF opens");
+        let descriptor = reader.rgba_essence_descriptor().expect("the descriptor");
+        let jpeg2000 = reader
+            .jpeg2000_sub_descriptor()
+            .expect("the sub-descriptor");
+        reader.close().unwrap();
+
+        let xml = crate::regxml::picture_descriptor_regxml(&descriptor, &jpeg2000);
+
+        // both instance ids are the MXF's own, not ones minted for the CPL
+        assert_ne!(descriptor.instance_id, jpeg2000.instance_id);
+        for instance in [descriptor.instance_id, jpeg2000.instance_id] {
+            assert!(
+                xml.contains(&format!(
+                    "<r1:InstanceID>{}</r1:InstanceID>",
+                    crate::regxml::urn_uuid(&instance)
+                )),
+                "{xml}"
+            );
+        }
+        assert!(xml.contains("<r1:SampleRate>24/1</r1:SampleRate>"));
+        assert!(xml.contains("<r1:FrameLayout>FullFrame</r1:FrameLayout>"));
+        assert!(xml.contains(&format!(
+            "<r1:StoredWidth>{}</r1:StoredWidth>",
+            descriptor.stored_width
+        )));
+        assert!(xml.contains(&format!(
+            "<r1:ContainerFormat>{}</r1:ContainerFormat>",
+            crate::regxml::urn_ul(&descriptor.essence_container)
+        )));
+        assert!(xml.contains(&format!(
+            "<r1:TransferCharacteristic>{}</r1:TransferCharacteristic>",
+            crate::regxml::urn_ul(&asdcplib::jp2k::TRANSFER_CHARACTERISTIC_ST2084)
+        )));
+        assert!(xml.contains(
+            "<r1:VideoLineMap><r2:Int32>1</r2:Int32><r2:Int32>0</r2:Int32></r1:VideoLineMap>"
+        ));
+        assert!(xml.contains(
+            "<r2:RGBAComponent><r2:Code>CompRed</r2:Code><r2:ComponentSize>12</r2:ComponentSize></r2:RGBAComponent>"
+        ));
+        assert!(xml.contains("<r0:JPEG2000SubDescriptor>"));
+        assert!(xml.contains("<r1:J2CLayout>"));
+        assert_eq!(
+            xml.matches("<r2:J2KComponentSizing>").count(),
+            jpeg2000.csize as usize
+        );
+        assert!(xml.contains(
+            "<r2:J2KComponentSizing><r2:Ssiz>11</r2:Ssiz><r2:XRSiz>1</r2:XRSiz><r2:YRSiz>1</r2:YRSiz></r2:J2KComponentSizing>"
+        ));
+    }
+
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
@@ -2326,6 +2430,7 @@ mod tests {
             mca_config: Some(McaConfig {
                 labels: mca.unwrap(),
                 spoken_language: Some("fr-CA".to_string()),
+                soundfield_group: None,
             }),
             resource_ids: vec![],
             hdr: None,
@@ -2357,14 +2462,17 @@ mod tests {
         }
     }
 
+    /// An IMF sound track file carries the MCA ChannelAssignment ST 2067-2 asks
+    /// for, one label per channel and one soundfield group naming the work.
     #[test]
-    fn wrap_pcm_mca_rejected_on_as02() {
+    fn wrap_pcm_writes_imf_mca_labels_on_as02() {
         let dir = tempfile::tempdir().unwrap();
         let wav_path = dir.path().join("51.wav");
         std::fs::write(&wav_path, make_wav(6, 48000, 24, 48000)).unwrap();
+        let out = dir.path().join("out.mxf");
         let opts = MxfWrapOptions {
             input_files: vec![wav_path],
-            output: dir.path().join("out.mxf"),
+            output: out.clone(),
             essence_type: EssenceType::Pcm,
             standard: MxfStandard::As02,
             fps_num: 24,
@@ -2373,7 +2481,13 @@ mod tests {
             encryption: None,
             mca_config: Some(McaConfig {
                 labels: "51(L,R,C,LFE,Ls,Rs)".to_string(),
-                spoken_language: None,
+                spoken_language: Some("de-DE".to_string()),
+                soundfield_group: Some(SoundfieldGroup {
+                    title: "Test Feature".to_string(),
+                    title_version: "Original Version".to_string(),
+                    audio_content_kind: "PRM".to_string(),
+                    audio_element_kind: "FCMP".to_string(),
+                }),
             }),
             resource_ids: vec![],
             hdr: None,
@@ -2381,8 +2495,33 @@ mod tests {
             timed_text_duration_frames: None,
         };
         let result = wrap_pcm(&opts);
-        assert!(!result.success, "MCA on AS-02 must be rejected");
-        assert!(result.error.contains("AS-DCP"), "got: {}", result.error);
+        assert!(result.success, "wrap failed: {}", result.error);
+
+        let mut reader = asdcplib::as02::pcm::MxfReader::new();
+        reader
+            .open_read(&out.to_string_lossy(), asdcplib::Rational::new(24, 1))
+            .unwrap();
+        assert_eq!(
+            reader
+                .channel_assignment()
+                .expect("read channel assignment"),
+            Some(asdcplib::as02::pcm::IMF_CHANNEL_ASSIGNMENT_MCA)
+        );
+        let labels = reader
+            .mca_label_subdescriptors()
+            .expect("read mca subdescriptors");
+        assert_eq!(labels.len(), 7, "six channels plus the soundfield group");
+        let group = labels
+            .iter()
+            .find(|label| label.kind == asdcplib::pcm::McaLabelKind::SoundfieldGroup)
+            .expect("a soundfield group label");
+        assert_eq!(group.spoken_language.as_deref(), Some("de-DE"));
+        assert_eq!(group.title.as_deref(), Some("Test Feature"));
+        assert_eq!(group.title_version.as_deref(), Some("Original Version"));
+        assert_eq!(group.audio_content_kind.as_deref(), Some("PRM"));
+        assert_eq!(group.audio_element_kind.as_deref(), Some("FCMP"));
+        let channels: Vec<u32> = labels.iter().filter_map(|label| label.channel_id).collect();
+        assert_eq!(channels, vec![1, 2, 3, 4, 5, 6]);
     }
 
     /// Wrap a structurally valid but synthetic DCData/Atmos payload and confirm

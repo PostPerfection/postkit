@@ -1025,6 +1025,7 @@ mod tests {
             mca_config: Some(crate::mxf_wrap::McaConfig {
                 labels: mca_config.to_string(),
                 spoken_language: None,
+                soundfield_group: None,
             }),
             resource_ids: vec![],
             hdr: None,
