@@ -456,6 +456,19 @@
 
 ### Fixed
 
+- **Canonical XML renders a namespaced attribute instead of refusing it**:
+  `c14n` returned `c14n does not support namespaced attribute '<name>'` for any
+  attribute carrying a prefix, so signing an IMF CPL failed outright: ST 2067-3
+  puts `xsi:type="TrackFileResourceType"` on every track file Resource. A
+  prefixed attribute is now written with the QName the source spells it with,
+  and the attributes of an element are sorted by namespace URI then local name,
+  which is Canonical XML 1.0 section 2.3 and what `xmllint --c14n` produces: the
+  unprefixed ones come first in local-name order, the prefixed ones follow in
+  URI order, never prefix order. The prefix resolves through the in-scope
+  declarations, `xml` is bound to `http://www.w3.org/XML/1998/namespace` without
+  a declaration, and a prefix with no declaration in scope is still an error
+  naming the attribute.
+
 - **The resumable video encode fails when ffmpeg fails**: the same hole on the
   path the dcpwizard CLI takes, a decode that produced nothing came back as a
   success with 0 frames and the wizard could only say no frames reached the

@@ -61,6 +61,8 @@ pub(crate) const ENVELOPED_TRANSFORM: &str =
 pub(crate) const SIG_METHOD: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 /// SHA-256 digest.
 pub(crate) const DIGEST_METHOD: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
+// bound by the namespaces spec, never declared
+const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
 /// The identity that signs: leaf certificate, its RSA private key, and the CA
 /// certificates above the leaf (intermediate(s) then root). All are embedded in
@@ -558,6 +560,7 @@ fn inherited_scope(
 
 /// Inject `inherited` namespace declarations onto the apex of a serialized
 /// subtree so it canonicalizes as an in-place node-set would.
+// TODO: a document subset's apex should also inherit the ancestors' xml:* attributes
 fn inject_namespaces(subtree: &str, inherited: &[(String, String)]) -> Result<String, String> {
     let bytes = subtree.as_bytes();
     if bytes.first() != Some(&b'<') {
@@ -1044,10 +1047,11 @@ impl Comments {
 /// byte-for-byte for the fragments the signer emits. Scope is narrowed to
 /// exactly that input: elements, text, comments, namespace declarations (the
 /// default and prefixed, including a descendant that redefines the default, as
-/// KDMRequiredExtensions and EncryptedKey do) and unprefixed attributes. A
-/// DOCTYPE, processing instruction, CDATA section, XML declaration, entity
-/// beyond the standard five, or namespaced attribute is a hard error: none can
-/// occur here, and canonicalizing one silently could yield a wrong digest.
+/// KDMRequiredExtensions and EncryptedKey do), unprefixed attributes and
+/// namespaced ones (the IMF CPL puts xsi:type on every Resource). A DOCTYPE,
+/// processing instruction, CDATA section, XML declaration, or entity beyond the
+/// standard five is a hard error: none can occur here, and canonicalizing one
+/// silently could yield a wrong digest.
 pub(crate) fn c14n(fragment: &str, comments: Comments) -> Result<Vec<u8>, String> {
     use quick_xml::escape::unescape;
     use quick_xml::events::Event;
@@ -1227,7 +1231,7 @@ fn c14n_start_tag(
 
     // Split attributes into namespace declarations and ordinary attributes.
     let mut decls: Vec<(String, String)> = Vec::new(); // (prefix, uri), "" = default
-    let mut attrs: Vec<(String, String)> = Vec::new(); // (name, value)
+    let mut attrs: Vec<(String, String)> = Vec::new(); // (qname as written, value)
     for attr in e.attributes() {
         let attr = attr.map_err(|err| format!("c14n cannot read an attribute: {err}"))?;
         let key = std::str::from_utf8(attr.key.as_ref())
@@ -1240,10 +1244,6 @@ fn c14n_start_tag(
             decls.push((String::new(), value));
         } else if let Some(prefix) = key.strip_prefix("xmlns:") {
             decls.push((prefix.to_string(), value));
-        } else if key.contains(':') {
-            return Err(format!(
-                "c14n does not support namespaced attribute '{key}'; the signer emits none"
-            ));
         } else {
             attrs.push((key.to_string(), value));
         }
@@ -1260,10 +1260,24 @@ fn c14n_start_tag(
     }
     ns_stack.push(rendered.clone());
 
-    // Namespaces sort by prefix (empty default first); attributes by name (all
-    // are unprefixed here, so no namespace-uri key participates in the sort).
+    // c14n orders attributes by namespace uri then local name, never by prefix
+    let mut sorted_attrs: Vec<(String, String, String, String)> = Vec::new();
+    for (qname, value) in attrs {
+        let (uri, local) = match qname.split_once(':') {
+            None => (String::new(), qname.clone()),
+            Some((prefix, local)) => {
+                let uri = attribute_namespace(ns_stack, prefix).ok_or_else(|| {
+                    format!("c14n attribute '{qname}' uses a prefix that is not in scope")
+                })?;
+                (uri, local.to_string())
+            }
+        };
+        sorted_attrs.push((uri, local, qname, value));
+    }
+
+    // Namespaces sort by prefix, empty default first.
     rendered.sort_by(|a, b| a.0.cmp(&b.0));
-    attrs.sort_by(|a, b| a.0.cmp(&b.0));
+    sorted_attrs.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
 
     let mut tag = String::new();
     tag.push('<');
@@ -1279,15 +1293,22 @@ fn c14n_start_tag(
         tag.push_str(&escape_attr(uri));
         tag.push('"');
     }
-    for (name, value) in &attrs {
+    for (_, _, qname, value) in &sorted_attrs {
         tag.push(' ');
-        tag.push_str(name);
+        tag.push_str(qname);
         tag.push_str("=\"");
         tag.push_str(&escape_attr(value));
         tag.push('"');
     }
     tag.push('>');
     Ok(tag)
+}
+
+fn attribute_namespace(ns_stack: &[Vec<(String, String)>], prefix: &str) -> Option<String> {
+    if prefix == "xml" {
+        return Some(XML_NAMESPACE.to_string());
+    }
+    inscope_uri(ns_stack, prefix)
 }
 
 fn c14n_end_tag(name: &[u8]) -> Result<String, String> {
@@ -2259,5 +2280,118 @@ mod tests {
                 .to_string();
         assert!(strip_signature(&mut xml));
         assert_eq!(xml, "<Root>\n</Root>");
+    }
+
+    // ─── namespaced attributes, which every IMF CPL Resource carries ──────
+
+    fn c14n_string(fragment: &str) -> String {
+        String::from_utf8(c14n(fragment, Comments::Keep).expect("canonicalize")).expect("utf-8")
+    }
+
+    // the expected bytes are what xmllint --c14n printed on libxml 2.12.10
+    #[test]
+    fn a_namespaced_attribute_matches_the_xmllint_bytes() {
+        assert_eq!(
+            c14n_string(
+                r#"<a xmlns="urn:x" xmlns:xsi="urn:xsi"><b xsi:type="T" z="1" a="2"/></a>"#
+            ),
+            r#"<a xmlns="urn:x" xmlns:xsi="urn:xsi"><b a="2" z="1" xsi:type="T"></b></a>"#
+        );
+    }
+
+    // Prefix "b" is bound to the lower URI, so a prefix sort would put a:one first.
+    #[test]
+    fn namespaced_attributes_sort_by_uri_not_by_prefix() {
+        assert_eq!(
+            c14n_string(r#"<a xmlns:b="urn:aaa" xmlns:a="urn:zzz"><c a:one="1" b:two="2"/></a>"#),
+            r#"<a xmlns:a="urn:zzz" xmlns:b="urn:aaa"><c b:two="2" a:one="1"></c></a>"#
+        );
+    }
+
+    // the xml namespace uri sorts after the empty one and before urn:p
+    #[test]
+    fn the_xml_prefix_needs_no_declaration() {
+        assert_eq!(
+            c14n_string(r#"<a xmlns:p="urn:p"><b p:z="1" p:a="2" q="3" xml:lang="en"/></a>"#),
+            r#"<a xmlns:p="urn:p"><b q="3" xml:lang="en" p:a="2" p:z="1"></b></a>"#
+        );
+    }
+
+    #[test]
+    fn an_attribute_with_an_undeclared_prefix_is_an_error() {
+        let err = c14n(r#"<a><b nope:type="T"/></a>"#, Comments::Keep)
+            .expect_err("an unresolvable prefix must not canonicalize silently");
+        assert!(err.contains("nope:type"), "got: {err}");
+    }
+
+    // xmlsec1 digests what libxml2 canonicalizes
+    #[test]
+    fn xmllint_canonicalizes_a_namespaced_document_the_same_way() {
+        let fragment = concat!(
+            r#"<Root xmlns="urn:cpl" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" "#,
+            r#"xmlns:cc="urn:cc">"#,
+            r#"<Resource xsi:type="TrackFileResourceType" cc:rank="2" Id="r1" xml:lang="en">"#,
+            r#"<Inner xmlns="urn:inner" xsi:nil="true"/>"#,
+            r#"</Resource></Root>"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("namespaced.xml");
+        std::fs::write(&path, fragment).unwrap();
+        let out = std::process::Command::new("xmllint")
+            .arg("--c14n")
+            .arg(&path)
+            .output()
+            .expect("run xmllint");
+        assert!(
+            out.status.success(),
+            "xmllint must canonicalize the fixture:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            c14n_string(fragment),
+            String::from_utf8(out.stdout).expect("xmllint output is utf-8")
+        );
+    }
+
+    fn cpl_doc_with_xsi_type() -> String {
+        let doc = cpl_doc()
+            .replace(
+                r#"xmlns="http://example.com/imf/cpl""#,
+                r#"xmlns="http://example.com/imf/cpl" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance""#,
+            )
+            .replace(
+                "      <Id>urn:uuid:66666666",
+                "      <Resource xsi:type=\"TrackFileResourceType\" Id=\"ID_res\"/>\n      <Id>urn:uuid:66666666",
+            );
+        assert!(doc.contains(r#"xsi:type="TrackFileResourceType""#));
+        doc
+    }
+
+    #[test]
+    fn a_document_with_xsi_type_signs_and_xmlsec1_verifies_it() {
+        let c = chain();
+        let signed = sign_document_enveloped(&cpl_doc_with_xsi_type(), &leaf_signer(c))
+            .expect("sign a document carrying xsi:type");
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("cpl-xsi-type.xml");
+        std::fs::write(&out, &signed).unwrap();
+        let result = xmlsec1_verify_no_id(&out, &c.root);
+        assert!(
+            result.status.success(),
+            "xmlsec1 must verify a signed document carrying xsi:type\n  {}",
+            xmlsec1_cli::report(&result)
+        );
+
+        let tampered = signed.replacen("TrackFileResourceType", "MarkerResourceType", 1);
+        assert_ne!(signed, tampered, "the tamper must change the document");
+        let tampered_path = dir.path().join("cpl-xsi-type-tampered.xml");
+        std::fs::write(&tampered_path, &tampered).unwrap();
+        let result = xmlsec1_verify_no_id(&tampered_path, &c.root);
+        assert!(
+            !result.status.success(),
+            "xmlsec1 must reject an edited xsi:type\n  {}",
+            xmlsec1_cli::report(&result)
+        );
     }
 }
