@@ -32,10 +32,23 @@ pub struct CompareResult {
     pub per_frame: Vec<FrameMetric>,
 }
 
+/// Comparisons started so far, so two running at once do not write each other's
+/// stats files. The pid alone does not cover two threads of one process.
+static COMPARISONS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A stats file only this comparison writes and reads.
+fn stats_log_path(metric: &str) -> PathBuf {
+    let comparison = COMPARISONS_STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "imfwizard_{metric}_{}_{comparison}.log",
+        std::process::id()
+    ))
+}
+
 /// Compare two video files frame-by-frame using ffmpeg PSNR and SSIM filters.
 pub fn compare_frames(reference: &Path, distorted: &Path) -> Result<CompareResult, String> {
-    let psnr_log = std::env::temp_dir().join("imfwizard_psnr.log");
-    let ssim_log = std::env::temp_dir().join("imfwizard_ssim.log");
+    let psnr_log = stats_log_path("psnr");
+    let ssim_log = stats_log_path("ssim");
 
     // Run ffmpeg with both PSNR and SSIM filters simultaneously
     let status = std::process::Command::new("ffmpeg")
@@ -217,8 +230,18 @@ fn parse_vmaf_json(data: &str) -> Result<VmafScore, String> {
     })
 }
 
+/// Component keys ffmpeg writes per pixel format: luma for YUV video, and the
+/// three primaries for RGB video, which is what DCP and IMF picture essence
+/// decodes to.
+const PSNR_COMPONENTS: [[&str; 3]; 2] = [
+    ["psnr_y", "psnr_u", "psnr_v"],
+    ["psnr_r", "psnr_g", "psnr_b"],
+];
+const SSIM_COMPONENTS: [&str; 2] = ["Y:", "R:"];
+
 /// Parse ffmpeg PSNR stats file.
 /// Format: n:1 mse_avg:0.00 mse_y:0.00 mse_u:0.00 mse_v:0.00 psnr_avg:inf psnr_y:inf psnr_u:inf psnr_v:inf
+/// RGB:    n:1 mse_avg:0.00 mse_r:0.00 mse_g:0.00 mse_b:0.00 psnr_avg:inf psnr_r:inf psnr_g:inf psnr_b:inf
 fn parse_psnr_log(data: &str) -> Vec<(f64, f64, f64, f64)> {
     data.lines()
         .filter_map(|line| {
@@ -234,32 +257,32 @@ fn parse_psnr_log(data: &str) -> Vec<(f64, f64, f64, f64)> {
                         }
                     })
             };
-            let psnr_y = get_val("psnr_y")?;
-            let psnr_u = get_val("psnr_u")?;
-            let psnr_v = get_val("psnr_v")?;
             let psnr_avg = get_val("psnr_avg")?;
-            Some((psnr_y, psnr_u, psnr_v, psnr_avg))
+            let (first, second, third) = PSNR_COMPONENTS
+                .iter()
+                .find_map(|keys| Some((get_val(keys[0])?, get_val(keys[1])?, get_val(keys[2])?)))?;
+            Some((first, second, third, psnr_avg))
         })
         .collect()
 }
 
 /// Parse ffmpeg SSIM stats file.
 /// Format: n:1 Y:1.000000 (inf) U:1.000000 (inf) V:1.000000 (inf) All:1.000000 (inf)
+/// RGB:    n:1 R:1.000000 G:1.000000 B:1.000000 All:1.000000 (inf)
 fn parse_ssim_log(data: &str) -> Vec<(f64, f64)> {
     data.lines()
         .filter_map(|line| {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            let ssim_y = parts
-                .iter()
-                .find(|s| s.starts_with("Y:"))
-                .and_then(|s| s.strip_prefix("Y:"))
-                .and_then(|v| v.parse::<f64>().ok())?;
-            let ssim_all = parts
-                .iter()
-                .find(|s| s.starts_with("All:"))
-                .and_then(|s| s.strip_prefix("All:"))
-                .and_then(|v| v.parse::<f64>().ok())?;
-            Some((ssim_y, ssim_all))
+            let value = |key: &str| -> Option<f64> {
+                parts
+                    .iter()
+                    .find(|s| s.starts_with(key))
+                    .and_then(|s| s.strip_prefix(key))
+                    .and_then(|v| v.parse::<f64>().ok())
+            };
+            let ssim_all = value("All:")?;
+            let ssim_first = SSIM_COMPONENTS.iter().find_map(|key| value(key))?;
+            Some((ssim_first, ssim_all))
         })
         .collect()
 }
@@ -383,6 +406,58 @@ mod tests {
         let sframes = parse_ssim_log(ssim);
         assert_eq!(sframes.len(), 2);
         assert!((sframes[1].1 - 0.985).abs() < 1e-9);
+    }
+
+    /// ffmpeg 8.1 stats for a yuv420p pair, pasted from a run.
+    const YUV_PSNR_LOG: &str = "\
+n:1 mse_avg:84.66 mse_y:65.39 mse_u:98.72 mse_v:147.66 psnr_avg:28.85 psnr_y:29.98 psnr_u:28.19 psnr_v:26.44
+n:2 mse_avg:89.44 mse_y:67.33 mse_u:98.41 mse_v:168.93 psnr_avg:28.62 psnr_y:29.85 psnr_u:28.20 psnr_v:25.85
+";
+    const YUV_SSIM_LOG: &str = "\
+n:1 Y:0.959888 U:0.946021 V:0.983675 All:0.961541 (14.150061)
+n:2 Y:0.958191 U:0.946849 V:0.981837 All:0.960242 (14.005705)
+";
+
+    /// The same, for a gbrp pair. DCP and IMF picture essence decodes to RGB,
+    /// so this is the naming every real package produces.
+    const RGB_PSNR_LOG: &str = "\
+n:1 mse_avg:64.04 mse_r:59.66 mse_g:64.36 mse_b:68.12 psnr_avg:30.07 psnr_r:30.37 psnr_g:30.04 psnr_b:29.80
+n:2 mse_avg:63.76 mse_r:64.56 mse_g:65.57 mse_b:61.16 psnr_avg:30.09 psnr_r:30.03 psnr_g:29.96 psnr_b:30.27
+";
+    const RGB_SSIM_LOG: &str = "\
+n:1 R:0.760857 G:0.731124 B:0.662389 All:0.718123 (5.499410)
+n:2 R:0.763922 G:0.730375 B:0.672471 All:0.722256 (5.563553)
+";
+
+    #[test]
+    fn rgb_stats_parse_the_way_luma_stats_do() {
+        let rgb = parse_psnr_log(RGB_PSNR_LOG);
+        let yuv = parse_psnr_log(YUV_PSNR_LOG);
+        assert_eq!(rgb.len(), yuv.len(), "an RGB run reported no frames");
+        assert!((rgb[0].3 - 30.07).abs() < 1e-9, "psnr_avg: {rgb:?}");
+        assert!((rgb[0].0 - 30.37).abs() < 1e-9, "psnr_r: {rgb:?}");
+        assert!((rgb[0].1 - 30.04).abs() < 1e-9, "psnr_g: {rgb:?}");
+        assert!((rgb[0].2 - 29.80).abs() < 1e-9, "psnr_b: {rgb:?}");
+        assert!((yuv[0].0 - 29.98).abs() < 1e-9, "psnr_y: {yuv:?}");
+
+        let rgb = parse_ssim_log(RGB_SSIM_LOG);
+        let yuv = parse_ssim_log(YUV_SSIM_LOG);
+        assert_eq!(rgb.len(), yuv.len(), "an RGB run reported no frames");
+        assert!((rgb[0].1 - 0.718123).abs() < 1e-9, "All: {rgb:?}");
+        assert!((rgb[0].0 - 0.760857).abs() < 1e-9, "R: {rgb:?}");
+        assert!((yuv[0].0 - 0.959888).abs() < 1e-9, "Y: {yuv:?}");
+    }
+
+    #[test]
+    fn two_comparisons_do_not_share_a_stats_file() {
+        assert_ne!(stats_log_path("psnr"), stats_log_path("psnr"));
+        assert_ne!(stats_log_path("psnr"), stats_log_path("ssim"));
+    }
+
+    #[test]
+    fn a_line_with_no_component_keys_is_no_frame() {
+        assert!(parse_psnr_log("n:1 mse_avg:0.00 psnr_avg:inf\n").is_empty());
+        assert!(parse_ssim_log("n:1 All:1.000000 (inf)\n").is_empty());
     }
 
     #[test]

@@ -482,6 +482,18 @@
 
 ### Fixed
 
+- **`compare_frames` returned "No frames compared" for every RGB video**: both
+  stats parsers required the luma component keys, `psnr_y`/`psnr_u`/`psnr_v` and
+  `Y:`, and ffmpeg writes `psnr_r`/`psnr_g`/`psnr_b` and `R:`/`G:`/`B:` when the
+  input is RGB. DCP and IMF picture essence decodes to RGB, so the comparison
+  worked on YUV sources and on no real package: every stats line was filtered
+  out and the frame count came to zero. Both namings parse now, a line still
+  needs `psnr_avg` (or `All:`) plus a complete component triple to count as a
+  frame, and the unit tests are ffmpeg 8.1 stats for a yuv420p and a gbrp pair,
+  pasted from runs. The two stats files also carried fixed names, so two
+  comparisons at once read each other's output; each comparison now gets its own
+  pair, named for the process and a counter.
+
 - **`accessibility` checks the tracks each standard's instrument names**: the
   EAA and Ofcom lists required an HI mix channel and named no caption track at
   all, and Ofcom required sign-language video, so a package with a 5.1 bed plus
