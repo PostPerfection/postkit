@@ -385,6 +385,23 @@
   of the texture upload and of the whole `render_opengl` call, prefixed
   `grok player render:`. Unset, the player still takes the two `Instant`
   readings and prints nothing.
+- **The tms upload logs in with an ssh key**: `TmsConfig` takes an optional
+  `private_key`, with `private_key_passphrase` for a key that is stored
+  encrypted, and sftp offers it through libssh2's `userauth_pubkey_file`. Only
+  when no key is named does the password go out, so `password` is now optional
+  and `validate` refuses a config carrying neither. An ftp config naming a key
+  is refused outright rather than falling back to the password ftp sends in the
+  clear, and Debug redacts the passphrase alongside the password. The host key
+  is still checked before either credential leaves the client. The tests start
+  an unprivileged sshd on a loopback port with a generated `AuthorizedKeysFile`
+  and put a nested package through `SftpTransport`, then read every file back
+  off the server's disk and compare its bytes and its path under the base
+  directory, so the sftp path is proved by files on disk rather than by a fake.
+  A second upload of the same package truncates what it replaces and leaves the
+  files it no longer carries, a wrong key is refused as a login failure naming
+  the user and the host, a mismatched host key is refused before the key is
+  offered, and a package directory the server cannot write fails naming the
+  file and the remote path.
 
 ### Changed
 

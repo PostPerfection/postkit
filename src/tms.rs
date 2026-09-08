@@ -1,7 +1,8 @@
 //! push a finished package to a theatre management system over ftp or sftp
 //! (DCP-o-matic's tms_protocol / tms_ip / tms_path / tms_user / tms_password).
-//! the config file holds the password: it is never logged, never echoed in
-//! errors, never passed as a command-line argument, and Debug redacts it.
+//! the config file holds the password and the key passphrase: neither is ever
+//! logged, echoed in an error, or passed as a command-line argument, and Debug
+//! redacts both.
 //!
 //! behind the `tms` feature, off by default: it pulls in ssh2, which links
 //! libssh2 and openssl, and a caller building postkit for wasm cannot have that.
@@ -20,6 +21,9 @@ const FTP_PORT: u16 = 21;
 const SSH_PORT: u16 = 22;
 /// mode for a directory we create on the remote: owner writes, others read.
 const REMOTE_DIR_MODE: i32 = 0o755;
+const REDACTED: &str = "<redacted>";
+const FTP_TAKES_NO_KEY: &str =
+    "ftp cannot log in with a key: give the tms config a password, or use sftp";
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -40,10 +44,17 @@ pub struct TmsConfig {
     /// remote directory the package directory is created under.
     pub path: String,
     pub user: String,
-    pub password: String,
+    #[serde(default)]
+    pub password: Option<String>,
+    /// sftp private key to log in with. when it is set the password is not sent.
+    #[serde(default)]
+    pub private_key: Option<PathBuf>,
+    /// passphrase of `private_key`, for a key that is stored encrypted.
+    #[serde(default)]
+    pub private_key_passphrase: Option<String>,
 }
 
-// redact the password so it can never leak through Debug/log output.
+// redact the password and the passphrase so neither can leak through Debug/log output.
 impl fmt::Debug for TmsConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TmsConfig")
@@ -52,9 +63,23 @@ impl fmt::Debug for TmsConfig {
             .field("port", &self.port)
             .field("path", &self.path)
             .field("user", &self.user)
-            .field("password", &"<redacted>")
+            .field("password", &self.password.as_ref().map(|_| REDACTED))
+            .field("private_key", &self.private_key)
+            .field(
+                "private_key_passphrase",
+                &self.private_key_passphrase.as_ref().map(|_| REDACTED),
+            )
             .finish()
     }
+}
+
+/// the credential the login sends.
+enum TmsLogin<'a> {
+    Password(&'a str),
+    PrivateKey {
+        path: &'a Path,
+        passphrase: Option<&'a str>,
+    },
 }
 
 impl TmsConfig {
@@ -67,7 +92,23 @@ impl TmsConfig {
         if self.user.trim().is_empty() {
             return Err("tms config needs a user".to_string());
         }
+        if self.protocol == TmsProtocol::Ftp && self.private_key.is_some() {
+            return Err(FTP_TAKES_NO_KEY.to_string());
+        }
+        self.login()?;
         Ok(())
+    }
+
+    /// the key when the config names one, the password otherwise.
+    fn login(&self) -> Result<TmsLogin<'_>, String> {
+        match (&self.private_key, &self.password) {
+            (Some(path), _) => Ok(TmsLogin::PrivateKey {
+                path,
+                passphrase: self.private_key_passphrase.as_deref(),
+            }),
+            (None, Some(password)) => Ok(TmsLogin::Password(password)),
+            (None, None) => Err("tms config needs a password or a private_key".to_string()),
+        }
     }
 
     pub fn port(&self) -> u16 {
@@ -268,15 +309,32 @@ impl SftpTransport {
             .handshake()
             .map_err(|e| format!("ssh handshake with {host}:{port} failed: {e}"))?;
         check_host_key(&session, host, port, known_hosts_file)?;
-        session
-            .userauth_password(&config.user, &config.password)
-            .map_err(|e| {
-                format!(
-                    "sftp login as {} on {host}:{port} failed: {}",
-                    config.user,
-                    e.message()
-                )
-            })?;
+        match config.login()? {
+            TmsLogin::Password(password) => {
+                session
+                    .userauth_password(&config.user, password)
+                    .map_err(|e| {
+                        format!(
+                            "sftp login as {} on {host}:{port} failed: {}",
+                            config.user,
+                            e.message()
+                        )
+                    })?;
+            }
+            TmsLogin::PrivateKey { path, passphrase } => {
+                // libssh2 reads the public half out of the private key file
+                session
+                    .userauth_pubkey_file(&config.user, None, path, passphrase)
+                    .map_err(|e| {
+                        format!(
+                            "sftp login as {} on {host}:{port} with the key {} failed: {}",
+                            config.user,
+                            path.display(),
+                            e.message()
+                        )
+                    })?;
+            }
+        }
         if !session.authenticated() {
             return Err(format!("sftp login as {} was refused", config.user));
         }
@@ -427,6 +485,10 @@ impl FtpTransport {
     fn connect(config: &TmsConfig) -> Result<Self, String> {
         let host = config.host.as_str();
         let port = config.port();
+        let password = match config.login()? {
+            TmsLogin::Password(password) => password,
+            TmsLogin::PrivateKey { .. } => return Err(FTP_TAKES_NO_KEY.to_string()),
+        };
         tracing::warn!(
             "ftp sends the {host} login and the package unencrypted; sftp is the safer protocol \
              wherever the TMS offers it"
@@ -434,7 +496,7 @@ impl FtpTransport {
         let mut stream = suppaftp::FtpStream::connect((host, port))
             .map_err(|e| format!("cannot reach {host}:{port}: {e}"))?;
         stream
-            .login(&config.user, &config.password)
+            .login(config.user.as_str(), password)
             .map_err(|e| format!("ftp login as {} on {host}:{port} failed: {e}", config.user))?;
         stream
             .transfer_type(suppaftp::types::FileType::Binary)
@@ -549,13 +611,80 @@ mod tests {
         .unwrap();
         assert_eq!(config.protocol, TmsProtocol::Sftp);
         assert_eq!(config.port(), 22);
-        assert_eq!(config.password, "hunter2");
+        assert_eq!(config.password.as_deref(), Some("hunter2"));
         let debug = format!("{config:?}");
         assert!(
             !debug.contains("hunter2"),
             "password must not appear in Debug: {debug}"
         );
-        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains(REDACTED));
+    }
+
+    #[test]
+    fn a_key_config_parses_and_debug_redacts_the_passphrase() {
+        let config = config_from_toml(
+            r#"
+            protocol = "sftp"
+            host = "tms.cinema.test"
+            path = "/dcp"
+            user = "projectionist"
+            private_key = "/home/projectionist/.ssh/tms_ed25519"
+            private_key_passphrase = "opensesame"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.password, None);
+        assert_eq!(
+            config.private_key.as_deref(),
+            Some(Path::new("/home/projectionist/.ssh/tms_ed25519"))
+        );
+        assert!(matches!(
+            config.login().unwrap(),
+            TmsLogin::PrivateKey {
+                passphrase: Some("opensesame"),
+                ..
+            }
+        ));
+        let debug = format!("{config:?}");
+        assert!(
+            !debug.contains("opensesame"),
+            "the passphrase must not appear in Debug: {debug}"
+        );
+        assert!(debug.contains("tms_ed25519"), "{debug}");
+    }
+
+    #[test]
+    fn a_key_wins_over_a_password_and_ftp_refuses_a_key() {
+        let both = r#"
+            protocol = "sftp"
+            host = "tms.cinema.test"
+            path = "/dcp"
+            user = "projectionist"
+            password = "hunter2"
+            private_key = "/home/projectionist/.ssh/tms_ed25519"
+            "#;
+        let config = config_from_toml(both).unwrap();
+        assert!(matches!(
+            config.login().unwrap(),
+            TmsLogin::PrivateKey { .. }
+        ));
+
+        let err = config_from_toml(&both.replace(r#""sftp""#, r#""ftp""#)).unwrap_err();
+        assert!(err.contains("ftp cannot log in with a key"), "{err}");
+    }
+
+    #[test]
+    fn a_config_with_no_password_and_no_key_is_refused() {
+        let err = config_from_toml(
+            r#"
+            protocol = "sftp"
+            host = "tms.cinema.test"
+            path = "/dcp"
+            user = "projectionist"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.contains("password or a private_key"), "{err}");
     }
 
     #[test]
@@ -692,9 +821,12 @@ mod tests {
 
 // unix only: an unprivileged sshd on a throwaway config is not a thing on windows
 #[cfg(all(test, unix))]
-mod host_key_tests {
-    use super::{REVOKED_MARKER, SftpTransport, TmsConfig, TmsProtocol};
+mod local_sshd_tests {
+    use super::{
+        REVOKED_MARKER, SftpTransport, TmsConfig, TmsProtocol, collect_files, upload_with,
+    };
     use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant};
@@ -705,11 +837,34 @@ mod host_key_tests {
     const PROBE_PASSWORD: &str = "this-password-must-never-leave-the-client";
     // sshd logs this only once a password arrived, not for the method probe that carries the user name
     const PASSWORD_ATTEMPT_LOG: &str = "Failed password";
+    // covers the Postponed, Accepted and Failed lines, so any key offered at all matches
+    const PUBKEY_ATTEMPT_LOG: &str = "publickey for";
+    const PUBKEY_ACCEPTED_LOG: &str = "Accepted publickey for";
     const LISTENING_LOG: &str = "Server listening on";
     const CONNECTION_OVER_LOG: &str = "Connection closed";
     const SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
     const LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
+    const HOST_KEY: &str = "hostkey";
+    const OTHER_HOST_KEY: &str = "otherkey";
+    const CLIENT_KEY: &str = "clientkey";
+    const WRONG_CLIENT_KEY: &str = "wrongkey";
+    const BASE_DIRECTORY: &str = "incoming";
+    const PACKAGE_NAME: &str = "MyFilm_FTR_F_EN-XX_OV";
+    // the mxf bytes carry a nul and a byte over 0x7f, so a text-mode transfer would show up
+    const PACKAGE_FILES: [(&str, &[u8]); 4] = [
+        ("ASSETMAP.xml", b"<AssetMap/>"),
+        ("CPL_x.xml", b"<CompositionPlaylist/>"),
+        ("VOLINDEX.xml", b"<VolumeIndex/>"),
+        (
+            "sub/deep/picture.mxf",
+            &[0x06, 0x0e, 0x2b, 0x34, 0x00, 0xff, 0x80, 0x0a, 0x0d, 0x1a],
+        ),
+    ];
+    // shorter than the ASSETMAP.xml above, so a second upload that did not truncate would leave a tail
+    const REPLACED_ASSETMAP: &[u8] = b"<A/>";
+    const READ_ONLY_DIRECTORY_MODE: u32 = 0o555;
+    const WRITABLE_DIRECTORY_MODE: u32 = 0o755;
 
     fn sshd_binary() -> PathBuf {
         let candidates = [
@@ -736,7 +891,18 @@ mod host_key_tests {
         listener.local_addr().unwrap().port()
     }
 
-    fn generate_host_key(directory: &Path, name: &str) -> String {
+    /// the account this sshd can log in: it runs unprivileged, so the only user it
+    /// can authenticate is the one that started it.
+    fn current_user() -> String {
+        let output = Command::new("id")
+            .arg("-un")
+            .output()
+            .expect("`id -un` must work to name the user the local sshd can log in");
+        assert!(output.status.success(), "`id -un` failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn generate_key(directory: &Path, name: &str) -> String {
         let key_path = directory.join(name);
         let status = Command::new("ssh-keygen")
             .args(["-t", "ed25519", "-N", "", "-C", "", "-q", "-f"])
@@ -752,20 +918,62 @@ mod host_key_tests {
         format!("{algorithm} {material}")
     }
 
+    #[derive(Clone, Copy, PartialEq)]
+    enum ServerLogin {
+        /// a probe user with no account, so the login is always refused
+        Password,
+        /// the user running the tests, by key, so the login can succeed and put files
+        PublicKey,
+    }
+
     struct LocalSshServer {
         process: Child,
         directory: tempfile::TempDir,
         port: u16,
         host_key: String,
         other_host_key: String,
+        login: ServerLogin,
     }
 
     impl LocalSshServer {
         fn start() -> Self {
+            Self::start_with(ServerLogin::Password)
+        }
+
+        fn start_with_key_login() -> Self {
+            Self::start_with(ServerLogin::PublicKey)
+        }
+
+        fn start_with(login: ServerLogin) -> Self {
             let directory = tempfile::tempdir().unwrap();
-            let host_key = generate_host_key(directory.path(), "hostkey");
-            let other_host_key = generate_host_key(directory.path(), "otherkey");
+            let host_key = generate_key(directory.path(), HOST_KEY);
+            let other_host_key = generate_key(directory.path(), OTHER_HOST_KEY);
             let port = free_loopback_port();
+            let authentication = match login {
+                ServerLogin::Password => "PasswordAuthentication yes\n\
+                     PubkeyAuthentication no\n\
+                     AuthorizedKeysFile none\n"
+                    .to_string(),
+                ServerLogin::PublicKey => {
+                    generate_key(directory.path(), CLIENT_KEY);
+                    generate_key(directory.path(), WRONG_CLIENT_KEY);
+                    let authorized_keys = directory.path().join("authorized_keys");
+                    std::fs::copy(
+                        directory.path().join(format!("{CLIENT_KEY}.pub")),
+                        &authorized_keys,
+                    )
+                    .unwrap();
+                    std::fs::create_dir_all(directory.path().join(BASE_DIRECTORY)).unwrap();
+                    format!(
+                        "PasswordAuthentication no\n\
+                         PubkeyAuthentication yes\n\
+                         UsePAM no\n\
+                         AuthorizedKeysFile {}\n\
+                         Subsystem sftp internal-sftp\n",
+                        authorized_keys.display()
+                    )
+                }
+            };
             let config_path = directory.path().join("sshd_config");
             std::fs::write(
                 &config_path,
@@ -775,13 +983,11 @@ mod host_key_tests {
                      HostKey {}\n\
                      PidFile none\n\
                      StrictModes no\n\
-                     PasswordAuthentication yes\n\
                      KbdInteractiveAuthentication no\n\
-                     PubkeyAuthentication no\n\
-                     AuthorizedKeysFile none\n\
                      PermitRootLogin no\n\
-                     LogLevel VERBOSE\n",
-                    directory.path().join("hostkey").display()
+                     LogLevel VERBOSE\n\
+                     {authentication}",
+                    directory.path().join(HOST_KEY).display()
                 ),
             )
             .unwrap();
@@ -801,6 +1007,7 @@ mod host_key_tests {
                 port,
                 host_key,
                 other_host_key,
+                login,
             };
             server.wait_until_listening();
             server
@@ -865,16 +1072,84 @@ mod host_key_tests {
             path
         }
 
+        /// the known_hosts line that records this server's own key.
+        fn own_entry(&self) -> String {
+            format!("[{LOOPBACK}]:{} {}", self.port, self.host_key)
+        }
+
+        /// the known_hosts line that records the other key, the one this server does
+        /// not answer with.
+        fn impostor_entry(&self) -> String {
+            format!("[{LOOPBACK}]:{} {}", self.port, self.other_host_key)
+        }
+
+        /// the remote directory an upload creates the package directory under.
+        fn base_path(&self) -> PathBuf {
+            self.directory.path().join(BASE_DIRECTORY)
+        }
+
         fn config(&self) -> TmsConfig {
+            let (user, password, private_key, path) = match self.login {
+                ServerLogin::Password => (
+                    PROBE_USER.to_string(),
+                    Some(PROBE_PASSWORD.to_string()),
+                    None,
+                    "/incoming".to_string(),
+                ),
+                ServerLogin::PublicKey => (
+                    current_user(),
+                    None,
+                    Some(self.directory.path().join(CLIENT_KEY)),
+                    self.base_path().display().to_string(),
+                ),
+            };
             TmsConfig {
                 protocol: TmsProtocol::Sftp,
                 host: LOOPBACK.to_string(),
                 port: Some(self.port),
-                path: "/incoming".to_string(),
-                user: PROBE_USER.to_string(),
-                password: PROBE_PASSWORD.to_string(),
+                path,
+                user,
+                password,
+                private_key,
+                private_key_passphrase: None,
             }
         }
+    }
+
+    /// what `upload_package` runs, with the known_hosts file pointed at the test's
+    /// own rather than the one in the home directory.
+    fn upload(config: &TmsConfig, known_hosts: &Path, package: &Path) -> Result<(), String> {
+        let mut transport = SftpTransport::connect_with_known_hosts(config, known_hosts)?;
+        upload_with(&mut transport, &config.path, package)
+    }
+
+    fn local_package(directory: &Path) -> PathBuf {
+        let package = directory.join(PACKAGE_NAME);
+        for (name, bytes) in PACKAGE_FILES {
+            let path = package.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        package
+    }
+
+    /// every file under `directory`, as slash-separated paths relative to it.
+    fn relative_paths(directory: &Path) -> Vec<String> {
+        collect_files(directory)
+            .unwrap()
+            .iter()
+            .map(|path| {
+                path.strip_prefix(directory)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn set_mode(directory: &Path, mode: u32) {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
     impl Drop for LocalSshServer {
@@ -904,7 +1179,7 @@ mod host_key_tests {
     #[test]
     fn a_mismatched_host_key_is_refused_before_the_password_is_sent() {
         let server = LocalSshServer::start();
-        let impostor = format!("[{LOOPBACK}]:{} {}", server.port, server.other_host_key);
+        let impostor = server.impostor_entry();
         let known_hosts = server.known_hosts_with(&impostor);
         let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
             .err()
@@ -921,11 +1196,8 @@ mod host_key_tests {
     #[test]
     fn a_revoked_host_key_is_refused_even_when_a_plain_line_matches() {
         let server = LocalSshServer::start();
-        let entry = format!("[{LOOPBACK}]:{} {}", server.port, server.host_key);
-        let revoked = format!(
-            "{REVOKED_MARKER} [{LOOPBACK}]:{} {}",
-            server.port, server.host_key
-        );
+        let entry = server.own_entry();
+        let revoked = format!("{REVOKED_MARKER} {}", server.own_entry());
         let known_hosts = server.known_hosts_with(&format!("{entry}\n{revoked}"));
         let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
             .err()
@@ -947,11 +1219,8 @@ mod host_key_tests {
     #[test]
     fn a_revoked_line_for_another_key_leaves_the_real_one_accepted() {
         let server = LocalSshServer::start();
-        let entry = format!("[{LOOPBACK}]:{} {}", server.port, server.host_key);
-        let revoked = format!(
-            "{REVOKED_MARKER} [{LOOPBACK}]:{} {}",
-            server.port, server.other_host_key
-        );
+        let entry = server.own_entry();
+        let revoked = format!("{REVOKED_MARKER} {}", server.impostor_entry());
         let known_hosts = server.known_hosts_with(&format!("{revoked}\n{entry}"));
         let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
             .err()
@@ -1018,7 +1287,7 @@ mod host_key_tests {
     #[test]
     fn a_matching_host_key_is_accepted_and_the_login_follows_it() {
         let server = LocalSshServer::start();
-        let entry = format!("[{LOOPBACK}]:{} {}", server.port, server.host_key);
+        let entry = server.own_entry();
         let known_hosts = server.known_hosts_with(&entry);
         // the login fails because PROBE_USER is nobody, what matters is that it was reached
         let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
@@ -1033,6 +1302,131 @@ mod host_key_tests {
         assert!(
             log.contains(PASSWORD_ATTEMPT_LOG) && log.contains(PROBE_USER),
             "sshd never saw a password attempt, so the check did not pass a known host. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_key_login_uploads_every_file_with_the_same_bytes_and_layout() {
+        let server = LocalSshServer::start_with_key_login();
+        let known_hosts = server.known_hosts_with(&server.own_entry());
+        let local = tempfile::tempdir().unwrap();
+        let package = local_package(local.path());
+
+        upload(&server.config(), &known_hosts, &package).unwrap();
+
+        let remote_root = server.base_path().join(PACKAGE_NAME);
+        let mut expected: Vec<String> = PACKAGE_FILES
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(relative_paths(&remote_root), expected);
+        assert_eq!(relative_paths(&package), expected);
+        for (name, bytes) in PACKAGE_FILES {
+            assert_eq!(
+                std::fs::read(remote_root.join(name)).unwrap(),
+                bytes,
+                "{name} did not arrive byte for byte"
+            );
+        }
+        let log = server.log();
+        assert!(
+            log.contains(PUBKEY_ACCEPTED_LOG),
+            "the upload did not authenticate with the key. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_second_upload_overwrites_the_files_it_finds_and_leaves_the_rest() {
+        let server = LocalSshServer::start_with_key_login();
+        let known_hosts = server.known_hosts_with(&server.own_entry());
+        let local = tempfile::tempdir().unwrap();
+        let package = local_package(local.path());
+        let config = server.config();
+        upload(&config, &known_hosts, &package).unwrap();
+
+        std::fs::write(package.join("ASSETMAP.xml"), REPLACED_ASSETMAP).unwrap();
+        std::fs::remove_file(package.join("CPL_x.xml")).unwrap();
+        upload(&config, &known_hosts, &package).unwrap();
+
+        let remote_root = server.base_path().join(PACKAGE_NAME);
+        assert_eq!(
+            std::fs::read(remote_root.join("ASSETMAP.xml")).unwrap(),
+            REPLACED_ASSETMAP,
+            "a second upload must truncate the file it replaces"
+        );
+        assert!(
+            remote_root.join("CPL_x.xml").is_file(),
+            "the upload adds and replaces files, it does not mirror the package directory"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_host_key_is_refused_before_the_key_is_offered() {
+        let server = LocalSshServer::start_with_key_login();
+        let known_hosts = server.known_hosts_with(&server.impostor_entry());
+        let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
+            .err()
+            .expect("a host whose key changed must not be logged in to");
+        assert!(error.contains("does not match"), "{error}");
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            !log.contains(PUBKEY_ATTEMPT_LOG),
+            "the key was offered to a host whose key does not match known_hosts. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_key_the_server_does_not_know_is_refused_as_a_login_failure() {
+        let server = LocalSshServer::start_with_key_login();
+        let known_hosts = server.known_hosts_with(&server.own_entry());
+        let mut config = server.config();
+        config.private_key = Some(server.directory.path().join(WRONG_CLIENT_KEY));
+        let error = SftpTransport::connect_with_known_hosts(&config, &known_hosts)
+            .err()
+            .expect("a key the server has no authorized_keys line for must not log in");
+        assert!(
+            error.contains(&format!("login as {}", config.user)),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("{LOOPBACK}:{}", server.port)),
+            "{error}"
+        );
+        assert!(error.contains(WRONG_CLIENT_KEY), "{error}");
+        assert!(
+            !error.contains("known_hosts") && !error.contains("does not match"),
+            "a refused key must not read as a host key problem: {error}"
+        );
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            log.contains(PUBKEY_ATTEMPT_LOG) && !log.contains(PUBKEY_ACCEPTED_LOG),
+            "sshd must have seen the key and refused it. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_file_the_server_refuses_names_the_file_and_the_remote_path() {
+        let server = LocalSshServer::start_with_key_login();
+        let known_hosts = server.known_hosts_with(&server.own_entry());
+        let local = tempfile::tempdir().unwrap();
+        let package = local_package(local.path());
+        let remote_root = server.base_path().join(PACKAGE_NAME);
+        std::fs::create_dir_all(&remote_root).unwrap();
+        set_mode(&remote_root, READ_ONLY_DIRECTORY_MODE);
+
+        let error = upload(&server.config(), &known_hosts, &package)
+            .expect_err("a package directory the server cannot write must not report success");
+
+        set_mode(&remote_root, WRITABLE_DIRECTORY_MODE);
+        let refused = remote_root.join("ASSETMAP.xml");
+        assert!(error.contains("ASSETMAP.xml"), "{error}");
+        assert!(error.contains(&refused.display().to_string()), "{error}");
+        assert!(
+            !refused.exists(),
+            "the file the error names must not be on the server"
         );
     }
 }
