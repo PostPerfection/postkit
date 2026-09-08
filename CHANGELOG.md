@@ -456,6 +456,18 @@
 
 ### Fixed
 
+- **`convert_dv_mode` reads the RPU files dovi_tool writes**: every RPU in a
+  `.bin` is escaped as an annex B NALU, and `parse_single_rpu`, `convert_rpu`
+  and `convert_dv_mode` all called `DoviRpu::parse_rpu`, which does not clear
+  the emulation prevention bytes, so converting a real extracted RPU failed
+  with `Failed to parse RPU: CM v2.9`. The 6 frame RPU of a profile 8.1 fixture
+  carries 83 of them, and so does the output of `dovi_tool generate`, so the
+  conversion worked on nothing. All three parse with
+  `DoviRpu::parse_unspec62_nalu` now, `parse_rpu_bin_file` hands each NALU over
+  with its start code, and the written RPUs are escaped again through
+  `write_hevc_unspec62_nalu`, where `write_rpu` left the payload raw for the
+  next reader to mangle.
+
 - **The sound descriptor RegXML spells `Locked` the SMPTE way**: the CPL entry
   wrote `<r1:Locked>true</r1:Locked>` where the SMPTE boolean type's values are
   `True` and `False`, so Photon reported every sound package's descriptor as not

@@ -85,7 +85,7 @@ pub struct HdrMetadataOptions {
 
 /// Build the libx265 params that embed HDR10 static metadata as SEI: mastering
 /// display colour volume (ST 2086) plus MaxCLL/MaxFALL (CTA 861.3).
-fn x265_hdr10_params(m: &Hdr10Metadata) -> String {
+pub fn x265_hdr10_params(m: &Hdr10Metadata) -> String {
     format!(
         "hdr10=1:hdr10-opt=1:repeat-headers=1:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc:\
          master-display=G({},{})B({},{})R({},{})WP({},{})L({},{}):max-cll={},{}",
@@ -361,8 +361,6 @@ pub fn extract_rpu(input: &Path, output: &Path) -> Result<(), String> {
 /// Reads raw RPU binary data, converts each RPU to the target mode, writes the result.
 /// For profile conversion on .bin RPU files (not full HEVC streams).
 pub fn convert_dv_mode(input: &Path, output: &Path, mode: DvMode) -> Result<(), String> {
-    use dolby_vision::rpu::dovi_rpu::DoviRpu;
-
     let data = std::fs::read(input).map_err(|e| format!("Failed to read RPU file: {e}"))?;
 
     // RPU .bin files contain concatenated RPU NALUs separated by start codes
@@ -370,17 +368,13 @@ pub fn convert_dv_mode(input: &Path, output: &Path, mode: DvMode) -> Result<(), 
     let conversion_mode: dolby_vision::rpu::ConversionMode = mode.into();
 
     let mut out_buf = Vec::new();
-    for rpu_data in &rpus {
+    for nalu in &rpus {
         let mut rpu =
-            DoviRpu::parse_rpu(rpu_data).map_err(|e| format!("Failed to parse RPU: {e}"))?;
+            DoviRpu::parse_unspec62_nalu(nalu).map_err(|e| format!("Failed to parse RPU: {e}"))?;
         rpu.convert_with_mode(conversion_mode)
             .map_err(|e| format!("Failed to convert RPU: {e}"))?;
-        let converted = rpu
-            .write_rpu()
-            .map_err(|e| format!("Failed to write RPU: {e}"))?;
-        // Write start code + NALU
-        out_buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
-        out_buf.extend_from_slice(&converted);
+        out_buf.extend_from_slice(NAL_START_CODE);
+        out_buf.extend_from_slice(&write_rpu_nalu(&rpu)?);
     }
 
     std::fs::write(output, &out_buf).map_err(|e| format!("Failed to write output: {e}"))?;
@@ -394,21 +388,30 @@ pub fn convert_dv_mode(input: &Path, output: &Path, mode: DvMode) -> Result<(), 
     Ok(())
 }
 
-/// Parse a single RPU NALU from raw bytes (no start code prefix).
+// a single RPU NALU, with or without its start code, escaped as it sits in a .bin
 pub fn parse_single_rpu(data: &[u8]) -> Result<dolby_vision::rpu::dovi_rpu::DoviRpu, String> {
-    dolby_vision::rpu::dovi_rpu::DoviRpu::parse_rpu(data)
+    dolby_vision::rpu::dovi_rpu::DoviRpu::parse_unspec62_nalu(data)
         .map_err(|e| format!("RPU parse error: {e}"))
 }
 
 /// Convert a single RPU in-memory to the target profile/mode.
 pub fn convert_rpu(data: &[u8], mode: DvMode) -> Result<Vec<u8>, String> {
-    use dolby_vision::rpu::dovi_rpu::DoviRpu;
-
-    let mut rpu = DoviRpu::parse_rpu(data).map_err(|e| format!("RPU parse error: {e}"))?;
+    let mut rpu = parse_single_rpu(data)?;
     let conversion_mode: dolby_vision::rpu::ConversionMode = mode.into();
     rpu.convert_with_mode(conversion_mode)
         .map_err(|e| format!("RPU conversion error: {e}"))?;
-    rpu.write_rpu().map_err(|e| format!("RPU write error: {e}"))
+    write_rpu_nalu(&rpu)
+}
+
+// the two byte HEVC NAL header write_hevc_unspec62_nalu prepends, which a .bin does not carry
+const HEVC_NAL_HEADER_BYTES: usize = 2;
+
+// dovi_tool keeps the emulation prevention bytes in a .bin, so the RPU is written as a NALU
+fn write_rpu_nalu(rpu: &DoviRpu) -> Result<Vec<u8>, String> {
+    let nalu = rpu
+        .write_hevc_unspec62_nalu()
+        .map_err(|e| format!("Failed to write RPU: {e}"))?;
+    Ok(nalu[HEVC_NAL_HEADER_BYTES..].to_vec())
 }
 
 /// Generate a default Dolby Vision profile 8.1 RPU.
@@ -609,7 +612,7 @@ pub fn write_dolby_vision_fixture(
     Ok(output)
 }
 
-/// Parse a .bin RPU file into individual RPU NALUs.
+// each NALU keeps its start code, which is what parse_unspec62_nalu trims
 fn parse_rpu_bin_file(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     let mut rpus = Vec::new();
     let mut i = 0;
@@ -641,7 +644,7 @@ fn parse_rpu_bin_file(data: &[u8]) -> Result<Vec<Vec<u8>>, String> {
         }
 
         if start < end {
-            rpus.push(data[start..end].to_vec());
+            rpus.push(data[i..end].to_vec());
         }
         i = end;
     }

@@ -1,6 +1,8 @@
 use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlockLevel6;
+use dolby_vision::utils::add_start_code_emulation_prevention_3_byte;
 use postkit::dolby_vision::{
-    DOLBY_VISION_FIXTURE_FRAMES, DolbyVisionFixtureProfile, DolbyVisionSummary, read_dolby_vision,
+    DOLBY_VISION_FIXTURE_FRAMES, DolbyVisionFixtureProfile, DolbyVisionSummary, DvMode,
+    convert_dv_mode, generate_profile81_rpu, parse_single_rpu, read_dolby_vision,
     refuse_undecodable_dolby_vision, write_dolby_vision_fixture,
 };
 use std::path::{Path, PathBuf};
@@ -239,4 +241,66 @@ fn a_profile_8_4_fixture_reads_back_as_profile_8() {
     assert_eq!(summary.frames, DOLBY_VISION_FIXTURE_FRAMES);
     assert_eq!(summary.mastering_display_max_nits, Some(1000.0));
     assert!(refuse_undecodable_dolby_vision(&summary).is_ok());
+}
+
+// the reshaping curve mode 5 writes, an eight segment polynomial over the luma
+const PROFILE_84_LUMA_PIVOTS: [u16; 9] = [63, 69, 230, 256, 256, 37, 16, 8, 7];
+const NAL_START_CODE: [u8; 4] = [0, 0, 0, 1];
+
+// 00 00 03 is the escape itself, a 00, 01 or 02 in its place would read as a start code
+fn emulated_start_code(data: &[u8]) -> Option<usize> {
+    let mut index = 0;
+    while index + 2 < data.len() {
+        if data[index] == 0 && data[index + 1] == 0 && data[index + 2] <= 3 {
+            if data[index + 2] != 3 {
+                return Some(index);
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+#[test]
+fn convert_dv_mode_reads_and_writes_an_escaped_rpu_bin() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let mut escaped = generate_profile81_rpu().unwrap();
+    let unescaped_length = escaped.len();
+    add_start_code_emulation_prevention_3_byte(&mut escaped);
+    assert!(
+        escaped.len() > unescaped_length,
+        "the generated RPU carries nothing to escape, so this proves no parsing"
+    );
+
+    let input = directory.path().join("profile81.bin");
+    let mut bin = NAL_START_CODE.to_vec();
+    bin.extend_from_slice(&escaped);
+    std::fs::write(&input, &bin).unwrap();
+
+    let output = directory.path().join("profile84.bin");
+    convert_dv_mode(&input, &output, DvMode::Mode5).unwrap();
+
+    let converted = std::fs::read(&output).unwrap();
+    assert!(converted.starts_with(&NAL_START_CODE));
+    let payload = &converted[NAL_START_CODE.len()..];
+    assert_eq!(
+        emulated_start_code(payload),
+        None,
+        "the written RPU emulates a start code"
+    );
+
+    let parsed = parse_single_rpu(&converted).unwrap();
+    assert_ne!(
+        payload,
+        parsed.write_rpu().unwrap().as_slice(),
+        "the written RPU carries no emulation prevention"
+    );
+    assert_eq!(parsed.dovi_profile, 8);
+    assert_eq!(
+        parsed.rpu_data_mapping.unwrap().curves[0].pivots,
+        PROFILE_84_LUMA_PIVOTS
+    );
 }
