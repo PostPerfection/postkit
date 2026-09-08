@@ -4,6 +4,27 @@
 
 ### Added
 
+- **The wrapped MXF descriptor reads back as CPL RegXML**:
+  `regxml::picture_descriptor_regxml` takes the `RgbaEssenceDescriptor` and the
+  `Jpeg2000PictureSubDescriptor` that `asdcplib::as02::jp2k::MxfReader` reads
+  back off a wrapped AS-02 JPEG 2000 track file, and writes them as the RegXML
+  an IMF CPL's EssenceDescriptorList carries. The RGBADescriptor gets
+  InstanceID, EssenceLength, LinkedTrackID, SampleRate, ContainerFormat,
+  FrameLayout, StoredWidth, StoredHeight, ImageAspectRatio, PictureCompression,
+  TransferCharacteristic, ColorPrimaries, ComponentMaxRef, ComponentMinRef,
+  ScanningDirection, MasteringDisplayPrimaries,
+  MasteringDisplayWhitePointChromaticity, MasteringDisplayMaximumLuminance,
+  MasteringDisplayMinimumLuminance, VideoLineMap and PixelLayout, the last as
+  eight RGBAComponent code and size pairs. The JPEG2000SubDescriptor nested in
+  SubDescriptors gets its own InstanceID, Rsiz, Xsiz, Ysiz, XOsiz, YOsiz, XTsiz,
+  YTsiz, XTOsiz, YTOsiz, Csiz, CodingStyleDefault, QuantizationDefault,
+  PictureComponentSizing as one J2KComponentSizing per component, and J2CLayout.
+  The optional items are written only when the descriptor carries them. Every
+  item, both InstanceIDs included, comes off the MXF, so a validator comparing
+  the two sees one descriptor twice. `regxml::urn_ul` and `regxml::urn_uuid` are
+  the urn spellings, a UL as `urn:smpte:ul:` in four dot-separated groups and an
+  InstanceID as `urn:uuid:`.
+
 - **A Dolby Vision test clip is built in process**:
   `dolby_vision::write_dolby_vision_fixture` encodes
   `DOLBY_VISION_FIXTURE_FRAMES` frames of 320x180 10 bit grey with ffmpeg's
@@ -348,6 +369,17 @@
 
 ### Changed
 
+- **An AS-02 PCM wrap writes the IMF MCA labels**: `wrap_pcm` refused an
+  `McaConfig` on AS-02 with "MCA labels are only supported on the AS-DCP (DCP)
+  PCM path", and now writes the labels. `McaConfig` gained
+  `soundfield_group: Option<SoundfieldGroup>`, carrying the title, title
+  version, audio content kind and audio element kind, which the AS-02 writer
+  requires: it returns an InvalidArgument error without it. The AS-DCP writer
+  ignores the field and takes the labels and the spoken language alone. Read
+  back, `wrap_pcm_writes_imf_mca_labels_on_as02` finds ChannelAssignment
+  `IMF_CHANNEL_ASSIGNMENT_MCA`, one AudioChannelLabelSubDescriptor per channel,
+  and one SoundfieldGroupLabelSubDescriptor with the language and the four group
+  items.
 - **The grok player carries RGBA frames**: the decode pool expands every frame
   to four bytes a pixel with an opaque alpha, on the worker thread that decoded
   it or while it copies the device's rows, so the presenter uploads `GL_RGBA`
