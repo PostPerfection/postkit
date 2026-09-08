@@ -734,6 +734,7 @@ fn sign_language_status(evidence: &PackageEvidence) -> (TrackStatus, String) {
     )
 }
 
+// each list maps the access services its instrument names onto DCP tracks
 fn required_tracks(standard: AccessibilityStandard) -> Vec<AccessibilityTrack> {
     match standard {
         AccessibilityStandard::Cvaa => vec![
@@ -741,17 +742,13 @@ fn required_tracks(standard: AccessibilityStandard) -> Vec<AccessibilityTrack> {
             AccessibilityTrack::AudioDescription,
         ],
         AccessibilityStandard::Eaa => vec![
-            AccessibilityTrack::AudioDescription,
-            AccessibilityTrack::HearingImpaired,
-        ],
-        AccessibilityStandard::Aoda => vec![
             AccessibilityTrack::ClosedCaptions,
             AccessibilityTrack::AudioDescription,
         ],
+        AccessibilityStandard::Aoda => vec![AccessibilityTrack::ClosedCaptions],
         AccessibilityStandard::Ofcom => vec![
+            AccessibilityTrack::ClosedCaptions,
             AccessibilityTrack::AudioDescription,
-            AccessibilityTrack::HearingImpaired,
-            AccessibilityTrack::SignLanguage,
         ],
     }
 }
@@ -759,9 +756,15 @@ fn required_tracks(standard: AccessibilityStandard) -> Vec<AccessibilityTrack> {
 fn recommended_tracks(standard: AccessibilityStandard) -> Vec<AccessibilityTrack> {
     match standard {
         AccessibilityStandard::Cvaa => vec![AccessibilityTrack::HearingImpaired],
-        AccessibilityStandard::Eaa => vec![AccessibilityTrack::SignLanguage],
-        AccessibilityStandard::Aoda => vec![AccessibilityTrack::HearingImpaired],
-        AccessibilityStandard::Ofcom => vec![],
+        AccessibilityStandard::Eaa => vec![
+            AccessibilityTrack::SignLanguage,
+            AccessibilityTrack::HearingImpaired,
+        ],
+        AccessibilityStandard::Aoda => vec![
+            AccessibilityTrack::AudioDescription,
+            AccessibilityTrack::HearingImpaired,
+        ],
+        AccessibilityStandard::Ofcom => vec![AccessibilityTrack::SignLanguage],
     }
 }
 
@@ -1217,7 +1220,11 @@ mod tests {
 
     #[test]
     fn sound_configuration_settles_the_accessibility_channels() {
-        let dir = package(&cpl("Feature", Some("51/L,R,C,LFE,Ls,Rs,HI,VIN,-,-"), ""));
+        let dir = package(&cpl(
+            "Feature",
+            Some("51/L,R,C,LFE,Ls,Rs,HI,VIN,-,-"),
+            CLOSED_CAPTION_ASSET,
+        ));
         let result = check_accessibility(dir.path(), AccessibilityStandard::Eaa);
         assert_eq!(
             result.track_status(AccessibilityTrack::AudioDescription),
@@ -1267,6 +1274,125 @@ mod tests {
         assert_eq!(result.findings[0].severity, Severity::Warning);
     }
 
+    /// A DCP CPL declaring exactly `tracks`, on a 5.1 bed the accessibility
+    /// channels are appended to.
+    fn package_with(tracks: &[AccessibilityTrack]) -> tempfile::TempDir {
+        let mut slots = vec!["L", "R", "C", "LFE", "Ls", "Rs"];
+        if tracks.contains(&AccessibilityTrack::HearingImpaired) {
+            slots.push("HI");
+        }
+        if tracks.contains(&AccessibilityTrack::AudioDescription) {
+            slots.push("VIN");
+        }
+        let mut reel_extras = String::new();
+        if tracks.contains(&AccessibilityTrack::ClosedCaptions) {
+            reel_extras.push_str(CLOSED_CAPTION_ASSET);
+        }
+        if tracks.contains(&AccessibilityTrack::SignLanguage) {
+            reel_extras.push_str(SIGN_LANGUAGE_METADATA);
+        }
+        package(&cpl(
+            "Feature",
+            Some(&format!("51/{}", slots.join(","))),
+            &reel_extras,
+        ))
+    }
+
+    fn finding_for(
+        result: &AccessibilityResult,
+        track: AccessibilityTrack,
+    ) -> &AccessibilityFinding {
+        result
+            .findings
+            .iter()
+            .find(|f| f.track_type == track)
+            .unwrap_or_else(|| panic!("no {track:?} finding in {:?}", result.findings))
+    }
+
+    /// A package holding every required track passes, dropping any one of them
+    /// fails with a finding naming that track and the standard, and every
+    /// recommended track missing is a warning rather than a failure.
+    fn assert_standard(
+        standard: AccessibilityStandard,
+        required: &[AccessibilityTrack],
+        recommended: &[AccessibilityTrack],
+    ) {
+        let prefix = standard_prefix(standard);
+        let complete = package_with(required);
+        let result = check_accessibility(complete.path(), standard);
+        assert!(result.compliant, "{prefix} must pass with {required:?}");
+        assert_eq!(result.errors, 0);
+        assert!(result.tracks_missing.is_empty());
+
+        for track in recommended {
+            let finding = finding_for(&result, *track);
+            assert_eq!(
+                finding.severity,
+                Severity::Warning,
+                "{prefix} only recommends {track:?}"
+            );
+            assert!(finding.rule_id.starts_with(prefix));
+        }
+        assert_eq!(result.warnings as usize, recommended.len());
+
+        for missing in required {
+            let kept: Vec<_> = required.iter().copied().filter(|t| t != missing).collect();
+            let short = package_with(&kept);
+            let result = check_accessibility(short.path(), standard);
+            assert!(!result.compliant, "{prefix} must fail without {missing:?}");
+            assert_eq!(result.tracks_missing, vec![*missing]);
+
+            let finding = finding_for(&result, *missing);
+            assert_eq!(finding.severity, Severity::Error);
+            assert!(finding.rule_id.starts_with(prefix), "{}", finding.rule_id);
+            let label = requirement(standard, *missing).label;
+            assert!(
+                finding.description.contains(prefix) && finding.description.contains(label),
+                "the finding names neither {prefix} nor {label}: {}",
+                finding.description
+            );
+        }
+    }
+
+    #[test]
+    fn eaa_requires_captions_and_narration_and_recommends_signing_and_the_hi_mix() {
+        assert_standard(
+            AccessibilityStandard::Eaa,
+            &[
+                AccessibilityTrack::ClosedCaptions,
+                AccessibilityTrack::AudioDescription,
+            ],
+            &[
+                AccessibilityTrack::SignLanguage,
+                AccessibilityTrack::HearingImpaired,
+            ],
+        );
+    }
+
+    #[test]
+    fn aoda_requires_captions_and_recommends_narration_and_the_hi_mix() {
+        assert_standard(
+            AccessibilityStandard::Aoda,
+            &[AccessibilityTrack::ClosedCaptions],
+            &[
+                AccessibilityTrack::AudioDescription,
+                AccessibilityTrack::HearingImpaired,
+            ],
+        );
+    }
+
+    #[test]
+    fn ofcom_requires_captions_and_narration_and_recommends_signing() {
+        assert_standard(
+            AccessibilityStandard::Ofcom,
+            &[
+                AccessibilityTrack::ClosedCaptions,
+                AccessibilityTrack::AudioDescription,
+            ],
+            &[AccessibilityTrack::SignLanguage],
+        );
+    }
+
     #[test]
     fn sign_language_comes_from_the_isdcf_extension_scope() {
         let with_extension = package(&cpl(
@@ -1279,7 +1405,6 @@ mod tests {
             result.track_status(AccessibilityTrack::SignLanguage),
             TrackStatus::Present
         );
-        assert!(result.compliant);
 
         let without = package(&cpl("Feature", Some("51/L,R,C,LFE,Ls,Rs,HI,VIN"), ""));
         let result = check_accessibility(without.path(), AccessibilityStandard::Ofcom);
@@ -1287,8 +1412,6 @@ mod tests {
             result.track_status(AccessibilityTrack::SignLanguage),
             TrackStatus::Undeterminable
         );
-        assert!(!result.compliant);
-        assert_eq!(result.errors, 1);
     }
 
     #[test]
@@ -1590,7 +1713,8 @@ mod tests {
             TrackStatus::Undeterminable
         );
         assert!(!result.compliant);
-        assert_eq!(result.errors, 3);
+        // the caption sequence settles the one other track OFCOM requires
+        assert_eq!(result.errors, 1);
     }
 
     #[test]
@@ -1636,21 +1760,65 @@ mod tests {
 
     #[test]
     fn required_tracks_vary_by_standard() {
+        use AccessibilityTrack::{AudioDescription, ClosedCaptions, HearingImpaired, SignLanguage};
+
         assert_eq!(
             required_tracks(AccessibilityStandard::Cvaa),
-            vec![
-                AccessibilityTrack::ClosedCaptions,
-                AccessibilityTrack::AudioDescription
-            ]
+            vec![ClosedCaptions, AudioDescription]
         );
         assert_eq!(
-            required_tracks(AccessibilityStandard::Ofcom),
-            vec![
-                AccessibilityTrack::AudioDescription,
-                AccessibilityTrack::HearingImpaired,
-                AccessibilityTrack::SignLanguage
-            ]
+            recommended_tracks(AccessibilityStandard::Cvaa),
+            vec![HearingImpaired]
         );
+
+        assert_eq!(
+            required_tracks(AccessibilityStandard::Eaa),
+            vec![ClosedCaptions, AudioDescription]
+        );
+        assert_eq!(
+            recommended_tracks(AccessibilityStandard::Eaa),
+            vec![SignLanguage, HearingImpaired]
+        );
+
+        assert_eq!(
+            required_tracks(AccessibilityStandard::Aoda),
+            vec![ClosedCaptions]
+        );
+        assert_eq!(
+            recommended_tracks(AccessibilityStandard::Aoda),
+            vec![AudioDescription, HearingImpaired]
+        );
+
+        assert_eq!(
+            required_tracks(AccessibilityStandard::Ofcom),
+            vec![ClosedCaptions, AudioDescription]
+        );
+        assert_eq!(
+            recommended_tracks(AccessibilityStandard::Ofcom),
+            vec![SignLanguage]
+        );
+    }
+
+    /// No standard requires a track this list leaves out, so a check can never
+    /// demand something the probe does not look for.
+    #[test]
+    fn every_required_and_recommended_track_is_one_the_probe_detects() {
+        for standard in [
+            AccessibilityStandard::Cvaa,
+            AccessibilityStandard::Eaa,
+            AccessibilityStandard::Aoda,
+            AccessibilityStandard::Ofcom,
+        ] {
+            for track in required_tracks(standard)
+                .into_iter()
+                .chain(recommended_tracks(standard))
+            {
+                assert!(
+                    ALL_TRACKS.contains(&track),
+                    "{standard:?} names {track:?}, which the probe never detects"
+                );
+            }
+        }
     }
 
     #[test]

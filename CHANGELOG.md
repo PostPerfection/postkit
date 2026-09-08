@@ -482,6 +482,36 @@
 
 ### Fixed
 
+- **`accessibility` checks the tracks each standard's instrument names**: the
+  EAA and Ofcom lists required an HI mix channel and named no caption track at
+  all, and Ofcom required sign-language video, so a package with a 5.1 bed plus
+  HI and VI-N passed the EAA check while a captioned package without an HI mix
+  failed it. The EAA names its access services in Annex I Section IV(b)(ii) and
+  Article 3(6) as subtitles for the deaf and hard of hearing, audio description,
+  spoken subtitles and sign language interpretation, and names no audio mix
+  anywhere
+  (https://eur-lex.europa.eu/legal-content/EN/TXT/PDF/?uri=CELEX%3A32019L0882).
+  Ofcom's Code on Television Access Services names subtitling, audio description
+  and signing, quotas of 80 to 90, 10 and 5 per cent of a schedule under
+  Communications Act 2003 s303, and no mix
+  (https://www.legislation.gov.uk/ukpga/2003/21/section/303). Ontario's
+  Integrated Accessibility Standards Regulation reaches internet websites and
+  web content only, and its s.14(4) schedule exempts WCAG success criteria 1.2.5
+  Audio Descriptions (Pre-recorded) from the Level AA duty while 1.2.2 Captions
+  (Prerecorded) is Level A and not exempt
+  (https://www.ontario.ca/laws/regulation/110191). So `required_tracks` gives
+  the EAA and Ofcom a closed-caption asset and a VI-N narration channel and AODA
+  the caption asset alone, the HI mix is a recommendation under all three, and
+  sign language is a recommendation under the EAA and Ofcom. None of the three
+  instruments names a cinema deliverable, so every list stays this crate's own
+  mapping of the access services an instrument names onto DCP tracks rather than
+  a citation. The CVAA list is unchanged and was not re-read against its own
+  instrument. `required_tracks_vary_by_standard` now pins all four required and
+  all four recommended lists, and one test per standard builds a CPL holding
+  exactly the tracks it requires, drops each one in turn and asserts the error
+  finding names that track and the standard, and asserts every missing
+  recommendation is a warning rather than a failure.
+
 - **`convert_dv_mode` reads the RPU files dovi_tool writes**: every RPU in a
   `.bin` is escaped as an annex B NALU, and `parse_single_rpu`, `convert_rpu`
   and `convert_dv_mode` all called `DoviRpu::parse_rpu`, which does not clear
