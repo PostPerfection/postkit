@@ -489,7 +489,7 @@ pub fn serve_dashboard(opts: &DashboardOptions) -> i32 {
         server.route_with_content_type(
             "GET",
             path,
-            Box::new(move |_method, req_path| dashboard_response(&db, req_path)),
+            Box::new(move |request| dashboard_response(&db, &request.path)),
         );
     }
 

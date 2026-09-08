@@ -388,6 +388,32 @@
 
 ### Changed
 
+- **`RestServer` parses the whole request, so a handler can read the body and
+  the headers**: it read one line off the socket, matched the path exactly and
+  handed the handler `(method, path)` and nothing else, which is why both
+  wizards wrote their own server rather than use it. It now reads the request
+  line, the headers up to the blank line and exactly `Content-Length` bytes of
+  body, so a body arriving in a second TCP segment is no longer truncated, and
+  a handler takes one `Request` carrying the method, the path, the headers with
+  their names lowercased and the body. `Request::header` finds a header whatever
+  case the client sent it in. A missing `Content-Length` on a POST is an empty
+  body, two of them or a `Transfer-Encoding` is a 400, and a length over
+  `MAX_BODY_BYTES` (1 MiB) is a 413 refused before anything is read. A header
+  line over 8 KiB, more than 100 headers, or a body that is not UTF-8 is a 400.
+  `route` and `route_with_content_type` still match the whole path and still
+  take the two handler forms, `route_with_parameter` matches a prefix ending in
+  a slash plus one more segment and hands the handler that segment, so
+  `/api/v1/jobs/` reaches `/api/v1/jobs/7` and not `/api/v1/jobsXYZ`.
+  `require_api_key(key, exempt_paths)` reads the key from `X-Api-Key` or
+  `Authorization: Bearer` only, never from anywhere else in the request,
+  compares it with `constant_time_eq` and exempts a path only if it is listed
+  exactly. The key is checked before routing, so an unknown path answers 401
+  rather than 404 to a caller without it. `bind` hands back the listener so a
+  caller can read the address port 0 gave it and then `serve_forever` on it,
+  where `start` still binds and serves in one blocking call. Each connection is
+  handled on its own thread with a 30 second read and write timeout, where one
+  slow client used to hold up every other.
+
 - **An AS-02 PCM wrap writes the IMF MCA labels**: `wrap_pcm` refused an
   `McaConfig` on AS-02 with "MCA labels are only supported on the AS-DCP (DCP)
   PCM path", and now writes the labels. `McaConfig` gained
