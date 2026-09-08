@@ -1,0 +1,30 @@
+[graph]
+targets = []
+all-features = true
+
+[licenses]
+allow = [
+    # postkit and asdcplib-rs are AGPL-3.0-or-later themselves
+    "AGPL-3.0-or-later",
+    "AGPL-3.0-only",  # grokj2k-sys
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",  # notify
+    "MPL-2.0",  # option-ext
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/PostPerfection/asdcplib-rs",
+    "https://github.com/GrokImageCompression/grok",
+]

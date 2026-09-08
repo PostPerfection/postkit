@@ -156,3 +156,18 @@ jobs:
 
       - name: Format check
         run: cargo fmt -- --check
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@cargo-deny
+
+      # advisories left out because ttf-parser is unmaintained per RUSTSEC-2026-0192
+      # with no safe upgrade, it comes in through cosmic-text then fontdb. don't add
+      # an ignore, it hides the finding.
+      - name: Cargo deny
+        run: cargo deny check bans licenses sources
