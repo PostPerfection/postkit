@@ -249,6 +249,14 @@ struct SftpTransport {
 
 impl SftpTransport {
     fn connect(config: &TmsConfig) -> Result<Self, String> {
+        Self::connect_with_known_hosts(config, &known_hosts_path()?)
+    }
+
+    // private so nothing outside this file can aim the host key check at another file
+    fn connect_with_known_hosts(
+        config: &TmsConfig,
+        known_hosts_file: &Path,
+    ) -> Result<Self, String> {
         let host = config.host.as_str();
         let port = config.port();
         let stream = std::net::TcpStream::connect((host, port))
@@ -259,7 +267,7 @@ impl SftpTransport {
         session
             .handshake()
             .map_err(|e| format!("ssh handshake with {host}:{port} failed: {e}"))?;
-        check_host_key(&session, host, port)?;
+        check_host_key(&session, host, port, known_hosts_file)?;
         session
             .userauth_password(&config.user, &config.password)
             .map_err(|e| {
@@ -283,7 +291,12 @@ impl SftpTransport {
 /// unknown host outright rather than handing it the password. libssh2 checks no
 /// host key on its own, so without this the upload trusts whatever answers on
 /// the address.
-fn check_host_key(session: &ssh2::Session, host: &str, port: u16) -> Result<(), String> {
+fn check_host_key(
+    session: &ssh2::Session,
+    host: &str,
+    port: u16,
+    known_hosts_file: &Path,
+) -> Result<(), String> {
     let (key, _key_type) = session
         .host_key()
         .ok_or_else(|| format!("{host} offered no host key"))?;
@@ -291,12 +304,11 @@ fn check_host_key(session: &ssh2::Session, host: &str, port: u16) -> Result<(), 
     let mut known_hosts = session
         .known_hosts()
         .map_err(|e| format!("cannot read known hosts: {e}"))?;
-    let known_hosts_file = known_hosts_path()?;
     // a missing file is not an error here: it leaves the check with no entry for
     // the host, which is the NotFound refusal below.
     if known_hosts_file.exists() {
         known_hosts
-            .read_file(&known_hosts_file, ssh2::KnownHostFileKind::OpenSSH)
+            .read_file(known_hosts_file, ssh2::KnownHostFileKind::OpenSSH)
             .map_err(|e| format!("cannot read {}: {e}", known_hosts_file.display()))?;
     }
     match known_hosts.check_port(host, port, key) {
@@ -628,5 +640,255 @@ mod tests {
         std::fs::create_dir_all(&empty).unwrap();
         let err = upload_with(&mut transport, "/srv/dcp", &empty).unwrap_err();
         assert!(err.contains("nothing to upload"), "{err}");
+    }
+}
+
+// unix only: an unprivileged sshd on a throwaway config is not a thing on windows
+#[cfg(all(test, unix))]
+mod host_key_tests {
+    use super::{SftpTransport, TmsConfig, TmsProtocol};
+    use std::io::Read;
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    const LOOPBACK: &str = "127.0.0.1";
+    // a name no account has, so an sshd log line naming it came from this test
+    const PROBE_USER: &str = "tms_upload_probe";
+    const PROBE_PASSWORD: &str = "this-password-must-never-leave-the-client";
+    // sshd logs this only once a password arrived, not for the method probe that carries the user name
+    const PASSWORD_ATTEMPT_LOG: &str = "Failed password";
+    const LISTENING_LOG: &str = "Server listening on";
+    const CONNECTION_OVER_LOG: &str = "Connection closed";
+    const SERVER_START_TIMEOUT: Duration = Duration::from_secs(20);
+    const LOG_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    fn sshd_binary() -> PathBuf {
+        let candidates = [
+            "/usr/sbin/sshd",
+            "/usr/bin/sshd",
+            "/usr/local/sbin/sshd",
+            "/usr/local/bin/sshd",
+            "/opt/homebrew/sbin/sshd",
+        ];
+        for candidate in candidates {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                return path;
+            }
+        }
+        panic!(
+            "no sshd found in {candidates:?}. this test needs the openssh server package, \
+             it is not skipped when the binary is missing"
+        );
+    }
+
+    fn free_loopback_port() -> u16 {
+        let listener = std::net::TcpListener::bind((LOOPBACK, 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    fn generate_host_key(directory: &Path, name: &str) -> String {
+        let key_path = directory.join(name);
+        let status = Command::new("ssh-keygen")
+            .args(["-t", "ed25519", "-N", "", "-C", "", "-q", "-f"])
+            .arg(&key_path)
+            .status()
+            .expect("ssh-keygen must be installed to run the host key tests");
+        assert!(status.success(), "ssh-keygen failed for {name}");
+        let published = std::fs::read_to_string(key_path.with_extension("pub")).unwrap();
+        // the pub file is "ssh-ed25519 <base64> <comment>", known_hosts wants the first two fields
+        let mut fields = published.split_whitespace();
+        let algorithm = fields.next().unwrap();
+        let material = fields.next().unwrap();
+        format!("{algorithm} {material}")
+    }
+
+    struct LocalSshServer {
+        process: Child,
+        directory: tempfile::TempDir,
+        port: u16,
+        host_key: String,
+        other_host_key: String,
+    }
+
+    impl LocalSshServer {
+        fn start() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let host_key = generate_host_key(directory.path(), "hostkey");
+            let other_host_key = generate_host_key(directory.path(), "otherkey");
+            let port = free_loopback_port();
+            let config_path = directory.path().join("sshd_config");
+            std::fs::write(
+                &config_path,
+                format!(
+                    "ListenAddress {LOOPBACK}\n\
+                     Port {port}\n\
+                     HostKey {}\n\
+                     PidFile none\n\
+                     StrictModes no\n\
+                     PasswordAuthentication yes\n\
+                     KbdInteractiveAuthentication no\n\
+                     PubkeyAuthentication no\n\
+                     AuthorizedKeysFile none\n\
+                     PermitRootLogin no\n\
+                     LogLevel VERBOSE\n",
+                    directory.path().join("hostkey").display()
+                ),
+            )
+            .unwrap();
+            let process = Command::new(sshd_binary())
+                .arg("-D")
+                .arg("-f")
+                .arg(&config_path)
+                .arg("-E")
+                .arg(directory.path().join("log"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("cannot start sshd");
+            let server = Self {
+                process,
+                directory,
+                port,
+                host_key,
+                other_host_key,
+            };
+            server.wait_until_listening();
+            server
+        }
+
+        // readiness comes off the log, a tcp probe would leave a connection in it that
+        // wait_for_connection_to_close would then mistake for the test's own
+        fn wait_until_listening(&self) {
+            let deadline = Instant::now() + SERVER_START_TIMEOUT;
+            while Instant::now() < deadline {
+                if self.log().contains(LISTENING_LOG) {
+                    return;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            panic!("sshd never listened on {}. log: {}", self.port, self.log());
+        }
+
+        fn log(&self) -> String {
+            let mut text = String::new();
+            if let Ok(mut file) = std::fs::File::open(self.directory.path().join("log")) {
+                let _ = file.read_to_string(&mut text);
+            }
+            text
+        }
+
+        // waiting for the close line keeps "no password arrived" from just reading the log too early
+        fn wait_for_connection_to_close(&self) {
+            let deadline = Instant::now() + LOG_SETTLE_TIMEOUT;
+            while Instant::now() < deadline {
+                if self.log().contains(CONNECTION_OVER_LOG) {
+                    return;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            panic!(
+                "sshd never logged the end of the connection, so the log cannot be trusted. log: {}",
+                self.log()
+            );
+        }
+
+        // the other entries are the markers and key types a real known_hosts holds, so a
+        // refusal is never an empty-file accident
+        fn known_hosts_with(&self, line: &str) -> PathBuf {
+            let path = self.directory.path().join("known_hosts");
+            std::fs::write(
+                &path,
+                format!(
+                    "@cert-authority *.cinema.test {other}\n\
+                     @revoked tms.decommissioned.test {other}\n\
+                     tms.other-cinema.test {other}\n\
+                     sk.cinema.test sk-ssh-ed25519@openssh.com \
+                     AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIHVDLwHNGVBmpXaMRRTvJXBiFPMuHkNxOm6\
+                     iRw+bHGZTAAAABHNzaDo=\n\
+                     |1|F1E1w0Ic4qCPGZC8yZBHiSZ0Vd0=|hK1Zx6dq8OqvKgTNy2FQ8HqfeBQ= ssh-ed25519 \
+                     AAAAC3NzaC1lZDI1NTE5AAAAIA1lNwjrY0xVeF7mQxvWpx7oOtXK5gYQfBBQ0nqPtvhZ\n\
+                     {line}\n",
+                    other = self.other_host_key
+                ),
+            )
+            .unwrap();
+            path
+        }
+
+        fn config(&self) -> TmsConfig {
+            TmsConfig {
+                protocol: TmsProtocol::Sftp,
+                host: LOOPBACK.to_string(),
+                port: Some(self.port),
+                path: "/incoming".to_string(),
+                user: PROBE_USER.to_string(),
+                password: PROBE_PASSWORD.to_string(),
+            }
+        }
+    }
+
+    impl Drop for LocalSshServer {
+        fn drop(&mut self) {
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+        }
+    }
+
+    #[test]
+    fn an_unknown_host_is_refused_before_the_password_is_sent() {
+        let server = LocalSshServer::start();
+        let known_hosts = server.known_hosts_with("# no entry for the server under test");
+        let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
+            .err()
+            .expect("an unknown host must not be uploaded to");
+        assert!(error.contains("is not in"), "{error}");
+        assert!(error.contains("ssh-keyscan"), "{error}");
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            !log.contains(PASSWORD_ATTEMPT_LOG),
+            "the password was sent to a host that is not in known_hosts. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_host_key_is_refused_before_the_password_is_sent() {
+        let server = LocalSshServer::start();
+        let impostor = format!("[{LOOPBACK}]:{} {}", server.port, server.other_host_key);
+        let known_hosts = server.known_hosts_with(&impostor);
+        let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
+            .err()
+            .expect("a host whose key changed must not be uploaded to");
+        assert!(error.contains("does not match"), "{error}");
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            !log.contains(PASSWORD_ATTEMPT_LOG),
+            "the password was sent to a host whose key does not match known_hosts. log: {log}"
+        );
+    }
+
+    #[test]
+    fn a_matching_host_key_is_accepted_and_the_login_follows_it() {
+        let server = LocalSshServer::start();
+        let entry = format!("[{LOOPBACK}]:{} {}", server.port, server.host_key);
+        let known_hosts = server.known_hosts_with(&entry);
+        // the login fails because PROBE_USER is nobody, what matters is that it was reached
+        let error = SftpTransport::connect_with_known_hosts(&server.config(), &known_hosts)
+            .err()
+            .expect("no account exists for the probe user");
+        assert!(
+            error.contains("login as") && !error.contains("known_hosts"),
+            "a known host key must pass the check and let the login run: {error}"
+        );
+        server.wait_for_connection_to_close();
+        let log = server.log();
+        assert!(
+            log.contains(PASSWORD_ATTEMPT_LOG) && log.contains(PROBE_USER),
+            "sshd never saw a password attempt, so the check did not pass a known host. log: {log}"
+        );
     }
 }
