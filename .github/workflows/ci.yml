@@ -56,17 +56,17 @@ jobs:
       - name: Install ffmpeg (Linux)
         if: runner.os == 'Linux'
         run: |
-          curl -fsSL --retry 5 --retry-all-errors -o ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-27-16-45/ffmpeg-n8.1.2-47-g156bb4d299-linux64-gpl-8.1.tar.xz
+          curl -fsSL --retry 5 --retry-all-errors -o ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz
           tar -xJf ffmpeg.tar.xz
-          echo "$PWD/ffmpeg-n8.1.2-47-g156bb4d299-linux64-gpl-8.1/bin" >> "$GITHUB_PATH"
+          echo "$PWD/$(ls -d ffmpeg-*linux64-gpl-8.1)/bin" >> "$GITHUB_PATH"
 
       - name: Install ffmpeg (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          curl -fsSL --retry 5 --retry-all-errors -o ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-27-16-45/ffmpeg-n8.1.2-47-g156bb4d299-win64-gpl-8.1.zip
+          curl -fsSL --retry 5 --retry-all-errors -o ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-gpl-8.1.zip
           unzip -q ffmpeg.zip
-          echo "$(cygpath -w "$PWD/ffmpeg-n8.1.2-47-g156bb4d299-win64-gpl-8.1/bin")" >> "$GITHUB_PATH"
+          echo "$(cygpath -w "$PWD/$(ls -d ffmpeg-*win64-gpl-8.1)/bin")" >> "$GITHUB_PATH"
 
       - name: Install xmlsec1 (Windows)
         if: runner.os == 'Windows'
