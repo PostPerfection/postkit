@@ -2996,6 +2996,41 @@ mod tests {
 
     #[cfg(feature = "grok-ffi")]
     #[test]
+    fn an_imf_frame_hits_the_bitrate_target_on_one_codec_thread() {
+        // an IMF codestream is one tile part per component, and grok's rate
+        // search once budgeted the first tile part alone at one thread
+        let frame = noise_frame(0, 2048, 1080, 12);
+        initialize(0);
+        let params = CompressParams {
+            profile: crate::j2k::imf_rsiz(
+                crate::j2k::ImfProfile::Imf2k,
+                crate::j2k::ImfLevels {
+                    main_level: 5,
+                    sub_level: 2,
+                },
+            ),
+            target_codestream_bytes: Some(DEFAULT_TARGET_BYTES),
+            edit_rate: crate::encode::FrameRate::whole(FEATURE_FPS),
+            threads_per_codec: 1,
+            ..CompressParams::default()
+        };
+        let mut buf = Vec::new();
+        let bytes = compress_frame_grok(&frame, &params, &mut buf)
+            .unwrap()
+            .len() as u64;
+        assert!(
+            bytes <= DEFAULT_TARGET_BYTES,
+            "{bytes} bytes exceeds the {DEFAULT_TARGET_BYTES} byte target"
+        );
+        let reached = bytes as f64 / DEFAULT_TARGET_BYTES as f64;
+        assert!(
+            reached >= TARGET_FLOOR,
+            "{bytes} bytes is only {reached} of the {DEFAULT_TARGET_BYTES} byte target"
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
     fn overlapping_pipelines_share_the_inline_pool() {
         // pipelines resize grok's global pool; unguarded, one pipeline's exit
         // destroys the executor another's codecs are running on (segfault).
