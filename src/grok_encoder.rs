@@ -535,9 +535,10 @@ where
 /// the wrap end reorders them. A feed that has stopped fails the encode, which is
 /// how a wrap error gets out.
 ///
-/// `codestream_byte_cap` is checked against each codestream as the writer puts it
-/// on disk, and the first frame over it fails the run there rather than after the
-/// whole sequence has been encoded.
+/// `codestream_byte_cap`, or the byte target when there is no cap, is checked
+/// against each codestream as the writer puts it on disk, and the first frame
+/// over it fails the run there rather than after the whole sequence has been
+/// encoded. A PSNR target is held to the cap alone.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_pipeline_with_mxf_feed<F, P>(
     output_dir: &Path,
@@ -590,6 +591,17 @@ where
 
     let encode_start = std::time::Instant::now();
 
+    // grok is asked to hold the target in rate mode, so a codestream over it is a defect
+    let byte_limit = match (
+        codestream_byte_cap,
+        params.target_codestream_bytes,
+        params.quality_psnr,
+    ) {
+        (cap, _, Some(_)) => cap,
+        (Some(cap), Some(target), None) => Some(cap.min(target)),
+        (cap, target, None) => cap.or(target),
+    };
+
     // Writer thread — decoupled disk I/O
     let writer_output_dir = output_dir.to_path_buf();
     let writer_encoded_count = frames_encoded.clone();
@@ -612,7 +624,7 @@ where
                 );
                 break;
             }
-            if let Some(cap) = codestream_byte_cap
+            if let Some(cap) = byte_limit
                 && let Err(e) = crate::encode::check_codestream_size(&path, cap)
             {
                 fail_pipeline(
@@ -3283,6 +3295,71 @@ mod tests {
             )),
             "wrong refusal: {}",
             result.error
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_target_grok_cannot_meet_fails_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("targeted");
+        let result = encode_noise_frames_at_the_target(&output, 8, None, Some(UNMEETABLE_CAP));
+        assert!(!result.success, "a 100 byte target has to fail the encode");
+        assert!(
+            result.error.contains(&format!(
+                "over the {UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
+            )),
+            "wrong refusal: {}",
+            result.error
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn an_imf_encode_at_a_bitrate_writes_no_codestream_over_it() {
+        // one codec thread, where grok once wrote about three times the target
+        const TOTAL: u64 = 2;
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("imf");
+        let params = CompressParams {
+            profile: crate::j2k::imf_rsiz(
+                crate::j2k::ImfProfile::Imf2k,
+                crate::j2k::ImfLevels {
+                    main_level: 5,
+                    sub_level: 2,
+                },
+            ),
+            target_codestream_bytes: Some(DEFAULT_TARGET_BYTES),
+            edit_rate: crate::encode::FrameRate::whole(FEATURE_FPS),
+            ..CompressParams::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let phase_clocks = Arc::new(PhaseClocks::default());
+        let mut next = 0u64;
+        initialize(0);
+        let result = encode_pipeline_with_mxf_feed(
+            &output,
+            &params,
+            TOTAL,
+            &cancel,
+            &phase_clocks,
+            None,
+            None,
+            || {
+                if next >= TOTAL {
+                    return None;
+                }
+                next += 1;
+                Some(noise_frame(next - 1, 2048, 1080, 12))
+            },
+            |_| {},
+        );
+        assert!(result.success, "imf encode failed: {}", result.error);
+        assert_eq!(written_codestreams(&output).len() as u64, TOTAL);
+        let largest = largest_codestream(&output);
+        assert!(
+            largest <= DEFAULT_TARGET_BYTES,
+            "a codestream reached {largest} over the {DEFAULT_TARGET_BYTES} byte target"
         );
     }
 
