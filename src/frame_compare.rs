@@ -476,9 +476,17 @@ n:2 R:0.763922 G:0.730375 B:0.672471 All:0.722256 (5.563553)
     #[test]
     fn ffmpeg_writes_a_stats_file_on_a_path_with_a_colon() {
         let dir = tempfile::tempdir().unwrap();
-        let colon_dir = dir.path().join("c:d");
-        std::fs::create_dir(&colon_dir).unwrap();
+        // windows forbids a colon in a name, its temp path has one in the drive
+        let colon_dir = if cfg!(windows) {
+            dir.path().to_path_buf()
+        } else {
+            let nested = dir.path().join("c:d");
+            std::fs::create_dir(&nested).unwrap();
+            nested
+        };
         let stats = colon_dir.join("psnr.log");
+        let escaped = filter_option_path(&stats);
+        assert!(escaped.contains("\\\\:"), "no colon to prove: {escaped}");
         let run = std::process::Command::new("ffmpeg")
             .args([
                 "-v",
@@ -494,7 +502,7 @@ n:2 R:0.763922 G:0.730375 B:0.672471 All:0.722256 (5.563553)
                 "-frames:v",
                 "1",
                 "-lavfi",
-                &format!("[0:v][1:v]psnr=stats_file={}", filter_option_path(&stats)),
+                &format!("[0:v][1:v]psnr=stats_file={escaped}"),
                 "-f",
                 "null",
                 "-",
