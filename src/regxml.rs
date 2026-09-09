@@ -4,8 +4,15 @@ use asdcplib::Rational;
 use asdcplib::as02::jp2k::{Jpeg2000PictureSubDescriptor, RgbaEssenceDescriptor};
 use asdcplib::as02::pcm::WaveAudioDescriptor;
 use asdcplib::pcm::{McaLabelKind, McaLabelSubDescriptor};
+use asdcplib::timed_text::TimedTextDescriptor;
 
 use crate::packaging::escape_xml;
+
+// the AS-02 clip-wrapped timed-text essence container asdcplib stamps as the
+// descriptor's ContainerFormat (MDD_TimedTextWrappingClip)
+const TIMED_TEXT_ESSENCE_CONTAINER_UL: [u8; 16] = [
+    0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0a, 0x0d, 0x01, 0x03, 0x01, 0x02, 0x13, 0x01, 0x01,
+];
 
 // the three registry namespaces a picture essence descriptor is spelled in
 const AAF: &str = "http://www.smpte-ra.org/reg/395/2014/13/1/aaf";
@@ -320,6 +327,74 @@ pub fn sound_descriptor_regxml(
         xml.push_str("        </r1:SubDescriptors>\n");
     }
     xml.push_str("      </r0:WAVEPCMDescriptor>");
+    xml
+}
+
+/// The timed-text (IMSC1) essence descriptor of a wrapped AS-02 timed-text track
+/// file, as the RegXML an IMF CPL's EssenceDescriptorList carries. `instance_id`
+/// and `linked_track_id` come off the MXF header, the way the picture and sound
+/// paths read theirs, so a validator comparing the CPL entry with the MXF sees
+/// one descriptor twice. The rest is the three-field asdcplib descriptor plus the
+/// fixed essence-container UL asdcplib stamps.
+pub fn timed_text_descriptor_regxml(
+    descriptor: &TimedTextDescriptor,
+    instance_id: &[u8; 16],
+    linked_track_id: u32,
+) -> String {
+    let mut xml = String::new();
+    let _ = writeln!(
+        xml,
+        r#"      <r0:DCTimedTextDescriptor xmlns:r0="{AAF}" xmlns:r1="{ITEMS}">"#
+    );
+    const INDENT: &str = "        ";
+    item(&mut xml, INDENT, "InstanceID", &urn_uuid(instance_id));
+    item(
+        &mut xml,
+        INDENT,
+        "SampleRate",
+        &rational(&descriptor.edit_rate),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "EssenceLength",
+        &descriptor.container_duration.to_string(),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "ContainerFormat",
+        &urn_ul(&TIMED_TEXT_ESSENCE_CONTAINER_UL),
+    );
+    // asdcplib writes DataEssenceCoding on the GenericDataEssenceDescriptor
+    // without ever setting it, so it reads back as the nil UL, which the CPL entry
+    // has to repeat
+    item(&mut xml, INDENT, "DataEssenceCoding", &urn_ul(&UNSET_UL));
+    item(
+        &mut xml,
+        INDENT,
+        "LinkedTrackID",
+        &linked_track_id.to_string(),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "ResourceID",
+        &urn_uuid(&descriptor.asset_id),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "UCSEncoding",
+        &escape_xml(&descriptor.ucs_encoding),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "NamespaceURI",
+        &escape_xml(&descriptor.namespace_uri),
+    );
+    xml.push_str("      </r0:DCTimedTextDescriptor>");
     xml
 }
 

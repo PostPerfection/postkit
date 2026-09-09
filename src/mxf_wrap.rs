@@ -1332,6 +1332,36 @@ fn timed_text_document_id(xml: &str) -> Option<[u8; 16]> {
     }
 }
 
+/// The IMSC profile the ST 2067-5 timed-text descriptor declares as its
+/// NamespaceURI: the `ttp:profile` attribute on the document root, defaulting to
+/// the IMSC1 text profile Photon accepts.
+fn imsc_profile(xml: &str) -> String {
+    use quick_xml::events::Event;
+
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                if let Some(profile) = e
+                    .attributes()
+                    .flatten()
+                    .find(|a| a.key.local_name().as_ref() == b"profile")
+                    .and_then(|a| String::from_utf8(a.value.into_owned()).ok())
+                {
+                    return profile;
+                }
+                return DEFAULT_IMSC_PROFILE.to_string();
+            }
+            Ok(Event::Eof) | Err(_) => return DEFAULT_IMSC_PROFILE.to_string(),
+            _ => {}
+        }
+    }
+}
+
+/// The IMSC1 text profile, the NamespaceURI a text-only IMF subtitle declares
+/// when the document names no other profile.
+const DEFAULT_IMSC_PROFILE: &str = "http://www.w3.org/ns/ttml/profile/imsc1/text";
+
 /// A document id written either as a `urn:uuid:` or as the bare uuid Interop
 /// uses.
 fn parse_document_uuid(text: &str) -> Option<[u8; 16]> {
@@ -1435,12 +1465,21 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
             };
         }
     };
+    // Photon rejects an IMF timed-text descriptor whose NamespaceURI is not an
+    // IMSC profile; asdcplib leaves it empty, so IMF wraps supply it here. A DCP
+    // (AS-DCP) subtitle keeps the empty value asdcplib always wrote.
+    let (namespace_uri, ucs_encoding) = match opts.standard {
+        MxfStandard::As02 => (imsc_profile(&xml_data), "UTF-8".to_string()),
+        MxfStandard::AsDcp => (String::new(), String::new()),
+    };
     // asdcplib writes the descriptor's AssetID as the ResourceID of the
     // timed-text resource, which ST 429-5 requires to be the document's own id
     let desc = asdcplib::timed_text::TimedTextDescriptor {
         edit_rate: asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
         container_duration: duration_frames,
         asset_id: document_id.unwrap_or(info.asset_uuid),
+        namespace_uri,
+        ucs_encoding,
     };
 
     let declared: Vec<_> = resources

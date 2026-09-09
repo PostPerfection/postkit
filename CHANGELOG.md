@@ -4,6 +4,20 @@
 
 ### Added
 
+- **Timed-text descriptor reads back as CPL RegXML**:
+  `timed_text_descriptor::read_timed_text_descriptor_regxml` opens a wrapped
+  AS-02 timed-text track file, takes the edit rate, container duration,
+  ResourceID, NamespaceURI and UCSEncoding `asdcplib::timed_text::MxfReader`
+  exposes, reads the descriptor's InstanceID and LinkedTrackID off the MXF
+  header, and writes the DCTimedTextDescriptor RegXML an IMF CPL's
+  EssenceDescriptorList carries so the entry matches the essence a validator
+  reads back. `regxml::timed_text_descriptor_regxml` builds that XML.
+- **IMF timed-text wraps declare an IMSC NamespaceURI**: the AS-02 timed-text
+  wrap sets the descriptor's NamespaceURI to the document's `ttp:profile`
+  (default `http://www.w3.org/ns/ttml/profile/imsc1/text`) and UCSEncoding to
+  `UTF-8`, which Photon requires. AS-DCP subtitles keep the empty values as
+  before. Needs the asdcplib-rs bump.
+
 - **The wrapped MXF descriptor reads back as CPL RegXML**:
   `regxml::picture_descriptor_regxml` takes the `RgbaEssenceDescriptor` and the
   `Jpeg2000PictureSubDescriptor` that `asdcplib::as02::jp2k::MxfReader` reads
