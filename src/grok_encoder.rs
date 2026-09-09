@@ -482,6 +482,8 @@ impl<T> BoundedQueue<T> {
     }
 
     pub fn close(&self) {
+        // without the lock a pop between its closed check and its wait misses this notify
+        let _queue = self.items.lock().unwrap();
         self.closed.store(true, Ordering::Relaxed);
         self.not_full.notify_all();
         self.not_empty.notify_all();

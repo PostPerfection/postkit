@@ -499,6 +499,14 @@
 
 ### Fixed
 
+- **An encode no longer hangs after its last frame**: `BoundedQueue::close`
+  set the closed flag and notified without the queue lock, so an encoder
+  thread that had just found the queue empty and read the flag as open went
+  to sleep after the notify and never woke, and `encode_pipeline` waited on
+  it forever. Seen on the macOS runner in dcpwizard's one-frame encodes
+  (`markers_cpl.rs`, `multi_composition.rs`), where the producer closes the
+  queue almost as soon as the encoder starts. `close` takes the lock first.
+
 - **`compare_frames` and `compute_vmaf` run on Windows**: the stats file path
   went into the ffmpeg filter graph as is, where a drive colon ends the option
   and a backslash escapes the next character, so every comparison failed with
