@@ -4,6 +4,7 @@
 //! are the pooled/aggregate wrappers. ffmpeg stat output is parsed by
 //! whitespace splitting, no regex.
 
+use crate::filter_path::filter_option_path;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -35,15 +36,6 @@ pub struct CompareResult {
 /// Comparisons started so far, so two running at once do not write each other's
 /// stats files. The pid alone does not cover two threads of one process.
 static COMPARISONS_STARTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-// a windows drive colon ends a filter option, and the graph parser strips one
-// backslash before the option parser sees the value
-fn filter_option_path(path: &Path) -> String {
-    path.display()
-        .to_string()
-        .replace('\\', "/")
-        .replace(':', "\\\\:")
-}
 
 /// A stats file only this comparison writes and reads.
 fn stats_log_path(metric: &str) -> PathBuf {

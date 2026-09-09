@@ -1,3 +1,4 @@
+use crate::filter_path::filter_option_path;
 use crate::grok_encoder::SampleOrder;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -65,7 +66,8 @@ pub fn convert_colour(opts: &ColourConvertOptions) -> std::io::Result<()> {
 
     // If a custom LUT is provided, use it for any pair of spaces.
     if let Some(ref lut) = opts.lut_path {
-        cmd.arg("-vf").arg(format!("lut3d={}", lut.display()));
+        cmd.arg("-vf")
+            .arg(format!("lut3d={}", filter_option_path(lut)));
     } else {
         // No LUT: only spaces the colorspace filter models are honest here.
         let (colorspace, primaries, trc) = ffmpeg_color_params(opts.target_space)
@@ -139,6 +141,18 @@ mod tests {
         }
         assert_eq!(parse_colour_space("srgb"), None);
         assert_eq!(parse_colour_space(""), None);
+    }
+
+    #[test]
+    fn a_windows_clut_path_is_escaped_for_the_filter_graph() {
+        let arg = format!(
+            "lut3d={}",
+            filter_option_path(std::path::Path::new(
+                "C:\\Users\\r\\AppData\\Local\\Temp\\swap.cube"
+            ))
+        );
+        assert_eq!(arg, "lut3d=C\\\\:/Users/r/AppData/Local/Temp/swap.cube");
+        assert!(!arg.contains("\\U"), "a bare backslash survived: {arg}");
     }
 
     #[test]
