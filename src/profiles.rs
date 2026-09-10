@@ -26,6 +26,8 @@ pub struct EncodingProfile {
     pub height: u32,
     /// Frame rate as string (e.g. "24", "23.976", "25")
     pub frame_rate: String,
+    /// Target bitrate in Mbps
+    pub bitrate_mbps: f64,
     /// Color space
     pub colour_space: String,
     /// Bit depth
@@ -82,13 +84,14 @@ fn theatrical_2k() -> EncodingProfile {
         width: 2048,
         height: 1080,
         frame_rate: "24".to_string(),
+        bitrate_mbps: 250.0,
         colour_space: "XYZ".to_string(),
         bit_depth: 12,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "5.1".to_string(),
-        specification: "DCI Digital Cinema System Specification: X'Y'Z' at 12 bits, 2048x1080 and 4096x2160".to_string(),
+        specification: "DCI Digital Cinema System Specification 4.3.3: 1,302,083 bytes a frame aggregate, so 250 Mbit/s at 24fps for 2K and 4K alike".to_string(),
         subtitle_format: "PNG".to_string(),
     }
 }
@@ -101,13 +104,14 @@ fn theatrical_4k() -> EncodingProfile {
         width: 4096,
         height: 2160,
         frame_rate: "24".to_string(),
+        bitrate_mbps: 250.0,
         colour_space: "XYZ".to_string(),
         bit_depth: 12,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "7.1".to_string(),
-        specification: "DCI Digital Cinema System Specification: X'Y'Z' at 12 bits, 2048x1080 and 4096x2160".to_string(),
+        specification: "DCI Digital Cinema System Specification 4.3.3: 1,302,083 bytes a frame aggregate, so 250 Mbit/s at 24fps for 2K and 4K alike".to_string(),
         subtitle_format: "PNG".to_string(),
     }
 }
@@ -120,6 +124,7 @@ fn netflix() -> EncodingProfile {
         width: 3840,
         height: 2160,
         frame_rate: "23.976".to_string(),
+        bitrate_mbps: 400.0,
         colour_space: "Rec.2020".to_string(),
         bit_depth: 16,
         progression: "CPRL".to_string(),
@@ -139,6 +144,7 @@ fn amazon() -> EncodingProfile {
         width: 3840,
         height: 2160,
         frame_rate: "23.976".to_string(),
+        bitrate_mbps: 350.0,
         colour_space: "Rec.2020".to_string(),
         bit_depth: 16,
         progression: "CPRL".to_string(),
@@ -158,6 +164,7 @@ fn disney() -> EncodingProfile {
         width: 3840,
         height: 2160,
         frame_rate: "23.976".to_string(),
+        bitrate_mbps: 400.0,
         colour_space: "Rec.2020".to_string(),
         bit_depth: 16,
         progression: "CPRL".to_string(),
@@ -177,6 +184,7 @@ fn apple() -> EncodingProfile {
         width: 3840,
         height: 2160,
         frame_rate: "23.976".to_string(),
+        bitrate_mbps: 400.0,
         colour_space: "P3-D65".to_string(),
         bit_depth: 16,
         progression: "CPRL".to_string(),
@@ -196,6 +204,7 @@ fn hbo() -> EncodingProfile {
         width: 3840,
         height: 2160,
         frame_rate: "23.976".to_string(),
+        bitrate_mbps: 350.0,
         colour_space: "Rec.2020".to_string(),
         bit_depth: 16,
         progression: "CPRL".to_string(),
@@ -215,6 +224,7 @@ fn archival() -> EncodingProfile {
         width: 4096,
         height: 2160,
         frame_rate: "24".to_string(),
+        bitrate_mbps: 0.0, // lossless
         colour_space: "XYZ".to_string(),
         bit_depth: 16,
         progression: "LRCP".to_string(),
@@ -234,6 +244,7 @@ fn broadcast() -> EncodingProfile {
         width: 1920,
         height: 1080,
         frame_rate: "25".to_string(),
+        bitrate_mbps: 200.0,
         colour_space: "Rec.709".to_string(),
         bit_depth: 10,
         progression: "CPRL".to_string(),
@@ -275,11 +286,20 @@ mod tests {
     }
 
     #[test]
+    fn dci_caps_2k_and_4k_at_the_same_bitrate() {
+        assert_eq!(
+            profile_for(Platform::TheatricalDci4k).bitrate_mbps,
+            profile_for(Platform::TheatricalDci2k).bitrate_mbps
+        );
+    }
+
+    #[test]
     fn theatrical_2k_dci_compliant() {
         let p = profile_for(Platform::TheatricalDci2k);
         assert_eq!(p.width, 2048);
         assert_eq!(p.height, 1080);
         assert_eq!(p.bit_depth, 12);
+        assert_eq!(p.bitrate_mbps, 250.0);
         assert_eq!(p.colour_space, "XYZ");
     }
 }
