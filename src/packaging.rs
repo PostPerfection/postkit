@@ -1580,8 +1580,7 @@ mod tests {
             let cpl_path = dir.path().join("CPL_lang_mca.xml");
             std::fs::write(&cpl_path, cpl.to_xml()).unwrap();
 
-            // ExtensionProperties is xs:any processContents="lax", so MaxCLL/MaxFALL are
-            // only really checked when the app2e schema is among the imports.
+            // ExtensionProperties is lax, so only the 2016 schema's MaxCLL and MaxFALL get checked
             let app2e_import = match walk(root, "app2e-2016.xsd") {
                 Some(p) => format!(
                     "\n  <xs:import namespace=\"{}\" schemaLocation=\"{}\"/>",
