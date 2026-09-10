@@ -92,6 +92,18 @@ pub fn check_package(package: &Path) -> DolbyVisionCompliance {
         return result;
     };
 
+    // an AS-DCP wrap is a DCP, whose picture is X'Y'Z' cinema essence. Table 1
+    // makes every Dolby Vision base layer HEVC or AVC, and unsignalled colour
+    // resolves to Rec.709, so grading one would pass it on a default.
+    if !is_as02_jpeg2000(&picture) {
+        result.errors.push(format!(
+            "{} is a DCP picture track, and a Dolby Vision base layer is HEVC or AVC \
+             in table 1, so the profile and level tables do not describe it",
+            picture.display()
+        ));
+        return result;
+    }
+
     let resolved = match resolve_picture(&picture) {
         Ok(resolved) => resolved,
         Err(e) => {
@@ -137,6 +149,13 @@ pub fn check_package(package: &Path) -> DolbyVisionCompliance {
     }
 
     result
+}
+
+fn is_as02_jpeg2000(picture: &Path) -> bool {
+    matches!(
+        asdcplib::essence_type(&picture.to_string_lossy()),
+        Ok(asdcplib::EssenceType::As02Jpeg2000)
+    )
 }
 
 fn package_picture(package: &Path) -> Option<PathBuf> {
@@ -232,6 +251,25 @@ pub fn check_master(master: &Path) -> DolbyVisionCompliance {
     };
 
     level_finding(probed.width, probed.height, probed.frames_per_second, &mut result);
+    if let (Some(level), Some(megabits_per_second)) = (
+        dolby_vision_level_for(probed.width, probed.height, probed.frames_per_second),
+        probed.megabits_per_second,
+    ) {
+        // table 3's tiers bound the delivered bitstream. A mezzanine sits far
+        // above them by design, so only a master is held to them.
+        if megabits_per_second > f64::from(level.high_tier_megabits_per_second) {
+            result.errors.push(format!(
+                "{megabits_per_second:.1} Mbps is over the {} Mbps high tier of level {:02} {}",
+                level.high_tier_megabits_per_second, level.id, level.name
+            ));
+        } else if megabits_per_second > f64::from(level.main_tier_megabits_per_second) {
+            result.warnings.push(format!(
+                "{megabits_per_second:.1} Mbps is over the {} Mbps main tier of level {:02} {}, \
+                 so it is a high tier stream",
+                level.main_tier_megabits_per_second, level.id, level.name
+            ));
+        }
+    }
 
     if allowed.contains(&probed.signalling) {
         result.checked.push(format!(
@@ -272,6 +310,8 @@ struct ProbedBaseLayer {
     width: u32,
     height: u32,
     frames_per_second: f64,
+    // absent on a raw elementary stream, which carries no bitrate
+    megabits_per_second: Option<f64>,
     signalling: BaseLayerSignalling,
 }
 
@@ -304,6 +344,10 @@ fn probe_base_layer(master: &Path) -> Option<ProbedBaseLayer> {
         width: stream.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         height: stream.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
         frames_per_second: parse_frame_rate(&text("avg_frame_rate")),
+        megabits_per_second: text("bit_rate")
+            .parse::<f64>()
+            .ok()
+            .map(|bits| bits / 1_000_000.0),
         signalling: BaseLayerSignalling {
             transfer_characteristics: transfer_code(&text("color_transfer")),
             colour_primaries: primaries_code(&text("color_primaries")),
