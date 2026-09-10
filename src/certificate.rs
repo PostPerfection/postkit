@@ -1106,56 +1106,8 @@ fn migrate_trusted_device(json_path: &Path, pem_path: &Path) -> Result<(), Strin
     Ok(())
 }
 
-/// KDM output format: modern SMPTE (ST 430-1) or legacy Interop (pre-SMPTE).
-///
-/// Interop differs from SMPTE in three ways handled here: the key block drops
-/// the 4-byte KeyType field (138 -> 134 bytes), the KDMRequiredExtensions uses
-/// the digicine namespace, and KeyIdList carries bare KeyId elements without the
-/// TypedKeyId wrapper. Interop output has not been checked against real legacy
-/// gear; validate before production use.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum KdmFormat {
-    #[default]
-    Smpte,
-    Interop,
-}
-
-impl KdmFormat {
-    /// Every format, for a caller listing the choices on a command line.
-    pub const ALL: [Self; 2] = [Self::Smpte, Self::Interop];
-
-    /// The command line spelling, which `Display` and `FromStr` both go
-    /// through. Serde is derived from the variant names and does not use this.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Smpte => "smpte",
-            Self::Interop => "interop",
-        }
-    }
-}
-
-impl std::fmt::Display for KdmFormat {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-/// Case-insensitive, so a command line spelling the format `SMPTE` parses. An
-/// empty value is still an error rather than a silent default.
-impl std::str::FromStr for KdmFormat {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|format| format.as_str().eq_ignore_ascii_case(s))
-            .ok_or_else(|| unknown_spelling("KDM format", s, &Self::ALL.map(Self::as_str)))
-    }
-}
-
 /// The error a `FromStr` over a fixed table of spellings returns, naming what
-/// the caller could have written instead. Shared by the two KDM vocabulary
-/// enums so both read the same on a command line.
+/// the caller could have written instead.
 fn unknown_spelling(label: &str, spelling: &str, known: &[&str]) -> String {
     format!("unknown {label} '{spelling}', expected one of {known:?}")
 }
@@ -1229,8 +1181,9 @@ impl std::fmt::Display for KdmFormulation {
     }
 }
 
-/// Case-insensitive, like [`KdmFormat`]'s. `Deserialize` goes through here, so a
-/// stored formulation reads back whatever case it was written in.
+/// Case-insensitive, so a command line spelling the formulation `DCI-ANY`
+/// parses. `Deserialize` goes through here, so a stored formulation reads back
+/// whatever case it was written in.
 impl std::str::FromStr for KdmFormulation {
     type Err = String;
 
@@ -1313,10 +1266,6 @@ pub struct KdmConfig {
     /// serialized: it holds secret key material.
     #[serde(skip)]
     pub content_keys: Vec<KdmContentKey>,
-    /// SMPTE (default) or legacy Interop output. Defaults to SMPTE so existing
-    /// callers are byte-identical.
-    #[serde(default)]
-    pub format: KdmFormat,
     /// Certificates of the playback devices this KDM is restricted to, listed by
     /// thumbprint in AuthorizedDeviceInfo. Empty emits the DCI assume-trust
     /// thumbprint instead, which places no device restriction. The recipient's
@@ -1362,12 +1311,10 @@ const KDM_STRUCTURE_ID: [u8; 16] = [
 /// Total size of the SMPTE key block, per ST 430-1 Table 6.
 const KDM_KEY_BLOCK_LEN: usize = 138;
 
-/// Interop key block size: the SMPTE layout minus the 4-byte KeyType field,
-/// matching libdcp's 134-byte case in decrypted_kdm.cc.
-const KDM_KEY_BLOCK_LEN_INTEROP: usize = 134;
-
-/// Interop (pre-SMPTE) KDMRequiredExtensions namespace, per libdcp.
-const KDM_INTEROP_NS: &str = "http://www.digicine.com/PROTO-ASDCP-KDM-20040311#";
+/// Legacy key block size a KDM written before ST 430-1 carries: the SMPTE
+/// layout minus the 4-byte KeyType field, matching libdcp's 134-byte case in
+/// decrypted_kdm.cc. Read only, nothing here writes it.
+const KDM_KEY_BLOCK_LEN_LEGACY: usize = 134;
 
 /// ST 430-1 6.3.7/6.3.8: timestamps are exactly 25 ASCII characters.
 const KDM_TIMESTAMP_LEN: usize = 25;
@@ -1446,13 +1393,11 @@ fn check_kdm_timestamp(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Build the plaintext key block. SMPTE (ST 430-1 Table 6) is 138 bytes:
-/// structure id (16), signer thumbprint (20), CPL id (16), key type (4),
-/// key id (16), not-valid-before (25), not-valid-after (25), content key (16).
-/// Interop drops the 4-byte key type field, giving 134 bytes.
+/// Build the plaintext key block, ST 430-1 Table 6: structure id (16), signer
+/// thumbprint (20), CPL id (16), key type (4), key id (16), not-valid-before
+/// (25), not-valid-after (25), content key (16).
 #[allow(clippy::too_many_arguments)]
 fn build_kdm_key_block(
-    format: KdmFormat,
     signer_thumbprint: &[u8; CERT_THUMBPRINT_LEN],
     cpl_id: &uuid::Uuid,
     key_type: &[u8; 4],
@@ -1468,22 +1413,16 @@ fn build_kdm_key_block(
     block.extend_from_slice(&KDM_STRUCTURE_ID);
     block.extend_from_slice(signer_thumbprint);
     block.extend_from_slice(cpl_id.as_bytes());
-    if format == KdmFormat::Smpte {
-        block.extend_from_slice(key_type);
-    }
+    block.extend_from_slice(key_type);
     block.extend_from_slice(key_id.as_bytes());
     block.extend_from_slice(not_before.as_bytes());
     block.extend_from_slice(not_after.as_bytes());
     block.extend_from_slice(content_key);
 
-    // The layout is fixed; a mismatch means the code above drifted from the spec.
-    let expected = match format {
-        KdmFormat::Smpte => KDM_KEY_BLOCK_LEN,
-        KdmFormat::Interop => KDM_KEY_BLOCK_LEN_INTEROP,
-    };
-    if block.len() != expected {
+    // the layout is fixed, a mismatch means the code above drifted from the spec
+    if block.len() != KDM_KEY_BLOCK_LEN {
         return Err(format!(
-            "internal error: key block is {} bytes, expected {expected}",
+            "internal error: key block is {} bytes, expected {KDM_KEY_BLOCK_LEN}",
             block.len()
         ));
     }
@@ -1608,7 +1547,6 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
         config,
         &cpl_uuid,
         &config.content_title,
-        KDM_MESSAGE_TYPE,
         &not_valid_before,
         &not_valid_after,
         &recipient,
@@ -1687,16 +1625,15 @@ fn check_formulation_devices(
 /// to `recipient` with `signer`'s thumbprint embedded.
 ///
 /// `config` is used only for the signer identity handed to `build_signature`
-/// (its cert, key and chain), the output format, the annotation, the
-/// formulation, the authorized device list and the forensic marking flags;
-/// every other field of the KDM comes from the explicit arguments so this core
-/// serves both fresh generation and re-wrap.
+/// (its cert, key and chain), the annotation, the formulation, the authorized
+/// device list and the forensic marking flags. Every other field of the KDM
+/// comes from the explicit arguments so this core serves both fresh generation
+/// and re-wrap.
 #[allow(clippy::too_many_arguments)]
 fn build_kdm_xml(
     config: &KdmConfig,
     cpl_uuid: &uuid::Uuid,
     content_title: &str,
-    message_type: &str,
     not_valid_before: &str,
     not_valid_after: &str,
     recipient: &Recipient,
@@ -1722,7 +1659,6 @@ fn build_kdm_xml(
             std::str::from_utf8(&key.key_type).map_err(|_| "key type is not ASCII".to_string())?;
 
         let key_block = build_kdm_key_block(
-            config.format,
             &signer.thumbprint,
             cpl_uuid,
             &key.key_type,
@@ -1734,21 +1670,14 @@ fn build_kdm_xml(
         let ciphertext = encrypt_key_block(&recipient.public_key, &key_block)?;
         let cipher_value = base64::engine::general_purpose::STANDARD.encode(&ciphertext);
 
-        // Interop has no KeyType, so its KeyIdList is bare KeyId elements.
-        match config.format {
-            KdmFormat::Smpte => typed_key_ids.push_str(&format!(
-                r#"          <TypedKeyId>
+        typed_key_ids.push_str(&format!(
+            r#"          <TypedKeyId>
             <KeyType>{key_type}</KeyType>
             <KeyId>urn:uuid:{key_id}</KeyId>
           </TypedKeyId>
 "#,
-                key_id = key.key_id,
-            )),
-            KdmFormat::Interop => typed_key_ids.push_str(&format!(
-                "          <KeyId>urn:uuid:{key_id}</KeyId>\n",
-                key_id = key.key_id,
-            )),
-        }
+            key_id = key.key_id,
+        ));
         encrypted_keys.push_str(&format!(
             r#"    <EncryptedKey xmlns="{ENC_NS}">
       <EncryptionMethod Algorithm="{KDM_ENCRYPTION_METHOD}"/>
@@ -1766,11 +1695,6 @@ fn build_kdm_xml(
     let recipient_serial = xml_escape(&recipient.serial);
     let signer_issuer = xml_escape(&signer.issuer_dn);
     let signer_serial = xml_escape(&signer.serial);
-
-    let kdm_ns = match config.format {
-        KdmFormat::Smpte => KDM_NS,
-        KdmFormat::Interop => KDM_INTEROP_NS,
-    };
 
     // AnnotationText: caller override (escaped), else the derived default.
     let annotation = match &config.annotation {
@@ -1800,7 +1724,7 @@ fn build_kdm_xml(
     let auth_public_inner = format!(
         r#"
     <MessageId>urn:uuid:{message_id}</MessageId>
-    <MessageType>{message_type}</MessageType>
+    <MessageType>{KDM_MESSAGE_TYPE}</MessageType>
     <AnnotationText>{annotation}</AnnotationText>
     <IssueDate>{issue_date}</IssueDate>
     <Signer xmlns:ds="{DSIG_NS}">
@@ -1808,7 +1732,7 @@ fn build_kdm_xml(
       <ds:X509SerialNumber>{signer_serial}</ds:X509SerialNumber>
     </Signer>
     <RequiredExtensions>
-      <KDMRequiredExtensions xmlns="{kdm_ns}">
+      <KDMRequiredExtensions xmlns="{KDM_NS}">
         <Recipient>
           <X509IssuerSerial xmlns:ds="{DSIG_NS}">
             <{X509_ISSUER_NAME_ELEMENT}>{recipient_issuer}</{X509_ISSUER_NAME_ELEMENT}>
@@ -1960,12 +1884,13 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
     for ciphertext in &parsed.cipher_values {
         use zeroize::Zeroize;
         let mut block = decrypt_key_block(&dkdm_key, ciphertext)?;
-        let recovered = parse_kdm_key_block(&block, parsed.format)?;
+        let recovered = parse_kdm_key_block(&block)?;
         block.zeroize();
 
-        // Re-wrap targets SMPTE key blocks, which need a key type.
+        // Re-wrap writes SMPTE key blocks, which need a key type.
         let key_type = recovered.key_type.ok_or_else(|| {
-            "cannot re-wrap an Interop DKDM: its key block carries no key type".to_string()
+            "cannot re-wrap a DKDM with a 134-byte legacy key block: it carries no key type"
+                .to_string()
         })?;
 
         // Every key in a KDM shares one CPL and one validity window.
@@ -2009,8 +1934,6 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         &window,
     )?;
 
-    // Preserve the source MessageType and title.
-    let message_type = parsed.message_type.as_deref().unwrap_or(KDM_MESSAGE_TYPE);
     let content_title = parsed.content_title.as_deref().unwrap_or("");
 
     // build_kdm_xml reads only the signer identity, the device list, the
@@ -2030,7 +1953,6 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         &signer_config,
         &cpl_uuid,
         content_title,
-        message_type,
         &not_valid_before,
         &not_valid_after,
         &recipient,
@@ -2065,8 +1987,8 @@ pub fn rewrap_dkdm_to_file(config: &RewrapConfig) -> Result<(), String> {
     Ok(())
 }
 
-/// A KeyId from a KDM's public KeyIdList. `key_type` is None for Interop, whose
-/// KeyIdList carries bare KeyId elements with no type.
+/// A KeyId from a KDM's public KeyIdList. `key_type` is None for a legacy KDM
+/// whose KeyIdList carries bare KeyId elements with no type.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KdmKeyId {
     pub key_type: Option<[u8; 4]>,
@@ -2078,7 +2000,6 @@ pub struct KdmKeyId {
 /// `unwrap_kdm`, which needs the recipient private key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KdmMetadata {
-    pub format: KdmFormat,
     pub cpl_id: uuid::Uuid,
     pub content_title: String,
     pub annotation_text: String,
@@ -2092,11 +2013,9 @@ pub struct KdmMetadata {
 /// Everything read from a KDM's XML without the recipient key: the public
 /// metadata plus the base64-decoded EncryptedKey ciphertexts.
 struct ParsedKdmXml {
-    format: KdmFormat,
     /// Base64-decoded ciphertext of every EncryptedKey under AuthenticatedPrivate.
     cipher_values: Vec<Vec<u8>>,
     content_title: Option<String>,
-    message_type: Option<String>,
     annotation_text: Option<String>,
     cpl_id: Option<uuid::Uuid>,
     not_valid_before: Option<String>,
@@ -2113,27 +2032,20 @@ fn parse_urn_uuid(value: &str) -> Result<uuid::Uuid, String> {
     uuid::Uuid::parse_str(trimmed).map_err(|e| format!("'{value}' is not a UUID: {e}"))
 }
 
-/// Parse a KDM's XML (SMPTE or Interop): the encrypted key blocks and the public
-/// metadata. No private key is needed; nothing here decrypts a content key.
+/// Parse a KDM's XML: the encrypted key blocks and the public metadata. No
+/// private key is needed and nothing here decrypts a content key.
 ///
 /// CipherValues are collected only from within AuthenticatedPrivate so nothing
-/// outside the private block can be mistaken for a content key. Format is taken
-/// from the KDMRequiredExtensions namespace.
+/// outside the private block can be mistaken for a content key.
 fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
     use base64::Engine;
     use quick_xml::events::Event;
     use quick_xml::reader::Reader;
 
-    let format = if xml.contains(KDM_INTEROP_NS) {
-        KdmFormat::Interop
-    } else {
-        KdmFormat::Smpte
-    };
-
     let mut reader = Reader::from_str(xml);
     let mut in_auth_private = false;
     let mut in_key_id_list = false;
-    // Type of the current TypedKeyId (SMPTE); None until a KeyType is seen.
+    // Type of the current TypedKeyId, None until a KeyType is seen.
     let mut pending_key_type: Option<[u8; 4]> = None;
     // Set while text is being gathered for the named field.
     let mut collecting: Option<&'static str> = None;
@@ -2141,7 +2053,6 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
 
     let mut cipher_values = Vec::new();
     let mut content_title = None;
-    let mut message_type = None;
     let mut annotation_text = None;
     let mut cpl_id = None;
     let mut not_valid_before = None;
@@ -2165,10 +2076,6 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
                 }
                 b"ContentTitleText" => {
                     collecting = Some("title");
-                    buffer.clear();
-                }
-                b"MessageType" => {
-                    collecting = Some("message_type");
                     buffer.clear();
                 }
                 b"AnnotationText" => {
@@ -2218,10 +2125,6 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
                     content_title = Some(buffer.trim().to_string());
                     collecting = None;
                 }
-                b"MessageType" if collecting == Some("message_type") => {
-                    message_type = Some(buffer.trim().to_string());
-                    collecting = None;
-                }
                 b"AnnotationText" if collecting == Some("annotation") => {
                     annotation_text = Some(buffer.trim().to_string());
                     collecting = None;
@@ -2264,10 +2167,8 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
     }
 
     Ok(ParsedKdmXml {
-        format,
         cipher_values,
         content_title,
-        message_type,
         annotation_text,
         cpl_id,
         not_valid_before,
@@ -2281,7 +2182,7 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
 /// and zeroed on drop. Read it with `content_key`.
 pub struct UnwrappedKey {
     pub key_id: uuid::Uuid,
-    /// ST 430-1 key type (MDIK/MDAK/...); None for Interop, whose block has none.
+    /// ST 430-1 key type (MDIK/MDAK/...), None for a legacy 134-byte key block.
     pub key_type: Option<[u8; 4]>,
     pub cpl_id: uuid::Uuid,
     pub not_valid_before: String,
@@ -2326,7 +2227,6 @@ impl Drop for UnwrappedKey {
 /// drop; none is ever logged. Look one up with `content_key`.
 #[derive(Debug)]
 pub struct UnwrappedKdm {
-    pub format: KdmFormat,
     pub cpl_id: uuid::Uuid,
     pub keys: Vec<UnwrappedKey>,
 }
@@ -2342,12 +2242,10 @@ impl UnwrappedKdm {
 }
 
 /// Read a KDM's public metadata (CPL id, validity window, KeyIds and types)
-/// without decrypting anything. Works for both SMPTE and Interop KDMs and needs
-/// no recipient key.
+/// without decrypting anything and with no recipient key.
 pub fn parse_kdm(kdm_xml: &str) -> Result<KdmMetadata, String> {
     let parsed = parse_kdm_xml(kdm_xml)?;
     Ok(KdmMetadata {
-        format: parsed.format,
         cpl_id: parsed.cpl_id.ok_or("KDM has no CompositionPlaylistId")?,
         content_title: parsed.content_title.unwrap_or_default(),
         annotation_text: parsed.annotation_text.unwrap_or_default(),
@@ -2363,7 +2261,7 @@ pub fn parse_kdm(kdm_xml: &str) -> Result<KdmMetadata, String> {
 
 /// Decrypt a KDM's content keys with the recipient's RSA private key.
 ///
-/// The inverse of `build_kdm`/`generate_kdm`: parses the KDM (SMPTE or Interop),
+/// The inverse of `build_kdm`/`generate_kdm`: parses the KDM,
 /// RSA-OAEP-decrypts every EncryptedKey with the recipient key, parses each
 /// plaintext key block and returns the recovered KeyId -> AES-128 key map. A
 /// wrong recipient key fails loud (the OAEP unpad or the key block structure-id
@@ -2381,7 +2279,7 @@ pub fn unwrap_kdm(kdm_xml: &str, recipient_key_file: &Path) -> Result<UnwrappedK
     for ciphertext in &parsed.cipher_values {
         use zeroize::Zeroize;
         let mut block = decrypt_key_block(&key, ciphertext)?;
-        let recovered = parse_kdm_key_block(&block, parsed.format)?;
+        let recovered = parse_kdm_key_block(&block)?;
         block.zeroize();
 
         // Every key in one KDM shares a single CPL id.
@@ -2403,11 +2301,7 @@ pub fn unwrap_kdm(kdm_xml: &str, recipient_key_file: &Path) -> Result<UnwrappedK
         });
     }
     let cpl_id = cpl_uuid.expect("at least one key block was decrypted");
-    Ok(UnwrappedKdm {
-        format: parsed.format,
-        cpl_id,
-        keys,
-    })
+    Ok(UnwrappedKdm { cpl_id, keys })
 }
 
 /// Decrypt a KDM file's content keys with the recipient's RSA private key.
@@ -2419,7 +2313,7 @@ pub fn unwrap_kdm_file(kdm_file: &Path, recipient_key_file: &Path) -> Result<Unw
 
 /// A content key recovered from a decrypted key block. Holds secret material:
 /// `content_key` is zeroed when this value drops and never logged. `key_type` is
-/// None for Interop, whose block carries no type field.
+/// None for a legacy block, which carries no type field.
 struct RecoveredKey {
     cpl_id: uuid::Uuid,
     key_type: Option<[u8; 4]>,
@@ -2436,22 +2330,20 @@ impl Drop for RecoveredKey {
     }
 }
 
-/// Parse a decrypted key block back into its fields, for the layout given by
-/// `format`: SMPTE (138 bytes, with a 4-byte key type) or Interop (134, none).
+/// Parse a decrypted key block back into its fields, taking the layout from its
+/// length like libdcp's reader does: 138 bytes is the ST 430-1 block with a
+/// 4-byte key type, 134 the legacy block without one.
 ///
-/// The layout mirrors `build_kdm_key_block`. A wrong length or a bad structure
-/// id means the wrong recipient key was used or the KDM is corrupt; either is
-/// fatal. The signer thumbprint at [16..36] is the original issuer's and is
-/// discarded: on re-wrap the new key block carries the re-issuer's thumbprint.
-fn parse_kdm_key_block(block: &[u8], format: KdmFormat) -> Result<RecoveredKey, String> {
-    let expected = match format {
-        KdmFormat::Smpte => KDM_KEY_BLOCK_LEN,
-        KdmFormat::Interop => KDM_KEY_BLOCK_LEN_INTEROP,
-    };
-    if block.len() != expected {
+/// The 138-byte layout mirrors `build_kdm_key_block`. A wrong length or a bad
+/// structure id means the wrong recipient key was used or the KDM is corrupt,
+/// either being fatal. The signer thumbprint at [16..36] is the original
+/// issuer's and is discarded: on re-wrap the new key block carries the
+/// re-issuer's thumbprint.
+fn parse_kdm_key_block(block: &[u8]) -> Result<RecoveredKey, String> {
+    if block.len() != KDM_KEY_BLOCK_LEN && block.len() != KDM_KEY_BLOCK_LEN_LEGACY {
         return Err(format!(
-            "decrypted key block is {} bytes, expected {expected} \
-             (wrong recipient key or corrupt KDM)",
+            "decrypted key block is {} bytes, expected {KDM_KEY_BLOCK_LEN} or \
+             {KDM_KEY_BLOCK_LEN_LEGACY} (wrong recipient key or corrupt KDM)",
             block.len()
         ));
     }
@@ -2464,14 +2356,13 @@ fn parse_kdm_key_block(block: &[u8], format: KdmFormat) -> Result<RecoveredKey, 
     let cpl_id = uuid::Uuid::from_slice(&block[36..52])
         .map_err(|e| format!("key block has a malformed CPL id: {e}"))?;
 
-    // SMPTE carries the 4-byte key type before the key id; Interop omits it.
-    let (key_type, mut off) = match format {
-        KdmFormat::Smpte => {
-            let mut kt = [0u8; 4];
-            kt.copy_from_slice(&block[52..56]);
-            (Some(kt), 56usize)
-        }
-        KdmFormat::Interop => (None, 52usize),
+    // ST 430-1 carries the 4-byte key type before the key id, the legacy block omits it
+    let (key_type, mut off) = if block.len() == KDM_KEY_BLOCK_LEN {
+        let mut key_type = [0u8; 4];
+        key_type.copy_from_slice(&block[52..56]);
+        (Some(key_type), 56usize)
+    } else {
+        (None, 52usize)
     };
 
     let key_id = uuid::Uuid::from_slice(&block[off..off + 16])
@@ -2973,7 +2864,6 @@ mod tests {
             valid_to: "7 days".to_string(),
             formulation: KdmFormulation::DciAny,
             content_keys: Vec::new(),
-            format: KdmFormat::Smpte,
             device_cert_files: vec![],
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
@@ -3011,7 +2901,6 @@ mod tests {
             valid_to: "7 days".to_string(),
             formulation: KdmFormulation::DciAny,
             content_keys: Vec::new(),
-            format: KdmFormat::Smpte,
             device_cert_files: vec![],
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
@@ -3200,91 +3089,17 @@ mod tests {
     }
 
     #[test]
-    fn interop_kdm_key_block_is_134_bytes_and_omits_key_type() {
-        let f = fixtures();
-        let mut config = test_config(f, PathBuf::from("unused"));
-        config.format = KdmFormat::Interop;
-        let kdm = build_kdm(&config).expect("build interop kdm");
-
-        // digicine namespace and bare KeyId, no TypedKeyId/KeyType wrapper
-        assert!(
-            kdm.xml.contains(KDM_INTEROP_NS),
-            "interop namespace missing"
-        );
-        assert!(
-            !kdm.xml.contains("<TypedKeyId>"),
-            "interop must not use TypedKeyId"
-        );
-        assert!(
-            !kdm.xml.contains("<KeyType>"),
-            "interop KeyIdList must omit KeyType"
-        );
-        assert!(
-            kdm.xml
-                .contains(&format!("<KeyId>urn:uuid:{}</KeyId>", kdm.key_id)),
-            "interop KeyIdList must carry a bare KeyId"
-        );
-
-        let block = recipient_private_key(f)
-            .decrypt(rsa::Oaep::new::<sha1::Sha1>(), &cipher_value(&kdm.xml))
-            .expect("recipient private key must decrypt the interop CipherValue");
-
-        // Interop 134-byte layout: SMPTE Table 6 minus the 4-byte KeyType, so the
-        // key id follows the CPL id directly (libdcp decrypted_kdm.cc 134 case).
-        assert_eq!(block.len(), KDM_KEY_BLOCK_LEN_INTEROP);
-        assert_eq!(&block[0..16], &KDM_STRUCTURE_ID, "structure id");
-
-        let signer = parse_signer(&f.root).expect("parse signer");
-        assert_eq!(&block[16..36], &signer.thumbprint, "signer thumbprint");
-
-        let cpl = uuid::Uuid::parse_str(&config.cpl_id).unwrap();
-        assert_eq!(&block[36..52], cpl.as_bytes(), "cpl id");
-        assert_eq!(
-            &block[52..68],
-            kdm.key_id.as_bytes(),
-            "key id (no key type)"
-        );
-
-        let not_before = std::str::from_utf8(&block[68..93]).expect("not-before ascii");
-        let not_after = std::str::from_utf8(&block[93..118]).expect("not-after ascii");
-        check_kdm_timestamp("not_before", not_before).expect("valid not-before");
-        check_kdm_timestamp("not_after", not_after).expect("valid not-after");
-        assert!(not_before < not_after);
-
-        assert_eq!(&block[118..134], &kdm.content_key, "content key roundtrip");
-    }
-
-    /// A default (SMPTE) KDM must be byte-identical to before the format field
-    /// existed: it still uses the SMPTE namespace and TypedKeyId.
-    #[test]
-    fn smpte_is_the_default_and_unchanged() {
-        assert_eq!(KdmFormat::default(), KdmFormat::Smpte);
+    fn kdm_uses_the_smpte_namespace_and_typed_key_ids() {
         let f = fixtures();
         let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
         assert!(
-            kdm.xml.contains(KDM_NS),
-            "default must use the SMPTE namespace"
+            kdm.xml
+                .contains(&format!("<KDMRequiredExtensions xmlns=\"{KDM_NS}\">")),
+            "KDMRequiredExtensions must carry the SMPTE namespace"
         );
         assert!(
             kdm.xml.contains("<TypedKeyId>"),
-            "default must use TypedKeyId"
-        );
-        assert!(!kdm.xml.contains(KDM_INTEROP_NS));
-    }
-
-    #[test]
-    fn interop_kdm_signature_verifies_with_xmlsec1() {
-        let f = fixtures();
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("interop.kdm.xml");
-        let mut config = chain_signed_config(f, out.clone());
-        config.format = KdmFormat::Interop;
-        generate_kdm(&config).expect("generate interop kdm");
-        let result = xmlsec1_verify(&out, &f.root, &[&f.intermediate]);
-        assert!(
-            result.status.success(),
-            "interop KDM signature must verify\n  {}",
-            crate::xmldsig::xmlsec1_cli::report(&result)
+            "the KeyIdList must use TypedKeyId"
         );
     }
 
@@ -3873,7 +3688,6 @@ mod tests {
             &config,
             &cpl,
             "Multi Key Feature",
-            "http://www.smpte-ra.org/430-1/2006/KDM#kdm-key-type-dci-any",
             &tomorrow(),
             &in_days(30),
             &recipient,
@@ -3947,7 +3761,7 @@ mod tests {
             let block = b_key
                 .decrypt(rsa::Oaep::new::<sha1::Sha1>(), &ct)
                 .expect("recipient B must decrypt the re-wrapped key");
-            let rk = parse_kdm_key_block(&block, KdmFormat::Smpte).expect("valid key block");
+            let rk = parse_kdm_key_block(&block).expect("valid key block");
             recovered.insert(rk.key_id, (rk.key_type, rk.content_key));
         }
         assert_eq!(
@@ -4123,7 +3937,6 @@ mod tests {
         let kdm = build_kdm(&config).expect("build kdm");
 
         let unwrapped = unwrap_kdm(&kdm.xml, &f.signer_key).expect("unwrap");
-        assert_eq!(unwrapped.format, KdmFormat::Smpte);
         assert_eq!(unwrapped.keys.len(), 2, "both wrapped keys must come back");
         assert_eq!(
             unwrapped.cpl_id,
@@ -4138,27 +3951,62 @@ mod tests {
         assert!(mdik.not_valid_before < mdik.not_valid_after);
     }
 
-    // Interop blocks are 134 bytes and carry no key type.
-    #[test]
-    fn unwrap_recovers_wrapped_key_interop() {
-        let f = fixtures();
-        let mut config = test_config(f, PathBuf::from("unused"));
-        config.format = KdmFormat::Interop;
-        let key_id = uuid::Uuid::new_v4();
-        let content = [0xC3u8; 16];
-        config.content_keys = vec![KdmContentKey {
-            key_type: *b"MDIK",
-            key_id,
-            content_key: content,
-        }];
-        let kdm = build_kdm(&config).expect("build interop kdm");
+    fn encrypt_to_recipient(f: &Fixtures, block: &[u8]) -> Vec<u8> {
+        let recipient = parse_recipient(&f.signer).expect("recipient");
+        encrypt_key_block(&recipient.public_key, block).expect("encrypt key block")
+    }
 
-        let unwrapped = unwrap_kdm(&kdm.xml, &f.signer_key).expect("unwrap interop");
-        assert_eq!(unwrapped.format, KdmFormat::Interop);
-        assert_eq!(unwrapped.content_key(&key_id), Some(&content));
+    fn splice_cipher_value(xml: &str, ciphertext: &[u8]) -> String {
+        use base64::Engine;
+        let start = xml.find("<CipherValue>").expect("no CipherValue") + "<CipherValue>".len();
+        let end = xml.find("</CipherValue>").expect("no closing CipherValue");
+        let encoded = base64::engine::general_purpose::STANDARD.encode(ciphertext);
+        format!("{}{encoded}{}", &xml[..start], &xml[end..])
+    }
+
+    // libdcp takes the key block layout from its decrypted length, so a KDM
+    // written before ST 430-1 still unwraps here.
+    #[test]
+    fn a_legacy_134_byte_key_block_unwraps_with_no_key_type() {
+        let f = fixtures();
+        let config = test_config(f, PathBuf::from("unused"));
+        let kdm = build_kdm(&config).expect("build kdm");
+
+        let signer = parse_signer(&f.root).expect("signer");
+        let cpl = uuid::Uuid::parse_str(&config.cpl_id).unwrap();
+        let key_id = uuid::Uuid::new_v4();
+        let content_key = [0xC3u8; 16];
+        let smpte_block = build_kdm_key_block(
+            &signer.thumbprint,
+            &cpl,
+            b"MDIK",
+            &key_id,
+            &tomorrow(),
+            &in_days(30),
+            &content_key,
+        )
+        .expect("build key block");
+
+        let mut legacy_block = smpte_block.clone();
+        legacy_block.drain(52..56);
+        assert_eq!(legacy_block.len(), KDM_KEY_BLOCK_LEN_LEGACY);
+
+        let xml = splice_cipher_value(&kdm.xml, &encrypt_to_recipient(f, &legacy_block));
+        let unwrapped = unwrap_kdm(&xml, &f.signer_key).expect("unwrap legacy key block");
+        assert_eq!(unwrapped.cpl_id, cpl);
+        assert_eq!(unwrapped.keys.len(), 1);
+        assert_eq!(unwrapped.keys[0].key_id, key_id);
+        assert_eq!(unwrapped.content_key(&key_id), Some(&content_key));
         assert_eq!(
             unwrapped.keys[0].key_type, None,
-            "interop key block carries no key type"
+            "a 134-byte block carries no key type"
+        );
+
+        let short = splice_cipher_value(&kdm.xml, &encrypt_to_recipient(f, &smpte_block[..130]));
+        let err = unwrap_kdm(&short, &f.signer_key).expect_err("130 bytes must be refused");
+        assert!(
+            err.contains("138") && err.contains("134"),
+            "the error must name both layouts, got: {err}"
         );
     }
 
@@ -4199,7 +4047,6 @@ mod tests {
         let kdm = build_kdm(&config).expect("build");
 
         let meta = parse_kdm(&kdm.xml).expect("parse metadata");
-        assert_eq!(meta.format, KdmFormat::Smpte);
         assert_eq!(meta.cpl_id, uuid::Uuid::parse_str(&config.cpl_id).unwrap());
         assert_eq!(meta.content_title, "Test Feature");
         assert_eq!(meta.key_ids.len(), 1);
@@ -4393,24 +4240,20 @@ mod tests {
     #[test]
     fn every_kdm_carries_an_authorized_device_info() {
         let f = fixtures();
-        for format in [KdmFormat::Smpte, KdmFormat::Interop] {
-            let mut config = test_config(f, PathBuf::from("unused"));
-            config.format = format;
-            let kdm = build_kdm(&config).expect("build");
+        let kdm = build_kdm(&test_config(f, PathBuf::from("unused"))).expect("build");
 
-            assert!(
-                kdm.xml.contains("<AuthorizedDeviceInfo>"),
-                "{format:?} KDM must carry AuthorizedDeviceInfo"
-            );
-            assert!(
-                kdm.xml.contains("<DeviceListIdentifier>urn:uuid:"),
-                "{format:?} DeviceListIdentifier must be a urn:uuid"
-            );
-            assert!(
-                !thumbprints_in(&kdm.xml).is_empty(),
-                "{format:?} DeviceList must not be empty"
-            );
-        }
+        assert!(
+            kdm.xml.contains("<AuthorizedDeviceInfo>"),
+            "a KDM must carry AuthorizedDeviceInfo"
+        );
+        assert!(
+            kdm.xml.contains("<DeviceListIdentifier>urn:uuid:"),
+            "DeviceListIdentifier must be a urn:uuid"
+        );
+        assert!(
+            !thumbprints_in(&kdm.xml).is_empty(),
+            "the DeviceList must not be empty"
+        );
     }
 
     #[test]
@@ -5338,44 +5181,6 @@ mod tests {
                 "the counterpart named in an error must take the device list {formulation} cannot"
             );
         }
-    }
-
-    #[test]
-    fn both_kdm_format_spellings_round_trip() {
-        assert_eq!(KdmFormat::Smpte.as_str(), "smpte");
-        assert_eq!(KdmFormat::Interop.as_str(), "interop");
-        for format in KdmFormat::ALL {
-            assert_eq!(format.as_str().parse::<KdmFormat>().unwrap(), format);
-            assert_eq!(format.to_string(), format.as_str());
-            assert_eq!(
-                format.as_str().to_uppercase().parse::<KdmFormat>().unwrap(),
-                format,
-                "a command line may spell the format in any case"
-            );
-        }
-
-        let err = "smtpe".parse::<KdmFormat>().unwrap_err();
-        for format in KdmFormat::ALL {
-            assert!(err.contains(format.as_str()), "got: {err}");
-        }
-        assert!(
-            "".parse::<KdmFormat>().is_err(),
-            "an empty value must not default"
-        );
-    }
-
-    /// The command line spelling is a separate vocabulary from the stored one:
-    /// a preferences file written before `FromStr` existed still reads back.
-    #[test]
-    fn kdm_format_serde_still_uses_the_variant_names() {
-        assert_eq!(
-            serde_json::to_string(&KdmFormat::Interop).unwrap(),
-            "\"Interop\""
-        );
-        assert_eq!(
-            serde_json::from_str::<KdmFormat>("\"Interop\"").unwrap(),
-            KdmFormat::Interop
-        );
     }
 
     /// A caller checking its own output asks for the URIs rather than spelling

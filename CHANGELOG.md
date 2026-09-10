@@ -420,6 +420,18 @@
   offered, and a package directory the server cannot write fails naming the
   file and the remote path.
 
+### Removed
+
+- **The Interop KDM writer**: `KdmConfig::format` and `KdmFormat` are gone, and
+  every KDM is written as SMPTE ST 430-1 with the 138-byte key block, the
+  TypedKeyId KeyIdList and the SMPTE KDMRequiredExtensions namespace, which is
+  what libdcp writes. The Interop setting produced a SMPTE ETM document with its
+  KDMRequiredExtensions renamed into the digicine namespace while keeping the
+  SMPTE MessageType and the SMPTE-only elements, so it was not the digicine 2004
+  document real Interop gear reads. The reading side is unchanged: `unwrap_kdm`
+  and `parse_kdm` take the layout from the decrypted block length like libdcp's
+  reader, so a 134-byte legacy block still unwraps, with no key type.
+
 ### Changed
 
 - **`RestServer` parses the whole request, so a handler can read the body and
