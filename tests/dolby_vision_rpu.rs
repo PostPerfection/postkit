@@ -304,3 +304,29 @@ fn convert_dv_mode_reads_and_writes_an_escaped_rpu_bin() {
         PROFILE_84_LUMA_PIVOTS
     );
 }
+
+/// The crate takes ToMel on profile 7 or 8, and postkit generates 8.1, so this
+/// is also the only profile 7 fixture source in the tree.
+#[test]
+fn to_mel_converts_a_profile_81_rpu() {
+    let directory = tempfile::tempdir().unwrap();
+
+    let mut escaped = generate_profile81_rpu().unwrap();
+    add_start_code_emulation_prevention_3_byte(&mut escaped);
+    let input = directory.path().join("profile81.bin");
+    let mut bin = NAL_START_CODE.to_vec();
+    bin.extend_from_slice(&escaped);
+    std::fs::write(&input, &bin).unwrap();
+
+    let output = directory.path().join("mel.bin");
+    convert_dv_mode(&input, &output, DvMode::ToMel).expect("ToMel on a profile 8.1 RPU");
+
+    let converted = std::fs::read(&output).unwrap();
+    let parsed = parse_single_rpu(&converted).expect("parse the converted RPU");
+    // a minimum enhancement layer is an enhancement layer, which is profile 7
+    assert_eq!(parsed.dovi_profile, 7);
+    assert_eq!(
+        parsed.el_type,
+        Some(dolby_vision::rpu::rpu_data_nlq::DoviELType::MEL)
+    );
+}
