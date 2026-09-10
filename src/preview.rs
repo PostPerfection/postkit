@@ -471,7 +471,7 @@ impl PictureReader {
         Ok(reader)
     }
 
-    fn writer_info(&mut self) -> Result<asdcplib::WriterInfo, PreviewError> {
+    pub(crate) fn writer_info(&mut self) -> Result<asdcplib::WriterInfo, PreviewError> {
         match self {
             PictureReader::AsDcp(r) => r.writer_info(),
             PictureReader::As02(r) => r.writer_info(),
@@ -479,7 +479,9 @@ impl PictureReader {
         .map_err(|e| PreviewError::Mxf(format!("writer info: {e}")))
     }
 
-    fn picture_descriptor(&mut self) -> Result<asdcplib::jp2k::PictureDescriptor, PreviewError> {
+    pub(crate) fn picture_descriptor(
+        &mut self,
+    ) -> Result<asdcplib::jp2k::PictureDescriptor, PreviewError> {
         match self {
             PictureReader::AsDcp(r) => r.picture_descriptor(),
             PictureReader::As02(r) => r.picture_descriptor(),

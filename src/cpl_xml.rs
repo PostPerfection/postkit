@@ -24,6 +24,11 @@ pub fn read_tag(xml: &str, tag: &str) -> Option<String> {
     }
 }
 
+// an OPL's <CompositionPlaylistId> must not match
+pub fn is_composition_playlist(xml: &str) -> bool {
+    regex::Regex::new(r"<(?:\w+:)?CompositionPlaylist[\s>]").is_ok_and(|root| root.is_match(xml))
+}
+
 pub fn read_prefixed_tag(xml: &str, name: &str) -> Option<String> {
     let pattern = format!(r"<(?:\w+:)?{name}(?:\s[^>]*)?>([^<]*)");
     let found = regex::Regex::new(&pattern).ok()?.captures(xml)?;

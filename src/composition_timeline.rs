@@ -110,9 +110,6 @@ fn segments_of(package_dir: &Path, assets: &[(String, String)], cpl: &str) -> Ve
 /// order a package states, so a package holding several CPLs resolves to the
 /// same one on every run.
 fn first_cpl(package_dir: &Path, assets: &[(String, String)]) -> Option<String> {
-    // an OPL carries a <CompositionPlaylistId>, so the root element name has to
-    // end at the match
-    let root = regex::Regex::new(r"<(?:\w+:)?CompositionPlaylist[\s>]").ok()?;
     assets
         .iter()
         .map(|(_, relative)| package_dir.join(relative))
@@ -122,7 +119,7 @@ fn first_cpl(package_dir: &Path, assets: &[(String, String)]) -> Option<String> 
         })
         .find_map(|path| {
             let text = std::fs::read_to_string(&path).ok()?;
-            root.is_match(&text).then_some(text)
+            crate::cpl_xml::is_composition_playlist(&text).then_some(text)
         })
 }
 
