@@ -6,9 +6,7 @@ pub enum Platform {
     TheatricalDci2k,
     TheatricalDci4k,
     Netflix,
-    AmazonPrime,
     Disney,
-    Apple,
     Hbo,
     ArchivalPreservation,
     Broadcast,
@@ -26,12 +24,13 @@ pub struct EncodingProfile {
     pub height: u32,
     /// Frame rate as string (e.g. "24", "23.976", "25")
     pub frame_rate: String,
-    /// Target bitrate in Mbps
+    /// Target bitrate in Mbps, 0 where the specification states no ceiling
     pub bitrate_mbps: f64,
     /// Color space
     pub colour_space: String,
     /// Bit depth
     pub bit_depth: u32,
+    pub light_levels_required: bool,
     /// JPEG 2000 progression order
     pub progression: String,
     /// Audio sample rate in Hz
@@ -46,15 +45,19 @@ pub struct EncodingProfile {
     pub specification: String,
 }
 
+impl EncodingProfile {
+    pub fn bitrate_ceiling_mbps(&self) -> Option<f64> {
+        (self.bitrate_mbps > 0.0).then_some(self.bitrate_mbps)
+    }
+}
+
 /// Get all available encoding profiles.
 pub fn all_profiles() -> Vec<EncodingProfile> {
     vec![
         theatrical_2k(),
         theatrical_4k(),
         netflix(),
-        amazon(),
         disney(),
-        apple(),
         hbo(),
         archival(),
         broadcast(),
@@ -67,9 +70,7 @@ pub fn profile_for(platform: Platform) -> EncodingProfile {
         Platform::TheatricalDci2k => theatrical_2k(),
         Platform::TheatricalDci4k => theatrical_4k(),
         Platform::Netflix => netflix(),
-        Platform::AmazonPrime => amazon(),
         Platform::Disney => disney(),
-        Platform::Apple => apple(),
         Platform::Hbo => hbo(),
         Platform::ArchivalPreservation => archival(),
         Platform::Broadcast => broadcast(),
@@ -87,6 +88,7 @@ fn theatrical_2k() -> EncodingProfile {
         bitrate_mbps: 250.0,
         colour_space: "XYZ".to_string(),
         bit_depth: 12,
+        light_levels_required: false,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
@@ -107,6 +109,7 @@ fn theatrical_4k() -> EncodingProfile {
         bitrate_mbps: 250.0,
         colour_space: "XYZ".to_string(),
         bit_depth: 12,
+        light_levels_required: false,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
@@ -116,42 +119,32 @@ fn theatrical_4k() -> EncodingProfile {
     }
 }
 
+// the Mainlevel 6 Sublevel 3 ceiling an App 2E UHD picture up to 30 fps is allowed
+const IMF_MAIN_LEVEL_6_SUB_LEVEL_3_MBPS: f64 = 800.0;
+
 fn netflix() -> EncodingProfile {
     EncodingProfile {
         platform: Platform::Netflix,
         name: "Netflix IMF".to_string(),
-        description: "Netflix IMF delivery specification".to_string(),
+        description: "Netflix UHD SDR IMF delivery".to_string(),
         width: 3840,
         height: 2160,
         frame_rate: "23.976".to_string(),
-        bitrate_mbps: 400.0,
-        colour_space: "Rec.2020".to_string(),
-        bit_depth: 16,
+        bitrate_mbps: IMF_MAIN_LEVEL_6_SUB_LEVEL_3_MBPS,
+        colour_space: "BT.709 RGB full range".to_string(),
+        bit_depth: 10,
+        light_levels_required: false,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "5.1".to_string(),
-        specification: "no public delivery specification, these numbers are unverified".to_string(),
-        subtitle_format: "IMSC1".to_string(),
-    }
-}
-
-fn amazon() -> EncodingProfile {
-    EncodingProfile {
-        platform: Platform::AmazonPrime,
-        name: "Amazon Prime IMF".to_string(),
-        description: "Amazon Prime Video IMF delivery specification".to_string(),
-        width: 3840,
-        height: 2160,
-        frame_rate: "23.976".to_string(),
-        bitrate_mbps: 350.0,
-        colour_space: "Rec.2020".to_string(),
-        bit_depth: 16,
-        progression: "CPRL".to_string(),
-        audio_sample_rate: 48000,
-        audio_bit_depth: 24,
-        audio_channels: "5.1".to_string(),
-        specification: "no public delivery specification, these numbers are unverified".to_string(),
+        specification: "Netflix IMF Delivery Specifications, read 2026-09-10 at \
+                        https://studiopartner.netflix.net/studio/branded-imf-delivery-specifications. \
+                        SDR is 10-bit BT.709 RGB 4:4:4 full range, and 800 Mbit/s is the 4k IMF \
+                        Single Tile Lossy Profile Mainlevel 6 Sublevel 3 ceiling for UHD up to 30 \
+                        fps. A Dolby Vision delivery is 12-bit P3-D65 ST 2084 instead, checked by \
+                        compliance -s dolby rather than by this row"
+            .to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -160,38 +153,24 @@ fn disney() -> EncodingProfile {
     EncodingProfile {
         platform: Platform::Disney,
         name: "Disney+ IMF".to_string(),
-        description: "Disney+ IMF delivery specification".to_string(),
+        description: "Disney UHD SDR IMF distribution package".to_string(),
         width: 3840,
         height: 2160,
         frame_rate: "23.976".to_string(),
-        bitrate_mbps: 400.0,
-        colour_space: "Rec.2020".to_string(),
-        bit_depth: 16,
+        bitrate_mbps: 0.0,
+        colour_space: "BT.709 YCbCr".to_string(),
+        bit_depth: 10,
+        light_levels_required: false,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
-        audio_channels: "7.1.4".to_string(),
-        specification: "no public delivery specification, these numbers are unverified".to_string(),
-        subtitle_format: "IMSC1".to_string(),
-    }
-}
-
-fn apple() -> EncodingProfile {
-    EncodingProfile {
-        platform: Platform::Apple,
-        name: "Apple TV+ IMF".to_string(),
-        description: "Apple TV+ IMF delivery specification".to_string(),
-        width: 3840,
-        height: 2160,
-        frame_rate: "23.976".to_string(),
-        bitrate_mbps: 400.0,
-        colour_space: "P3-D65".to_string(),
-        bit_depth: 16,
-        progression: "CPRL".to_string(),
-        audio_sample_rate: 48000,
-        audio_bit_depth: 24,
-        audio_channels: "7.1.4".to_string(),
-        specification: "no public delivery specification, these numbers are unverified".to_string(),
+        audio_channels: "5.1".to_string(),
+        specification: "Disney IMF Distribution Packages v1.13.2, read 2026-09-10 at \
+                        https://mediatechspecs.disney.com/mastering/video/imf-distribution-packages. \
+                        App 2E ST 2067-21:2020, SDR is 10-bit BT.709 / BT.1886 YCbCr and HDR is \
+                        12-bit BT.2020 ST 2084. The page states no bitrate ceiling, so this row \
+                        names none"
+            .to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -199,19 +178,28 @@ fn apple() -> EncodingProfile {
 fn hbo() -> EncodingProfile {
     EncodingProfile {
         platform: Platform::Hbo,
-        name: "HBO Max IMF".to_string(),
-        description: "HBO Max IMF delivery specification".to_string(),
+        name: "HBO Max HDR IMF".to_string(),
+        description: "HBO Max UHD HDR IMF delivery".to_string(),
         width: 3840,
         height: 2160,
         frame_rate: "23.976".to_string(),
-        bitrate_mbps: 350.0,
-        colour_space: "Rec.2020".to_string(),
-        bit_depth: 16,
+        bitrate_mbps: IMF_MAIN_LEVEL_6_SUB_LEVEL_3_MBPS,
+        colour_space: "BT.2020 PQ".to_string(),
+        bit_depth: 12,
+        light_levels_required: true,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
-        audio_channels: "5.1".to_string(),
-        specification: "no public delivery specification, these numbers are unverified".to_string(),
+        audio_channels: "IAB".to_string(),
+        specification: "Warner Bros. Discovery High Dynamic Range (HDR) ingest specification v1.9 \
+                        of 2026-02-06, read 2026-09-10 at \
+                        https://partnerhub.warnermediagroup.com/ingest-specifications/hdr-content. \
+                        UHD HDR IMP only, 12-bit full range RGB BT.2020 ST 2084, Dolby Atmos as \
+                        IAB with 5.1 and 2.0 not accepted, and MaxCLL and MaxFALL must be present \
+                        in MMC metadata or the CPL. The page names JPEG 2000 IMF single-tile lossy \
+                        Main-Level 6 Sub-Level 3 and no Mbit/s figure, so 800 Mbit/s here is that \
+                        sub level's own ceiling"
+            .to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -227,6 +215,7 @@ fn archival() -> EncodingProfile {
         bitrate_mbps: 0.0, // lossless
         colour_space: "XYZ".to_string(),
         bit_depth: 16,
+        light_levels_required: false,
         progression: "LRCP".to_string(),
         audio_sample_rate: 96000,
         audio_bit_depth: 24,
@@ -247,6 +236,7 @@ fn broadcast() -> EncodingProfile {
         bitrate_mbps: 200.0,
         colour_space: "Rec.709".to_string(),
         bit_depth: 10,
+        light_levels_required: false,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
@@ -262,14 +252,54 @@ mod tests {
 
     #[test]
     fn all_profiles_count() {
-        assert_eq!(all_profiles().len(), 9);
+        assert_eq!(all_profiles().len(), 7);
     }
 
     #[test]
     fn profile_lookup() {
         let p = profile_for(Platform::Netflix);
         assert_eq!(p.width, 3840);
-        assert_eq!(p.colour_space, "Rec.2020");
+        assert_eq!(p.colour_space, "BT.709 RGB full range");
+    }
+
+    const PUBLISHED_STREAMING_PLATFORMS: [Platform; 3] =
+        [Platform::Netflix, Platform::Disney, Platform::Hbo];
+
+    #[test]
+    fn every_streaming_profile_cites_a_page_someone_can_open() {
+        for platform in PUBLISHED_STREAMING_PLATFORMS {
+            let profile = profile_for(platform);
+            assert!(
+                profile.specification.contains("https://"),
+                "{} cites no URL: {}",
+                profile.name,
+                profile.specification
+            );
+        }
+    }
+
+    #[test]
+    fn no_profile_carries_unverified_numbers() {
+        for profile in all_profiles() {
+            assert!(
+                !profile.specification.contains("unverified"),
+                "{} still calls its numbers unverified",
+                profile.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_stating_no_bitrate_ceiling_names_none() {
+        assert_eq!(profile_for(Platform::Disney).bitrate_ceiling_mbps(), None);
+        assert_eq!(
+            profile_for(Platform::ArchivalPreservation).bitrate_ceiling_mbps(),
+            None
+        );
+        assert_eq!(
+            profile_for(Platform::Netflix).bitrate_ceiling_mbps(),
+            Some(800.0)
+        );
     }
 
     /// A profile with no citation is a number nobody can check, which is how the

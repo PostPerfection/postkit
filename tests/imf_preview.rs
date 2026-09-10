@@ -46,6 +46,13 @@ const NARROW_MID_GREY_12BIT: i32 = 2048;
 const NARROW_CHROMA_MIDPOINT: i32 = 2048;
 /// The red chroma the right half of the 4:2:2 frame steps up to.
 const RED_CHROMA_HIGH_12BIT: i32 = 2500;
+const YCBCR_TRIPLE: [i32; 3] = [2048, 1700, 2300];
+const NARROW_LUMA_BLACK: f64 = 256.0;
+const NARROW_LUMA_WHITE: f64 = 3760.0;
+const NARROW_CHROMA_HALF_RANGE: f64 = 1792.0;
+const BT709_LUMA_RED_BLUE: [f64; 2] = [0.2126, 0.0722];
+const MATRIX_TOLERANCE: i32 = 2;
+const MXF_HEADER_SIZE: u32 = 16384;
 
 const IMF_4K_FIXTURE: &str = "imf4k_black_3840x2160.j2c";
 
@@ -85,6 +92,39 @@ fn wrap_app2e(frame: Vec<u8>, hdr: HdrMetadata) -> Wrapped {
         timed_text_duration_frames: None,
     });
     assert!(result.success, "wrap failed: {}", result.error);
+    Wrapped { _dir: dir, output }
+}
+
+fn wrap_app2e_cdci(frame: &[u8], hdr: HdrMetadata) -> Wrapped {
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("picture.mxf");
+    let descriptor = asdcplib::jp2k::PictureDescriptor {
+        edit_rate: asdcplib::Rational::new(24, 1),
+        sample_rate: asdcplib::Rational::new(24, 1),
+        stored_width: WIDTH,
+        stored_height: HEIGHT,
+        aspect_ratio: asdcplib::Rational::new(WIDTH as i32, HEIGHT as i32),
+        container_duration: 1,
+        codestream: asdcplib::jp2k::CodestreamHeader::parse(frame).expect("codestream header"),
+    };
+    let mut writer = asdcplib::as02::jp2k::MxfWriter::new();
+    writer
+        .open_write_cdci(
+            &output.to_string_lossy(),
+            &asdcplib::WriterInfo::default(),
+            &descriptor,
+            asdcplib::as02::jp2k::ChromaSubsampling {
+                horizontal: 1,
+                vertical: 1,
+            },
+            Some(&hdr),
+            MXF_HEADER_SIZE,
+        )
+        .expect("a 4:4:4 CDCI wrap has to open");
+    writer
+        .write_frame(frame, None, None)
+        .expect("frame written");
+    writer.finalize().expect("wrap finalized");
     Wrapped { _dir: dir, output }
 }
 
@@ -529,6 +569,122 @@ fn a_422_track_file_renders_its_ycbcr_as_rgb() {
     assert_eq!(
         tinted[2], grey[2],
         "the blue chroma did not step, so blue must not move: {grey:?} against {tinted:?}"
+    );
+}
+
+fn rec709_rgb8_of_ycbcr(codes: [i32; 3]) -> [u8; 3] {
+    let [red_luma, blue_luma] = BT709_LUMA_RED_BLUE;
+    let green_luma = 1.0 - red_luma - blue_luma;
+    let luma = (f64::from(codes[0]) - NARROW_LUMA_BLACK) / (NARROW_LUMA_WHITE - NARROW_LUMA_BLACK);
+    let blue_chroma = f64::from(codes[1] - NARROW_CHROMA_MIDPOINT) / NARROW_CHROMA_HALF_RANGE;
+    let red_chroma = f64::from(codes[2] - NARROW_CHROMA_MIDPOINT) / NARROW_CHROMA_HALF_RANGE;
+    [
+        luma + 2.0 * (1.0 - red_luma) * red_chroma,
+        luma - 2.0 * blue_luma * (1.0 - blue_luma) / green_luma * blue_chroma
+            - 2.0 * red_luma * (1.0 - red_luma) / green_luma * red_chroma,
+        luma + 2.0 * (1.0 - blue_luma) * blue_chroma,
+    ]
+    .map(|channel| {
+        let code = (channel.clamp(0.0, 1.0) * f64::from(FULL_SCALE_12BIT)).round() as i32;
+        (code >> 4) as u8
+    })
+}
+
+fn rgb8_of_codes(codes: [i32; 3]) -> [u8; 3] {
+    codes.map(|code| (code >> 4) as u8)
+}
+
+fn centre_pixel(pixels: &[u8]) -> [u8; 3] {
+    let offset = ((HEIGHT as usize / 2) * WIDTH as usize + WIDTH as usize / 2) * 3;
+    [pixels[offset], pixels[offset + 1], pixels[offset + 2]]
+}
+
+fn assert_within_tolerance(rendered: [u8; 3], expected: [u8; 3], what: &str) {
+    let apart = (0..3)
+        .map(|channel| (i32::from(rendered[channel]) - i32::from(expected[channel])).abs())
+        .max()
+        .unwrap();
+    assert!(
+        apart <= MATRIX_TOLERANCE,
+        "{what} rendered {rendered:?}, and the YCbCr matrix gives {expected:?}"
+    );
+}
+
+#[test]
+fn a_444_cdci_track_file_renders_its_ycbcr_as_rgb() {
+    let samples = (WIDTH * HEIGHT) as usize;
+    let frame = encode_imf_frame(YCBCR_TRIPLE.map(|code| vec![code; samples]));
+    let matrixed = rec709_rgb8_of_ycbcr(YCBCR_TRIPLE);
+    let raw = rgb8_of_codes(YCBCR_TRIPLE);
+    assert_ne!(
+        matrixed, raw,
+        "the triple has to matrix to something other than itself or the test proves nothing"
+    );
+
+    let cdci = wrap_app2e_cdci(&frame, rec709_sdr_picture_colour());
+    let resolved = preview::resolve_picture(&cdci.output).unwrap();
+    assert!(resolved.as02, "the CDCI wrap has to read back as AS-02");
+    assert!(
+        resolved.descriptor_says_ycbcr,
+        "the CDCI essence descriptor is the only thing saying these samples are YCbCr"
+    );
+    assert_eq!(
+        (resolved.color_primaries, resolved.transfer_characteristic),
+        (
+            Some(COLOR_PRIMARIES_BT709),
+            Some(TRANSFER_CHARACTERISTIC_BT709)
+        ),
+        "the colour ULs have to read off a CDCI descriptor as they do off an RGBA one"
+    );
+
+    let extracted_path = out_path("cdci444extract");
+    assert_eq!(
+        preview::extract_frame(&cdci.output, 0, &extracted_path, None),
+        0,
+        "a 4:4:4 CDCI frame has to extract"
+    );
+    let extracted = centre_pixel(&read_ppm(&extracted_path, WIDTH, HEIGHT));
+    std::fs::remove_file(&extracted_path).ok();
+    assert_within_tolerance(extracted, matrixed, "the extracted frame");
+    assert_ne!(
+        extracted, raw,
+        "the chroma planes must not reach the screen as green and blue"
+    );
+
+    let previewed_path = out_path("cdci444preview");
+    let opts = DcpPreviewOptions {
+        source: cdci.output.clone(),
+        ..Default::default()
+    };
+    preview::render_imf_frame(&opts, 0, &previewed_path).expect("a 4:4:4 CDCI frame has to render");
+    let previewed = centre_pixel(&read_ppm(&previewed_path, WIDTH, HEIGHT));
+    std::fs::remove_file(&previewed_path).ok();
+    assert_within_tolerance(previewed, matrixed, "the previewed frame");
+}
+
+#[test]
+fn the_same_444_planes_wrapped_as_rgba_stay_rgb() {
+    let samples = (WIDTH * HEIGHT) as usize;
+    let frame = encode_imf_frame(YCBCR_TRIPLE.map(|code| vec![code; samples]));
+    let rgba = wrap_app2e(frame, rec709_sdr_picture_colour());
+    let resolved = preview::resolve_picture(&rgba.output).unwrap();
+    assert!(
+        !resolved.descriptor_says_ycbcr,
+        "an RGBA essence descriptor carries no chroma subsampling to read"
+    );
+
+    let out = out_path("rgba444");
+    assert_eq!(
+        preview::extract_frame(&rgba.output, 0, &out, None),
+        0,
+        "a 4:4:4 RGBA frame has to extract"
+    );
+    let rendered = centre_pixel(&read_ppm(&out, WIDTH, HEIGHT));
+    std::fs::remove_file(&out).ok();
+    assert_eq!(
+        rendered,
+        rgb8_of_codes(YCBCR_TRIPLE),
+        "an RGBA Rec.709 SDR frame drops its low four bits and reaches the screen unchanged"
     );
 }
 

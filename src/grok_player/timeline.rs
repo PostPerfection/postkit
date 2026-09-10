@@ -344,6 +344,8 @@ mod tests {
             color_primaries: None,
             transfer_characteristic: None,
             mastering_display_max_luminance: None,
+            descriptor_says_ycbcr: false,
+            coding_equations: None,
         };
         let trim = composition_timeline::SegmentTrim {
             start_seconds: 1.0,

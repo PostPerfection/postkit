@@ -513,6 +513,12 @@
 
 ### Fixed
 
+- **A 4:4:4 App 2E CDCI master no longer shows its chroma planes as green and
+  blue**: the preview took a frame for YCbCr only when the codestream was
+  subsampled, and now reads the CDCI essence descriptor `resolve_picture`
+  returns, taking the YCbCr matrix from its CodingEquations UL when it carries
+  one.
+
 - **An encode no longer hangs after its last frame**: `BoundedQueue::close`
   set the closed flag and notified without the queue lock, so an encoder
   thread that had just found the queue empty and read the flag as open went

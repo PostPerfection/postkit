@@ -224,7 +224,7 @@ fn package_picture(package: &Path) -> Option<PathBuf> {
 }
 
 // App 2E puts MaxCLL and MaxFALL in the CPL ExtensionProperties
-fn cpl_light_levels(package: &Path) -> Option<(String, String)> {
+pub fn cpl_light_levels(package: &Path) -> Option<(String, String)> {
     for entry in std::fs::read_dir(package).ok()?.flatten() {
         let path = entry.path();
         let is_xml = path

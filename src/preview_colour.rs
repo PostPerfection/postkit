@@ -4,7 +4,7 @@
 //!
 //! An HDR frame is tone mapped with the ITU-R BT.2390 EETF from the mastering
 //! display's peak down to a 100 cd/m² SDR peak, a wide gamut frame is matrixed
-//! into Rec.709 through XYZ and clipped, and a 4:2:2 frame's YCbCr samples are
+//! into Rec.709 through XYZ and clipped, and a YCbCr frame's samples are
 //! converted to RGB first. A Rec.709 SDR frame comes out of the same path
 //! unchanged, code for code, as the pass-through that used to be here.
 
@@ -54,10 +54,21 @@ const MASTERING_LUMINANCE_STEPS_PER_NIT: f64 = 10_000.0;
 const EETF_KNEE_SLOPE: f64 = 1.5;
 const EETF_KNEE_OFFSET: f64 = 0.5;
 
+const BT601_LUMA_RED_BLUE: [f32; 2] = [0.299, 0.114];
 /// ITU-R BT.709 luma coefficients for red and blue.
 const BT709_LUMA_RED_BLUE: [f32; 2] = [0.2126, 0.0722];
 /// ITU-R BT.2020 non-constant-luminance luma coefficients for red and blue.
 const BT2020_LUMA_RED_BLUE: [f32; 2] = [0.2627, 0.0593];
+
+const CODING_EQUATIONS_BT601: [u8; 16] = [
+    0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x04, 0x01, 0x01, 0x01, 0x02, 0x01, 0x00, 0x00,
+];
+const CODING_EQUATIONS_BT709: [u8; 16] = [
+    0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x01, 0x04, 0x01, 0x01, 0x01, 0x02, 0x02, 0x00, 0x00,
+];
+const CODING_EQUATIONS_BT2020: [u8; 16] = [
+    0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0d, 0x04, 0x01, 0x01, 0x01, 0x02, 0x06, 0x00, 0x00,
+];
 
 /// Narrow range at 12 bits: luma black and white, and the chroma midpoint with
 /// the code range either side of it.
@@ -82,6 +93,13 @@ pub enum DisplayTransfer {
     Hlg,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LumaCoefficients {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
 /// What the picture's samples are, resolved from the descriptor's ULs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PictureColour {
@@ -90,6 +108,8 @@ pub struct PictureColour {
     /// The ST 2086 mastering display peak in the descriptor's own 0.0001 cd/m²
     /// steps, `None` when it signals none.
     pub mastering_display_max_luminance: Option<u32>,
+    pub descriptor_says_ycbcr: bool,
+    pub luma_coefficients: Option<LumaCoefficients>,
 }
 
 /// Resolve the descriptor's colour ULs, refusing only one this module has no
@@ -132,10 +152,26 @@ pub fn resolve_picture_colour(resolved: &ResolvedPicture) -> Result<PictureColou
         }
     };
 
+    let luma_coefficients = match resolved.coding_equations {
+        None => None,
+        Some(ul) if ul == CODING_EQUATIONS_BT601 => Some(LumaCoefficients::Bt601),
+        Some(ul) if ul == CODING_EQUATIONS_BT709 => Some(LumaCoefficients::Bt709),
+        Some(ul) if ul == CODING_EQUATIONS_BT2020 => Some(LumaCoefficients::Bt2020),
+        Some(ul) => {
+            tracing::warn!(
+                "{file} signals the unrecognised coding equations {ul:02x?}, so the preview takes \
+                 the luma coefficients its colour primaries imply"
+            );
+            None
+        }
+    };
+
     Ok(PictureColour {
         primaries,
         transfer,
         mastering_display_max_luminance: resolved.mastering_display_max_luminance,
+        descriptor_says_ycbcr: resolved.descriptor_says_ycbcr,
+        luma_coefficients,
     })
 }
 
@@ -191,9 +227,8 @@ pub fn render_display_rgb8(
     }
 
     let transform = DisplayTransform::new(colour);
-    let ycbcr = decoded
-        .chroma_subsampled
-        .then(|| ycbcr_to_rgb_matrix(colour.primaries));
+    let ycbcr = (colour.descriptor_says_ycbcr || decoded.chroma_subsampled)
+        .then(|| ycbcr_to_rgb_matrix(colour));
     let encode = DisplayEncode::new();
 
     let mut data = Vec::with_capacity(samples * IMF_COMPONENT_COUNT);
@@ -332,12 +367,18 @@ fn rec709_matrix(primaries: DisplayPrimaries) -> Option<[[f32; 3]; 3]> {
     Some(linear_rgb_to_rec709(&rec709.to_xyz, &source.to_xyz))
 }
 
-/// The non-constant-luminance YCbCr to R'G'B' matrix of the signalled
-/// primaries. P3-D65 has no luma coefficients of its own, so it takes BT.709's.
-fn ycbcr_to_rgb_matrix(primaries: DisplayPrimaries) -> [[f32; 3]; 3] {
-    let [red, blue] = match primaries {
-        DisplayPrimaries::Bt2020 => BT2020_LUMA_RED_BLUE,
-        DisplayPrimaries::Bt709 | DisplayPrimaries::P3D65 => BT709_LUMA_RED_BLUE,
+/// The non-constant-luminance YCbCr to R'G'B' matrix, from the descriptor's
+/// coding equations when it names some and from the signalled primaries
+/// otherwise. P3-D65 has no luma coefficients of its own, so it takes BT.709's.
+fn ycbcr_to_rgb_matrix(colour: &PictureColour) -> [[f32; 3]; 3] {
+    let [red, blue] = match colour.luma_coefficients {
+        Some(LumaCoefficients::Bt601) => BT601_LUMA_RED_BLUE,
+        Some(LumaCoefficients::Bt709) => BT709_LUMA_RED_BLUE,
+        Some(LumaCoefficients::Bt2020) => BT2020_LUMA_RED_BLUE,
+        None => match colour.primaries {
+            DisplayPrimaries::Bt2020 => BT2020_LUMA_RED_BLUE,
+            DisplayPrimaries::Bt709 | DisplayPrimaries::P3D65 => BT709_LUMA_RED_BLUE,
+        },
     };
     let green = 1.0 - red - blue;
     [
@@ -393,12 +434,15 @@ mod tests {
     use super::*;
 
     const MID_GREY_12BIT: i32 = 2048;
+    const YCBCR_TRIPLE: [i32; 3] = [MID_GREY_12BIT, 1700, 2300];
 
     fn colour(primaries: DisplayPrimaries, transfer: DisplayTransfer) -> PictureColour {
         PictureColour {
             primaries,
             transfer,
             mastering_display_max_luminance: None,
+            descriptor_says_ycbcr: false,
+            luma_coefficients: None,
         }
     }
 
@@ -547,6 +591,45 @@ mod tests {
                 true
             ),
             [255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn a_cdci_descriptor_makes_a_444_frame_ycbcr() {
+        let rgba = colour(DisplayPrimaries::Bt709, DisplayTransfer::Bt709);
+        let mut cdci = rgba;
+        cdci.descriptor_says_ycbcr = true;
+
+        let as_rgb = render(YCBCR_TRIPLE, &rgba, false);
+        let as_ycbcr = render(YCBCR_TRIPLE, &cdci, false);
+        assert_ne!(
+            as_ycbcr, as_rgb,
+            "a 4:4:4 CDCI frame must not read as RGB, which is what {as_rgb:?} is"
+        );
+
+        let matrix = ycbcr_to_rgb_matrix(&cdci);
+        let expected =
+            ycbcr_codes_to_rgb_codes(&matrix, YCBCR_TRIPLE).map(|code| (code >> 4) as u8);
+        assert_eq!(as_ycbcr, expected);
+    }
+
+    #[test]
+    fn the_coding_equations_beat_the_colour_primaries() {
+        let mut bt2020_equations = colour(DisplayPrimaries::Bt709, DisplayTransfer::Bt709);
+        bt2020_equations.luma_coefficients = Some(LumaCoefficients::Bt2020);
+        let bt2020_primaries = colour(DisplayPrimaries::Bt2020, DisplayTransfer::Bt709);
+        assert_eq!(
+            ycbcr_to_rgb_matrix(&bt2020_equations),
+            ycbcr_to_rgb_matrix(&bt2020_primaries),
+            "BT.2020 coding equations have to give the BT.2020 matrix whatever the primaries are"
+        );
+
+        let mut bt601_equations = colour(DisplayPrimaries::Bt2020, DisplayTransfer::Bt709);
+        bt601_equations.luma_coefficients = Some(LumaCoefficients::Bt601);
+        assert_ne!(
+            ycbcr_to_rgb_matrix(&bt601_equations),
+            ycbcr_to_rgb_matrix(&bt2020_primaries),
+            "BT.601 coding equations have to beat the BT.2020 primaries"
         );
     }
 

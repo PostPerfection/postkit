@@ -442,6 +442,8 @@ pub struct ResolvedPicture {
     /// ST 2086 MasteringDisplayMaximumLuminance in 0.0001 cd/m² steps, the peak
     /// the HDR tone map maps down from.
     pub mastering_display_max_luminance: Option<u32>,
+    pub descriptor_says_ycbcr: bool,
+    pub coding_equations: Option<[u8; 16]>,
 }
 
 /// A JPEG 2000 picture reader, one variant per MXF flavour.
@@ -483,6 +485,13 @@ impl PictureReader {
             PictureReader::As02(r) => r.picture_descriptor(),
         }
         .map_err(|e| PreviewError::Mxf(format!("picture descriptor: {e}")))
+    }
+
+    fn cdci_descriptor(&mut self) -> Option<asdcplib::as02::jp2k::CdciDescriptor> {
+        match self {
+            PictureReader::AsDcp(_) => None,
+            PictureReader::As02(r) => r.cdci_descriptor().ok(),
+        }
     }
 
     fn hdr_metadata(&mut self) -> Result<asdcplib::jp2k::HdrMetadata, PreviewError> {
@@ -594,6 +603,7 @@ pub fn resolve_picture(source: &Path) -> Result<ResolvedPicture, PreviewError> {
     let desc = reader.picture_descriptor()?;
     // a descriptor with no colour items is not an error, it reads as unsignalled
     let colour = reader.hdr_metadata().unwrap_or_default();
+    let cdci = reader.cdci_descriptor();
     reader.close();
 
     let fps = if desc.edit_rate.denominator != 0 {
@@ -614,6 +624,8 @@ pub fn resolve_picture(source: &Path) -> Result<ResolvedPicture, PreviewError> {
         color_primaries: colour.color_primaries,
         transfer_characteristic: colour.transfer_characteristic,
         mastering_display_max_luminance: colour.mastering_display_max_luminance,
+        descriptor_says_ycbcr: cdci.is_some(),
+        coding_equations: cdci.and_then(|cdci| cdci.coding_equations),
     })
 }
 

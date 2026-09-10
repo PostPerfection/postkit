@@ -1153,6 +1153,8 @@ mod tests {
             primaries: crate::preview_colour::DisplayPrimaries::Bt2020,
             transfer: crate::preview_colour::DisplayTransfer::Pq,
             mastering_display_max_luminance: Some(10_000_000),
+            descriptor_says_ycbcr: false,
+            luma_coefficients: None,
         };
         let codestreams: Vec<Vec<u8>> = (0..FRAMES).map(imf_2k_codestream_of_frame).collect();
         the_device_pool_shows_what_the_cpu_pool_shows(

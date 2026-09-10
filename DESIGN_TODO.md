@@ -1,12 +1,5 @@
 # Planned
 
-- A 4:4:4 App 2E codestream cannot be told from RGB. `grok_decoder` reads a
-  subsampled codestream as YCbCr, which ST 2067-21 allows only as CDCI, but a
-  4:4:4 one could be either and the only thing that says which is the CDCI
-  descriptor, which the AS-02 reader binding does not expose. So the preview
-  reads every 4:4:4 App 2E frame as RGB, and a 4:4:4 CDCI master would show with
-  its chroma planes taken for green and blue. Needs a descriptor accessor in
-  asdcplib-rs before it can be decided. Same entry in imfwizard's DESIGN_TODO.
 - Stereoscopic JPEG 2000 stays on libmpv. `GrokPlayer::accepts` returns false for
   `EssenceType::Jpeg2000Stereo` and `load` refuses it by name, because the mono
   AS-DCP reader cannot read it. Needs asdcplib's stereo reader.
