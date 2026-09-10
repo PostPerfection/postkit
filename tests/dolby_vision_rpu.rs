@@ -281,7 +281,7 @@ fn convert_dv_mode_reads_and_writes_an_escaped_rpu_bin() {
     std::fs::write(&input, &bin).unwrap();
 
     let output = directory.path().join("profile84.bin");
-    convert_dv_mode(&input, &output, DvMode::Mode5).unwrap();
+    convert_dv_mode(&input, &output, DvMode::To84).unwrap();
 
     let converted = std::fs::read(&output).unwrap();
     assert!(converted.starts_with(&NAL_START_CODE));

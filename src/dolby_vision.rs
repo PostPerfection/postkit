@@ -306,33 +306,23 @@ pub fn convert_hdr(input: &Path, target_type: HdrType, output: &Path) -> i32 {
 /// Dolby Vision RPU mode for dovi_tool operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DvMode {
-    Mode0,
-    Mode1,
-    Mode2,
-    Mode4,
-    Mode5,
-}
-
-impl DvMode {
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Mode0 => "0",
-            Self::Mode1 => "1",
-            Self::Mode2 => "2",
-            Self::Mode4 => "4",
-            Self::Mode5 => "5",
-        }
-    }
+    Lossless,
+    ToMel,
+    To81,
+    To81MappingPreserved,
+    To84,
 }
 
 impl From<DvMode> for dolby_vision::rpu::ConversionMode {
     fn from(mode: DvMode) -> Self {
         match mode {
-            DvMode::Mode0 => dolby_vision::rpu::ConversionMode::Lossless,
-            DvMode::Mode1 => dolby_vision::rpu::ConversionMode::ToMel,
-            DvMode::Mode2 => dolby_vision::rpu::ConversionMode::To81,
-            DvMode::Mode4 => dolby_vision::rpu::ConversionMode::To81MappingPreserved,
-            DvMode::Mode5 => dolby_vision::rpu::ConversionMode::To84,
+            DvMode::Lossless => dolby_vision::rpu::ConversionMode::Lossless,
+            DvMode::ToMel => dolby_vision::rpu::ConversionMode::ToMel,
+            DvMode::To81 => dolby_vision::rpu::ConversionMode::To81,
+            DvMode::To81MappingPreserved => {
+                dolby_vision::rpu::ConversionMode::To81MappingPreserved
+            }
+            DvMode::To84 => dolby_vision::rpu::ConversionMode::To84,
         }
     }
 }
@@ -380,9 +370,9 @@ pub fn convert_dv_mode(input: &Path, output: &Path, mode: DvMode) -> Result<(), 
     std::fs::write(output, &out_buf).map_err(|e| format!("Failed to write output: {e}"))?;
 
     tracing::info!(
-        "Converted {} RPU(s) to mode {} → {}",
+        "Converted {} RPU(s) to {} → {}",
         rpus.len(),
-        mode.as_str(),
+        conversion_mode,
         output.display()
     );
     Ok(())
@@ -1144,5 +1134,24 @@ mod tests {
         assert!(!allowed_base_layer_signalling(5).contains(&HDR10_BASE_LAYER));
         assert_eq!(allowed_base_layer_signalling(5), &[IPT_BASE_LAYER]);
         assert!(allowed_base_layer_signalling(6).is_empty());
+    }
+
+    /// The variants used to be named for dovi_tool's mode numbers and two of
+    /// them named the wrong one, so the mapping is pinned.
+    #[test]
+    fn each_mode_converts_to_what_it_is_named() {
+        use dolby_vision::rpu::ConversionMode;
+        for (mode, expected) in [
+            (DvMode::Lossless, ConversionMode::Lossless),
+            (DvMode::ToMel, ConversionMode::ToMel),
+            (DvMode::To81, ConversionMode::To81),
+            (
+                DvMode::To81MappingPreserved,
+                ConversionMode::To81MappingPreserved,
+            ),
+            (DvMode::To84, ConversionMode::To84),
+        ] {
+            assert_eq!(ConversionMode::from(mode), expected, "{mode:?}");
+        }
     }
 }
