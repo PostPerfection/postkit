@@ -42,6 +42,8 @@ pub struct EncodingProfile {
     pub audio_channels: String,
     /// Subtitle format (e.g. "IMSC1", "PNG", "SRT")
     pub subtitle_format: String,
+    // where these numbers come from, so a profile cannot be added without saying
+    pub specification: String,
 }
 
 /// Get all available encoding profiles.
@@ -89,6 +91,7 @@ fn theatrical_2k() -> EncodingProfile {
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "5.1".to_string(),
+        specification: "DCI Digital Cinema System Specification 4.3.3: 1,302,083 bytes a frame aggregate, so 250 Mbit/s at 24fps for 2K and 4K alike".to_string(),
         subtitle_format: "PNG".to_string(),
     }
 }
@@ -101,13 +104,14 @@ fn theatrical_4k() -> EncodingProfile {
         width: 4096,
         height: 2160,
         frame_rate: "24".to_string(),
-        bitrate_mbps: 500.0,
+        bitrate_mbps: 250.0,
         colour_space: "XYZ".to_string(),
         bit_depth: 12,
         progression: "CPRL".to_string(),
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "7.1".to_string(),
+        specification: "DCI Digital Cinema System Specification 4.3.3: 1,302,083 bytes a frame aggregate, so 250 Mbit/s at 24fps for 2K and 4K alike".to_string(),
         subtitle_format: "PNG".to_string(),
     }
 }
@@ -127,6 +131,7 @@ fn netflix() -> EncodingProfile {
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "5.1".to_string(),
+        specification: "no public delivery specification, these numbers are unverified".to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -146,6 +151,7 @@ fn amazon() -> EncodingProfile {
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "5.1".to_string(),
+        specification: "no public delivery specification, these numbers are unverified".to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -165,6 +171,7 @@ fn disney() -> EncodingProfile {
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "7.1.4".to_string(),
+        specification: "no public delivery specification, these numbers are unverified".to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -184,6 +191,7 @@ fn apple() -> EncodingProfile {
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "7.1.4".to_string(),
+        specification: "no public delivery specification, these numbers are unverified".to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -203,6 +211,7 @@ fn hbo() -> EncodingProfile {
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "5.1".to_string(),
+        specification: "no public delivery specification, these numbers are unverified".to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -222,6 +231,7 @@ fn archival() -> EncodingProfile {
         audio_sample_rate: 96000,
         audio_bit_depth: 24,
         audio_channels: "7.1".to_string(),
+        specification: "house profile, no external specification".to_string(),
         subtitle_format: "IMSC1".to_string(),
     }
 }
@@ -241,6 +251,7 @@ fn broadcast() -> EncodingProfile {
         audio_sample_rate: 48000,
         audio_bit_depth: 24,
         audio_channels: "stereo".to_string(),
+        specification: "house profile, no external specification".to_string(),
         subtitle_format: "SRT".to_string(),
     }
 }
@@ -259,6 +270,27 @@ mod tests {
         let p = profile_for(Platform::Netflix);
         assert_eq!(p.width, 3840);
         assert_eq!(p.colour_space, "Rec.2020");
+    }
+
+    /// A profile with no citation is a number nobody can check, which is how the
+    /// unverified ones got in.
+    #[test]
+    fn every_profile_says_where_its_numbers_came_from() {
+        for profile in all_profiles() {
+            assert!(
+                !profile.specification.trim().is_empty(),
+                "{} cites no specification",
+                profile.name
+            );
+        }
+    }
+
+    #[test]
+    fn dci_caps_2k_and_4k_at_the_same_bitrate() {
+        assert_eq!(
+            profile_for(Platform::TheatricalDci4k).bitrate_mbps,
+            profile_for(Platform::TheatricalDci2k).bitrate_mbps
+        );
     }
 
     #[test]
