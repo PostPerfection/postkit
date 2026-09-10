@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Fixed
+- **`create_dcdm` escapes the LUT path for the filter graph**: a Windows drive colon ended the `lut3d` option, so `dcdm --lut` failed on every Windows path. The same `filter_option_path` the colour conversion uses now writes it.
+
 ### Added
 
 - **Timed-text descriptor reads back as CPL RegXML**:

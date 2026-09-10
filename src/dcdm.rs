@@ -163,8 +163,10 @@ pub fn create_dcdm(opts: &DcdmOptions) -> DcdmResult {
     .arg(&frame_list);
 
     if !opts.lut_path.as_os_str().is_empty() && opts.lut_path.exists() {
-        cmd.arg("-vf")
-            .arg(format!("lut3d={}", opts.lut_path.display()));
+        cmd.arg("-vf").arg(format!(
+            "lut3d={}",
+            crate::filter_path::filter_option_path(&opts.lut_path)
+        ));
     }
 
     cmd.arg("-s")
