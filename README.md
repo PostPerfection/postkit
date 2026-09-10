@@ -80,8 +80,10 @@ install grok first (cmake, e.g. to `~/bin/grok`), then put its `lib/pkgconfig` o
 
 The stream encode runs ffmpeg 8 or later from `PATH`, built with libzimg: the
 HDR decode chain uses its `zscale` filter. Homebrew and conda-forge build
-without it, so macOS takes a static build such as martin-riedl.de's, which is
-what CI installs.
+without it. macOS CI (and local macOS) uses the pinned arm64 9.0.1 zip from
+`https://ffmpeg.martin-riedl.de/download/macos/arm64/1787073674_9.0.1`
+(`ffmpeg.zip` / `ffprobe.zip`); Linux and Windows CI use BtbN's n8.1 gpl
+builds. Put that `ffmpeg` first on `PATH` — `brew shellenv` otherwise wins.
 
 grok's accelerator plugin runs the wavelet and T1 on a device. grok looks for
 `libgrokj2k_plugin` under `GRK_PLUGIN_PATH`, then in the working directory, then
@@ -113,8 +115,9 @@ when a batch begins. A 4096x1716 DCP sustains 32.7 frames a second on an RTX
 A 4096x2160 12-bit App 2E IMP sustains 21.0 frames a second with its transform
 on the device, against 11.8 with the host running it.
 
-With the plugin on, ffmpeg decodes with `-hwaccel cuda` and the frames reach
-the batch in the layout the plugin takes rather than the one postkit converts
+With the plugin on, ffmpeg decodes with `-hwaccel cuda` on Linux/Windows and
+`-hwaccel videotoolbox` on macOS. Frames reach the batch in the layout the
+plugin takes (planar YUV when it can) rather than the one postkit converts
 itself. A yuv420p, yuv422p, yuv420p10le or yuv422p10le source goes to the pipe
 as its own three planes and the device upsamples the chroma, converts YUV to
 RGB and runs the X'Y'Z' transform. Every other source goes as packed 16-bit

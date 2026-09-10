@@ -489,7 +489,10 @@ impl DecodeSource {
 /// Decode on the GPU and bring the frames back to system memory. Without
 /// `-hwaccel_output_format` ffmpeg downloads them itself, and a codec the device
 /// cannot decode falls back to software decoding with no error.
+#[cfg(not(target_os = "macos"))]
 const HARDWARE_DECODE_ARGS: [&str; 2] = ["-hwaccel", "cuda"];
+#[cfg(target_os = "macos")]
+const HARDWARE_DECODE_ARGS: [&str; 2] = ["-hwaccel", "videotoolbox"];
 
 /// Packed 16-bit RGB: three components per pixel, six bytes. postkit
 /// deinterleaves the big-endian layout itself and hands the little-endian one to
@@ -2902,19 +2905,38 @@ mod tests {
 
     #[test]
     fn an_accelerated_decode_asks_for_the_hardware_decoder() {
-        assert_eq!(
-            decode_input_args(DecodeSource::Video, None, true).unwrap(),
-            vec!["-hwaccel", "cuda"]
-        );
-        assert_eq!(
-            decode_input_args(DecodeSource::ImageList, None, true).unwrap(),
-            vec!["-f", "concat", "-safe", "0", "-hwaccel", "cuda"]
-        );
-        assert_eq!(
-            decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24)), true).unwrap(),
-            vec!["-hwaccel", "cuda", "-r", "24"],
-            "the hardware decoder goes before -i with the rest of the input arguments"
-        );
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(
+                decode_input_args(DecodeSource::Video, None, true).unwrap(),
+                vec!["-hwaccel", "cuda"]
+            );
+            assert_eq!(
+                decode_input_args(DecodeSource::ImageList, None, true).unwrap(),
+                vec!["-f", "concat", "-safe", "0", "-hwaccel", "cuda"]
+            );
+            assert_eq!(
+                decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24)), true).unwrap(),
+                vec!["-hwaccel", "cuda", "-r", "24"],
+                "the hardware decoder goes before -i with the rest of the input arguments"
+            );
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                decode_input_args(DecodeSource::Video, None, true).unwrap(),
+                vec!["-hwaccel", "videotoolbox"]
+            );
+            assert_eq!(
+                decode_input_args(DecodeSource::ImageList, None, true).unwrap(),
+                vec!["-f", "concat", "-safe", "0", "-hwaccel", "videotoolbox"]
+            );
+            assert_eq!(
+                decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24)), true).unwrap(),
+                vec!["-hwaccel", "videotoolbox", "-r", "24"],
+                "the hardware decoder goes before -i with the rest of the input arguments"
+            );
+        }
         assert_eq!(
             decode_input_args(DecodeSource::Video, None, false).unwrap(),
             Vec::<String>::new(),
