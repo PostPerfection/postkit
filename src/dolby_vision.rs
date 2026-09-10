@@ -908,6 +908,152 @@ pub fn read_dolby_vision(path: &Path) -> Result<Option<DolbyVisionSummary>, Stri
     Ok(Some(summarise_rpus(first, &rpus)?))
 }
 
+// Dolby Vision Profiles and levels V1.2.92 table 3, the level a base layer fits
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DolbyVisionLevel {
+    pub id: u8,
+    pub name: &'static str,
+    pub max_pixels_per_second: u64,
+    pub main_tier_megabits_per_second: u32,
+    pub high_tier_megabits_per_second: u32,
+}
+
+// table 3 gives a resolution times frame rate per level and says the product is
+// the constant that bounds it
+pub const DOLBY_VISION_LEVELS: [DolbyVisionLevel; 9] = [
+    DolbyVisionLevel {
+        id: 1,
+        name: "hd24",
+        max_pixels_per_second: 1280 * 720 * 24,
+        main_tier_megabits_per_second: 20,
+        high_tier_megabits_per_second: 50,
+    },
+    DolbyVisionLevel {
+        id: 2,
+        name: "hd30",
+        max_pixels_per_second: 1280 * 720 * 30,
+        main_tier_megabits_per_second: 20,
+        high_tier_megabits_per_second: 50,
+    },
+    DolbyVisionLevel {
+        id: 3,
+        name: "fhd24",
+        max_pixels_per_second: 1920 * 1080 * 24,
+        main_tier_megabits_per_second: 20,
+        high_tier_megabits_per_second: 70,
+    },
+    DolbyVisionLevel {
+        id: 4,
+        name: "fhd30",
+        max_pixels_per_second: 1920 * 1080 * 30,
+        main_tier_megabits_per_second: 20,
+        high_tier_megabits_per_second: 70,
+    },
+    DolbyVisionLevel {
+        id: 5,
+        name: "fhd60",
+        max_pixels_per_second: 1920 * 1080 * 60,
+        main_tier_megabits_per_second: 20,
+        high_tier_megabits_per_second: 70,
+    },
+    DolbyVisionLevel {
+        id: 6,
+        name: "uhd24",
+        max_pixels_per_second: 3840 * 2160 * 24,
+        main_tier_megabits_per_second: 25,
+        high_tier_megabits_per_second: 130,
+    },
+    DolbyVisionLevel {
+        id: 7,
+        name: "uhd30",
+        max_pixels_per_second: 3840 * 2160 * 30,
+        main_tier_megabits_per_second: 25,
+        high_tier_megabits_per_second: 130,
+    },
+    DolbyVisionLevel {
+        id: 8,
+        name: "uhd48",
+        max_pixels_per_second: 3840 * 2160 * 48,
+        main_tier_megabits_per_second: 40,
+        high_tier_megabits_per_second: 130,
+    },
+    DolbyVisionLevel {
+        id: 9,
+        name: "uhd60",
+        max_pixels_per_second: 3840 * 2160 * 60,
+        main_tier_megabits_per_second: 40,
+        high_tier_megabits_per_second: 130,
+    },
+];
+
+// the lowest level that covers this raster and frame rate, None above uhd60
+pub fn dolby_vision_level_for(
+    width: u32,
+    height: u32,
+    frames_per_second: f64,
+) -> Option<DolbyVisionLevel> {
+    if width == 0 || height == 0 || frames_per_second <= 0.0 || frames_per_second.is_nan() {
+        return None;
+    }
+    let pixels_per_second = (f64::from(width) * f64::from(height) * frames_per_second).ceil();
+    DOLBY_VISION_LEVELS
+        .into_iter()
+        .find(|level| pixels_per_second <= level.max_pixels_per_second as f64)
+}
+
+// the base layer VUI as table 1 writes it: EOTF, primaries, matrix, range
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BaseLayerSignalling {
+    pub transfer_characteristics: u8,
+    pub colour_primaries: u8,
+    pub matrix_coefficients: u8,
+    pub full_range: bool,
+}
+
+// table 1 note: the cross-compatibility ID picking between these rows is not in
+// the bitstream, so the base layer VUI is the only thing that says which it is
+const IPT_BASE_LAYER: BaseLayerSignalling = BaseLayerSignalling {
+    transfer_characteristics: 2,
+    colour_primaries: 2,
+    matrix_coefficients: 2,
+    full_range: true,
+};
+
+const HDR10_BASE_LAYER: BaseLayerSignalling = BaseLayerSignalling {
+    transfer_characteristics: 16,
+    colour_primaries: 9,
+    matrix_coefficients: 9,
+    full_range: false,
+};
+
+const REC709_BASE_LAYER: BaseLayerSignalling = BaseLayerSignalling {
+    transfer_characteristics: 1,
+    colour_primaries: 1,
+    matrix_coefficients: 1,
+    full_range: false,
+};
+
+// cross-compatibility ID 4, HLG signalled as preferred_transfer_function 18
+const HLG_BASE_LAYER: BaseLayerSignalling = BaseLayerSignalling {
+    transfer_characteristics: 18,
+    colour_primaries: 9,
+    matrix_coefficients: 9,
+    full_range: false,
+};
+
+// what table 1 allows a profile's base layer to carry, empty for a profile it
+// does not list
+pub fn allowed_base_layer_signalling(profile: u8) -> &'static [BaseLayerSignalling] {
+    match profile {
+        4 => &[REC709_BASE_LAYER],
+        5 => &[IPT_BASE_LAYER],
+        7 => &[HDR10_BASE_LAYER],
+        8 => &[HDR10_BASE_LAYER, REC709_BASE_LAYER, HLG_BASE_LAYER],
+        9 => &[REC709_BASE_LAYER],
+        _ => &[],
+    }
+}
+
 pub fn refuse_undecodable_dolby_vision(summary: &DolbyVisionSummary) -> Result<(), String> {
     if summary.profile == DOLBY_VISION_PROFILE_5 {
         return Err("Dolby Vision profile 5 carries IPT PQ c2 colour that only the RPU can turn back into RGB, export a profile 8.1 or an HDR10 master instead".to_string());
@@ -970,5 +1116,33 @@ mod tests {
             summary.profile = profile;
             assert!(refuse_undecodable_dolby_vision(&summary).is_ok());
         }
+    }
+
+    #[test]
+    fn a_uhd24_master_fits_the_level_dolby_names_for_it() {
+        let level = dolby_vision_level_for(3840, 2160, 24.0).expect("a level for uhd24");
+        assert_eq!(level.name, "uhd24");
+        assert_eq!(level.id, 6);
+        assert_eq!(level.high_tier_megabits_per_second, 130);
+    }
+
+    // table 3 lists 1920x1080x25 under fhd30 rather than giving it a level
+    #[test]
+    fn a_1080p25_master_fits_fhd30() {
+        let level = dolby_vision_level_for(1920, 1080, 25.0).expect("a level for 1080p25");
+        assert_eq!(level.name, "fhd30");
+    }
+
+    #[test]
+    fn a_master_past_uhd60_fits_no_dolby_level() {
+        assert!(dolby_vision_level_for(3840, 2160, 120.0).is_none());
+    }
+
+    #[test]
+    fn profile_8_takes_an_hdr10_base_layer_and_profile_5_does_not() {
+        assert!(allowed_base_layer_signalling(8).contains(&HDR10_BASE_LAYER));
+        assert!(!allowed_base_layer_signalling(5).contains(&HDR10_BASE_LAYER));
+        assert_eq!(allowed_base_layer_signalling(5), &[IPT_BASE_LAYER]);
+        assert!(allowed_base_layer_signalling(6).is_empty());
     }
 }
