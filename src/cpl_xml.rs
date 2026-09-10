@@ -24,6 +24,13 @@ pub fn read_tag(xml: &str, tag: &str) -> Option<String> {
     }
 }
 
+pub fn read_prefixed_tag(xml: &str, name: &str) -> Option<String> {
+    let pattern = format!(r"<(?:\w+:)?{name}(?:\s[^>]*)?>([^<]*)");
+    let found = regex::Regex::new(&pattern).ok()?.captures(xml)?;
+    let text = found[1].trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 /// Replace the text content of the first `<tag ...>...</tag>` element, escaping
 /// XML special characters in `new_value`. Returns the input unchanged when the
 /// tag is not found.
@@ -67,6 +74,16 @@ mod tests {
         assert_eq!(read_tag(xml, "Title").as_deref(), Some("Hello"));
         assert_eq!(read_tag(xml, "Empty"), None);
         assert_eq!(read_tag(xml, "Missing"), None);
+    }
+
+    #[test]
+    fn read_prefixed_tag_reads_past_the_prefix_and_the_xmlns() {
+        let xml = "<app2e:MaxCLL xmlns:app2e=\"http://www.smpte-ra.org/ns/2067-21/2020\">993\
+                   </app2e:MaxCLL><MaxFALL>362</MaxFALL><Empty></Empty>";
+        assert_eq!(read_prefixed_tag(xml, "MaxCLL").as_deref(), Some("993"));
+        assert_eq!(read_prefixed_tag(xml, "MaxFALL").as_deref(), Some("362"));
+        assert_eq!(read_prefixed_tag(xml, "Empty"), None);
+        assert_eq!(read_prefixed_tag(xml, "MaxCL"), None);
     }
 
     #[test]

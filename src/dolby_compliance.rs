@@ -1,5 +1,7 @@
+use crate::cpl_xml::read_prefixed_tag;
 use crate::dolby_vision::{
-    BaseLayerSignalling, allowed_base_layer_signalling, dolby_vision_level_for, read_dolby_vision,
+    BaseLayerSignalling, DolbyVisionLevel, allowed_base_layer_signalling, dolby_vision_level_for,
+    read_dolby_vision,
 };
 use crate::preview::{is_jpeg2000_mxf, resolve_picture};
 use crate::preview_colour::{DisplayPrimaries, DisplayTransfer, resolve_picture_colour};
@@ -44,20 +46,34 @@ fn signalling_of(
             matrix_coefficients: 1,
             full_range: false,
         },
-        (DisplayTransfer::Hlg, DisplayPrimaries::Bt2020) => BaseLayerSignalling {
-            transfer_characteristics: 18,
-            colour_primaries: 9,
-            matrix_coefficients: 9,
-            full_range: false,
-        },
         _ => return None,
     };
     Some(signalling)
 }
 
-// cross-compatibility ID 1 is CTA HDR10, which the same table makes carry
-// MaxCLL and MaxFALL
+// V1.2.92 calls HDR10 without MaxCLL and MaxFALL PQ10
 const HDR10_TRANSFER_CHARACTERISTICS: u8 = 16;
+
+fn base_layer_finding(
+    profile: u8,
+    signalling: BaseLayerSignalling,
+    result: &mut DolbyVisionCompliance,
+) {
+    let allowed = allowed_base_layer_signalling(profile);
+    if allowed.contains(&signalling) {
+        result.checked.push(format!(
+            "base layer VUI {} is what table 1 allows profile {profile}",
+            signalling_name(signalling)
+        ));
+        return;
+    }
+    let allowed_names: Vec<String> = allowed.iter().copied().map(signalling_name).collect();
+    result.errors.push(format!(
+        "base layer VUI {} is not what table 1 allows profile {profile}: {}",
+        signalling_name(signalling),
+        allowed_names.join(" or ")
+    ));
+}
 
 fn level_finding(
     width: u32,
@@ -65,6 +81,13 @@ fn level_finding(
     frames_per_second: f64,
     result: &mut DolbyVisionCompliance,
 ) {
+    if width == 0 || height == 0 || frames_per_second <= 0.0 || frames_per_second.is_nan() {
+        result.errors.push(format!(
+            "the raster or frame rate could not be read: \
+             {width}x{height} @ {frames_per_second:.3}fps"
+        ));
+        return;
+    }
     match dolby_vision_level_for(width, height, frames_per_second) {
         Some(level) => result.checked.push(format!(
             "{width}x{height} @ {frames_per_second:.3}fps is Dolby Vision level {:02} {}, \
@@ -78,6 +101,26 @@ fn level_finding(
             "{width}x{height} @ {frames_per_second:.3}fps is past uhd60, the highest \
              Dolby Vision level"
         )),
+    }
+}
+
+// only a master is held to the tiers, a mezzanine sits above them by design
+fn tier_finding(
+    level: DolbyVisionLevel,
+    megabits_per_second: f64,
+    result: &mut DolbyVisionCompliance,
+) {
+    if megabits_per_second > f64::from(level.high_tier_megabits_per_second) {
+        result.errors.push(format!(
+            "{megabits_per_second:.1} Mbps is over the {} Mbps high tier of level {:02} {}",
+            level.high_tier_megabits_per_second, level.id, level.name
+        ));
+    } else if megabits_per_second > f64::from(level.main_tier_megabits_per_second) {
+        result.warnings.push(format!(
+            "{megabits_per_second:.1} Mbps is over the {} Mbps main tier of level {:02} {}, \
+             so it is a high tier stream",
+            level.main_tier_megabits_per_second, level.id, level.name
+        ));
     }
 }
 
@@ -140,16 +183,15 @@ pub fn check_package(package: &Path) -> DolbyVisionCompliance {
 
     if signalling.transfer_characteristics == HDR10_TRANSFER_CHARACTERISTICS {
         let light_levels = cpl_light_levels(package);
-        if light_levels.is_none() {
-            result.errors.push(
-                "a PQ BT.2020 base layer is cross-compatibility 1, CTA HDR10, which needs \
-                 MaxCLL and MaxFALL, and the CPL carries neither"
-                    .to_string(),
-            );
-        } else if let Some((max_content, max_frame_average)) = light_levels {
-            result.checked.push(format!(
+        match light_levels {
+            Some((max_content, max_frame_average)) => result.checked.push(format!(
                 "the CPL carries MaxCLL {max_content} and MaxFALL {max_frame_average}"
-            ));
+            )),
+            None => result.warnings.push(
+                "a PQ BT.2020 base layer is cross-compatibility 1, CTA HDR10, and the CPL \
+                 carries no MaxCLL and MaxFALL, which V1.2.92 calls PQ10"
+                    .to_string(),
+            ),
         }
     }
 
@@ -198,23 +240,14 @@ fn cpl_light_levels(package: &Path) -> Option<(String, String)> {
         if !xml.contains("CompositionPlaylist") {
             continue;
         }
-        let max_content = element_text(&xml, "MaxCLL");
-        let max_frame_average = element_text(&xml, "MaxFALL");
+        // the CPL binds these to the App 2E namespace
+        let max_content = read_prefixed_tag(&xml, "MaxCLL");
+        let max_frame_average = read_prefixed_tag(&xml, "MaxFALL");
         if let (Some(max_content), Some(max_frame_average)) = (max_content, max_frame_average) {
             return Some((max_content, max_frame_average));
         }
     }
     None
-}
-
-// the CPL binds these to the App 2E namespace, so the tag carries a prefix
-fn element_text(xml: &str, name: &str) -> Option<String> {
-    let open = format!("{name}>");
-    let start = xml.find(&open)? + open.len();
-    let rest = &xml[start..];
-    let end = rest.find("</")?;
-    let text = rest[..end].trim();
-    (!text.is_empty()).then(|| text.to_string())
 }
 
 // an HEVC master still has its RPU, so the profile picks the rows table 1 allows
@@ -265,37 +298,10 @@ pub fn check_master(master: &Path) -> DolbyVisionCompliance {
         dolby_vision_level_for(probed.width, probed.height, probed.frames_per_second),
         probed.megabits_per_second,
     ) {
-        // table 3's tiers bound the delivered bitstream. A mezzanine sits far
-        // above them by design, so only a master is held to them.
-        if megabits_per_second > f64::from(level.high_tier_megabits_per_second) {
-            result.errors.push(format!(
-                "{megabits_per_second:.1} Mbps is over the {} Mbps high tier of level {:02} {}",
-                level.high_tier_megabits_per_second, level.id, level.name
-            ));
-        } else if megabits_per_second > f64::from(level.main_tier_megabits_per_second) {
-            result.warnings.push(format!(
-                "{megabits_per_second:.1} Mbps is over the {} Mbps main tier of level {:02} {}, \
-                 so it is a high tier stream",
-                level.main_tier_megabits_per_second, level.id, level.name
-            ));
-        }
+        tier_finding(level, megabits_per_second, &mut result);
     }
 
-    if allowed.contains(&probed.signalling) {
-        result.checked.push(format!(
-            "base layer VUI {} is what table 1 allows profile {}",
-            signalling_name(probed.signalling),
-            summary.profile
-        ));
-    } else {
-        let allowed_names: Vec<String> = allowed.iter().copied().map(signalling_name).collect();
-        result.errors.push(format!(
-            "base layer VUI {} is not what table 1 allows profile {}: {}",
-            signalling_name(probed.signalling),
-            summary.profile,
-            allowed_names.join(" or ")
-        ));
-    }
+    base_layer_finding(summary.profile, probed.signalling, &mut result);
 
     if probed.signalling.transfer_characteristics == HDR10_TRANSFER_CHARACTERISTICS {
         match (
@@ -305,9 +311,9 @@ pub fn check_master(master: &Path) -> DolbyVisionCompliance {
             (Some(max_content), Some(max_frame_average)) => result.checked.push(format!(
                 "the RPU level 6 block carries MaxCLL {max_content} and MaxFALL {max_frame_average}"
             )),
-            _ => result.errors.push(
-                "a PQ BT.2020 base layer is cross-compatibility 1, CTA HDR10, which needs \
-                 MaxCLL and MaxFALL, and the RPU carries no level 6 block with both"
+            _ => result.warnings.push(
+                "a PQ BT.2020 base layer is cross-compatibility 1, CTA HDR10, and the RPU \
+                 carries no level 6 block with MaxCLL and MaxFALL, which V1.2.92 calls PQ10"
                     .to_string(),
             ),
         }
@@ -325,57 +331,22 @@ struct ProbedBaseLayer {
     signalling: BaseLayerSignalling,
 }
 
+const BITS_PER_MEGABIT: f64 = 1_000_000.0;
+
 fn probe_base_layer(master: &Path) -> Option<ProbedBaseLayer> {
-    let out = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-select_streams",
-            "v:0",
-            "-show_streams",
-            "-of",
-            "json",
-        ])
-        .arg(master)
-        .output()
-        .ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let stream = value.get("streams")?.as_array()?.first()?;
-
-    let text = |key: &str| {
-        stream
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or_default()
-            .to_string()
-    };
-
+    let probed = crate::probe::probe_video(master)?;
     Some(ProbedBaseLayer {
-        width: stream.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        height: stream.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
-        frames_per_second: parse_frame_rate(&text("avg_frame_rate")),
-        megabits_per_second: text("bit_rate")
-            .parse::<f64>()
-            .ok()
-            .map(|bits| bits / 1_000_000.0),
+        width: probed.width,
+        height: probed.height,
+        frames_per_second: f64::from(probed.fps_num) / f64::from(probed.fps_den),
+        megabits_per_second: probed.bit_rate.map(|bits| bits as f64 / BITS_PER_MEGABIT),
         signalling: BaseLayerSignalling {
-            transfer_characteristics: transfer_code(&text("color_transfer")),
-            colour_primaries: primaries_code(&text("color_primaries")),
-            matrix_coefficients: matrix_code(&text("color_space")),
-            full_range: text("color_range") == "pc",
+            transfer_characteristics: transfer_code(&probed.color_transfer),
+            colour_primaries: primaries_code(&probed.color_primaries),
+            matrix_coefficients: matrix_code(&probed.color_space),
+            full_range: probed.color_range == "pc",
         },
     })
-}
-
-fn parse_frame_rate(rate: &str) -> f64 {
-    let (numerator, denominator) = rate.split_once('/').unwrap_or((rate, "1"));
-    let numerator: f64 = numerator.parse().unwrap_or(0.0);
-    let denominator: f64 = denominator.parse().unwrap_or(0.0);
-    if denominator == 0.0 {
-        0.0
-    } else {
-        numerator / denominator
-    }
 }
 
 // H.265 VUI code points, 2 is the unspecified both ffprobe and table 1 use
@@ -417,8 +388,25 @@ mod tests {
     }
 
     #[test]
+    fn an_hdr10_base_layer_is_what_table_1_allows_profile_8() {
+        let hdr10 =
+            signalling_of(DisplayTransfer::Pq, DisplayPrimaries::Bt2020).expect("a table 1 row");
+        let mut result = DolbyVisionCompliance::default();
+        base_layer_finding(8, hdr10, &mut result);
+        assert!(result.errors.is_empty(), "{result:?}");
+        assert!(result.warnings.is_empty(), "{result:?}");
+        assert_eq!(result.checked.len(), 1, "{result:?}");
+        assert!(result.checked[0].contains("16,9,9,0"), "{result:?}");
+    }
+
+    #[test]
     fn a_p3d65_picture_is_no_dolby_vision_base_layer() {
         assert!(signalling_of(DisplayTransfer::Pq, DisplayPrimaries::P3D65).is_none());
+    }
+
+    #[test]
+    fn an_hlg_picture_is_no_dolby_vision_base_layer() {
+        assert!(signalling_of(DisplayTransfer::Hlg, DisplayPrimaries::Bt2020).is_none());
     }
 
     #[test]
@@ -427,14 +415,55 @@ mod tests {
         assert_eq!(transfer_code("arib-std-b67"), 18);
         assert_eq!(primaries_code("bt2020"), 9);
         assert_eq!(matrix_code("bt2020nc"), 9);
-        // ffprobe prints nothing for an unsignalled stream
-        assert_eq!(transfer_code(""), 2);
+        assert_eq!(transfer_code("unknown"), 2);
+    }
+
+    // uhd60 is the last row of table 3
+    #[test]
+    fn a_raster_past_uhd60_is_named_as_past_the_table() {
+        let mut result = DolbyVisionCompliance::default();
+        level_finding(3840, 2160, 120.0, &mut result);
+        assert_eq!(result.checked.len(), 0);
+        assert_eq!(result.errors.len(), 1, "{result:?}");
+        assert!(result.errors[0].contains("past uhd60"), "{result:?}");
     }
 
     #[test]
-    fn a_frame_rate_comes_off_the_ffprobe_ratio() {
-        assert!((parse_frame_rate("24000/1001") - 23.976).abs() < 0.001);
-        assert_eq!(parse_frame_rate("25/1"), 25.0);
-        assert_eq!(parse_frame_rate("0/0"), 0.0);
+    fn an_unreadable_raster_is_named_as_unread_rather_than_past_the_table() {
+        let mut result = DolbyVisionCompliance::default();
+        level_finding(0, 0, 0.0, &mut result);
+        assert_eq!(result.errors.len(), 1, "{result:?}");
+        assert!(result.errors[0].contains("could not be read"), "{result:?}");
+        assert!(!result.errors[0].contains("uhd60"), "{result:?}");
+    }
+
+    // level 09 uhd60: 40 Mbps main tier, 130 Mbps high tier
+    fn uhd60() -> DolbyVisionLevel {
+        dolby_vision_level_for(3840, 2160, 60.0).expect("the last row of table 3")
+    }
+
+    #[test]
+    fn a_main_tier_bitrate_is_no_finding_at_all() {
+        let mut result = DolbyVisionCompliance::default();
+        tier_finding(uhd60(), 39.0, &mut result);
+        assert_eq!(result, DolbyVisionCompliance::default());
+    }
+
+    #[test]
+    fn a_bitrate_between_the_tiers_warns_that_it_is_a_high_tier_stream() {
+        let mut result = DolbyVisionCompliance::default();
+        tier_finding(uhd60(), 90.0, &mut result);
+        assert!(result.errors.is_empty(), "{result:?}");
+        assert_eq!(result.warnings.len(), 1, "{result:?}");
+        assert!(result.warnings[0].contains("09 uhd60"), "{result:?}");
+    }
+
+    #[test]
+    fn a_bitrate_over_the_high_tier_is_an_error() {
+        let mut result = DolbyVisionCompliance::default();
+        tier_finding(uhd60(), 131.0, &mut result);
+        assert!(result.warnings.is_empty(), "{result:?}");
+        assert_eq!(result.errors.len(), 1, "{result:?}");
+        assert!(result.errors[0].contains("09 uhd60"), "{result:?}");
     }
 }

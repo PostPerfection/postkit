@@ -222,29 +222,6 @@ fn a_profile_5_fixture_reads_back_and_is_refused() {
     assert!(refusal.contains("profile 8.1"), "{refusal}");
 }
 
-// the summary carries no field that separates 8.4 from 8.1, both read back as profile 8
-#[test]
-fn a_profile_8_4_fixture_reads_back_as_profile_8() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = write_dolby_vision_fixture(
-        directory.path(),
-        "dv84.hevc",
-        DolbyVisionFixtureProfile::Profile84,
-        Some(level6_block()),
-        None,
-    )
-    .unwrap();
-
-    let summary = read_dolby_vision(&path).unwrap().expect("rpus were found");
-
-    assert_eq!(summary.profile, 8);
-    assert_eq!(summary.frames, DOLBY_VISION_FIXTURE_FRAMES);
-    assert_eq!(summary.mastering_display_max_nits, Some(1000.0));
-    assert!(refuse_undecodable_dolby_vision(&summary).is_ok());
-}
-
-// the reshaping curve mode 5 writes, an eight segment polynomial over the luma
-const PROFILE_84_LUMA_PIVOTS: [u16; 9] = [63, 69, 230, 256, 256, 37, 16, 8, 7];
 const NAL_START_CODE: [u8; 4] = [0, 0, 0, 1];
 
 // 00 00 03 is the escape itself, a 00, 01 or 02 in its place would read as a start code
@@ -280,8 +257,8 @@ fn convert_dv_mode_reads_and_writes_an_escaped_rpu_bin() {
     bin.extend_from_slice(&escaped);
     std::fs::write(&input, &bin).unwrap();
 
-    let output = directory.path().join("profile84.bin");
-    convert_dv_mode(&input, &output, DvMode::To84).unwrap();
+    let output = directory.path().join("converted.bin");
+    convert_dv_mode(&input, &output, DvMode::Lossless).unwrap();
 
     let converted = std::fs::read(&output).unwrap();
     assert!(converted.starts_with(&NAL_START_CODE));
@@ -299,10 +276,6 @@ fn convert_dv_mode_reads_and_writes_an_escaped_rpu_bin() {
         "the written RPU carries no emulation prevention"
     );
     assert_eq!(parsed.dovi_profile, 8);
-    assert_eq!(
-        parsed.rpu_data_mapping.unwrap().curves[0].pivots,
-        PROFILE_84_LUMA_PIVOTS
-    );
 }
 
 /// The crate takes ToMel on profile 7 or 8, and postkit generates 8.1, so this

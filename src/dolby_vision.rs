@@ -310,7 +310,6 @@ pub enum DvMode {
     ToMel,
     To81,
     To81MappingPreserved,
-    To84,
 }
 
 impl From<DvMode> for dolby_vision::rpu::ConversionMode {
@@ -320,7 +319,6 @@ impl From<DvMode> for dolby_vision::rpu::ConversionMode {
             DvMode::ToMel => dolby_vision::rpu::ConversionMode::ToMel,
             DvMode::To81 => dolby_vision::rpu::ConversionMode::To81,
             DvMode::To81MappingPreserved => dolby_vision::rpu::ConversionMode::To81MappingPreserved,
-            DvMode::To84 => dolby_vision::rpu::ConversionMode::To84,
         }
     }
 }
@@ -414,18 +412,6 @@ pub fn generate_profile81_rpu() -> Result<Vec<u8>, String> {
         .map_err(|e| format!("Failed to write RPU: {e}"))
 }
 
-/// Generate a default Dolby Vision profile 8.4 RPU.
-pub fn generate_profile84_rpu() -> Result<Vec<u8>, String> {
-    use dolby_vision::rpu::dovi_rpu::DoviRpu;
-    use dolby_vision::rpu::generate::GenerateConfig;
-
-    let config = GenerateConfig::default();
-    let rpu = DoviRpu::profile84_config(&config)
-        .map_err(|e| format!("Failed to generate profile 8.4 RPU: {e}"))?;
-    rpu.write_rpu()
-        .map_err(|e| format!("Failed to write RPU: {e}"))
-}
-
 pub const DOLBY_VISION_FIXTURE_FRAMES: usize = 6;
 
 const FIXTURE_SOURCE_FILTER: &str = "color=c=gray:s=320x180:r=25";
@@ -439,7 +425,6 @@ const LAST_VIDEO_CODING_NAL_TYPE: u8 = 21;
 pub enum DolbyVisionFixtureProfile {
     Profile5,
     Profile81,
-    Profile84,
 }
 
 impl From<DolbyVisionFixtureProfile> for dolby_vision::rpu::generate::GenerateProfile {
@@ -448,7 +433,6 @@ impl From<DolbyVisionFixtureProfile> for dolby_vision::rpu::generate::GeneratePr
         match profile {
             DolbyVisionFixtureProfile::Profile5 => GenerateProfile::Profile5,
             DolbyVisionFixtureProfile::Profile81 => GenerateProfile::Profile81,
-            DolbyVisionFixtureProfile::Profile84 => GenerateProfile::Profile84,
         }
     }
 }
@@ -1021,14 +1005,6 @@ const REC709_BASE_LAYER: BaseLayerSignalling = BaseLayerSignalling {
     full_range: false,
 };
 
-// cross-compatibility ID 4, HLG signalled as preferred_transfer_function 18
-const HLG_BASE_LAYER: BaseLayerSignalling = BaseLayerSignalling {
-    transfer_characteristics: 18,
-    colour_primaries: 9,
-    matrix_coefficients: 9,
-    full_range: false,
-};
-
 // what table 1 allows a profile's base layer to carry, empty for a profile it
 // does not list
 pub fn allowed_base_layer_signalling(profile: u8) -> &'static [BaseLayerSignalling] {
@@ -1036,7 +1012,7 @@ pub fn allowed_base_layer_signalling(profile: u8) -> &'static [BaseLayerSignalli
         4 => &[REC709_BASE_LAYER],
         5 => &[IPT_BASE_LAYER],
         7 => &[HDR10_BASE_LAYER],
-        8 => &[HDR10_BASE_LAYER, REC709_BASE_LAYER, HLG_BASE_LAYER],
+        8 => &[HDR10_BASE_LAYER, REC709_BASE_LAYER],
         9 => &[REC709_BASE_LAYER],
         _ => &[],
     }
@@ -1132,6 +1108,10 @@ mod tests {
         assert!(!allowed_base_layer_signalling(5).contains(&HDR10_BASE_LAYER));
         assert_eq!(allowed_base_layer_signalling(5), &[IPT_BASE_LAYER]);
         assert!(allowed_base_layer_signalling(6).is_empty());
+        assert_eq!(
+            allowed_base_layer_signalling(8),
+            &[HDR10_BASE_LAYER, REC709_BASE_LAYER]
+        );
     }
 
     /// The variants used to be named for dovi_tool's mode numbers and two of
@@ -1147,7 +1127,6 @@ mod tests {
                 DvMode::To81MappingPreserved,
                 ConversionMode::To81MappingPreserved,
             ),
-            (DvMode::To84, ConversionMode::To84),
         ] {
             assert_eq!(ConversionMode::from(mode), expected, "{mode:?}");
         }

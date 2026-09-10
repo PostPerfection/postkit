@@ -6,6 +6,7 @@
 //! and what the whole thing is called, so resolution goes ASSETMAP → CPL →
 //! picture track files and mpv gets them as one EDL timeline.
 
+use crate::cpl_xml::read_prefixed_tag;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -153,7 +154,7 @@ fn main_picture_references(cpl: &str) -> Vec<PictureReference> {
 /// first and the track files are read inside each one. A resource without its
 /// own EditRate plays at the composition's.
 fn image_resource_references(cpl: &str) -> Vec<PictureReference> {
-    let composition_rate = element_text(cpl, "EditRate")
+    let composition_rate = read_prefixed_tag(cpl, "EditRate")
         .as_deref()
         .and_then(seconds_per_edit_unit);
     element_blocks(cpl, "MainImageSequence")
@@ -186,7 +187,7 @@ fn segment_trim(
     if entry_point == 0 && !plays_part_of_the_file {
         return None;
     }
-    let seconds_per_unit = element_text(block, "EditRate")
+    let seconds_per_unit = read_prefixed_tag(block, "EditRate")
         .as_deref()
         .and_then(seconds_per_edit_unit)
         .or(fallback_seconds_per_unit)?;
@@ -199,8 +200,8 @@ fn segment_trim(
 /// The title the CPL states: a DCP's ContentTitleText, else an IMF's
 /// ContentTitle.
 fn composition_title(cpl: &str) -> Option<String> {
-    let stated =
-        element_text(cpl, "ContentTitleText").or_else(|| element_text(cpl, "ContentTitle"))?;
+    let stated = read_prefixed_tag(cpl, "ContentTitleText")
+        .or_else(|| read_prefixed_tag(cpl, "ContentTitle"))?;
     let title = match quick_xml::escape::unescape(&stated) {
         Ok(unescaped) => unescaped.into_owned(),
         Err(_) => stated,
@@ -234,15 +235,8 @@ fn element_blocks<'text>(xml: &'text str, name: &str) -> Vec<&'text str> {
         .collect()
 }
 
-/// The text of the first `name` element in `block`.
-fn element_text(block: &str, name: &str) -> Option<String> {
-    let pattern = format!(r"<(?:\w+:)?{name}>([^<]*)");
-    let found = regex::Regex::new(&pattern).ok()?.captures(block)?;
-    Some(found[1].trim().to_string())
-}
-
 fn element_u64(block: &str, name: &str) -> Option<u64> {
-    element_text(block, name)?.parse().ok()
+    read_prefixed_tag(block, name)?.parse().ok()
 }
 
 /// The bare lowercased uuid in the first `name` element of `block`.

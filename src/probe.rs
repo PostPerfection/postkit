@@ -19,6 +19,12 @@ pub struct VideoInfo {
     pub color_space: String,
     /// ffprobe's `color_range`, "pc" for full range and "tv" for studio range.
     pub color_range: String,
+    #[serde(default = "untagged")]
+    pub color_transfer: String,
+    #[serde(default = "untagged")]
+    pub color_primaries: String,
+    #[serde(default)]
+    pub bit_rate: Option<u64>,
 }
 
 impl VideoInfo {
@@ -27,12 +33,18 @@ impl VideoInfo {
             pix_fmt: self.pix_fmt.clone(),
             color_space: self.color_space.clone(),
             color_range: self.color_range.clone(),
+            color_transfer: self.color_transfer.clone(),
+            color_primaries: self.color_primaries.clone(),
         }
     }
 }
 
 /// What ffprobe prints for a field the stream carries no tag for.
 const UNTAGGED: &str = "unknown";
+
+fn untagged() -> String {
+    UNTAGGED.to_string()
+}
 
 /// The pixel format and colour tags of a video stream, spelled the way ffprobe
 /// prints them.
@@ -41,14 +53,20 @@ pub struct PixelFormatInfo {
     pub pix_fmt: String,
     pub color_space: String,
     pub color_range: String,
+    #[serde(default = "untagged")]
+    pub color_transfer: String,
+    #[serde(default = "untagged")]
+    pub color_primaries: String,
 }
 
 impl Default for PixelFormatInfo {
     fn default() -> Self {
         Self {
-            pix_fmt: UNTAGGED.to_string(),
-            color_space: UNTAGGED.to_string(),
-            color_range: UNTAGGED.to_string(),
+            pix_fmt: untagged(),
+            color_space: untagged(),
+            color_range: untagged(),
+            color_transfer: untagged(),
+            color_primaries: untagged(),
         }
     }
 }
@@ -64,7 +82,7 @@ pub fn probe_pixel_format(path: &Path) -> PixelFormatInfo {
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=pix_fmt,color_space,color_range",
+            "stream=pix_fmt,color_space,color_range,color_transfer,color_primaries",
             "-of",
             "default=noprint_wrappers=1",
         ])
@@ -86,6 +104,8 @@ pub fn probe_pixel_format(path: &Path) -> PixelFormatInfo {
             "pix_fmt" => &mut info.pix_fmt,
             "color_space" => &mut info.color_space,
             "color_range" => &mut info.color_range,
+            "color_transfer" => &mut info.color_transfer,
+            "color_primaries" => &mut info.color_primaries,
             _ => continue,
         };
         *field = value.trim().to_string();
@@ -160,6 +180,9 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
         pix_fmt: pixel_format.pix_fmt,
         color_space: pixel_format.color_space,
         color_range: pixel_format.color_range,
+        color_transfer: pixel_format.color_transfer,
+        color_primaries: pixel_format.color_primaries,
+        bit_rate: ffprobe_video_field(path, "bit_rate", &[]).and_then(|value| value.parse().ok()),
     })
 }
 

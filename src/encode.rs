@@ -2480,6 +2480,7 @@ mod tests {
             pix_fmt: pix_fmt.to_string(),
             color_space: "bt2020nc".to_string(),
             color_range: color_range.to_string(),
+            ..Default::default()
         }
     }
 
@@ -2750,6 +2751,7 @@ mod tests {
             pix_fmt: "yuv422p10le".to_string(),
             color_space: "bt2020nc".to_string(),
             color_range: "pc".to_string(),
+            ..Default::default()
         };
         let chosen = choose_pipe_format(
             &PipeFormatInputs {
