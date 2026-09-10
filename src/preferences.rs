@@ -76,10 +76,14 @@ pub fn json_insert_if_missing(json: &str, key: &str, value: &str) -> String {
 
 /// Get the platform-specific config directory for an app.
 ///
-/// - Linux: `$XDG_CONFIG_HOME/<app>` or `~/.config/<app>`
+/// - `$XDG_CONFIG_HOME/<app>` on every platform when the variable is set
+/// - Linux: `~/.config/<app>`
 /// - macOS: `~/Library/Application Support/<app>`
 /// - Windows: `%APPDATA%/<app>`
 pub fn config_dir(app_name: &str) -> PathBuf {
+    if let Some(xdg_config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return PathBuf::from(xdg_config_home).join(app_name);
+    }
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(app_name)
@@ -242,6 +246,19 @@ mod tests {
     fn config_dir_nonempty() {
         let dir = config_dir("postkit-test");
         assert!(dir.to_string_lossy().contains("postkit-test"));
+    }
+
+    #[test]
+    fn config_dir_follows_xdg_config_home_on_every_platform() {
+        let home = tempfile::TempDir::new().unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", home.path()) };
+        let dir = config_dir("postkit-test");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("XDG_CONFIG_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CONFIG_HOME") },
+        }
+        assert_eq!(dir, home.path().join("postkit-test"));
     }
 
     #[test]
