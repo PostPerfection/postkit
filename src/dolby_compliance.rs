@@ -27,7 +27,10 @@ fn signalling_name(signalling: BaseLayerSignalling) -> String {
 
 // an App 2E descriptor names its colour by UL, so the VUI code points come back
 // from the pair the descriptor resolved to
-fn signalling_of(transfer: DisplayTransfer, primaries: DisplayPrimaries) -> Option<BaseLayerSignalling> {
+fn signalling_of(
+    transfer: DisplayTransfer,
+    primaries: DisplayPrimaries,
+) -> Option<BaseLayerSignalling> {
     let signalling = match (transfer, primaries) {
         (DisplayTransfer::Pq, DisplayPrimaries::Bt2020) => BaseLayerSignalling {
             transfer_characteristics: 16,
@@ -114,7 +117,9 @@ pub fn check_package(package: &Path) -> DolbyVisionCompliance {
     let colour = match resolve_picture_colour(&resolved) {
         Ok(colour) => colour,
         Err(e) => {
-            result.errors.push(format!("unreadable picture colour: {e}"));
+            result
+                .errors
+                .push(format!("unreadable picture colour: {e}"));
             return result;
         }
     };
@@ -250,7 +255,12 @@ pub fn check_master(master: &Path) -> DolbyVisionCompliance {
         return result;
     };
 
-    level_finding(probed.width, probed.height, probed.frames_per_second, &mut result);
+    level_finding(
+        probed.width,
+        probed.height,
+        probed.frames_per_second,
+        &mut result,
+    );
     if let (Some(level), Some(megabits_per_second)) = (
         dolby_vision_level_for(probed.width, probed.height, probed.frames_per_second),
         probed.megabits_per_second,
@@ -361,7 +371,11 @@ fn parse_frame_rate(rate: &str) -> f64 {
     let (numerator, denominator) = rate.split_once('/').unwrap_or((rate, "1"));
     let numerator: f64 = numerator.parse().unwrap_or(0.0);
     let denominator: f64 = denominator.parse().unwrap_or(0.0);
-    if denominator == 0.0 { 0.0 } else { numerator / denominator }
+    if denominator == 0.0 {
+        0.0
+    } else {
+        numerator / denominator
+    }
 }
 
 // H.265 VUI code points, 2 is the unspecified both ffprobe and table 1 use
@@ -396,8 +410,8 @@ mod tests {
 
     #[test]
     fn a_pq_bt2020_picture_is_the_hdr10_base_layer_table_1_names() {
-        let signalling = signalling_of(DisplayTransfer::Pq, DisplayPrimaries::Bt2020)
-            .expect("a table 1 row");
+        let signalling =
+            signalling_of(DisplayTransfer::Pq, DisplayPrimaries::Bt2020).expect("a table 1 row");
         assert_eq!(signalling_name(signalling), "16,9,9,0");
         assert!(allowed_base_layer_signalling(8).contains(&signalling));
     }

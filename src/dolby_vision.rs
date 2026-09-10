@@ -319,9 +319,7 @@ impl From<DvMode> for dolby_vision::rpu::ConversionMode {
             DvMode::Lossless => dolby_vision::rpu::ConversionMode::Lossless,
             DvMode::ToMel => dolby_vision::rpu::ConversionMode::ToMel,
             DvMode::To81 => dolby_vision::rpu::ConversionMode::To81,
-            DvMode::To81MappingPreserved => {
-                dolby_vision::rpu::ConversionMode::To81MappingPreserved
-            }
+            DvMode::To81MappingPreserved => dolby_vision::rpu::ConversionMode::To81MappingPreserved,
             DvMode::To84 => dolby_vision::rpu::ConversionMode::To84,
         }
     }
