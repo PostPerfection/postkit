@@ -3096,6 +3096,7 @@ mod tests {
         // well past the queue capacity plus one frame per encoder thread
         const CANCEL_AT_FRAME: u64 = 200;
         const RETURN_WITHIN: std::time::Duration = std::time::Duration::from_secs(60);
+        const STALL: std::time::Duration = std::time::Duration::from_millis(500);
         const FRAME_BYTES: usize = 2048 * 1080 * 6;
         let dir = tempfile::tempdir().unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -3115,9 +3116,6 @@ mod tests {
                 &phase_clocks,
                 || {
                     let index = pipeline_produced.fetch_add(1, Ordering::Relaxed);
-                    if index == CANCEL_AT_FRAME {
-                        pipeline_cancel.store(true, Ordering::Relaxed);
-                    }
                     Some(RawFrame::Packed {
                         data: vec![0u8; FRAME_BYTES],
                         order: SampleOrder::Big,
@@ -3131,6 +3129,29 @@ mod tests {
             );
             let _ = done_tx.send(result);
         });
+        // The producer cannot set cancel itself: once the queue is full it is
+        // blocked in push and the callback does not run.
+        let started = std::time::Instant::now();
+        let mut last = 0u64;
+        let mut last_change = started;
+        loop {
+            let n = produced.load(Ordering::Relaxed);
+            if n >= CANCEL_AT_FRAME {
+                break;
+            }
+            if n != last {
+                last = n;
+                last_change = std::time::Instant::now();
+            } else if n >= 4 && last_change.elapsed() >= STALL {
+                break;
+            }
+            assert!(
+                started.elapsed() < RETURN_WITHIN / 2,
+                "the producer never handed over a frame"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cancel.store(true, Ordering::Relaxed);
         let result = done_rx
             .recv_timeout(RETURN_WITHIN)
             .expect("the pipeline never returned after the cancel");
