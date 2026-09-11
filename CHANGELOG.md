@@ -3,9 +3,10 @@
 ## Unreleased
 
 ### Changed
-- **Grok preview GL no longer copies the decoded frame into a texture store on macOS**: when the context has `GL_APPLE_client_storage`, the presenter keeps the composed `Arc` and `glTexImage2D` uses that buffer as the texture. The shader still samples it into the host framebuffer so letterbox and `flip_y` stay the same. Other GL drivers keep the previous upload copy.
+- **Grok preview GL no longer copies the decoded frame into a texture store on macOS**: when the context has `GL_APPLE_client_storage`, the presenter keeps the composed `Arc` and `glTexImage2D` uses that buffer as the texture. That only applies when decode and the window share a GPU (Apple UMA). A discrete encode GPU with an iGPU display still copies through the host. Letterbox and `flip_y` still go through the shader. Other GL drivers keep the previous upload copy.
 
 ### Fixed
+- **Windows grok_player tests no longer AV on WASAPI**: every `GrokPlayer` opened the default output device in `new()`, and GitHub's Windows runner has no usable device, so `tests/grok_player.rs` died with `STATUS_ACCESS_VIOLATION` after the first case. The stream is opened on the first Load that has MainSound reels, and a panic from cpal is treated as no device.
 - **Grok preview plays the composition's MainSound**: the player took JPEG 2000 picture only, so a DCP with a sound MXF was silent while the picture ran. Load now resolves MainSound the same way it resolves MainPicture, reads the PCM with asdcplib, downmixes 5.1 to stereo (centre and surrounds at 0.707), and plays it on the picture clock. A missing device or a failed stream leaves the picture running.
 - **`create_dcdm` escapes the LUT path for the filter graph**: a Windows drive colon ended the `lut3d` option, so `dcdm --lut` failed on every Windows path. The same `filter_option_path` the colour conversion uses now writes it.
 

@@ -155,8 +155,8 @@ pub(crate) struct GlPresenter {
     uploaded_serial: u64,
     picture_uniform: i32,
     flip_y_uniform: i32,
-    // GL_APPLE_client_storage: the texture is the decoded buffer, so the Arc
-    // has to outlive the draw that samples it
+    // GL_APPLE_client_storage only: same GPU as the GL context. A 3060 decode
+    // with an iGPU window still copies through the host (no Apple extension).
     client_storage: bool,
     backing: Option<Arc<ComposedFrame>>,
 }

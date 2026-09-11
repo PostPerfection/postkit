@@ -48,7 +48,6 @@ struct Shared {
 pub(super) struct Output {
     commands: Sender<Command>,
     feeder: Mutex<Option<JoinHandle<()>>>,
-    _stream: Mutex<Option<Stream>>,
 }
 
 impl Output {
@@ -59,7 +58,9 @@ impl Output {
             sample_rate: AtomicU32::new(48_000),
             buffer: Mutex::new(VecDeque::new()),
         });
-        let stream = start_stream(Arc::clone(&shared));
+        // open the device on the first Load that has reels. picture-only
+        // players (and Windows CI, which has no usable WASAPI device) never
+        // touch the host; opening it from every GrokPlayer::new AVs there.
         let feeder = {
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || feed(shared, incoming))
@@ -67,7 +68,6 @@ impl Output {
         Output {
             commands,
             feeder: Mutex::new(Some(feeder)),
-            _stream: Mutex::new(stream),
         }
     }
 
@@ -143,6 +143,12 @@ fn trim_in_frames(trim: Option<&SegmentTrim>, fps: f64) -> (u32, u64) {
 }
 
 fn start_stream(shared: Arc<Shared>) -> Option<Stream> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| try_start_stream(shared)))
+        .ok()
+        .flatten()
+}
+
+fn try_start_stream(shared: Arc<Shared>) -> Option<Stream> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
     let supported = device.default_output_config().ok()?;
@@ -220,6 +226,7 @@ struct Feeder {
     channels: u16,
     bits: u16,
     bytes_per_edit_unit: usize,
+    stream: Option<Stream>,
 }
 
 struct AudioLayout {
@@ -238,6 +245,7 @@ fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
         channels: 0,
         bits: 0,
         bytes_per_edit_unit: 0,
+        stream: None,
     };
     loop {
         if feeder.shared.playing.load(Ordering::Acquire) {
@@ -280,6 +288,9 @@ impl Feeder {
         }
         self.reels = reels;
         self.next_frame = 0;
+        if self.stream.is_none() && !self.reels.is_empty() {
+            self.stream = start_stream(Arc::clone(&self.shared));
+        }
     }
 
     fn seek(&mut self, frame: u64) {
