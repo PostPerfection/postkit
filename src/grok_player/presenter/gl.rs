@@ -1,4 +1,5 @@
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::{ComposedFrame, GetProcAddressFn, RGBA_BYTES_PER_PIXEL};
@@ -27,6 +28,12 @@ const GL_COMPILE_STATUS: u32 = 0x8B81;
 const GL_LINK_STATUS: u32 = 0x8B82;
 const GL_TEXTURE0: u32 = 0x84C0;
 const GL_FALSE: u8 = 0;
+const GL_TRUE: i32 = 1;
+const GL_EXTENSIONS: u32 = 0x1F03;
+const GL_NUM_EXTENSIONS: u32 = 0x821D;
+const GL_UNPACK_CLIENT_STORAGE_APPLE: u32 = 0x85B2;
+const GL_TEXTURE_STORAGE_HINT_APPLE: u32 = 0x85BC;
+const GL_STORAGE_SHARED_APPLE: i32 = 0x85BF;
 
 const INFO_LOG_BYTES: i32 = 1024;
 const QUAD_VERTICES: i32 = 4;
@@ -96,6 +103,8 @@ type GlClearColor = unsafe extern "C" fn(f32, f32, f32, f32);
 type GlClear = unsafe extern "C" fn(u32);
 type GlDrawArrays = unsafe extern "C" fn(u32, i32, i32);
 type GlActiveTexture = unsafe extern "C" fn(u32);
+type GlGetIntegerv = unsafe extern "C" fn(u32, *mut i32);
+type GlGetStringi = unsafe extern "C" fn(u32, u32) -> *const u8;
 
 struct Entries {
     gen_textures: GlGenTextures,
@@ -131,6 +140,8 @@ struct Entries {
     clear: GlClear,
     draw_arrays: GlDrawArrays,
     active_texture: GlActiveTexture,
+    get_integerv: GlGetIntegerv,
+    get_stringi: GlGetStringi,
 }
 
 // every method must run on the thread whose gl context built it
@@ -144,6 +155,10 @@ pub(crate) struct GlPresenter {
     uploaded_serial: u64,
     picture_uniform: i32,
     flip_y_uniform: i32,
+    // GL_APPLE_client_storage: the texture is the decoded buffer, so the Arc
+    // has to outlive the draw that samples it
+    client_storage: bool,
+    backing: Option<Arc<ComposedFrame>>,
 }
 
 // fails by name rather than leaving a null that draws nothing
@@ -198,6 +213,8 @@ impl GlPresenter {
                 clear: entry(loader, context, "glClear")?,
                 draw_arrays: entry(loader, context, "glDrawArrays")?,
                 active_texture: entry(loader, context, "glActiveTexture")?,
+                get_integerv: entry(loader, context, "glGetIntegerv")?,
+                get_stringi: entry(loader, context, "glGetStringi")?,
             }
         };
 
@@ -214,6 +231,7 @@ impl GlPresenter {
         let mut vertex_array = 0u32;
         let mut vertex_buffer = 0u32;
         let mut texture = 0u32;
+        let client_storage;
         unsafe {
             (entries.gen_vertex_arrays)(1, &mut vertex_array);
             (entries.bind_vertex_array)(vertex_array);
@@ -252,7 +270,21 @@ impl GlPresenter {
             (entries.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             (entries.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             (entries.tex_parameteri)(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            client_storage = has_extension(&entries, b"GL_APPLE_client_storage");
+            if client_storage {
+                (entries.tex_parameteri)(
+                    GL_TEXTURE_2D,
+                    GL_TEXTURE_STORAGE_HINT_APPLE,
+                    GL_STORAGE_SHARED_APPLE,
+                );
+                (entries.pixel_storei)(GL_UNPACK_CLIENT_STORAGE_APPLE, GL_TRUE);
+            }
             (entries.bind_texture)(GL_TEXTURE_2D, 0);
+        }
+        if client_storage {
+            tracing::info!(
+                "grok preview: GL_APPLE_client_storage, decoded frames stay in client memory"
+            );
         }
 
         Ok(GlPresenter {
@@ -264,6 +296,8 @@ impl GlPresenter {
             uploaded_serial: 0,
             picture_uniform,
             flip_y_uniform,
+            client_storage,
+            backing: None,
         })
     }
 
@@ -274,7 +308,7 @@ impl GlPresenter {
         width: i32,
         height: i32,
         flip_y: bool,
-        frame: Option<&ComposedFrame>,
+        frame: Option<Arc<ComposedFrame>>,
         serial: u64,
     ) -> Result<Option<Duration>, String> {
         unsafe {
@@ -318,29 +352,20 @@ impl GlPresenter {
         Ok(uploaded)
     }
 
-    fn upload(&mut self, frame: &ComposedFrame, serial: u64) -> Option<Duration> {
+    fn upload(&mut self, frame: Arc<ComposedFrame>, serial: u64) -> Option<Duration> {
         let size = (frame.width, frame.height);
         if serial == self.uploaded_serial && size == self.texture_size {
             return None;
         }
         let started = Instant::now();
+        let pixels = frame.data().as_ptr() as *const c_void;
         let entries = &self.entries;
         unsafe {
             (entries.bind_texture)(GL_TEXTURE_2D, self.texture);
             (entries.pixel_storei)(GL_UNPACK_ALIGNMENT, RGBA_BYTES_PER_PIXEL as i32);
-            if size == self.texture_size {
-                (entries.tex_sub_image_2d)(
-                    GL_TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    frame.width as i32,
-                    frame.height as i32,
-                    GL_RGBA,
-                    GL_UNSIGNED_BYTE,
-                    frame.data().as_ptr() as *const c_void,
-                );
-            } else {
+            // client storage: TexImage2D keeps this pointer as the store, no copy.
+            // otherwise SubImage copies into the existing allocation when the size matches.
+            if self.client_storage || size != self.texture_size {
                 (entries.tex_image_2d)(
                     GL_TEXTURE_2D,
                     0,
@@ -350,14 +375,43 @@ impl GlPresenter {
                     0,
                     GL_RGBA,
                     GL_UNSIGNED_BYTE,
-                    frame.data().as_ptr() as *const c_void,
+                    pixels,
+                );
+            } else {
+                (entries.tex_sub_image_2d)(
+                    GL_TEXTURE_2D,
+                    0,
+                    0,
+                    0,
+                    frame.width as i32,
+                    frame.height as i32,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    pixels,
                 );
             }
         }
         self.texture_size = size;
         self.uploaded_serial = serial;
+        self.backing = Some(frame);
         Some(started.elapsed())
     }
+}
+
+fn has_extension(entries: &Entries, name: &[u8]) -> bool {
+    let mut count = 0i32;
+    unsafe { (entries.get_integerv)(GL_NUM_EXTENSIONS, &mut count) };
+    for index in 0..count.max(0) as u32 {
+        let pointer = unsafe { (entries.get_stringi)(GL_EXTENSIONS, index) };
+        if pointer.is_null() {
+            continue;
+        }
+        let extension = unsafe { CStr::from_ptr(pointer as *const c_char) };
+        if extension.to_bytes() == name {
+            return true;
+        }
+    }
+    false
 }
 
 fn link_program(entries: &Entries) -> Result<u32, String> {

@@ -327,8 +327,7 @@ impl GrokPlayer {
         let frame = self.shared.current_frame();
         let serial = self.shared.serial.load(Ordering::Acquire);
         let started = Instant::now();
-        let upload =
-            presenter.draw(framebuffer, width, height, flip_y, frame.as_deref(), serial)?;
+        let upload = presenter.draw(framebuffer, width, height, flip_y, frame, serial)?;
         if let Some(upload) = upload {
             record_render_timing(upload, started.elapsed());
         }

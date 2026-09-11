@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Changed
+- **Grok preview GL no longer copies the decoded frame into a texture store on macOS**: when the context has `GL_APPLE_client_storage`, the presenter keeps the composed `Arc` and `glTexImage2D` uses that buffer as the texture. The shader still samples it into the host framebuffer so letterbox and `flip_y` stay the same. Other GL drivers keep the previous upload copy.
+
 ### Fixed
 - **Grok preview plays the composition's MainSound**: the player took JPEG 2000 picture only, so a DCP with a sound MXF was silent while the picture ran. Load now resolves MainSound the same way it resolves MainPicture, reads the PCM with asdcplib, downmixes 5.1 to stereo (centre and surrounds at 0.707), and plays it on the picture clock. A missing device or a failed stream leaves the picture running.
 - **`create_dcdm` escapes the LUT path for the filter graph**: a Windows drive colon ended the `lut3d` option, so `dcdm --lut` failed on every Windows path. The same `filter_option_path` the colour conversion uses now writes it.
