@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::composition_timeline;
+use crate::composition_timeline::{self, SoundSegment};
 use crate::preview::{self, PictureReader, ResolvedPicture};
 use crate::preview_colour::PictureColour;
 
@@ -42,6 +42,7 @@ pub(super) struct Timeline {
     pub width: u32,
     pub height: u32,
     pub title: String,
+    pub sound: Vec<SoundSegment>,
 }
 
 impl Timeline {
@@ -49,7 +50,8 @@ impl Timeline {
         if source.is_dir() {
             if crate::assetmap::find(source).is_some() {
                 let (segments, title) = composition_timeline::read_composition(source);
-                return Self::from_composition(source, segments, title);
+                let sound = composition_timeline::read_sound(source);
+                return Self::from_composition(source, segments, title, sound);
             }
             return Self::from_codestream_directory(source);
         }
@@ -57,7 +59,7 @@ impl Timeline {
             return Err(format!("{} is not a file or a directory", source.display()));
         }
         match extension(source).as_deref() {
-            Some(MXF_EXTENSION) => Self::from_composition(source, Vec::new(), None),
+            Some(MXF_EXTENSION) => Self::from_composition(source, Vec::new(), None, Vec::new()),
             Some(CPL_EXTENSION) => {
                 let (segments, title) = composition_timeline::read_composition_from_cpl(source);
                 if segments.is_empty() {
@@ -66,7 +68,8 @@ impl Timeline {
                         source.display()
                     ));
                 }
-                Self::from_composition(source, segments, title)
+                let sound = composition_timeline::read_sound_from_cpl(source);
+                Self::from_composition(source, segments, title, sound)
             }
             _ => Err(format!(
                 "{} is neither a JPEG 2000 MXF, a CPL, nor a directory of codestreams",
@@ -79,6 +82,7 @@ impl Timeline {
         source: &Path,
         segments: Vec<composition_timeline::PictureSegment>,
         title: Option<String>,
+        sound: Vec<SoundSegment>,
     ) -> Result<Self, String> {
         let listed: Vec<(PathBuf, Option<composition_timeline::SegmentTrim>)> =
             if segments.is_empty() {
@@ -119,6 +123,7 @@ impl Timeline {
             height,
             title: title.unwrap_or_else(|| file_name(source)),
             frames: Frames::Essence(opened),
+            sound,
         })
     }
 
@@ -147,6 +152,7 @@ impl Timeline {
             height: header.height,
             title: file_name(directory),
             frames: Frames::Codestreams { files, render },
+            sound: Vec::new(),
         })
     }
 

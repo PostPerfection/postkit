@@ -1,3 +1,4 @@
+mod audio;
 mod compositor;
 mod decode_pool;
 mod presenter;

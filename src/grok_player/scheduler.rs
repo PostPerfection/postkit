@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
+use super::audio;
 use super::compositor::{Compositor, Layers};
 use super::decode_pool::{DecodeJob, DecodePool};
 use super::timeline::Timeline;
@@ -106,6 +107,7 @@ struct Scheduler {
     presentations: VecDeque<Instant>,
     dropped_frames: u64,
     delayed_frames: u64,
+    sound: audio::Output,
 }
 
 impl Scheduler {
@@ -132,6 +134,7 @@ impl Scheduler {
             presentations: VecDeque::new(),
             dropped_frames: 0,
             delayed_frames: 0,
+            sound: audio::Output::new(),
         }
     }
 
@@ -205,6 +208,7 @@ impl Scheduler {
         self.eof = true;
         self.clock = None;
         self.presentations.clear();
+        self.sound.set_playing(false);
         self.shared.fire_update();
     }
 
@@ -362,6 +366,7 @@ impl Scheduler {
         let timeline = Timeline::open(source)?;
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
+        self.sound.load(&timeline.sound, timeline.fps);
         self.timeline = Some(timeline);
         self.current_frame = 0;
         self.needs_publish = true;
@@ -370,6 +375,7 @@ impl Scheduler {
     }
 
     fn stop(&mut self) {
+        self.sound.stop();
         self.timeline = None;
         self.last_plain = None;
         self.playing = false;
@@ -404,6 +410,7 @@ impl Scheduler {
             self.playing = false;
             self.clock = None;
             self.presentations.clear();
+            self.sound.set_playing(false);
             return;
         }
         if self.timeline.is_none() {
@@ -415,6 +422,8 @@ impl Scheduler {
         }
         self.playing = true;
         self.clock = Some(Clock::new(Instant::now(), self.current_frame, self.fps()));
+        self.sound.seek(self.current_frame);
+        self.sound.set_playing(true);
     }
 
     fn seek_to_seconds(&mut self, seconds: f64) {
@@ -433,6 +442,7 @@ impl Scheduler {
         self.current_frame = frame.min(frame_count - 1);
         self.eof = false;
         self.presentations.clear();
+        self.sound.seek(self.current_frame);
         self.restart_decoding();
     }
 

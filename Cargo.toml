@@ -11,6 +11,7 @@ ar-reshaper = "1.5"
 asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "03834857a3995be25c884be6e8486a98c7032447" }
 base64 = "0.22"
 chrono = "0.4"
+cpal = { version = "0.15", optional = true }
 cosmic-text = { version = "0.17", default-features = false, features = ["std", "swash"] }
 dirs = "6"
 dolby_vision = { version = "3.4", features = ["xml"] }
@@ -55,7 +56,7 @@ pkg-config = "0.3"
 [features]
 default = []
 async = ["dep:tokio"]
-grok-ffi = ["dep:grokj2k-sys"]
+grok-ffi = ["dep:grokj2k-sys", "dep:cpal"]
 grok-gpu = ["grok-ffi"]
 icc = ["dep:lcms2"]
 libmpv = []

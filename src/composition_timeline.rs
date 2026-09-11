@@ -25,6 +25,14 @@ pub struct PictureSegment {
     pub trim: Option<SegmentTrim>,
 }
 
+/// A MainSound track file as the composition plays it, same span rules as
+/// picture so the two stay on one clock.
+#[derive(Debug, PartialEq)]
+pub struct SoundSegment {
+    pub path: PathBuf,
+    pub trim: Option<SegmentTrim>,
+}
+
 /// Seconds into the file and seconds of it. Length is None when the CPL states
 /// an entry point without a duration.
 #[derive(Debug, PartialEq)]
@@ -84,24 +92,66 @@ pub fn read_composition_from_cpl(cpl_path: &Path) -> (Vec<PictureSegment>, Optio
     )
 }
 
+/// Every MainSound track file the composition names, in reel order. Empty when
+/// the package has no sound, which is a valid composition.
+pub fn read_sound(package_dir: &Path) -> Vec<SoundSegment> {
+    let Some(assets) = package_assets(package_dir) else {
+        return Vec::new();
+    };
+    let Some(cpl) = first_cpl(package_dir, &assets) else {
+        return Vec::new();
+    };
+    sound_segments_of(package_dir, &assets, &cpl)
+}
+
+pub fn read_sound_from_cpl(cpl_path: &Path) -> Vec<SoundSegment> {
+    let package_dir = cpl_path.parent().unwrap_or(Path::new("."));
+    let Some(assets) = package_assets(package_dir) else {
+        return Vec::new();
+    };
+    let Ok(cpl) = std::fs::read_to_string(cpl_path) else {
+        return Vec::new();
+    };
+    sound_segments_of(package_dir, &assets, &cpl)
+}
+
 fn package_assets(package_dir: &Path) -> Option<Vec<(String, String)>> {
     let assetmap = crate::assetmap::find(package_dir)?;
     Some(crate::assetmap::parse_ordered(&assetmap))
 }
 
 fn segments_of(package_dir: &Path, assets: &[(String, String)], cpl: &str) -> Vec<PictureSegment> {
+    resolve_segments(package_dir, assets, picture_references(cpl))
+        .into_iter()
+        .map(|(path, trim)| PictureSegment { path, trim })
+        .collect()
+}
+
+fn sound_segments_of(
+    package_dir: &Path,
+    assets: &[(String, String)],
+    cpl: &str,
+) -> Vec<SoundSegment> {
+    resolve_segments(package_dir, assets, reel_asset_references(cpl, "MainSound"))
+        .into_iter()
+        .map(|(path, trim)| SoundSegment { path, trim })
+        .collect()
+}
+
+fn resolve_segments(
+    package_dir: &Path,
+    assets: &[(String, String)],
+    references: Vec<PictureReference>,
+) -> Vec<(PathBuf, Option<SegmentTrim>)> {
     let path_by_id: HashMap<&str, &str> = assets
         .iter()
         .map(|(id, relative)| (id.as_str(), relative.as_str()))
         .collect();
-    picture_references(cpl)
+    references
         .into_iter()
-        .filter_map(|picture| {
-            let relative = path_by_id.get(picture.asset_id.as_str())?;
-            Some(PictureSegment {
-                path: package_dir.join(relative),
-                trim: picture.trim,
-            })
+        .filter_map(|asset| {
+            let relative = path_by_id.get(asset.asset_id.as_str())?;
+            Some((package_dir.join(relative), asset.trim))
         })
         .collect()
 }
@@ -136,7 +186,12 @@ fn picture_references(cpl: &str) -> Vec<PictureReference> {
 
 /// One MainPicture per reel, so a single forward scan gives reel order.
 fn main_picture_references(cpl: &str) -> Vec<PictureReference> {
-    element_blocks(cpl, "MainPicture")
+    reel_asset_references(cpl, "MainPicture")
+}
+
+/// One named reel asset per reel (MainPicture, MainSound), in reel order.
+fn reel_asset_references(cpl: &str, name: &str) -> Vec<PictureReference> {
+    element_blocks(cpl, name)
         .into_iter()
         .filter_map(|block| {
             Some(PictureReference {
@@ -338,6 +393,25 @@ mod tests {
         )
     }
 
+    fn dcp_cpl_with_sound(reels: &[(&str, &str)]) -> String {
+        let reels: String = reels
+            .iter()
+            .map(|(picture, sound)| {
+                format!(
+                    "<Reel><AssetList>\
+                     <MainPicture><Id>urn:uuid:{picture}</Id><Duration>48</Duration></MainPicture>\
+                     <MainSound><Id>urn:uuid:{sound}</Id><Duration>48</Duration></MainSound>\
+                     </AssetList></Reel>"
+                )
+            })
+            .collect();
+        format!(
+            "<?xml version=\"1.0\"?>\n<CompositionPlaylist xmlns=\"x\">\
+             <Id>urn:uuid:cc10cc10-0000-0000-0000-000000000000</Id>\
+             <ReelList>{reels}</ReelList></CompositionPlaylist>"
+        )
+    }
+
     fn imf_cpl(track_file_ids: &[&str]) -> String {
         let resources: String = track_file_ids
             .iter()
@@ -418,6 +492,42 @@ mod tests {
             source_uri(dir.path()),
             Some(dir.path().join("only.mxf").to_string_lossy().into_owned())
         );
+    }
+
+    #[test]
+    fn a_package_resolves_main_sound_beside_picture() {
+        const SOUND: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let dir = tempfile::tempdir().unwrap();
+        write_assetmap(
+            dir.path(),
+            "CPL_a.xml",
+            &[(REEL_UUIDS[0], "picture.mxf"), (SOUND, "sound.mxf")],
+        );
+        std::fs::write(
+            dir.path().join("CPL_a.xml"),
+            dcp_cpl_with_sound(&[(REEL_UUIDS[0], SOUND)]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            picture_files(dir.path()),
+            vec![dir.path().join("picture.mxf")]
+        );
+        assert_eq!(
+            read_sound(dir.path())
+                .into_iter()
+                .map(|segment| segment.path)
+                .collect::<Vec<_>>(),
+            vec![dir.path().join("sound.mxf")]
+        );
+    }
+
+    #[test]
+    fn a_picture_only_package_has_no_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        write_assetmap(dir.path(), "CPL_a.xml", &[(REEL_UUIDS[0], "only.mxf")]);
+        std::fs::write(dir.path().join("CPL_a.xml"), dcp_cpl(&REEL_UUIDS[..1])).unwrap();
+        assert!(read_sound(dir.path()).is_empty());
     }
 
     #[test]
