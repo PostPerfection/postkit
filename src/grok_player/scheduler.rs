@@ -21,33 +21,54 @@ const SRT_EXTENSION: &str = "srt";
 const ASS_EXTENSIONS: [&str; 2] = ["ass", "ssa"];
 
 #[derive(Clone, Copy)]
+enum ClockSource {
+    WallClock(Instant),
+    SoundDevice,
+}
+
+#[derive(Clone, Copy)]
 pub(super) struct Clock {
-    start: Instant,
+    source: ClockSource,
     start_frame: u64,
     fps: f64,
 }
 
 impl Clock {
-    fn new(start: Instant, start_frame: u64, fps: f64) -> Self {
+    fn wall_clock(start: Instant, start_frame: u64, fps: f64) -> Self {
         Clock {
-            start,
+            source: ClockSource::WallClock(start),
             start_frame,
             fps,
         }
     }
 
-    fn target_frame(&self, now: Instant) -> u64 {
-        let elapsed = now.saturating_duration_since(self.start).as_secs_f64();
+    fn sound_device(start_frame: u64, fps: f64) -> Self {
+        Clock {
+            source: ClockSource::SoundDevice,
+            start_frame,
+            fps,
+        }
+    }
+
+    fn elapsed_seconds(&self, now: Instant, sound_position: Option<f64>) -> Option<f64> {
+        match self.source {
+            ClockSource::WallClock(start) => {
+                Some(now.saturating_duration_since(start).as_secs_f64())
+            }
+            ClockSource::SoundDevice => Some(sound_position? - self.start_frame as f64 / self.fps),
+        }
+    }
+
+    fn target_frame(&self, elapsed: f64) -> u64 {
         self.start_frame + (elapsed * self.fps).floor().max(0.0) as u64
     }
 
-    fn display_time(&self, frame: u64) -> Instant {
-        let ahead = frame.saturating_sub(self.start_frame) as f64 / self.fps;
-        self.start + Duration::from_secs_f64(ahead)
+    fn frame_offset_seconds(&self, frame: u64) -> f64 {
+        frame.saturating_sub(self.start_frame) as f64 / self.fps
     }
 
-    fn frame_period(&self) -> Duration {
-        Duration::from_secs_f64(1.0 / self.fps)
+    fn frame_period_seconds(&self) -> f64 {
+        1.0 / self.fps
     }
 }
 
@@ -140,6 +161,26 @@ impl Scheduler {
 
     // ─── the clock ─────────────────────────────────────────────────────────
 
+    fn new_clock(&self) -> Clock {
+        if self.sound.media_position_seconds().is_some() {
+            return Clock::sound_device(self.current_frame, self.fps());
+        }
+        Clock::wall_clock(Instant::now(), self.current_frame, self.fps())
+    }
+
+    fn clock_and_elapsed(&mut self) -> Option<(Clock, f64)> {
+        let clock = self.clock?;
+        if let Some(elapsed) =
+            clock.elapsed_seconds(Instant::now(), self.sound.media_position_seconds())
+        {
+            return Some((clock, elapsed));
+        }
+        // the sound stream stopped, so the picture carries on from here
+        let clock = Clock::wall_clock(Instant::now(), self.current_frame, self.fps());
+        self.clock = Some(clock);
+        Some((clock, 0.0))
+    }
+
     fn tick(&mut self) {
         let Some(frame_count) = self.timeline.as_ref().map(|timeline| timeline.frame_count) else {
             return;
@@ -154,7 +195,7 @@ impl Scheduler {
         if !self.playing {
             return;
         }
-        let Some(clock) = self.clock else {
+        let Some((clock, elapsed)) = self.clock_and_elapsed() else {
             return;
         };
         let next = self.current_frame + 1;
@@ -162,17 +203,16 @@ impl Scheduler {
             self.reach_end();
             return;
         }
-        let now = Instant::now();
-        if now < clock.display_time(next) {
+        if elapsed < clock.frame_offset_seconds(next) {
             return;
         }
-        let target = clock.target_frame(now).clamp(next, frame_count - 1);
+        let target = clock.target_frame(elapsed).clamp(next, frame_count - 1);
         let Some(index) = self.pool.newest_decoded_in(next, target) else {
             self.skip_over_a_failed_frame(target);
             return;
         };
         self.dropped_frames += index - next;
-        if now > clock.display_time(index) + clock.frame_period() {
+        if elapsed > clock.frame_offset_seconds(index) + clock.frame_period_seconds() {
             self.delayed_frames += 1;
         }
         let Some(plain) = self.pool.decoded(index) else {
@@ -305,13 +345,17 @@ impl Scheduler {
         let Some(clock) = self.clock else {
             return IDLE_WAIT;
         };
-        let due = clock.display_time(self.current_frame + 1);
-        let now = Instant::now();
-        if now < due {
-            return due - now;
+        let Some(elapsed) =
+            clock.elapsed_seconds(Instant::now(), self.sound.media_position_seconds())
+        else {
+            return IDLE_WAIT;
+        };
+        let ahead = clock.frame_offset_seconds(self.current_frame + 1) - elapsed;
+        if ahead > 0.0 {
+            return Duration::from_secs_f64(ahead);
         }
         // past due with nothing decoded, and a finished decode wakes this sooner
-        clock.frame_period()
+        Duration::from_secs_f64(clock.frame_period_seconds())
     }
 
     // ─── commands ──────────────────────────────────────────────────────────
@@ -401,7 +445,7 @@ impl Scheduler {
         }
         if self.playing {
             // otherwise the refill stall counts as dropped frames
-            self.clock = Some(Clock::new(Instant::now(), self.current_frame, self.fps()));
+            self.clock = Some(self.new_clock());
         }
     }
 
@@ -421,7 +465,7 @@ impl Scheduler {
             self.seek_to_frame(0);
         }
         self.playing = true;
-        self.clock = Some(Clock::new(Instant::now(), self.current_frame, self.fps()));
+        self.clock = Some(self.new_clock());
         self.sound.seek(self.current_frame);
         self.sound.set_playing(true);
     }
@@ -545,29 +589,53 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    #[test]
-    fn the_target_frame_follows_the_wall_clock() {
-        let start = Instant::now();
-        let clock = Clock::new(start, 10, 24.0);
-        assert_eq!(clock.target_frame(start), 10);
-        // 2.4 frames have elapsed, so frame 12 is the one due
-        assert_eq!(clock.target_frame(start + Duration::from_millis(100)), 12);
-        assert_eq!(clock.target_frame(start + Duration::from_secs(1)), 34);
-        // a clock read before its own start does not run backwards
-        assert_eq!(clock.target_frame(start - Duration::from_secs(1)), 10);
+    fn elapsed(clock: &Clock, now: Instant, sound: Option<f64>) -> f64 {
+        clock
+            .elapsed_seconds(now, sound)
+            .expect("the clock stopped")
     }
 
     #[test]
-    fn a_frames_display_time_is_its_distance_from_the_start_frame() {
+    fn the_target_frame_follows_the_wall_clock() {
         let start = Instant::now();
-        let clock = Clock::new(start, 10, 24.0);
-        assert_eq!(clock.display_time(10), start);
-        let due = clock.display_time(13).saturating_duration_since(start);
-        assert!(
-            (due.as_secs_f64() - 0.125).abs() < 1e-9,
-            "frame 13 came due at {due:?}"
+        let clock = Clock::wall_clock(start, 10, 24.0);
+        assert_eq!(clock.target_frame(elapsed(&clock, start, None)), 10);
+        // 2.4 frames have elapsed, so frame 12 is the one due
+        let tenth = start + Duration::from_millis(100);
+        assert_eq!(clock.target_frame(elapsed(&clock, tenth, None)), 12);
+        let second = start + Duration::from_secs(1);
+        assert_eq!(clock.target_frame(elapsed(&clock, second, None)), 34);
+        // a clock read before its own start does not run backwards
+        let before = start - Duration::from_secs(1);
+        assert_eq!(clock.target_frame(elapsed(&clock, before, None)), 10);
+    }
+
+    #[test]
+    fn the_target_frame_follows_the_sound_device() {
+        let clock = Clock::sound_device(24, 24.0);
+        let now = Instant::now();
+        // the device is still on the frame the sound was seeked to
+        assert_eq!(elapsed(&clock, now, Some(1.0)), 0.0);
+        assert_eq!(clock.target_frame(elapsed(&clock, now, Some(1.0))), 24);
+        assert_eq!(clock.target_frame(elapsed(&clock, now, Some(1.5))), 36);
+        // silence played while the queue was empty still moves the picture on
+        assert_eq!(clock.target_frame(elapsed(&clock, now, Some(3.0))), 72);
+        // the wall clock has no say while the sound leads
+        assert_eq!(
+            clock.target_frame(elapsed(&clock, now + Duration::from_secs(10), Some(1.5))),
+            36
         );
-        assert_eq!(clock.frame_period(), Duration::from_secs_f64(1.0 / 24.0));
+        assert!(clock.elapsed_seconds(now, None).is_none());
+    }
+
+    #[test]
+    fn a_frames_offset_is_its_distance_from_the_start_frame() {
+        let clock = Clock::wall_clock(Instant::now(), 10, 24.0);
+        assert_eq!(clock.frame_offset_seconds(10), 0.0);
+        let due = clock.frame_offset_seconds(13);
+        assert!((due - 0.125).abs() < 1e-9, "frame 13 came due at {due}");
+        assert!(clock.frame_offset_seconds(9) == 0.0);
+        assert!((clock.frame_period_seconds() - 1.0 / 24.0).abs() < 1e-9);
     }
 
     #[test]

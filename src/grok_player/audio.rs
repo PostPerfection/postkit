@@ -1,4 +1,4 @@
-//! PCM from a composition's MainSound, played on the picture clock.
+//! PCM from a composition's MainSound, and the clock the picture follows.
 //!
 //! Grok's player is picture-only. A DCP still names a sound MXF, so this reads
 //! it with asdcplib and feeds a stereo downmix to the default output device.
@@ -7,25 +7,26 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, Stream};
+use cpal::{SampleFormat, SampleRate, Stream};
 
 use crate::composition_timeline::{SegmentTrim, SoundSegment};
 
 const STEREO_CHANNELS: usize = 2;
 const CENTRE_AND_SURROUND: f32 = 0.707;
-const HIGH_WATER_FRAMES: usize = 48_000 / 5; // ~200 ms at 48 kHz
+const QUEUED_SOUND_SECONDS: f64 = 0.5;
 const FEED_WAIT: Duration = Duration::from_millis(5);
 const FULL_SCALE_I32: f32 = 2147483648.0;
+const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 
 enum Command {
-    Load(Vec<SoundReel>, u32),
+    Load(Vec<SoundReel>, f64),
     Seek(u64),
     SetPlaying(bool),
     Stop,
@@ -41,23 +42,45 @@ struct SoundReel {
 
 struct Shared {
     playing: AtomicBool,
-    sample_rate: AtomicU32,
+    stream_live: AtomicBool,
+    reels_loaded: AtomicBool,
+    device_sample_rate: AtomicU32,
+    seek_frame: AtomicU64,
+    emitted_sample_frames: AtomicU64,
     buffer: Mutex<VecDeque<f32>>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Shared {
+            playing: AtomicBool::new(false),
+            stream_live: AtomicBool::new(false),
+            reels_loaded: AtomicBool::new(false),
+            device_sample_rate: AtomicU32::new(DEFAULT_SAMPLE_RATE),
+            seek_frame: AtomicU64::new(0),
+            emitted_sample_frames: AtomicU64::new(0),
+            buffer: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    fn count_emitted(&self, samples: usize) {
+        let sample_frames = (samples / STEREO_CHANNELS) as u64;
+        self.emitted_sample_frames
+            .fetch_add(sample_frames, Ordering::AcqRel);
+    }
 }
 
 pub(super) struct Output {
     commands: Sender<Command>,
+    shared: Arc<Shared>,
+    frames_per_second: AtomicU64,
     feeder: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Output {
     pub(super) fn new() -> Self {
         let (commands, incoming) = mpsc::channel();
-        let shared = Arc::new(Shared {
-            playing: AtomicBool::new(false),
-            sample_rate: AtomicU32::new(48_000),
-            buffer: Mutex::new(VecDeque::new()),
-        });
+        let shared = Arc::new(Shared::new());
         // open the device on the first Load that has reels. picture-only
         // players (and Windows CI, which has no usable WASAPI device) never
         // touch the host; opening it from every GrokPlayer::new AVs there.
@@ -67,6 +90,8 @@ impl Output {
         };
         Output {
             commands,
+            shared,
+            frames_per_second: AtomicU64::new(0.0f64.to_bits()),
             feeder: Mutex::new(Some(feeder)),
         }
     }
@@ -77,12 +102,39 @@ impl Output {
             let _ = self.commands.send(Command::Stop);
             return;
         }
-        let rate = 48_000;
-        let _ = self.commands.send(Command::Load(reels, rate));
+        self.frames_per_second
+            .store(fps.to_bits(), Ordering::Release);
+        self.mark_seek(0);
+        let _ = self.commands.send(Command::Load(reels, fps));
     }
 
     pub(super) fn seek(&self, frame: u64) {
+        self.mark_seek(frame);
         let _ = self.commands.send(Command::Seek(frame));
+    }
+
+    // where the device has played to, which is what the picture follows
+    pub(super) fn media_position_seconds(&self) -> Option<f64> {
+        if !self.shared.stream_live.load(Ordering::Acquire)
+            || !self.shared.reels_loaded.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let fps = f64::from_bits(self.frames_per_second.load(Ordering::Acquire));
+        let sample_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
+        if fps <= 0.0 || sample_rate == 0 {
+            return None;
+        }
+        let seek_seconds = self.shared.seek_frame.load(Ordering::Acquire) as f64 / fps;
+        let played = self.shared.emitted_sample_frames.load(Ordering::Acquire) as f64;
+        Some(seek_seconds + played / f64::from(sample_rate))
+    }
+
+    fn mark_seek(&self, frame: u64) {
+        self.shared
+            .emitted_sample_frames
+            .store(0, Ordering::Release);
+        self.shared.seek_frame.store(frame, Ordering::Release);
     }
 
     pub(super) fn set_playing(&self, playing: bool) {
@@ -142,20 +194,34 @@ fn trim_in_frames(trim: Option<&SegmentTrim>, fps: f64) -> (u32, u64) {
     (entry, frames)
 }
 
-fn start_stream(shared: Arc<Shared>) -> Option<Stream> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| try_start_stream(shared)))
-        .ok()
-        .flatten()
+fn start_stream(shared: Arc<Shared>, pcm_sample_rate: u32) -> Option<Stream> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        try_start_stream(shared, pcm_sample_rate)
+    }))
+    .ok()
+    .flatten()
 }
 
-fn try_start_stream(shared: Arc<Shared>) -> Option<Stream> {
+fn try_start_stream(shared: Arc<Shared>, pcm_sample_rate: u32) -> Option<Stream> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
-    let supported = device.default_output_config().ok()?;
+    let default = device.default_output_config().ok()?;
+    let supported = device
+        .supported_output_configs()
+        .ok()
+        .and_then(|ranges| {
+            ranges
+                .filter(|range| {
+                    range.channels() >= STEREO_CHANNELS as u16
+                        && matches!(range.sample_format(), SampleFormat::F32 | SampleFormat::I16)
+                })
+                .find_map(|range| range.try_with_sample_rate(SampleRate(pcm_sample_rate)))
+        })
+        .unwrap_or(default);
     let mut config = supported.config();
     config.channels = STEREO_CHANNELS as u16;
     shared
-        .sample_rate
+        .device_sample_rate
         .store(config.sample_rate.0, Ordering::Release);
     let playing = Arc::clone(&shared);
     let err_fn = |error| tracing::error!("preview sound: {error}");
@@ -200,10 +266,13 @@ fn write_f32(shared: &Shared, dest: &mut [f32]) {
         dest.fill(0.0);
         return;
     }
-    let mut buffer = shared.buffer.lock().unwrap();
-    for sample in dest {
-        *sample = buffer.pop_front().unwrap_or(0.0);
+    {
+        let mut buffer = shared.buffer.lock().unwrap();
+        for sample in dest.iter_mut() {
+            *sample = buffer.pop_front().unwrap_or(0.0);
+        }
     }
+    shared.count_emitted(dest.len());
 }
 
 fn write_i16(shared: &Shared, dest: &mut [i16]) {
@@ -211,11 +280,14 @@ fn write_i16(shared: &Shared, dest: &mut [i16]) {
         dest.fill(0);
         return;
     }
-    let mut buffer = shared.buffer.lock().unwrap();
-    for sample in dest {
-        let value = buffer.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
-        *sample = (value * f32::from(i16::MAX)).round() as i16;
+    {
+        let mut buffer = shared.buffer.lock().unwrap();
+        for sample in dest.iter_mut() {
+            let value = buffer.pop_front().unwrap_or(0.0).clamp(-1.0, 1.0);
+            *sample = (value * f32::from(i16::MAX)).round() as i16;
+        }
     }
+    shared.count_emitted(dest.len());
 }
 
 struct Feeder {
@@ -223,9 +295,10 @@ struct Feeder {
     reels: Vec<SoundReel>,
     reader: Option<(PathBuf, asdcplib::pcm::MxfReader, AudioLayout)>,
     next_frame: u64,
-    channels: u16,
-    bits: u16,
-    bytes_per_edit_unit: usize,
+    seek_frame: Option<u64>,
+    fps: f64,
+    pcm_sample_rate: u32,
+    resampler: Option<Resampler>,
     stream: Option<Stream>,
 }
 
@@ -234,6 +307,7 @@ struct AudioLayout {
     bits: u16,
     bytes_per_edit_unit: usize,
     edit_units: u32,
+    sample_rate: u32,
 }
 
 fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
@@ -242,18 +316,17 @@ fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
         reels: Vec::new(),
         reader: None,
         next_frame: 0,
-        channels: 0,
-        bits: 0,
-        bytes_per_edit_unit: 0,
+        seek_frame: None,
+        fps: 0.0,
+        pcm_sample_rate: DEFAULT_SAMPLE_RATE,
+        resampler: None,
         stream: None,
     };
     loop {
-        if feeder.shared.playing.load(Ordering::Acquire) {
-            feeder.fill();
-        }
+        feeder.fill();
         match commands.recv_timeout(FEED_WAIT) {
             Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-            Ok(Command::Load(reels, _rate)) => feeder.load(reels),
+            Ok(Command::Load(reels, fps)) => feeder.load(reels, fps),
             Ok(Command::Seek(frame)) => feeder.seek(frame),
             Ok(Command::SetPlaying(playing)) => {
                 feeder.shared.playing.store(playing, Ordering::Release);
@@ -265,55 +338,101 @@ fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
 }
 
 impl Feeder {
-    fn load(&mut self, reels: Vec<SoundReel>) {
+    fn load(&mut self, reels: Vec<SoundReel>, fps: f64) {
         self.stop();
-        if let Some(first) = reels.first() {
-            match open_layout(&first.path) {
-                Ok(layout) => {
-                    eprintln!(
-                        "[preview] sound: {}ch {}-bit from {}",
-                        layout.channels,
-                        layout.bits,
-                        first.path.display()
-                    );
-                    self.channels = layout.channels;
-                    self.bits = layout.bits;
-                    self.bytes_per_edit_unit = layout.bytes_per_edit_unit;
-                }
-                Err(error) => {
-                    tracing::warn!("preview sound: {error}");
-                    return;
-                }
+        let Some(first) = reels.first() else {
+            return;
+        };
+        let (reader, layout) = match open_reader(&first.path) {
+            Ok(open) => open,
+            Err(error) => {
+                tracing::warn!("preview sound: {error}");
+                return;
             }
-        }
-        self.reels = reels;
+        };
+        eprintln!(
+            "[preview] sound: {}ch {}-bit {} Hz from {}",
+            layout.channels,
+            layout.bits,
+            layout.sample_rate,
+            first.path.display()
+        );
+        self.pcm_sample_rate = layout.sample_rate;
+        self.reader = Some((first.path.clone(), reader, layout));
+        self.fps = fps;
         self.next_frame = 0;
-        if self.stream.is_none() && !self.reels.is_empty() {
-            self.stream = start_stream(Arc::clone(&self.shared));
+        self.seek_frame = Some(0);
+        self.reels = reels;
+        self.shared.reels_loaded.store(true, Ordering::Release);
+        if self.stream.is_none() {
+            self.stream = start_stream(Arc::clone(&self.shared), self.pcm_sample_rate);
+            self.shared
+                .stream_live
+                .store(self.stream.is_some(), Ordering::Release);
         }
+        self.reset_resampler();
     }
 
     fn seek(&mut self, frame: u64) {
         self.next_frame = frame;
+        self.seek_frame = Some(frame);
         self.shared.buffer.lock().unwrap().clear();
-        self.reader = None;
+        self.reset_resampler();
     }
 
     fn stop(&mut self) {
         self.shared.playing.store(false, Ordering::Release);
+        self.shared.reels_loaded.store(false, Ordering::Release);
         self.shared.buffer.lock().unwrap().clear();
         self.reels.clear();
         self.reader = None;
         self.next_frame = 0;
+        self.seek_frame = None;
+    }
+
+    fn reset_resampler(&mut self) {
+        let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
+        self.resampler =
+            (device_rate > 0 && self.pcm_sample_rate > 0 && device_rate != self.pcm_sample_rate)
+                .then(|| Resampler::new(self.pcm_sample_rate, device_rate));
     }
 
     fn fill(&mut self) {
-        let high_water = HIGH_WATER_FRAMES * STEREO_CHANNELS;
-        while self.shared.buffer.lock().unwrap().len() < high_water {
+        let Some(seek_frame) = self.seek_frame else {
+            return;
+        };
+        if self.reels.is_empty() {
+            return;
+        }
+        let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
+        let high_water = (f64::from(device_rate) * QUEUED_SOUND_SECONDS) as usize * STEREO_CHANNELS;
+        loop {
+            let queued = self.shared.buffer.lock().unwrap().len();
+            if queued >= high_water {
+                break;
+            }
+            self.catch_up(seek_frame, queued, device_rate);
             if !self.push_edit_unit() {
                 break;
             }
         }
+    }
+
+    fn catch_up(&mut self, seek_frame: u64, queued: usize, device_rate: u32) {
+        if self.fps <= 0.0 || device_rate == 0 {
+            return;
+        }
+        let played = self.shared.emitted_sample_frames.load(Ordering::Acquire);
+        let sample_frames = played + (queued / STEREO_CHANNELS) as u64;
+        let reached = frame_at_queue_end(seek_frame, sample_frames, self.fps, device_rate);
+        if self.next_frame >= reached {
+            return;
+        }
+        tracing::debug!(
+            "preview sound: skipping frames {} to {reached} to keep up with the device",
+            self.next_frame
+        );
+        self.next_frame = reached;
     }
 
     fn push_edit_unit(&mut self) -> bool {
@@ -343,7 +462,15 @@ impl Feeder {
         );
         let mut stereo = Vec::new();
         downmix(&interleaved, layout.channels as usize, &mut stereo);
-        self.shared.buffer.lock().unwrap().extend(stereo);
+        let device_samples = match self.resampler.as_mut() {
+            Some(resampler) => {
+                let mut resampled = Vec::new();
+                resampler.push(&stereo, &mut resampled);
+                resampled
+            }
+            None => stereo,
+        };
+        self.shared.buffer.lock().unwrap().extend(device_samples);
         self.next_frame += 1;
         true
     }
@@ -373,9 +500,6 @@ impl Feeder {
         }
         match open_reader(path) {
             Ok((reader, layout)) => {
-                self.channels = layout.channels;
-                self.bits = layout.bits;
-                self.bytes_per_edit_unit = layout.bytes_per_edit_unit;
                 self.reader = Some((path.to_path_buf(), reader, layout));
                 true
             }
@@ -385,6 +509,58 @@ impl Feeder {
                 false
             }
         }
+    }
+}
+
+fn frame_at_queue_end(seek_frame: u64, sample_frames: u64, fps: f64, sample_rate: u32) -> u64 {
+    if fps <= 0.0 || sample_rate == 0 {
+        return seek_frame;
+    }
+    let played = sample_frames as f64 * fps / f64::from(sample_rate);
+    seek_frame + played.floor().max(0.0) as u64
+}
+
+struct Resampler {
+    step: f64,
+    position: f64,
+    carry: [f32; STEREO_CHANNELS],
+}
+
+impl Resampler {
+    fn new(source_rate: u32, device_rate: u32) -> Self {
+        Resampler {
+            step: f64::from(source_rate) / f64::from(device_rate),
+            position: 0.0,
+            carry: [0.0; STEREO_CHANNELS],
+        }
+    }
+
+    fn push(&mut self, stereo: &[f32], out: &mut Vec<f32>) {
+        let sample_frames = stereo.len() / STEREO_CHANNELS;
+        if sample_frames == 0 {
+            return;
+        }
+        let carry = self.carry;
+        // the frame before this block, so a partial step carries across blocks
+        let frame = |index: f64| -> [f32; STEREO_CHANNELS] {
+            if index < 0.0 {
+                return carry;
+            }
+            let start = index as usize * STEREO_CHANNELS;
+            [stereo[start], stereo[start + 1]]
+        };
+        let last = sample_frames as f64 - 1.0;
+        while self.position < last {
+            let base = self.position.floor();
+            let fraction = (self.position - base) as f32;
+            let before = frame(base);
+            let after = frame(base + 1.0);
+            out.push(before[0] + (after[0] - before[0]) * fraction);
+            out.push(before[1] + (after[1] - before[1]) * fraction);
+            self.position += self.step;
+        }
+        self.carry = frame(last);
+        self.position -= sample_frames as f64;
     }
 }
 
@@ -412,8 +588,17 @@ fn open_reader(path: &Path) -> Result<(asdcplib::pcm::MxfReader, AudioLayout), S
             bytes_per_edit_unit: descriptor.block_align as usize
                 * frames_per_edit_unit(&descriptor) as usize,
             edit_units: descriptor.container_duration,
+            sample_rate: sample_rate_of(&descriptor),
         },
     ))
+}
+
+fn sample_rate_of(descriptor: &asdcplib::pcm::AudioDescriptor) -> u32 {
+    let rate = descriptor.audio_sampling_rate;
+    if rate.numerator <= 0 || rate.denominator <= 0 {
+        return DEFAULT_SAMPLE_RATE;
+    }
+    (rate.numerator as u32) / (rate.denominator as u32)
 }
 
 fn frames_per_edit_unit(descriptor: &asdcplib::pcm::AudioDescriptor) -> u32 {
@@ -500,5 +685,80 @@ mod tests {
     #[test]
     fn a_whole_file_trim_starts_at_the_first_edit_unit() {
         assert_eq!(trim_in_frames(None, 24.0), (0, u64::MAX));
+    }
+
+    #[test]
+    fn the_queue_end_is_where_the_device_will_be() {
+        assert_eq!(frame_at_queue_end(100, 0, 24.0, 48_000), 100);
+        // one edit unit of 24 fps sound is 2000 sample frames
+        assert_eq!(frame_at_queue_end(100, 2_000, 24.0, 48_000), 101);
+        assert_eq!(frame_at_queue_end(100, 1_999, 24.0, 48_000), 100);
+        assert_eq!(frame_at_queue_end(100, 96_000, 24.0, 48_000), 148);
+        assert_eq!(frame_at_queue_end(100, 96_000, 0.0, 48_000), 100);
+        assert_eq!(frame_at_queue_end(100, 96_000, 24.0, 0), 100);
+    }
+
+    #[test]
+    fn silence_on_an_empty_queue_still_counts_as_played() {
+        let shared = Shared::new();
+        shared.playing.store(true, Ordering::Release);
+        let mut dest = [1.0f32; 8];
+        write_f32(&shared, &mut dest);
+        assert_eq!(dest, [0.0; 8]);
+        assert_eq!(shared.emitted_sample_frames.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn a_paused_callback_does_not_count() {
+        let shared = Shared::new();
+        let mut dest = [1.0f32; 8];
+        write_f32(&shared, &mut dest);
+        assert_eq!(shared.emitted_sample_frames.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn halving_the_rate_takes_every_other_sample_frame() {
+        let mut resampler = Resampler::new(48_000, 24_000);
+        let source = [0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0];
+        let mut out = Vec::new();
+        resampler.push(&source, &mut out);
+        assert_eq!(out, vec![0.0, 10.0, 2.0, 12.0]);
+    }
+
+    #[test]
+    fn doubling_the_rate_interpolates_between_sample_frames() {
+        let mut resampler = Resampler::new(24_000, 48_000);
+        let source = [0.0, 0.0, 1.0, -1.0];
+        let mut out = Vec::new();
+        resampler.push(&source, &mut out);
+        assert_eq!(out, vec![0.0, 0.0, 0.5, -0.5]);
+    }
+
+    #[test]
+    fn the_resampler_carries_a_partial_step_into_the_next_block() {
+        let mut resampler = Resampler::new(48_000, 32_000);
+        let first = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        let mut out = Vec::new();
+        resampler.push(&first, &mut out);
+        assert_eq!(out, vec![0.0, 0.0, 1.5, 1.5]);
+        let second = [4.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0, 7.0];
+        out.clear();
+        resampler.push(&second, &mut out);
+        assert_eq!(out, vec![3.0, 3.0, 4.5, 4.5, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn the_resampler_emits_about_the_device_rate() {
+        let mut resampler = Resampler::new(48_000, 44_100);
+        let block: Vec<f32> = (0..4_000).map(|index| index as f32).collect();
+        let mut out = Vec::new();
+        for _ in 0..24 {
+            resampler.push(&block, &mut out);
+        }
+        let emitted = (out.len() / STEREO_CHANNELS) as i64;
+        assert!(
+            (emitted - 44_100).abs() <= 2,
+            "a second of 48 kHz sound became {emitted} sample frames"
+        );
     }
 }
