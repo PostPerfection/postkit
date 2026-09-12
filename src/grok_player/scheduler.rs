@@ -232,7 +232,7 @@ impl Scheduler {
 
     fn publish_current(&mut self) {
         let index = self.current_frame;
-        if let Some(plain) = self.pool.decoded(index) {
+        if let Some(plain) = self.pool.decoded_at(index, self.reduce) {
             self.needs_publish = false;
             self.present(index, plain);
             return;
@@ -305,16 +305,17 @@ impl Scheduler {
             return;
         };
         let lookahead = self.pool.lookahead_frames();
+        let reduce = self.reduce;
         let wanted = {
             let pool = &self.pool;
-            self.in_flight.retain(|index| !pool.holds(*index));
+            self.in_flight
+                .retain(|index| !pool.holds_at(*index, reduce));
             let in_flight = &self.in_flight;
             frames_to_request(self.current_frame, frame_count, lookahead, |index| {
-                pool.holds(index) || in_flight.contains(&index)
+                pool.holds_at(index, reduce) || in_flight.contains(&index)
             })
         };
         let generation = self.generation;
-        let reduce = self.reduce;
         // reading a whole window at once stalls the clock
         let batch = self.pool.worker_count;
         let Some(timeline) = self.timeline.as_mut() else {
@@ -333,7 +334,7 @@ impl Scheduler {
                         mxf,
                     });
                 }
-                Err(reason) => self.pool.record_failure(generation, index, reason),
+                Err(reason) => self.pool.record_failure(generation, index, reduce, reason),
             }
         }
     }
@@ -386,7 +387,7 @@ impl Scheduler {
                     return;
                 }
                 self.reduce = scale.reduce();
-                self.restart_decoding();
+                self.change_decode_scale();
             }
             Command::SetSubtitleFile(slot, file, reply) => {
                 let _ = reply.send(self.set_subtitle_file(slot, file.as_deref()));
@@ -434,6 +435,16 @@ impl Scheduler {
         self.shared.clear_frame();
         self.shared.set_source_size(None);
         self.shared.fire_update();
+    }
+
+    // the frames already decoded are still worth showing, so only the queued jobs go
+    fn change_decode_scale(&mut self) {
+        self.generation += 1;
+        self.in_flight.clear();
+        self.pool.discard_queued_jobs();
+        if !self.playing {
+            self.needs_publish = true;
+        }
     }
 
     fn restart_decoding(&mut self) {

@@ -179,6 +179,28 @@ fn shown_colour(player: &GrokPlayer, width: usize, height: usize) -> [u8; 3] {
     pixel(&software_frame(player, width, height), width, 0, 0)
 }
 
+fn dropped_frames(player: &GrokPlayer) -> u64 {
+    const KEY: &str = r#""dropped_frames": "#;
+    let metadata = player.metadata_json();
+    let at = metadata.find(KEY).expect("dropped_frames in the metadata") + KEY.len();
+    let rest = &metadata[at..];
+    let end = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().expect("a dropped frame count")
+}
+
+// the smallest the cache gets while it waits, sampled as fast as the poll can read it
+fn lowest_cached_until(player: &GrokPlayer, what: &str, mut ready: impl FnMut() -> bool) -> usize {
+    let deadline = Instant::now() + PATIENCE;
+    let mut lowest = player.cached_frame_count();
+    while !ready() {
+        lowest = lowest.min(player.cached_frame_count());
+        assert!(Instant::now() < deadline, "{what} did not happen");
+    }
+    lowest
+}
+
 fn loaded_player(source: &Path) -> GrokPlayer {
     let player = GrokPlayer::new();
     player.init_software().unwrap();
@@ -342,6 +364,63 @@ fn the_decode_scale_sets_the_size_of_the_frame_on_screen() {
     player.set_paused(true);
     player.set_decode_scale(DecodeScale::Full);
     wait_until("the full-scale frame came back", || {
+        player.frame_size() == Some((SIZE, SIZE))
+    });
+}
+
+#[test]
+fn a_decode_scale_change_during_playback_keeps_the_frames_already_decoded() {
+    const SIZE: u32 = 320;
+    const FRAMES: usize = 72;
+    let directory = tempfile::tempdir().unwrap();
+    let mxf = flat_mxf(directory.path(), "picture.mxf", SIZE, SIZE, FRAMES);
+
+    let player = loaded_player(&mxf);
+    let window = (player.lookahead_frames() + 1).min(FRAMES);
+    wait_until("the decode window filled", || {
+        player.cached_frame_count() >= window
+    });
+
+    player.set_paused(false);
+    wait_until("playback moved off the first frame", || {
+        player.position().is_some_and(|position| position > 0.0)
+    });
+    let before = player.position().expect("a position while playing");
+
+    player.set_decode_scale(DecodeScale::Quarter);
+    let lowest = lowest_cached_until(&player, "a quarter-scale frame reached the screen", || {
+        player.frame_size() == Some((SIZE / 4, SIZE / 4))
+    });
+    assert!(!player.eof_reached(), "the fixture ended before the change");
+    assert!(
+        lowest >= window / 2,
+        "the scale change emptied the cache, down to {lowest} frames of {window}"
+    );
+    assert_eq!(
+        dropped_frames(&player),
+        0,
+        "the scale change dropped frames"
+    );
+
+    // six frame periods, so a picture held back by the refill shows up as a stop
+    const KEEPS_MOVING: Duration = Duration::from_millis(250);
+    let deadline = Instant::now() + KEEPS_MOVING;
+    while player.position() == Some(before) {
+        assert!(
+            Instant::now() < deadline,
+            "the picture stopped at {before:?} over the scale change"
+        );
+    }
+    assert_eq!(
+        dropped_frames(&player),
+        0,
+        "frames were dropped after the scale change"
+    );
+
+    // the same change with no clock to carry it
+    player.set_paused(true);
+    player.set_decode_scale(DecodeScale::Full);
+    wait_until("the full-scale frame came back while paused", || {
         player.frame_size() == Some((SIZE, SIZE))
     });
 }

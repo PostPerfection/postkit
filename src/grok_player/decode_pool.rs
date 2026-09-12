@@ -32,47 +32,98 @@ pub(super) enum CachedFrame {
     Failed(String),
 }
 
-pub(super) struct FrameCache {
+struct CachedResult {
+    frame: CachedFrame,
+    reduce: u8,
     generation: u64,
-    frames: BTreeMap<u64, CachedFrame>,
+}
+
+pub(super) struct FrameCache {
+    // a seek moves this on, a decode scale change does not
+    dropped_before: u64,
+    frames: BTreeMap<u64, CachedResult>,
 }
 
 impl FrameCache {
     fn new() -> Self {
         FrameCache {
-            generation: 0,
+            dropped_before: 0,
             frames: BTreeMap::new(),
         }
     }
 
     pub fn restart(&mut self, generation: u64) {
-        self.generation = generation;
+        self.dropped_before = generation;
         self.frames.clear();
     }
 
-    // a result from before a seek is dropped
-    pub fn store(&mut self, generation: u64, frame_index: u64, frame: CachedFrame) -> bool {
-        if generation != self.generation {
+    pub fn accepts(&self, generation: u64) -> bool {
+        generation >= self.dropped_before
+    }
+
+    // a result from before a seek is dropped, one from before a scale change is kept
+    pub fn store(
+        &mut self,
+        generation: u64,
+        frame_index: u64,
+        reduce: u8,
+        frame: CachedFrame,
+    ) -> bool {
+        if !self.accepts(generation) {
             return false;
         }
-        self.frames.insert(frame_index, frame);
+        // a frame decoded at the old scale must not replace one already made at the new
+        if self
+            .frames
+            .get(&frame_index)
+            .is_some_and(|held| held.generation > generation)
+        {
+            return false;
+        }
+        self.frames.insert(
+            frame_index,
+            CachedResult {
+                frame,
+                reduce,
+                generation,
+            },
+        );
         true
     }
 
-    pub fn holds(&self, frame_index: u64) -> bool {
-        self.frames.contains_key(&frame_index)
+    pub fn holds_at(&self, frame_index: u64, reduce: u8) -> bool {
+        self.frames
+            .get(&frame_index)
+            .is_some_and(|held| held.reduce == reduce)
     }
 
     pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgba8Frame>> {
         match self.frames.get(&frame_index) {
-            Some(CachedFrame::Decoded(frame)) => Some(frame.clone()),
+            Some(CachedResult {
+                frame: CachedFrame::Decoded(frame),
+                ..
+            }) => Some(frame.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn decoded_at(&self, frame_index: u64, reduce: u8) -> Option<Arc<Rgba8Frame>> {
+        match self.frames.get(&frame_index) {
+            Some(CachedResult {
+                frame: CachedFrame::Decoded(frame),
+                reduce: held,
+                ..
+            }) if *held == reduce => Some(frame.clone()),
             _ => None,
         }
     }
 
     pub fn failure(&self, frame_index: u64) -> Option<&str> {
         match self.frames.get(&frame_index) {
-            Some(CachedFrame::Failed(reason)) => Some(reason),
+            Some(CachedResult {
+                frame: CachedFrame::Failed(reason),
+                ..
+            }) => Some(reason),
             _ => None,
         }
     }
@@ -82,7 +133,7 @@ impl FrameCache {
         self.frames
             .range(first..=last)
             .rev()
-            .find(|(_, frame)| matches!(frame, CachedFrame::Decoded(_)))
+            .find(|(_, held)| matches!(held.frame, CachedFrame::Decoded(_)))
             .map(|(index, _)| *index)
     }
 
@@ -327,26 +378,37 @@ impl DecodePool {
     }
 
     pub fn restart(&self, generation: u64) {
+        self.discard_queued_jobs();
+        self.cache.lock().unwrap().restart(generation);
+    }
+
+    // a scale change resubmits what had not started and keeps every decoded frame
+    pub fn discard_queued_jobs(&self) {
         self.cpu_queue.discard_queued();
         if let Some(device_queue) = &self.device_queue {
             device_queue.discard_queued();
         }
-        self.cache.lock().unwrap().restart(generation);
     }
 
-    pub fn record_failure(&self, generation: u64, frame_index: u64, reason: String) {
-        self.cache
-            .lock()
-            .unwrap()
-            .store(generation, frame_index, CachedFrame::Failed(reason));
+    pub fn record_failure(&self, generation: u64, frame_index: u64, reduce: u8, reason: String) {
+        self.cache.lock().unwrap().store(
+            generation,
+            frame_index,
+            reduce,
+            CachedFrame::Failed(reason),
+        );
     }
 
-    pub fn holds(&self, frame_index: u64) -> bool {
-        self.cache.lock().unwrap().holds(frame_index)
+    pub fn holds_at(&self, frame_index: u64, reduce: u8) -> bool {
+        self.cache.lock().unwrap().holds_at(frame_index, reduce)
     }
 
     pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgba8Frame>> {
         self.cache.lock().unwrap().decoded(frame_index)
+    }
+
+    pub fn decoded_at(&self, frame_index: u64, reduce: u8) -> Option<Arc<Rgba8Frame>> {
+        self.cache.lock().unwrap().decoded_at(frame_index, reduce)
     }
 
     pub fn failure(&self, frame_index: u64) -> Option<String> {
@@ -390,17 +452,18 @@ fn run_worker(queue: &JobQueue<DecodeJob>, cache: &Mutex<FrameCache>, finished: 
     // the table build costs a few hundred microseconds
     let display = Display::Srgb(XyzToSrgb::new());
     while let Some(job) = queue.pop() {
-        if cache.lock().unwrap().generation != job.generation {
+        if !cache.lock().unwrap().accepts(job.generation) {
             continue;
         }
-        let decoded = match decode_job(job.codestream, job.reduce, job.render, &job.mxf, &display) {
+        let reduce = job.reduce;
+        let decoded = match decode_job(job.codestream, reduce, job.render, &job.mxf, &display) {
             Ok(frame) => CachedFrame::Decoded(Arc::new(Rgba8Frame::from_rgb8(&frame))),
             Err(reason) => CachedFrame::Failed(reason),
         };
         cache
             .lock()
             .unwrap()
-            .store(job.generation, job.frame_index, decoded);
+            .store(job.generation, job.frame_index, reduce, decoded);
         if finished.send(Command::DecodeFinished).is_err() {
             return;
         }
@@ -532,6 +595,7 @@ mod device {
     struct FrameContext {
         generation: u64,
         frame_index: u64,
+        reduce: u8,
         render: DisplayRender,
         mxf: PathBuf,
         codestream: Vec<u8>,
@@ -759,7 +823,7 @@ mod device {
                 generation: self.generation,
                 frame_index: self.frame_index,
                 codestream: self.codestream,
-                reduce: 0,
+                reduce: self.reduce,
                 render: self.render,
                 mxf: self.mxf,
             }
@@ -789,6 +853,7 @@ mod device {
         let context = Box::new(FrameContext {
             generation: job.generation,
             frame_index: job.frame_index,
+            reduce: job.reduce,
             render: job.render,
             mxf: job.mxf,
             codestream: job.codestream,
@@ -833,11 +898,12 @@ mod device {
                 }
                 Err(reason) => CachedFrame::Failed(reason),
             };
-            state
-                .cache
-                .lock()
-                .unwrap()
-                .store(context.generation, context.frame_index, cached);
+            state.cache.lock().unwrap().store(
+                context.generation,
+                context.frame_index,
+                context.reduce,
+                cached,
+            );
             let _ = state.finished.send(Command::DecodeFinished);
         }
         state.in_flight.fetch_sub(1, Ordering::AcqRel);
@@ -925,6 +991,9 @@ mod device {
 mod tests {
     use super::*;
 
+    const FULL: u8 = 0;
+    const QUARTER: u8 = 2;
+
     fn frame(width: u32) -> CachedFrame {
         CachedFrame::Decoded(Arc::new(Rgba8Frame {
             width,
@@ -937,23 +1006,68 @@ mod tests {
     fn a_result_from_before_a_seek_is_discarded() {
         let mut cache = FrameCache::new();
         cache.restart(1);
-        assert!(cache.store(1, 10, frame(2)), "the live generation stores");
+        assert!(
+            cache.store(1, 10, FULL, frame(2)),
+            "the live generation stores"
+        );
         cache.restart(2);
         assert!(
-            !cache.store(1, 11, frame(2)),
+            !cache.store(1, 11, FULL, frame(2)),
             "the stale generation does not"
         );
-        assert!(!cache.holds(11));
-        assert!(!cache.holds(10), "a restart empties the cache");
+        assert!(!cache.holds_at(11, FULL));
+        assert!(!cache.holds_at(10, FULL), "a restart empties the cache");
+    }
+
+    #[test]
+    fn a_result_from_before_a_scale_change_still_stores() {
+        let mut cache = FrameCache::new();
+        cache.restart(1);
+        assert!(cache.store(1, 10, FULL, frame(8)));
+        // the scale change only bumps the job generation
+        assert!(
+            cache.store(1, 11, FULL, frame(8)),
+            "a frame decoded at the old scale is still a frame to show"
+        );
+        assert!(cache.holds_at(11, FULL));
+        assert!(cache.store(2, 11, QUARTER, frame(2)));
+        assert!(cache.holds_at(11, QUARTER));
+        assert!(
+            !cache.holds_at(11, FULL),
+            "the new scale replaces the old one"
+        );
+        assert!(
+            !cache.store(1, 11, FULL, frame(8)),
+            "a late old-scale result does not replace the new scale"
+        );
+        assert_eq!(
+            cache.decoded_at(11, QUARTER).map(|frame| frame.width),
+            Some(2)
+        );
+        assert!(cache.decoded_at(11, FULL).is_none());
+    }
+
+    #[test]
+    fn the_scale_a_frame_was_made_at_says_whether_it_is_wanted() {
+        let mut cache = FrameCache::new();
+        cache.store(0, 4, FULL, frame(8));
+        cache.store(0, 5, FULL, CachedFrame::Failed("no".into()));
+        assert!(cache.holds_at(4, FULL));
+        assert!(!cache.holds_at(4, QUARTER), "the full-scale frame is stale");
+        assert!(
+            cache.holds_at(5, FULL),
+            "a failure counts as held, or it is asked for again"
+        );
+        assert!(!cache.holds_at(6, FULL));
     }
 
     #[test]
     fn the_newest_decoded_frame_up_to_the_target_is_the_one_to_show() {
         let mut cache = FrameCache::new();
         for index in [3u64, 5, 8] {
-            cache.store(0, index, frame(2));
+            cache.store(0, index, FULL, frame(2));
         }
-        cache.store(0, 7, CachedFrame::Failed("no".into()));
+        cache.store(0, 7, FULL, CachedFrame::Failed("no".into()));
         assert_eq!(cache.newest_decoded_in(3, 8), Some(8));
         // 7 failed, so the answer falls back past it
         assert_eq!(cache.newest_decoded_in(3, 7), Some(5));
@@ -964,11 +1078,11 @@ mod tests {
     fn presenting_keeps_only_the_frame_before_the_current_one() {
         let mut cache = FrameCache::new();
         for index in 0u64..6 {
-            cache.store(0, index, frame(2));
+            cache.store(0, index, FULL, frame(2));
         }
         cache.forget_before(3);
-        assert!(!cache.holds(2));
-        assert!(cache.holds(3));
+        assert!(!cache.holds_at(2, FULL));
+        assert!(cache.holds_at(3, FULL));
         assert_eq!(cache.len(), 3);
     }
 
