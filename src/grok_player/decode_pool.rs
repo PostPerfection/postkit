@@ -226,12 +226,49 @@ fn route(reduce: u8, device_switched_on: bool) -> Route {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaybackDecoder {
+    Device,
+    CpuWithGpuSettingOff,
+    CpuAtReducedResolution,
+    CpuWithNoAcceleratorPlugin,
+}
+
+impl PlaybackDecoder {
+    fn line(self) -> &'static str {
+        match self {
+            PlaybackDecoder::Device => "grok player: decoding on the device",
+            PlaybackDecoder::CpuWithGpuSettingOff => {
+                "grok player: decoding on the cpu, gpu setting off"
+            }
+            PlaybackDecoder::CpuAtReducedResolution => {
+                "grok player: decoding on the cpu, reduced resolution"
+            }
+            PlaybackDecoder::CpuWithNoAcceleratorPlugin => {
+                "grok player: decoding on the cpu, no accelerator plugin"
+            }
+        }
+    }
+}
+
+// a full resolution frame with the setting on reaches the cpu only when there is no device queue
+fn cpu_decoder(reduce: u8, device_switched_on: bool) -> PlaybackDecoder {
+    if !device_switched_on {
+        PlaybackDecoder::CpuWithGpuSettingOff
+    } else if reduce > 0 {
+        PlaybackDecoder::CpuAtReducedResolution
+    } else {
+        PlaybackDecoder::CpuWithNoAcceleratorPlugin
+    }
+}
+
 pub(super) struct DecodePool {
     cpu_queue: Arc<JobQueue<DecodeJob>>,
     device_queue: Option<Arc<JobQueue<DecodeJob>>>,
     workers: Vec<JoinHandle<()>>,
     device_thread: Option<JoinHandle<()>>,
     cache: Arc<Mutex<FrameCache>>,
+    last_logged_decoder: Mutex<Option<PlaybackDecoder>>,
     pub worker_count: usize,
 }
 
@@ -257,6 +294,7 @@ impl DecodePool {
             workers,
             device_thread,
             cache,
+            last_logged_decoder: Mutex::new(None),
             worker_count,
         }
     }
@@ -268,9 +306,24 @@ impl DecodePool {
     pub fn submit(&self, job: DecodeJob) {
         let device_switched_on = crate::grok_encoder::gpu_active();
         match (&self.device_queue, route(job.reduce, device_switched_on)) {
-            (Some(device_queue), Route::Device) => device_queue.push(job),
-            _ => self.cpu_queue.push(job),
+            (Some(device_queue), Route::Device) => {
+                self.log_decoder(PlaybackDecoder::Device);
+                device_queue.push(job);
+            }
+            _ => {
+                self.log_decoder(cpu_decoder(job.reduce, device_switched_on));
+                self.cpu_queue.push(job);
+            }
         }
+    }
+
+    fn log_decoder(&self, decoder: PlaybackDecoder) {
+        let mut last = self.last_logged_decoder.lock().unwrap();
+        if *last == Some(decoder) {
+            return;
+        }
+        *last = Some(decoder);
+        eprintln!("{}", decoder.line());
     }
 
     pub fn restart(&self, generation: u64) {
@@ -416,7 +469,6 @@ fn to_eight_bits(code: i32, precision: u8) -> u8 {
 
 // the plugin's in-memory decode batch: its workers pull frames from the device queue,
 // its threads hand decoded planes back, one backend thread begins and ends the batch
-#[cfg(feature = "grok-ffi")]
 mod device {
     use super::*;
     use crate::device_lease::{DEVICE_LEASE, PlaybackLease};
@@ -451,6 +503,7 @@ mod device {
             }),
             batch: None,
             declined_generation: None,
+            last_fallback: None,
             idle_polls: 0,
             returned_at_last_poll: 0,
         };
@@ -493,6 +546,7 @@ mod device {
         batch: Option<RunningBatch>,
         // the plugin declined this generation's shape, its frames stay on the cpu
         declined_generation: Option<u64>,
+        last_fallback: Option<CpuFallback>,
         idle_polls: u32,
         returned_at_last_poll: usize,
     }
@@ -501,6 +555,25 @@ mod device {
         Running,
         Declined,
         DeviceBusy,
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CpuFallback {
+        EncodeHoldsTheDevice,
+        DeviceDeclinedTheBatch,
+    }
+
+    impl CpuFallback {
+        fn line(self) -> &'static str {
+            match self {
+                CpuFallback::EncodeHoldsTheDevice => {
+                    "grok player: frames to the cpu, an encode holds the device"
+                }
+                CpuFallback::DeviceDeclinedTheBatch => {
+                    "grok player: frames to the cpu, the device declined the batch"
+                }
+            }
+        }
     }
 
     impl Backend {
@@ -547,11 +620,11 @@ mod device {
             self.idle_polls = 0;
             if DEVICE_LEASE.encode_wants_the_device() {
                 self.end_batch();
-                self.to_cpu(job);
+                self.queue_on_cpu(job, CpuFallback::EncodeHoldsTheDevice);
                 return;
             }
             if self.declined_generation == Some(job.generation) {
-                self.to_cpu(job);
+                self.queue_on_cpu(job, CpuFallback::DeviceDeclinedTheBatch);
                 return;
             }
             if self.batch.is_none() {
@@ -559,11 +632,11 @@ mod device {
                     Begin::Running => {}
                     Begin::Declined => {
                         self.declined_generation = Some(job.generation);
-                        self.to_cpu(job);
+                        self.queue_on_cpu(job, CpuFallback::DeviceDeclinedTheBatch);
                         return;
                     }
                     Begin::DeviceBusy => {
-                        self.to_cpu(job);
+                        self.queue_on_cpu(job, CpuFallback::EncodeHoldsTheDevice);
                         return;
                     }
                 }
@@ -571,7 +644,11 @@ mod device {
             self.state.queue.push_front(job);
         }
 
-        fn to_cpu(&self, job: DecodeJob) {
+        fn queue_on_cpu(&mut self, job: DecodeJob, fallback: CpuFallback) {
+            if self.last_fallback != Some(fallback) {
+                self.last_fallback = Some(fallback);
+                eprintln!("{}", fallback.line());
+            }
             self.state.cpu_queue.push(job);
         }
 
@@ -620,10 +697,11 @@ mod device {
                         .rgb8_on_device
                         .store(rgb8_on_device, Ordering::Release);
                     eprintln!(
-                        "grok player decode backend: device, colour on the {}",
+                        "grok player: device batch open, colour on the {}",
                         if rgb8_on_device { "device" } else { "cpu" }
                     );
                     self.batch = Some(RunningBatch { _lease: lease });
+                    self.last_fallback = None;
                     self.returned_at_last_poll = self.state.returned.load(Ordering::Acquire);
                     self.idle_polls = 0;
                     Begin::Running
@@ -657,10 +735,11 @@ mod device {
             if !unsafe { grokj2k_sys::grk_plugin_batch_decompress_memory_end() } {
                 tracing::warn!("grok's accelerator plugin failed to drain the decode batch");
             }
-            eprintln!("grok player decode backend: cpu");
+            eprintln!("grok player: device batch closed");
             if DEVICE_LEASE.encode_wants_the_device() {
-                for job in self.state.queue.drain() {
-                    self.to_cpu(job);
+                let stranded = self.state.queue.drain();
+                for job in stranded {
+                    self.queue_on_cpu(job, CpuFallback::EncodeHoldsTheDevice);
                 }
             }
         }
@@ -839,19 +918,6 @@ mod device {
             components,
             chroma_subsampled: false,
         })
-    }
-}
-
-#[cfg(not(feature = "grok-ffi"))]
-mod device {
-    use super::*;
-
-    pub(super) fn start(
-        _cpu_queue: &Arc<JobQueue<DecodeJob>>,
-        _cache: &Arc<Mutex<FrameCache>>,
-        _finished: &Sender<Command>,
-    ) -> (Option<Arc<JobQueue<DecodeJob>>>, Option<JoinHandle<()>>) {
-        (None, None)
     }
 }
 

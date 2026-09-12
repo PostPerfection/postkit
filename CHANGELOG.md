@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Changed
+- **The grok player log names where playback frames decode**: `grok player: decoding on the device` or `decoding on the cpu` with the reason (gpu setting off, reduced resolution, no accelerator plugin), printed once per change. A device batch logs `device batch open` and `device batch closed` in place of the old `decode backend: cpu` line, which read as a switch to CPU decoding. Frames handed back to the CPU while an encode holds the device, or after the device declines a batch, get their own line once per transition.
 - **Grok preview GL no longer copies the decoded frame into a texture store on macOS**: when the context has `GL_APPLE_client_storage`, the presenter keeps the composed `Arc` and `glTexImage2D` uses that buffer as the texture. That only applies when decode and the window share a GPU (Apple UMA). A discrete encode GPU with an iGPU display still copies through the host. Letterbox and `flip_y` still go through the shader. Other GL drivers keep the previous upload copy.
 
 ### Fixed
