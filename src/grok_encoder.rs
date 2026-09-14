@@ -10,7 +10,7 @@
 //! Enable with the `grok-ffi` cargo feature.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 /// Byte order of the 16-bit samples in a packed rgb48 frame.
@@ -689,6 +689,9 @@ where
     }
     let batch_shape = batch.as_ref().map(Batch::shape);
 
+    // every encoder thread narrows its rate search from whichever frame finished last
+    let slope_hint = AtomicU16::new(0);
+
     let frames_produced = std::thread::scope(|s| {
         let encoder_handles: Vec<_> = (0..num_encoder_threads)
             .map(|_| {
@@ -699,6 +702,7 @@ where
                 let cancel = cancel.clone();
                 let params = params.clone();
                 let phase_clocks = phase_clocks.clone();
+                let slope_hint = &slope_hint;
 
                 s.spawn(move || {
                     encoder_thread_fn(
@@ -710,6 +714,7 @@ where
                         &params,
                         &phase_clocks,
                         batch_shape,
+                        slope_hint,
                     );
                 })
             })
@@ -853,6 +858,7 @@ fn encoder_thread_fn(
     params: &CompressParams,
     phase_clocks: &PhaseClocks,
     batch_shape: Option<BatchShape>,
+    slope_hint: &AtomicU16,
 ) {
     // Pre-allocate output buffer once per thread and reuse across frames
     let buf_size = 2048 * 1080 * 3 * 2; // max 2K frame uncompressed size
@@ -885,7 +891,7 @@ fn encoder_thread_fn(
         let encode_start = std::time::Instant::now();
         let compressed = match batch_shape {
             Some(shape) => submit_frame_to_batch(&frame, shape).map(|()| None),
-            None => compress_frame_grok(&frame, params, &mut output_buf).map(Some),
+            None => compress_frame_grok(&frame, params, slope_hint, &mut output_buf).map(Some),
         };
         phase_clocks.add(EncodePhase::Jpeg2000, encode_start.elapsed());
 
@@ -979,14 +985,21 @@ fn rate_allocation(frame: &RawFrame, params: &CompressParams) -> Result<Allocati
 fn compress_frame_grok(
     frame: &RawFrame,
     params: &CompressParams,
+    slope_hint: &AtomicU16,
     output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     let Some(psnr) = params.quality_psnr else {
         let by_rate = rate_allocation(frame, params)?;
-        return compress_frame_once(frame, params, by_rate, output_buf);
+        return compress_frame_once(frame, params, by_rate, slope_hint, output_buf);
     };
 
-    let compressed = compress_frame_once(frame, params, Allocation::Quality { psnr }, output_buf)?;
+    let compressed = compress_frame_once(
+        frame,
+        params,
+        Allocation::Quality { psnr },
+        slope_hint,
+        output_buf,
+    )?;
     let Some(cap) = params.codestream_byte_cap else {
         return Ok(compressed);
     };
@@ -999,7 +1012,7 @@ fn compress_frame_grok(
         ratio: cinema_raw_frame_bytes(frame) as f64 / cap as f64,
         max_bytes: cap,
     };
-    compress_frame_once(frame, params, by_ratio, output_buf)
+    compress_frame_once(frame, params, by_ratio, slope_hint, output_buf)
 }
 
 /// The bit depth IMF App 2E picture is written at.
@@ -1322,11 +1335,16 @@ fn build_cparameters(
     }
 }
 
+// the fraction of a layer's byte budget grok's rate search may leave unused
+#[cfg(feature = "grok-ffi")]
+const RATE_CONTROL_TOLERANCE: f64 = 0.02;
+
 #[cfg(feature = "grok-ffi")]
 fn compress_frame_once(
     frame: &RawFrame,
     params: &CompressParams,
     allocation: Allocation,
+    slope_hint: &AtomicU16,
     output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     use grokj2k_sys::*;
@@ -1339,9 +1357,19 @@ fn compress_frame_once(
         output_buf.resize(needed, 0);
     }
 
+    let rate_control_runs = matches!(allocation, Allocation::Ratio { ratio, .. } if ratio > 1.0);
+    // grok narrows the search from the hint only for a single layer
+    let carries_slope_hint = rate_control_runs && params.num_layers == 1;
+
     unsafe {
         let image = build_grok_image(frame, precision, bits_to_drop)?;
         let mut cparams = build_cparameters(params, rsiz, allocation);
+        if rate_control_runs {
+            cparams.rate_control_tolerance = RATE_CONTROL_TOLERANCE;
+        }
+        if carries_slope_hint {
+            cparams.rate_control_slope_hint = slope_hint.load(Ordering::Relaxed);
+        }
 
         let mut stream_params: grk_stream_params = std::mem::zeroed();
         stream_params.buf = output_buf.as_mut_ptr();
@@ -1354,6 +1382,9 @@ fn compress_frame_once(
         }
 
         let compressed_len = grk_compress(codec, ptr::null_mut());
+        if carries_slope_hint {
+            slope_hint.store(grk_compress_get_slope_threshold(codec), Ordering::Relaxed);
+        }
         grk_object_unref(codec);
         grk_object_unref(&mut (*image).obj);
 
@@ -1369,6 +1400,7 @@ fn compress_frame_once(
 fn compress_frame_grok(
     _frame: &RawFrame,
     _params: &CompressParams,
+    _slope_hint: &AtomicU16,
     _output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     Err("grok-ffi feature not enabled — cannot use in-process encoder".to_string())
@@ -2840,7 +2872,7 @@ mod tests {
         let start = std::time::Instant::now();
         let n = 10;
         for _ in 0..n {
-            let result = compress_frame_grok(&frame, &params, &mut output_buf);
+            let result = compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut output_buf);
             assert!(result.is_ok(), "compress failed: {:?}", result.err());
         }
         let elapsed = start.elapsed();
@@ -2870,7 +2902,13 @@ mod tests {
         };
         initialize(0);
         let mut buf = Vec::new();
-        let bytes = compress_frame_grok(&frame, &CompressParams::default(), &mut buf).unwrap();
+        let bytes = compress_frame_grok(
+            &frame,
+            &CompressParams::default(),
+            &AtomicU16::new(0),
+            &mut buf,
+        )
+        .unwrap();
         // SOC ff4f, SIZ ff51, Lsiz u16, then Rsiz u16
         assert_eq!(&bytes[..4], &[0xff, 0x4f, 0xff, 0x51]);
         let rsiz = u16::from_be_bytes([bytes[6], bytes[7]]);
@@ -2898,6 +2936,7 @@ mod tests {
         let bytes = compress_frame_grok(
             &grey_frame(4096, 2160),
             &CompressParams::default(),
+            &AtomicU16::new(0),
             &mut buf,
         )
         .expect("a 4K frame compresses under the default profile");
@@ -2924,6 +2963,7 @@ mod tests {
         let bytes = compress_frame_grok(
             &grey_frame(4096, 2160),
             &CompressParams::default(),
+            &AtomicU16::new(0),
             &mut buf,
         )
         .expect("a 4K frame compresses");
@@ -2942,6 +2982,7 @@ mod tests {
         let error = compress_frame_grok(
             &grey_frame(4097, 2160),
             &CompressParams::default(),
+            &AtomicU16::new(0),
             &mut buf,
         )
         .expect_err("no cinema profile holds a frame wider than 4096");
@@ -2969,7 +3010,7 @@ mod tests {
             ..CompressParams::default()
         };
         let mut buf = Vec::new();
-        compress_frame_grok(&frame, &params, &mut buf)
+        compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut buf)
             .unwrap()
             .len() as u64
     }
@@ -3027,9 +3068,59 @@ mod tests {
             ..CompressParams::default()
         };
         let mut buf = Vec::new();
-        let bytes = compress_frame_grok(&frame, &params, &mut buf)
+        let bytes = compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut buf)
             .unwrap()
             .len() as u64;
+        assert!(
+            bytes <= DEFAULT_TARGET_BYTES,
+            "{bytes} bytes exceeds the {DEFAULT_TARGET_BYTES} byte target"
+        );
+        let reached = bytes as f64 / DEFAULT_TARGET_BYTES as f64;
+        assert!(
+            reached >= TARGET_FLOOR,
+            "{bytes} bytes is only {reached} of the {DEFAULT_TARGET_BYTES} byte target"
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_frame_encoded_with_the_previous_frames_slope_hint_holds_the_target() {
+        initialize(0);
+        let params = CompressParams {
+            profile: crate::j2k::imf_rsiz(
+                crate::j2k::ImfProfile::Imf2k,
+                crate::j2k::ImfLevels {
+                    main_level: 5,
+                    sub_level: 2,
+                },
+            ),
+            target_codestream_bytes: Some(DEFAULT_TARGET_BYTES),
+            edit_rate: crate::encode::FrameRate::whole(FEATURE_FPS),
+            threads_per_codec: 1,
+            ..CompressParams::default()
+        };
+        let slope_hint = AtomicU16::new(0);
+        let mut buf = Vec::new();
+        compress_frame_grok(
+            &noise_frame(0, 2048, 1080, 12),
+            &params,
+            &slope_hint,
+            &mut buf,
+        )
+        .unwrap();
+        assert_ne!(
+            slope_hint.load(Ordering::Relaxed),
+            0,
+            "a rate allocated frame reported no slope threshold"
+        );
+        let bytes = compress_frame_grok(
+            &noise_frame(1, 2048, 1080, 12),
+            &params,
+            &slope_hint,
+            &mut buf,
+        )
+        .unwrap()
+        .len() as u64;
         assert!(
             bytes <= DEFAULT_TARGET_BYTES,
             "{bytes} bytes exceeds the {DEFAULT_TARGET_BYTES} byte target"
@@ -3432,8 +3523,13 @@ mod tests {
         };
         let mut output = Vec::new();
 
-        let error = compress_frame_grok(&frame, &CompressParams::default(), &mut output)
-            .expect_err("compression should require grok-ffi");
+        let error = compress_frame_grok(
+            &frame,
+            &CompressParams::default(),
+            &AtomicU16::new(0),
+            &mut output,
+        )
+        .expect_err("compression should require grok-ffi");
         assert!(error.contains("grok-ffi feature not enabled"));
     }
 }
