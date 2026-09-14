@@ -1335,10 +1335,6 @@ fn build_cparameters(
     }
 }
 
-// the fraction of a layer's byte budget grok's rate search may leave unused
-#[cfg(feature = "grok-ffi")]
-const RATE_CONTROL_TOLERANCE: f64 = 0.02;
-
 #[cfg(feature = "grok-ffi")]
 fn compress_frame_once(
     frame: &RawFrame,
@@ -1364,9 +1360,6 @@ fn compress_frame_once(
     unsafe {
         let image = build_grok_image(frame, precision, bits_to_drop)?;
         let mut cparams = build_cparameters(params, rsiz, allocation);
-        if rate_control_runs {
-            cparams.rate_control_tolerance = RATE_CONTROL_TOLERANCE;
-        }
         if carries_slope_hint {
             cparams.rate_control_slope_hint = slope_hint.load(Ordering::Relaxed);
         }
@@ -3477,7 +3470,7 @@ mod tests {
 
     #[cfg(feature = "grok-ffi")]
     #[test]
-    fn a_generous_cap_encodes_the_same_sizes_as_no_cap() {
+    fn a_generous_cap_encodes_the_same_frames_as_no_cap() {
         const TOTAL: u64 = 8;
         let dir = tempfile::tempdir().unwrap();
 
@@ -3499,14 +3492,11 @@ mod tests {
         assert_eq!(result.frames_encoded, TOTAL);
         let capped_frames = written_codestreams(&capped);
         assert_eq!(capped_frames.len() as u64, TOTAL);
-        // the slope hint each frame starts from depends on thread timing
         for (with_cap, without) in capped_frames.iter().zip(&uncapped_frames) {
-            let capped_bytes = std::fs::metadata(with_cap).unwrap().len() as f64;
-            let uncapped_bytes = std::fs::metadata(without).unwrap().len() as f64;
-            let ratio = capped_bytes / uncapped_bytes;
-            assert!(
-                (ratio - 1.0).abs() <= RATE_CONTROL_TOLERANCE,
-                "{} is {capped_bytes} bytes against {uncapped_bytes} for {}",
+            assert_eq!(
+                std::fs::read(with_cap).unwrap(),
+                std::fs::read(without).unwrap(),
+                "{} differs from {}",
                 with_cap.display(),
                 without.display()
             );
