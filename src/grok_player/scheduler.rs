@@ -16,6 +16,8 @@ use crate::subtitle_formats::{StyledCue, StyledRun, VAlign};
 
 // a worker finishing a frame wakes the scheduler sooner than this
 const IDLE_WAIT: Duration = Duration::from_millis(100);
+// a timed wait on macOS can oversleep several times its length, past the next frame
+const PLAYING_WAIT_CAP: Duration = Duration::from_millis(4);
 const PRESENTATION_WINDOW_FRAMES: usize = 24;
 const SRT_EXTENSION: &str = "srt";
 const ASS_EXTENSIONS: [&str; 2] = ["ass", "ssa"];
@@ -353,10 +355,10 @@ impl Scheduler {
         };
         let ahead = clock.frame_offset_seconds(self.current_frame + 1) - elapsed;
         if ahead > 0.0 {
-            return Duration::from_secs_f64(ahead);
+            return Duration::from_secs_f64(ahead).min(PLAYING_WAIT_CAP);
         }
         // past due with nothing decoded, and a finished decode wakes this sooner
-        Duration::from_secs_f64(clock.frame_period_seconds())
+        Duration::from_secs_f64(clock.frame_period_seconds()).min(PLAYING_WAIT_CAP)
     }
 
     // ─── commands ──────────────────────────────────────────────────────────
