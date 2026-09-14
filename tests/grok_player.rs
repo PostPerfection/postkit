@@ -190,13 +190,14 @@ fn dropped_frames(player: &GrokPlayer) -> u64 {
     rest[..end].parse().expect("a dropped frame count")
 }
 
-// the smallest the cache gets while it waits, sampled as fast as the poll can read it
+// the smallest the cache gets while it waits, sampled every poll
 fn lowest_cached_until(player: &GrokPlayer, what: &str, mut ready: impl FnMut() -> bool) -> usize {
     let deadline = Instant::now() + PATIENCE;
     let mut lowest = player.cached_frame_count();
     while !ready() {
         lowest = lowest.min(player.cached_frame_count());
         assert!(Instant::now() < deadline, "{what} did not happen");
+        std::thread::sleep(POLL);
     }
     lowest
 }
@@ -410,6 +411,7 @@ fn a_decode_scale_change_during_playback_keeps_the_frames_already_decoded() {
             Instant::now() < deadline,
             "the picture stopped at {before:?} over the scale change"
         );
+        std::thread::sleep(POLL);
     }
     assert_eq!(
         dropped_frames(&player),
