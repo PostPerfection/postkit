@@ -3127,6 +3127,58 @@ mod tests {
 
     #[cfg(feature = "grok-ffi")]
     #[test]
+    fn a_hint_one_above_the_bracket_floor_holds_the_target() {
+        initialize(0);
+        let params = CompressParams {
+            profile: crate::j2k::imf_rsiz(
+                crate::j2k::ImfProfile::Imf2k,
+                crate::j2k::ImfLevels {
+                    main_level: 5,
+                    sub_level: 2,
+                },
+            ),
+            target_codestream_bytes: Some(DEFAULT_TARGET_BYTES),
+            edit_rate: crate::encode::FrameRate::whole(FEATURE_FPS),
+            threads_per_codec: 1,
+            ..CompressParams::default()
+        };
+        let frame = noise_frame(0, 2048, 1080, 12);
+        let slope_hint = AtomicU16::new(0);
+        let mut buf = Vec::new();
+        let baseline = compress_frame_grok(&frame, &params, &slope_hint, &mut buf)
+            .unwrap()
+            .len() as u64;
+        let threshold = slope_hint.load(Ordering::Relaxed);
+        assert!(
+            threshold > 1024,
+            "a threshold of {threshold} leaves no room below the hint bracket, so the bracket cannot be tested"
+        );
+        for offset in [-513i32, -512, -511, -510, -1, 0, 1, 510, 511, 512, 513] {
+            let Ok(hint) = u16::try_from(i32::from(threshold) + offset) else {
+                continue;
+            };
+            slope_hint.store(hint, Ordering::Relaxed);
+            let bytes = compress_frame_grok(&frame, &params, &slope_hint, &mut buf)
+                .unwrap()
+                .len() as u64;
+            assert_eq!(
+                bytes, baseline,
+                "offset {offset} hint {hint} gave {bytes} bytes instead of the {baseline} byte baseline"
+            );
+            assert!(
+                bytes <= DEFAULT_TARGET_BYTES,
+                "offset {offset} hint {hint} gave {bytes} bytes, over the {DEFAULT_TARGET_BYTES} byte target"
+            );
+            let reported = slope_hint.load(Ordering::Relaxed);
+            assert_eq!(
+                reported, threshold,
+                "offset {offset} hint {hint} reported a threshold of {reported} instead of {threshold}"
+            );
+        }
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
     fn overlapping_pipelines_share_the_inline_pool() {
         // pipelines resize grok's global pool; unguarded, one pipeline's exit
         // destroys the executor another's codecs are running on (segfault).
