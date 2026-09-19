@@ -27,7 +27,7 @@
   (mpv.lib or libmpv.dll.a in MPV_LIB_DIR on windows, homebrew's mpv.pc on
   macos) or running is verified.
 - Player controls the wizards lack, easyDCP Player parity: loop (dom#2700),
-  speed (dom#2917), markers (dom#2893), waveform (dom#3091), 3D view modes
+  markers (dom#2893), waveform (dom#3091), 3D view modes
   (dom#1974, dom#3165), A/V sync offset (dom#3083). They waited on real-time 4K
   decode, which the device backend now gives.
 - SDI output via Blackmagic DeckLink (easyDCP Player+ parity). A playback sink
