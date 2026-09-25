@@ -1215,6 +1215,12 @@ pub fn probe_video(input: &Path) -> (u32, u32, u64) {
 
 /// Probe whatever ffmpeg will decode for dimensions and frame count.
 pub fn probe_decode_source(input: &Path, source: DecodeSource) -> (u32, u32, u64) {
+    if source == DecodeSource::Video
+        && let Some(info) = crate::probe::probe_video(input)
+    {
+        return (info.width, info.height, u64::from(info.total_frames));
+    }
+
     let demuxer = source.demuxer_args();
     let dim_output = std::process::Command::new("ffprobe")
         .args(["-v", "error"])
