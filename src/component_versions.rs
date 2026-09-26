@@ -27,6 +27,8 @@ pub fn installed_components(
 
     #[cfg(feature = "grok-ffi")]
     versions.push(ComponentVersion::new("Grok", grok_version()));
+    #[cfg(all(feature = "grok-ffi", grok_plugin_build_info))]
+    versions.push(ComponentVersion::new("Grok plugin", plugin_build_info()));
 
     versions.push(ComponentVersion::new("FFmpeg", ffmpeg_version()));
     versions
@@ -39,6 +41,17 @@ fn grok_version() -> String {
         return "unavailable".to_string();
     }
     unsafe { std::ffi::CStr::from_ptr(version) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(all(feature = "grok-ffi", grok_plugin_build_info))]
+fn plugin_build_info() -> String {
+    let build_info = unsafe { grokj2k_sys::grk_plugin_build_info() };
+    if build_info.is_null() {
+        return "not loaded".to_string();
+    }
+    unsafe { std::ffi::CStr::from_ptr(build_info) }
         .to_string_lossy()
         .into_owned()
 }
@@ -89,5 +102,12 @@ mod tests {
             versions[1],
             ComponentVersion::new("PostKit", env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[cfg(all(feature = "grok-ffi", grok_plugin_build_info))]
+    #[test]
+    fn grok_plugin_is_not_loaded_without_initialising_grok() {
+        let versions = installed_components("Test Wizard", "1.2.3");
+        assert!(versions.contains(&ComponentVersion::new("Grok plugin", "not loaded")));
     }
 }

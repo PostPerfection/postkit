@@ -1885,6 +1885,49 @@ pub fn initialize(_num_threads: u32) {}
 
 // ─── grok's accelerator plugin ────────────────────────────────────────────────
 
+#[cfg(all(feature = "grok-ffi", target_os = "linux"))]
+const PACKAGED_GPU_PLUGIN_FILE_NAME: &str = "libgrokj2k_plugin.so";
+
+#[cfg(all(feature = "grok-ffi", target_os = "linux"))]
+fn packaged_gpu_plugin_directory(
+    executable: &Path,
+    application_directory_name: &str,
+) -> Option<PathBuf> {
+    Some(
+        executable
+            .parent()?
+            .join("../lib")
+            .join(application_directory_name),
+    )
+}
+
+#[cfg(all(feature = "grok-ffi", target_os = "linux"))]
+pub fn set_packaged_gpu_plugin_path(application_directory_name: &str) {
+    if std::env::var_os("GRK_PLUGIN_PATH").is_some() {
+        return;
+    }
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let Some(plugin_directory) =
+        packaged_gpu_plugin_directory(&executable, application_directory_name)
+    else {
+        return;
+    };
+    if !plugin_directory
+        .join(PACKAGED_GPU_PLUGIN_FILE_NAME)
+        .is_file()
+    {
+        return;
+    }
+    unsafe {
+        std::env::set_var("GRK_PLUGIN_PATH", plugin_directory);
+    }
+}
+
+#[cfg(all(feature = "grok-ffi", not(target_os = "linux")))]
+pub fn set_packaged_gpu_plugin_path(_application_directory_name: &str) {}
+
 /// Whether the plugin is switched into grok's compress and decompress calls.
 /// [`use_gpu`] and [`use_cpu`] are the only writers.
 #[cfg(feature = "grok-ffi")]
@@ -2433,6 +2476,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(feature = "grok-ffi", target_os = "linux"))]
+    #[test]
+    fn packaged_gpu_plugin_is_beside_installed_binaries() {
+        let directory = packaged_gpu_plugin_directory(Path::new("/usr/bin/dcpwizard"), "dcpwizard");
+        assert_eq!(directory, Some(PathBuf::from("/usr/bin/../lib/dcpwizard")));
+    }
 
     /// A planar YUV frame is shifted nowhere after the plugin converts it, so
     /// the depth it converts to has to be the depth the code stream carries.
