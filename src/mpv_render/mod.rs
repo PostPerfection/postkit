@@ -26,6 +26,11 @@ use crate::mpv::pick_picture_mxf;
 const SOFTWARE_PIXEL_FORMAT: &str = "rgb0";
 const BYTES_PER_PIXEL: usize = 4;
 
+pub fn client_api_version() -> String {
+    let version = unsafe { ffi::mpv_client_api_version() };
+    format!("client API {}.{}", version >> 16, version & 0xffff)
+}
+
 /// Options applied before `mpv_initialize`. `vo=libmpv` is what makes mpv route
 /// video to a render context instead of opening its own window.
 const COMMON_OPTIONS: &[(&str, &str)] = &[

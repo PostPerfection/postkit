@@ -5,6 +5,7 @@
 #![allow(non_camel_case_types)]
 
 use std::ffi::{c_char, c_int, c_void};
+use std::os::raw::c_ulong;
 
 pub enum mpv_handle {}
 pub enum mpv_render_context {}
@@ -55,6 +56,7 @@ pub struct mpv_opengl_fbo {
 pub type mpv_render_update_fn = unsafe extern "C" fn(cb_ctx: *mut c_void);
 
 unsafe extern "C" {
+    pub fn mpv_client_api_version() -> c_ulong;
     pub fn mpv_create() -> *mut mpv_handle;
     pub fn mpv_initialize(ctx: *mut mpv_handle) -> c_int;
     pub fn mpv_terminate_destroy(ctx: *mut mpv_handle);

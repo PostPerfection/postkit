@@ -17,6 +17,10 @@
 
 ### Added
 
+- **Component versions for the Settings page and the job log**:
+  `component_versions::installed_components` returns the application, PostKit,
+  Grok and FFmpeg versions. `mpv_render::client_api_version` reads libmpv's
+  client API version.
 - **Timed-text descriptor reads back as CPL RegXML**:
   `timed_text_descriptor::read_timed_text_descriptor_regxml` opens a wrapped
   AS-02 timed-text track file, takes the edit rate, container duration,
