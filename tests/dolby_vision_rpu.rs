@@ -1,8 +1,8 @@
 use dolby_vision::rpu::extension_metadata::blocks::ExtMetadataBlockLevel6;
 use dolby_vision::utils::add_start_code_emulation_prevention_3_byte;
 use postkit::dolby_vision::{
-    DOLBY_VISION_FIXTURE_FRAMES, DolbyVisionFixtureProfile, DolbyVisionSummary, DvMode,
-    convert_dv_mode, generate_profile81_rpu, parse_single_rpu, read_dolby_vision,
+    DOLBY_VISION_FIXTURE_FRAMES, DolbyVisionFixtureProfile, DolbyVisionSummary, DvMode, HdrType,
+    convert_dv_mode, detect_hdr_type, generate_profile81_rpu, parse_single_rpu, read_dolby_vision,
     refuse_undecodable_dolby_vision, write_dolby_vision_fixture,
 };
 use std::path::{Path, PathBuf};
@@ -302,4 +302,60 @@ fn to_mel_converts_a_profile_81_rpu() {
         parsed.el_type,
         Some(dolby_vision::rpu::rpu_data_nlq::DoviELType::MEL)
     );
+}
+
+fn bt2020_hevc(directory: &Path, name: &str, transfer: &str) -> PathBuf {
+    let output = directory.join(name);
+    run(
+        "ffmpeg",
+        &[
+            "-y",
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=gray:s=320x180:r=25",
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            &format!("log-level=none:colorprim=bt2020:transfer={transfer}:colormatrix=bt2020nc"),
+            "-f",
+            "hevc",
+            output.to_str().unwrap(),
+        ],
+    );
+    output
+}
+
+#[test]
+fn detection_reads_the_transfer_tag_not_the_primaries() {
+    let directory = tempfile::tempdir().unwrap();
+    let cases = [
+        ("bt2020_sdr.hevc", "bt709", HdrType::Sdr),
+        ("bt2020_hlg.hevc", "arib-std-b67", HdrType::Hlg),
+        ("bt2020_pq.hevc", "smpte2084", HdrType::Hdr10),
+    ];
+    for (name, transfer, expected) in cases {
+        let path = bt2020_hevc(directory.path(), name, transfer);
+        assert_eq!(detect_hdr_type(&path), expected, "{name}");
+    }
+}
+
+#[test]
+fn detection_names_a_dolby_vision_fixture() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = write_dolby_vision_fixture(
+        directory.path(),
+        "profile81.hevc",
+        DolbyVisionFixtureProfile::Profile81,
+        None,
+        Some(PQ_CODE_600_NITS),
+    )
+    .unwrap();
+    assert_eq!(detect_hdr_type(&path), HdrType::DolbyVision);
 }

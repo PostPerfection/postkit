@@ -1885,23 +1885,71 @@ pub fn initialize(_num_threads: u32) {}
 
 // ─── grok's accelerator plugin ────────────────────────────────────────────────
 
-#[cfg(all(feature = "grok-ffi", target_os = "linux"))]
-const PACKAGED_GPU_PLUGIN_FILE_NAME: &str = "libgrokj2k_plugin.so";
+#[cfg(all(
+    feature = "grok-ffi",
+    any(test, target_os = "linux", target_os = "macos")
+))]
+#[derive(Debug, Clone, Copy)]
+enum PackagedGpuPluginLayout {
+    #[cfg(any(test, target_os = "linux"))]
+    LinuxApplicationLibraryDirectory,
+    #[cfg(any(test, target_os = "macos"))]
+    MacOsBundleExecutableDirectory,
+}
+
+#[cfg(all(feature = "grok-ffi", any(test, target_os = "linux")))]
+const LINUX_GPU_PLUGIN_FILE_NAME: &str = "libgrokj2k_plugin.so";
+#[cfg(all(feature = "grok-ffi", any(test, target_os = "linux")))]
+const LINUX_LIBRARY_DIRECTORY_FROM_EXECUTABLE: &str = "../lib";
+#[cfg(all(feature = "grok-ffi", any(test, target_os = "macos")))]
+const MACOS_GPU_PLUGIN_FILE_NAME: &str = "libgrokj2k_plugin.dylib";
 
 #[cfg(all(feature = "grok-ffi", target_os = "linux"))]
+const PACKAGED_GPU_PLUGIN_LAYOUT: PackagedGpuPluginLayout =
+    PackagedGpuPluginLayout::LinuxApplicationLibraryDirectory;
+#[cfg(all(feature = "grok-ffi", target_os = "macos"))]
+const PACKAGED_GPU_PLUGIN_LAYOUT: PackagedGpuPluginLayout =
+    PackagedGpuPluginLayout::MacOsBundleExecutableDirectory;
+
+#[cfg(all(
+    feature = "grok-ffi",
+    any(test, target_os = "linux", target_os = "macos")
+))]
+fn packaged_gpu_plugin_file_name(layout: PackagedGpuPluginLayout) -> &'static str {
+    match layout {
+        #[cfg(any(test, target_os = "linux"))]
+        PackagedGpuPluginLayout::LinuxApplicationLibraryDirectory => LINUX_GPU_PLUGIN_FILE_NAME,
+        #[cfg(any(test, target_os = "macos"))]
+        PackagedGpuPluginLayout::MacOsBundleExecutableDirectory => MACOS_GPU_PLUGIN_FILE_NAME,
+    }
+}
+
+#[cfg(all(
+    feature = "grok-ffi",
+    any(test, target_os = "linux", target_os = "macos")
+))]
 fn packaged_gpu_plugin_directory(
+    layout: PackagedGpuPluginLayout,
     executable: &Path,
     application_directory_name: &str,
 ) -> Option<PathBuf> {
-    Some(
-        executable
-            .parent()?
-            .join("../lib")
-            .join(application_directory_name),
-    )
+    let executable_directory = executable.parent()?;
+    match layout {
+        #[cfg(any(test, target_os = "linux"))]
+        PackagedGpuPluginLayout::LinuxApplicationLibraryDirectory => Some(
+            executable_directory
+                .join(LINUX_LIBRARY_DIRECTORY_FROM_EXECUTABLE)
+                .join(application_directory_name),
+        ),
+        // grok's own executable directory fallback reads /proc/self/exe, which macOS lacks
+        #[cfg(any(test, target_os = "macos"))]
+        PackagedGpuPluginLayout::MacOsBundleExecutableDirectory => {
+            Some(executable_directory.to_path_buf())
+        }
+    }
 }
 
-#[cfg(all(feature = "grok-ffi", target_os = "linux"))]
+#[cfg(all(feature = "grok-ffi", any(target_os = "linux", target_os = "macos")))]
 pub fn set_packaged_gpu_plugin_path(application_directory_name: &str) {
     if std::env::var_os("GRK_PLUGIN_PATH").is_some() {
         return;
@@ -1909,13 +1957,15 @@ pub fn set_packaged_gpu_plugin_path(application_directory_name: &str) {
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
-    let Some(plugin_directory) =
-        packaged_gpu_plugin_directory(&executable, application_directory_name)
-    else {
+    let Some(plugin_directory) = packaged_gpu_plugin_directory(
+        PACKAGED_GPU_PLUGIN_LAYOUT,
+        &executable,
+        application_directory_name,
+    ) else {
         return;
     };
     if !plugin_directory
-        .join(PACKAGED_GPU_PLUGIN_FILE_NAME)
+        .join(packaged_gpu_plugin_file_name(PACKAGED_GPU_PLUGIN_LAYOUT))
         .is_file()
     {
         return;
@@ -1925,7 +1975,11 @@ pub fn set_packaged_gpu_plugin_path(application_directory_name: &str) {
     }
 }
 
-#[cfg(all(feature = "grok-ffi", not(target_os = "linux")))]
+// no Windows package ships the plugin
+#[cfg(all(
+    feature = "grok-ffi",
+    not(any(target_os = "linux", target_os = "macos"))
+))]
 pub fn set_packaged_gpu_plugin_path(_application_directory_name: &str) {}
 
 /// Whether the plugin is switched into grok's compress and decompress calls.
@@ -2477,11 +2531,44 @@ where
 mod tests {
     use super::*;
 
-    #[cfg(all(feature = "grok-ffi", target_os = "linux"))]
+    #[cfg(feature = "grok-ffi")]
+    fn packaged_gpu_plugin_path(
+        layout: PackagedGpuPluginLayout,
+        executable: &str,
+        application_directory_name: &str,
+    ) -> Option<PathBuf> {
+        packaged_gpu_plugin_directory(layout, Path::new(executable), application_directory_name)
+            .map(|directory| directory.join(packaged_gpu_plugin_file_name(layout)))
+    }
+
+    #[cfg(feature = "grok-ffi")]
     #[test]
-    fn packaged_gpu_plugin_is_beside_installed_binaries() {
-        let directory = packaged_gpu_plugin_directory(Path::new("/usr/bin/dcpwizard"), "dcpwizard");
-        assert_eq!(directory, Some(PathBuf::from("/usr/bin/../lib/dcpwizard")));
+    fn a_linux_package_keeps_the_plugin_in_the_application_library_directory() {
+        assert_eq!(
+            packaged_gpu_plugin_path(
+                PackagedGpuPluginLayout::LinuxApplicationLibraryDirectory,
+                "/usr/bin/dcpwizard",
+                "dcpwizard",
+            ),
+            Some(PathBuf::from(
+                "/usr/bin/../lib/dcpwizard/libgrokj2k_plugin.so"
+            ))
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_macos_bundle_keeps_the_plugin_beside_the_executable() {
+        assert_eq!(
+            packaged_gpu_plugin_path(
+                PackagedGpuPluginLayout::MacOsBundleExecutableDirectory,
+                "/Applications/DCP Wizard.app/Contents/MacOS/dcpwizard-gui",
+                "dcpwizard",
+            ),
+            Some(PathBuf::from(
+                "/Applications/DCP Wizard.app/Contents/MacOS/libgrokj2k_plugin.dylib"
+            ))
+        );
     }
 
     /// A planar YUV frame is shifted nowhere after the plugin converts it, so

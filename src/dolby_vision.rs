@@ -181,26 +181,39 @@ pub fn detect_hdr_type(input: &Path) -> HdrType {
         return HdrType::Sdr;
     };
 
-    let json_str = String::from_utf8_lossy(&output.stdout);
+    hdr_type_from_frame_json(&String::from_utf8_lossy(&output.stdout))
+}
 
-    // Check for Dolby Vision RPU
-    if json_str.contains("dovi") || json_str.contains("DOVI") {
+// ffprobe 8.1's names for the frame side data and transfer tags that mark a grade
+const DOLBY_VISION_RPU_SIDE_DATA: &str = "Dolby Vision RPU Data";
+const HDR10_PLUS_SIDE_DATA: &str = "HDR Dynamic Metadata SMPTE2094-40 (HDR10+)";
+const PQ_TRANSFER: &str = "smpte2084";
+const HLG_TRANSFER: &str = "arib-std-b67";
+
+pub fn hdr_type_from_frame_json(json: &str) -> HdrType {
+    let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let frame = &parsed["frames"][0];
+    let side_data_types: Vec<&str> = frame["side_data_list"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry["side_data_type"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if side_data_types.contains(&DOLBY_VISION_RPU_SIDE_DATA) {
         return HdrType::DolbyVision;
     }
-    // Check for HDR10+
-    if json_str.contains("hdr10plus") || json_str.contains("HDR10PLUS") {
+    if side_data_types.contains(&HDR10_PLUS_SIDE_DATA) {
         return HdrType::Hdr10Plus;
     }
-    // Check for PQ/HDR10
-    if json_str.contains("smpte2084") || json_str.contains("bt2020") {
-        return HdrType::Hdr10;
+    match frame["color_transfer"].as_str() {
+        Some(PQ_TRANSFER) => HdrType::Hdr10,
+        Some(HLG_TRANSFER) => HdrType::Hlg,
+        _ => HdrType::Sdr,
     }
-    // Check for HLG
-    if json_str.contains("arib-std-b67") || json_str.contains("hlg") {
-        return HdrType::Hlg;
-    }
-
-    HdrType::Sdr
 }
 
 /// Read HDR10 static metadata from a video file using ffprobe.
@@ -1028,6 +1041,88 @@ pub fn refuse_undecodable_dolby_vision(summary: &DolbyVisionSummary) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ffprobe_frame_json(
+        color_primaries: Option<&str>,
+        color_transfer: Option<&str>,
+        side_data_types: &[&str],
+    ) -> String {
+        let mut frame = serde_json::json!({
+            "media_type": "video",
+            "pix_fmt": "yuv420p10le",
+            "color_range": "tv",
+            "side_data_list": side_data_types
+                .iter()
+                .map(|side_data_type| serde_json::json!({ "side_data_type": side_data_type }))
+                .collect::<Vec<_>>(),
+        });
+        if let Some(primaries) = color_primaries {
+            frame["color_primaries"] = primaries.into();
+        }
+        if let Some(transfer) = color_transfer {
+            frame["color_transfer"] = transfer.into();
+        }
+        serde_json::json!({ "frames": [frame] }).to_string()
+    }
+
+    const USER_DATA_UNREGISTERED_SIDE_DATA: &str = "H.26[45] User Data Unregistered SEI message";
+
+    #[test]
+    fn a_bt2020_sdr_frame_is_sdr() {
+        let json = ffprobe_frame_json(Some("bt2020"), Some("bt709"), &[]);
+        assert_eq!(hdr_type_from_frame_json(&json), HdrType::Sdr);
+    }
+
+    #[test]
+    fn a_bt2020_frame_with_no_transfer_tag_is_sdr() {
+        let json = ffprobe_frame_json(Some("bt2020"), None, &[]);
+        assert_eq!(hdr_type_from_frame_json(&json), HdrType::Sdr);
+    }
+
+    #[test]
+    fn a_bt2020_hlg_frame_is_hlg() {
+        let json = ffprobe_frame_json(Some("bt2020"), Some(HLG_TRANSFER), &[]);
+        assert_eq!(hdr_type_from_frame_json(&json), HdrType::Hlg);
+    }
+
+    #[test]
+    fn a_pq_frame_is_hdr10() {
+        let json = ffprobe_frame_json(Some("bt2020"), Some(PQ_TRANSFER), &[]);
+        assert_eq!(hdr_type_from_frame_json(&json), HdrType::Hdr10);
+    }
+
+    #[test]
+    fn a_frame_with_hdr10_plus_side_data_is_hdr10_plus() {
+        let json = ffprobe_frame_json(
+            Some("bt2020"),
+            Some(PQ_TRANSFER),
+            &[USER_DATA_UNREGISTERED_SIDE_DATA, HDR10_PLUS_SIDE_DATA],
+        );
+        assert_eq!(hdr_type_from_frame_json(&json), HdrType::Hdr10Plus);
+    }
+
+    #[test]
+    fn a_frame_with_a_dolby_vision_rpu_is_dolby_vision() {
+        let json = ffprobe_frame_json(
+            None,
+            None,
+            &[
+                USER_DATA_UNREGISTERED_SIDE_DATA,
+                DOLBY_VISION_RPU_SIDE_DATA,
+                "Dolby Vision Metadata",
+            ],
+        );
+        assert_eq!(hdr_type_from_frame_json(&json), HdrType::DolbyVision);
+    }
+
+    #[test]
+    fn an_untagged_frame_and_empty_output_are_sdr() {
+        assert_eq!(
+            hdr_type_from_frame_json(&ffprobe_frame_json(None, None, &[])),
+            HdrType::Sdr
+        );
+        assert_eq!(hdr_type_from_frame_json(""), HdrType::Sdr);
+    }
 
     #[test]
     fn x265_params_carry_mastering_display_and_cll() {
