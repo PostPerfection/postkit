@@ -1,6 +1,8 @@
 //! AS-02 (IMF) MXF wrapping roundtrip through postkit's public wrap API.
 
-use postkit::mxf_wrap::{EssenceType, MxfEncryption, MxfStandard, MxfWrapOptions, mxf_wrap};
+use postkit::mxf_wrap::{
+    EssenceType, McaConfig, MxfEncryption, MxfStandard, MxfWrapOptions, SoundfieldGroup, mxf_wrap,
+};
 use std::path::PathBuf;
 
 /// A one-subtitle DCST, the smallest input the timed-text wrap accepts.
@@ -308,13 +310,41 @@ fn as02_timed_text_refuses_ancillary_resources() {
     std::fs::remove_file(&font).ok();
 }
 
-#[test]
-fn as02_atmos_errors() {
-    let input = temp_path("atmos.iab");
-    std::fs::write(&input, b"dummy").unwrap();
-    let output = temp_path("atmos.mxf");
-    let result = mxf_wrap(&MxfWrapOptions {
-        input_files: vec![input.clone()],
+const PREAMBLE_TAG: u8 = 0x01;
+const IA_FRAME_TAG: u8 = 0x02;
+const IAB_ASSET_UUID: [u8; 16] = [5; 16];
+
+// element values are filler: no real IA bitstream is available
+fn synthetic_ia_bitstream_frame(
+    seed: u8,
+    preamble_length: usize,
+    ia_frame_length: usize,
+) -> Vec<u8> {
+    let mut frame = vec![PREAMBLE_TAG];
+    frame.extend((preamble_length as u32).to_be_bytes());
+    frame.extend((0..preamble_length).map(|i| seed.wrapping_add(i as u8)));
+    frame.push(IA_FRAME_TAG);
+    frame.extend((ia_frame_length as u32).to_be_bytes());
+    frame.extend((0..ia_frame_length).map(|i| seed.wrapping_mul(7).wrapping_add(i as u8)));
+    frame
+}
+
+fn iab_soundfield() -> McaConfig {
+    McaConfig {
+        labels: String::new(),
+        spoken_language: Some("en-US".to_string()),
+        soundfield_group: Some(SoundfieldGroup {
+            title: "Sol Levante".to_string(),
+            title_version: "Original Version".to_string(),
+            audio_content_kind: "PRM".to_string(),
+            audio_element_kind: "FCMP".to_string(),
+        }),
+    }
+}
+
+fn iab_options(input_files: Vec<PathBuf>, output: PathBuf) -> MxfWrapOptions {
+    MxfWrapOptions {
+        input_files,
         output,
         essence_type: EssenceType::Atmos,
         standard: MxfStandard::As02,
@@ -322,17 +352,117 @@ fn as02_atmos_errors() {
         fps_den: 1,
         partition_size: 1,
         encryption: None,
-        mca_config: None,
+        mca_config: Some(iab_soundfield()),
         resource_ids: vec![],
         hdr: None,
-        asset_uuid: None,
+        asset_uuid: Some(IAB_ASSET_UUID),
         timed_text_duration_frames: None,
-    });
-    assert!(!result.success);
-    assert!(
-        result.error.contains("AS-02"),
-        "error was: {}",
-        result.error
+    }
+}
+
+// one payload file per picture frame, listed in name order the way a frame directory is read
+fn frame_directory(frames: &[Vec<u8>]) -> (tempfile::TempDir, Vec<PathBuf>) {
+    let directory = tempfile::tempdir().unwrap();
+    for (index, frame) in frames.iter().enumerate() {
+        std::fs::write(
+            directory.path().join(format!("frame_{index:05}.iab")),
+            frame,
+        )
+        .unwrap();
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    files.sort();
+    (directory, files)
+}
+
+#[test]
+fn as02_atmos_wraps_a_frame_directory_as_iab() {
+    let frames: Vec<Vec<u8>> = (0..4u8)
+        .map(|seed| {
+            synthetic_ia_bitstream_frame(seed, 8 + seed as usize, 1_000 * (seed as usize + 1))
+        })
+        .collect();
+    let (directory, input_files) = frame_directory(&frames);
+    let output = directory.path().join("iab.mxf");
+
+    let result = mxf_wrap(&iab_options(input_files, output.clone()));
+    assert!(result.success, "AS-02 IAB wrap failed: {}", result.error);
+    assert!(result.error.is_empty(), "{}", result.error);
+    assert_eq!(result.duration, frames.len() as u64);
+    assert_eq!(
+        result.uuid,
+        uuid::Uuid::from_bytes(IAB_ASSET_UUID).to_string()
     );
-    std::fs::remove_file(&input).ok();
+
+    let output_string = output.to_string_lossy().to_string();
+    assert_eq!(
+        asdcplib::essence_type(&output_string).unwrap(),
+        asdcplib::EssenceType::As02Iab
+    );
+    let mut reader = asdcplib::as02::iab::MxfReader::new();
+    reader.open_read(&output_string).unwrap();
+    assert_eq!(reader.frame_count().unwrap(), frames.len() as u32);
+    for (index, expected) in frames.iter().enumerate() {
+        assert_eq!(
+            reader.read_frame(index as u32).unwrap(),
+            expected.as_slice(),
+            "frame {index}"
+        );
+    }
+    let descriptor = reader.iab_essence_descriptor().unwrap();
+    assert_eq!(descriptor.sample_rate, asdcplib::Rational::new(24, 1));
+    assert_eq!(descriptor.audio_sampling_rate, asdcplib::SAMPLE_RATE_48K);
+    assert_eq!(descriptor.container_duration, Some(frames.len() as u64));
+    assert_eq!(
+        descriptor.reference_image_edit_rate,
+        Some(asdcplib::Rational::new(24, 1))
+    );
+    assert_eq!(
+        descriptor.reference_audio_alignment_level,
+        Some(-20i8 as u8)
+    );
+    let label = reader.soundfield_label().unwrap();
+    assert_eq!(descriptor.sub_descriptors, vec![label.instance_id]);
+    assert_eq!(label.spoken_language.as_deref(), Some("en-US"));
+    assert_eq!(label.title.as_deref(), Some("Sol Levante"));
+    assert_eq!(label.audio_element_kind.as_deref(), Some("FCMP"));
+}
+
+#[test]
+fn as02_atmos_refuses_what_an_iab_track_cannot_carry() {
+    let (directory, input_files) = frame_directory(&[synthetic_ia_bitstream_frame(1, 4, 100)]);
+    let output = directory.path().join("iab.mxf");
+
+    let not_a_frame = directory.path().join("not_a_frame.iab");
+    std::fs::write(&not_a_frame, b"dummy").unwrap();
+    let malformed = mxf_wrap(&iab_options(vec![not_a_frame.clone()], output.clone()));
+    assert!(!malformed.success);
+    assert!(
+        malformed.error.contains("not_a_frame.iab") && malformed.error.contains("IA bitstream"),
+        "{}",
+        malformed.error
+    );
+
+    let mut unlabelled = iab_options(input_files.clone(), output.clone());
+    unlabelled.mca_config = None;
+    let mut channel_labels = iab_options(input_files.clone(), output.clone());
+    channel_labels.mca_config = Some(McaConfig {
+        labels: "51(L,R,C,LFE,Ls,Rs)".to_string(),
+        ..iab_soundfield()
+    });
+    let mut encrypted = iab_options(input_files, output.clone());
+    encrypted.encryption = Some(MxfEncryption {
+        content_key: [1; 16],
+        key_id: [2; 16],
+    });
+    for refused in [unlabelled, channel_labels, encrypted] {
+        std::fs::remove_file(&output).ok();
+        let result = mxf_wrap(&refused);
+        assert!(!result.success);
+        assert!(!result.error.is_empty());
+        assert!(!output.exists(), "{}", result.error);
+    }
 }

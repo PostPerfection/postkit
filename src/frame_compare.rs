@@ -4,6 +4,7 @@
 //! are the pooled/aggregate wrappers. ffmpeg stat output is parsed by
 //! whitespace splitting, no regex.
 
+use crate::ffmpeg_input::FfmpegInput;
 use crate::filter_path::filter_option_path;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -48,15 +49,24 @@ fn stats_log_path(metric: &str) -> PathBuf {
 
 /// Compare two video files frame-by-frame using ffmpeg PSNR and SSIM filters.
 pub fn compare_frames(reference: &Path, distorted: &Path) -> Result<CompareResult, String> {
+    compare_frame_inputs(
+        &FfmpegInput::File(reference.to_path_buf()),
+        &FfmpegInput::File(distorted.to_path_buf()),
+    )
+}
+
+pub fn compare_frame_inputs(
+    reference: &FfmpegInput,
+    distorted: &FfmpegInput,
+) -> Result<CompareResult, String> {
     let psnr_log = stats_log_path("psnr");
     let ssim_log = stats_log_path("ssim");
 
     // Run ffmpeg with both PSNR and SSIM filters simultaneously
     let status = std::process::Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(reference)
-        .args(["-i"])
-        .arg(distorted)
+        .arg("-y")
+        .args(reference.arguments())
+        .args(distorted.arguments())
         .args([
             "-lavfi",
             // each input pad can only be consumed once, so split both before
@@ -177,6 +187,16 @@ pub fn ffmpeg_has_libvmaf() -> bool {
 /// filter maps input 1 (distorted) then input 0 (reference). Errors clearly if
 /// the local ffmpeg has no libvmaf.
 pub fn compute_vmaf(reference: &Path, distorted: &Path) -> Result<VmafScore, String> {
+    compute_vmaf_inputs(
+        &FfmpegInput::File(reference.to_path_buf()),
+        &FfmpegInput::File(distorted.to_path_buf()),
+    )
+}
+
+pub fn compute_vmaf_inputs(
+    reference: &FfmpegInput,
+    distorted: &FfmpegInput,
+) -> Result<VmafScore, String> {
     if !ffmpeg_has_libvmaf() {
         return Err(
             "ffmpeg has no libvmaf filter; install an ffmpeg built with --enable-libvmaf".into(),
@@ -189,10 +209,9 @@ pub fn compute_vmaf(reference: &Path, distorted: &Path) -> Result<VmafScore, Str
         filter_option_path(&log)
     );
     let out = std::process::Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(reference)
-        .arg("-i")
-        .arg(distorted)
+        .arg("-y")
+        .args(reference.arguments())
+        .args(distorted.arguments())
         .args(["-lavfi", &filter, "-f", "null", "-"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())

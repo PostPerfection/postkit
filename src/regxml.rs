@@ -1,6 +1,7 @@
 use std::fmt::Write;
 
 use asdcplib::Rational;
+use asdcplib::as02::iab::{IabEssenceDescriptor, IabSoundfieldLabel};
 use asdcplib::as02::jp2k::{Jpeg2000PictureSubDescriptor, RgbaEssenceDescriptor};
 use asdcplib::as02::pcm::WaveAudioDescriptor;
 use asdcplib::pcm::{McaLabelKind, McaLabelSubDescriptor};
@@ -398,6 +399,156 @@ pub fn timed_text_descriptor_regxml(
     xml
 }
 
+pub fn iab_descriptor_regxml(
+    descriptor: &IabEssenceDescriptor,
+    label: &IabSoundfieldLabel,
+) -> String {
+    let mut xml = String::new();
+    let _ = writeln!(
+        xml,
+        r#"      <r0:IABEssenceDescriptor xmlns:r0="{AAF}" xmlns:r1="{ITEMS}">"#
+    );
+    const INDENT: &str = "        ";
+    item(
+        &mut xml,
+        INDENT,
+        "InstanceID",
+        &urn_uuid(&descriptor.instance_id),
+    );
+    if let Some(generation) = &descriptor.generation_id {
+        item(
+            &mut xml,
+            INDENT,
+            "LinkedGenerationID",
+            &urn_uuid(generation),
+        );
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "SampleRate",
+        &rational(&descriptor.sample_rate),
+    );
+    if let Some(duration) = descriptor.container_duration {
+        item(&mut xml, INDENT, "EssenceLength", &duration.to_string());
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "ContainerFormat",
+        &urn_ul(&descriptor.essence_container),
+    );
+    if let Some(codec) = &descriptor.codec {
+        item(&mut xml, INDENT, "Codec", &urn_ul(codec));
+    }
+    if let Some(track) = descriptor.linked_track_id {
+        item(&mut xml, INDENT, "LinkedTrackID", &track.to_string());
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "AudioSampleRate",
+        &rational(&descriptor.audio_sampling_rate),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "Locked",
+        if descriptor.locked { "True" } else { "False" },
+    );
+    if let Some(level) = descriptor.audio_ref_level {
+        item(
+            &mut xml,
+            INDENT,
+            "AudioReferenceLevel",
+            &(level as i8).to_string(),
+        );
+    }
+    item(
+        &mut xml,
+        INDENT,
+        "ChannelCount",
+        &descriptor.channel_count.to_string(),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "QuantizationBits",
+        &descriptor.quantization_bits.to_string(),
+    );
+    if let Some(dial_norm) = descriptor.dial_norm {
+        item(&mut xml, INDENT, "DialNorm", &(dial_norm as i8).to_string());
+    }
+    if descriptor.sound_essence_coding != UNSET_UL {
+        item(
+            &mut xml,
+            INDENT,
+            "SoundCompression",
+            &urn_ul(&descriptor.sound_essence_coding),
+        );
+    }
+    if let Some(level) = descriptor.reference_audio_alignment_level {
+        item(
+            &mut xml,
+            INDENT,
+            "ReferenceAudioAlignmentLevel",
+            &(level as i8).to_string(),
+        );
+    }
+    if let Some(edit_rate) = &descriptor.reference_image_edit_rate {
+        item(
+            &mut xml,
+            INDENT,
+            "ReferenceImageEditRate",
+            &rational(edit_rate),
+        );
+    }
+    xml.push_str("        <r1:SubDescriptors>\n");
+    xml.push_str(&iab_soundfield_label_sub_descriptor_regxml(label));
+    xml.push_str("        </r1:SubDescriptors>\n");
+    xml.push_str("      </r0:IABEssenceDescriptor>");
+    xml
+}
+
+fn iab_soundfield_label_sub_descriptor_regxml(label: &IabSoundfieldLabel) -> String {
+    const INDENT: &str = "            ";
+    let mut xml = String::new();
+    xml.push_str("          <r0:IABSoundfieldLabelSubDescriptor>\n");
+    item(
+        &mut xml,
+        INDENT,
+        "InstanceID",
+        &urn_uuid(&label.instance_id),
+    );
+    item(
+        &mut xml,
+        INDENT,
+        "MCALabelDictionaryID",
+        &urn_ul(&label.label_dictionary_id),
+    );
+    item(&mut xml, INDENT, "MCALinkID", &urn_uuid(&label.link_id));
+    item(
+        &mut xml,
+        INDENT,
+        "MCATagSymbol",
+        &escape_xml(&label.tag_symbol),
+    );
+    for (name, value) in [
+        ("MCATagName", &label.tag_name),
+        ("RFC5646SpokenLanguage", &label.spoken_language),
+        ("MCATitle", &label.title),
+        ("MCATitleVersion", &label.title_version),
+        ("MCAAudioContentKind", &label.audio_content_kind),
+        ("MCAAudioElementKind", &label.audio_element_kind),
+    ] {
+        if let Some(value) = value {
+            item(&mut xml, INDENT, name, &escape_xml(value));
+        }
+    }
+    xml.push_str("          </r0:IABSoundfieldLabelSubDescriptor>\n");
+    xml
+}
+
 fn mca_label_sub_descriptor_regxml(label: &McaLabelSubDescriptor) -> String {
     const INDENT: &str = "            ";
     let element = match label.kind {
@@ -612,5 +763,116 @@ mod tests {
             urn_ul(&ul),
             "urn:smpte:ul:060e2b34.0401010d.04010101.010b0000"
         );
+    }
+
+    const IAB_ESSENCE_CONTAINER_UL: [u8; 16] = [
+        0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0d, 0x0d, 0x01, 0x03, 0x01, 0x02, 0x1d, 0x01,
+        0x01,
+    ];
+    const IMMERSIVE_AUDIO_CODING_UL: [u8; 16] = [
+        0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x05, 0x0e, 0x09, 0x06, 0x04, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+    const IAB_SOUNDFIELD_UL: [u8; 16] = [
+        0x06, 0x0e, 0x2b, 0x34, 0x04, 0x01, 0x01, 0x0d, 0x03, 0x02, 0x02, 0x21, 0x00, 0x00, 0x00,
+        0x00,
+    ];
+
+    fn iab_descriptor(label_instance_id: [u8; 16]) -> IabEssenceDescriptor {
+        IabEssenceDescriptor {
+            instance_id: [1; 16],
+            generation_id: None,
+            locators: vec![],
+            sub_descriptors: vec![label_instance_id],
+            linked_track_id: Some(2),
+            sample_rate: Rational::new(24, 1),
+            container_duration: Some(96),
+            essence_container: IAB_ESSENCE_CONTAINER_UL,
+            codec: None,
+            audio_sampling_rate: Rational::new(48_000, 1),
+            locked: false,
+            audio_ref_level: None,
+            electro_spatial_formulation: None,
+            channel_count: 0,
+            quantization_bits: 24,
+            dial_norm: None,
+            sound_essence_coding: IMMERSIVE_AUDIO_CODING_UL,
+            reference_audio_alignment_level: None,
+            reference_image_edit_rate: None,
+        }
+    }
+
+    fn iab_label() -> IabSoundfieldLabel {
+        IabSoundfieldLabel {
+            instance_id: [3; 16],
+            tag_symbol: "IAB".to_string(),
+            tag_name: Some("IAB".to_string()),
+            label_dictionary_id: IAB_SOUNDFIELD_UL,
+            link_id: [4; 16],
+            spoken_language: Some("de-DE".to_string()),
+            title: Some("Sun & Moon".to_string()),
+            title_version: Some("Original Version".to_string()),
+            audio_content_kind: Some("PRM".to_string()),
+            audio_element_kind: None,
+        }
+    }
+
+    #[test]
+    fn an_iab_descriptor_carries_its_soundfield_label_as_a_sub_descriptor() {
+        let label = iab_label();
+        let xml = iab_descriptor_regxml(&iab_descriptor(label.instance_id), &label);
+
+        assert!(
+            xml.starts_with(&format!(
+                r#"      <r0:IABEssenceDescriptor xmlns:r0="{AAF}" xmlns:r1="{ITEMS}">"#
+            )),
+            "{xml}"
+        );
+        assert!(xml.ends_with("</r0:IABEssenceDescriptor>"), "{xml}");
+        for expected in [
+            "<r1:InstanceID>urn:uuid:01010101-0101-0101-0101-010101010101</r1:InstanceID>",
+            "<r1:SampleRate>24/1</r1:SampleRate>",
+            "<r1:EssenceLength>96</r1:EssenceLength>",
+            "<r1:ContainerFormat>urn:smpte:ul:060e2b34.0401010d.0d010301.021d0101</r1:ContainerFormat>",
+            "<r1:LinkedTrackID>2</r1:LinkedTrackID>",
+            "<r1:AudioSampleRate>48000/1</r1:AudioSampleRate>",
+            "<r1:Locked>False</r1:Locked>",
+            "<r1:ChannelCount>0</r1:ChannelCount>",
+            "<r1:QuantizationBits>24</r1:QuantizationBits>",
+            "<r1:SoundCompression>urn:smpte:ul:060e2b34.04010105.0e090604.00000000</r1:SoundCompression>",
+        ] {
+            assert!(xml.contains(expected), "no {expected} in\n{xml}");
+        }
+        // Photon refuses a Codec item on an IAB descriptor, and the MXF has none
+        assert!(!xml.contains("Codec"), "{xml}");
+
+        let sub_descriptors = &xml[xml.find("<r1:SubDescriptors>").expect("SubDescriptors")
+            ..xml
+                .find("</r1:SubDescriptors>")
+                .expect("SubDescriptors end")];
+        assert_eq!(
+            sub_descriptors
+                .matches("<r0:IABSoundfieldLabelSubDescriptor>")
+                .count(),
+            1,
+            "{xml}"
+        );
+        for expected in [
+            "<r1:InstanceID>urn:uuid:03030303-0303-0303-0303-030303030303</r1:InstanceID>",
+            "<r1:MCALabelDictionaryID>urn:smpte:ul:060e2b34.0401010d.03020221.00000000</r1:MCALabelDictionaryID>",
+            "<r1:MCALinkID>urn:uuid:04040404-0404-0404-0404-040404040404</r1:MCALinkID>",
+            "<r1:MCATagSymbol>IAB</r1:MCATagSymbol>",
+            "<r1:MCATagName>IAB</r1:MCATagName>",
+            "<r1:RFC5646SpokenLanguage>de-DE</r1:RFC5646SpokenLanguage>",
+            "<r1:MCATitle>Sun &amp; Moon</r1:MCATitle>",
+            "<r1:MCATitleVersion>Original Version</r1:MCATitleVersion>",
+            "<r1:MCAAudioContentKind>PRM</r1:MCAAudioContentKind>",
+        ] {
+            assert!(
+                sub_descriptors.contains(expected),
+                "no {expected} in\n{sub_descriptors}"
+            );
+        }
+        assert!(!xml.contains("MCAAudioElementKind"), "{xml}");
     }
 }

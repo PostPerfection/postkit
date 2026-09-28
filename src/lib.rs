@@ -17,6 +17,7 @@ pub mod dolby_compliance;
 pub mod dolby_vision;
 pub mod edl_import;
 pub mod encode;
+pub mod ffmpeg_input;
 pub mod file_uri;
 pub mod filter_path;
 pub mod font_subset;

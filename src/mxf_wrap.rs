@@ -111,7 +111,8 @@ pub struct MxfWrapOptions {
     /// claims. Never serialized: it carries secret key material.
     #[serde(skip)]
     pub encryption: Option<MxfEncryption>,
-    /// SMPTE 377-4 MCA labels for PCM. AS-DCP (DCP) only.
+    /// SMPTE 377-4 MCA labels for PCM. An AS-02 Atmos (IAB) wrap requires it
+    /// with empty labels, for the language and soundfield group of its one label.
     #[serde(default)]
     pub mca_config: Option<McaConfig>,
     /// TimedText only: explicit asset ids for the ancillary resources (the
@@ -1545,12 +1546,8 @@ fn wrap_timed_text(opts: &MxfWrapOptions) -> MxfTrackFile {
 }
 
 fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
-    // asdcplib exposes AS-02 IAB as detection-only, no writer exists.
     if opts.standard == MxfStandard::As02 {
-        return MxfTrackFile {
-            error: "AS-02 (IMF) Atmos/IAB wrapping is not supported; asdcplib provides AS-02 writers only for J2K, PCM, and TimedText".to_string(),
-            ..Default::default()
-        };
+        return wrap_as02_iab(opts);
     }
     if opts.input_files.is_empty() {
         return MxfTrackFile {
@@ -1624,6 +1621,86 @@ fn wrap_atmos(opts: &MxfWrapOptions) -> MxfTrackFile {
 
     MxfTrackFile {
         uuid: uuid_str,
+        hash,
+        size,
+        duration: opts.input_files.len() as u64,
+        path: opts.output.clone(),
+        success: true,
+        error: String::new(),
+    }
+}
+
+// TODO: read the sample rate out of the IA frames, 96 kHz IAB is labelled 48 kHz
+const IAB_AUDIO_SAMPLING_RATE: asdcplib::Rational = asdcplib::SAMPLE_RATE_48K;
+const IAB_REFERENCE_AUDIO_ALIGNMENT_LEVEL_DBFS: i8 = -20;
+
+fn wrap_as02_iab(opts: &MxfWrapOptions) -> MxfTrackFile {
+    let failed = |error: String| MxfTrackFile {
+        error,
+        ..Default::default()
+    };
+    if opts.input_files.is_empty() {
+        return failed("no input files".to_string());
+    }
+    if opts.encryption.is_some() {
+        return failed("asdcplib writes AS-02 IAB track files in the clear only".to_string());
+    }
+    let Some(mca) = &opts.mca_config else {
+        return failed(
+            "an AS-02 IAB wrap needs mca_config with the spoken language and soundfield group"
+                .to_string(),
+        );
+    };
+    if !mca.labels.is_empty() {
+        return failed(format!(
+            "an AS-02 IAB track carries one IAB soundfield label, not the channel labels {:?}",
+            mca.labels
+        ));
+    }
+    let Some(group) = &mca.soundfield_group else {
+        return failed("an AS-02 IAB wrap needs the soundfield group properties".to_string());
+    };
+    let soundfield = asdcplib::as02::pcm::SoundfieldGroupProperties {
+        language: mca.spoken_language.as_deref().unwrap_or_default(),
+        title: &group.title,
+        title_version: &group.title_version,
+        audio_content_kind: &group.audio_content_kind,
+        audio_element_kind: &group.audio_element_kind,
+    };
+
+    let info = make_writer_info(opts.asset_uuid);
+    let mut writer = asdcplib::as02::iab::MxfWriter::new();
+    let output_str = opts.output.to_string_lossy().to_string();
+    if let Err(e) = writer.open_write(
+        &output_str,
+        &info,
+        &soundfield,
+        asdcplib::Rational::new(opts.fps_num as i32, opts.fps_den as i32),
+        IAB_AUDIO_SAMPLING_RATE,
+        IAB_REFERENCE_AUDIO_ALIGNMENT_LEVEL_DBFS,
+    ) {
+        return failed(format!("IAB open_write failed: {e}"));
+    }
+
+    for path in &opts.input_files {
+        let frame = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(e) => return failed(format!("failed to read {}: {e}", path.display())),
+        };
+        if let Err(e) = writer.write_frame(&frame) {
+            return failed(format!("IAB write_frame failed on {}: {e}", path.display()));
+        }
+    }
+
+    if let Err(e) = writer.finalize() {
+        return failed(format!("IAB finalize failed: {e}"));
+    }
+
+    let (hash, size) = compute_hash_and_size(&opts.output);
+    MxfTrackFile {
+        uuid: uuid::Uuid::from_bytes(info.asset_uuid)
+            .hyphenated()
+            .to_string(),
         hash,
         size,
         duration: opts.input_files.len() as u64,

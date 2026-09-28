@@ -18,6 +18,10 @@
 - **`create_dcdm` escapes the LUT path for the filter graph**: a Windows drive colon ended the `lut3d` option, so `dcdm --lut` failed on every Windows path. The same `filter_option_path` the colour conversion uses now writes it.
 
 ### Added
+- **`regxml::iab_descriptor_regxml` writes the IAB essence descriptor**: it spells an `IABEssenceDescriptor` and its one `IABSoundfieldLabelSubDescriptor`, as `asdcplib::as02::iab::MxfReader` returns them, as the RegXML an IMF CPL's EssenceDescriptorList carries, item for item the way the WAVE PCM descriptor is written.
+- **`ffmpeg_input` reads a directory of frames as one ffmpeg input**: `FfmpegInput::resolve` turns a directory of numbered frames into an image2 pattern with `-start_number` from its first frame and `-framerate` from the rate the caller names, refusing a gap or a mixed name by the frame, and `frame_output` turns a directory output into numbered frames.
+- **`convert_colour_input`, `compare_frame_inputs` and `compute_vmaf_inputs` take a resolved input**: each runs the same ffmpeg command as `convert_colour`, `compare_frames` and `compute_vmaf`, which now call them with the path as a file input.
+- **`mxf_wrap` writes AS-02 Atmos as an IAB track file**: `EssenceType::Atmos` with `MxfStandard::As02` wraps `input_files`, one IA bitstream frame file per picture frame in order, through `asdcplib::as02::iab::MxfWriter` at the wrap edit rate and 48 kHz. It needs `mca_config` with empty labels, the spoken language and the `SoundfieldGroup`. It refuses encryption, and a frame file that is not a preamble followed by an IA frame. The `IABEssenceDescriptor` carries the wrap edit rate as its reference image edit rate and a -20 dBFS reference audio alignment level. The refusal "AS-02 (IMF) Atmos/IAB wrapping is not supported" is gone.
 
 - **Component versions for the Settings page and the job log**:
   `component_versions::installed_components` returns the application, PostKit,

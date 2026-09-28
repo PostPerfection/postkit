@@ -1,7 +1,8 @@
+use crate::ffmpeg_input::FfmpegInput;
 use crate::filter_path::filter_option_path;
 use crate::grok_encoder::SampleOrder;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Colour space identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,19 +62,35 @@ pub struct ColourConvertOptions {
 /// rejected. For the Rec.709 to DCI X'Y'Z' transform use `rgb_to_xyz_inplace` /
 /// the `dcdm` module, which implement it correctly.
 pub fn convert_colour(opts: &ColourConvertOptions) -> std::io::Result<()> {
+    convert_colour_input(
+        &FfmpegInput::File(opts.input.clone()),
+        &opts.output,
+        opts.source_space,
+        opts.target_space,
+        opts.lut_path.as_deref(),
+    )
+}
+
+pub fn convert_colour_input(
+    input: &FfmpegInput,
+    output: &Path,
+    source_space: ColourSpace,
+    target_space: ColourSpace,
+    lut_path: Option<&Path>,
+) -> std::io::Result<()> {
     let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.arg("-y").arg("-i").arg(&opts.input);
+    cmd.arg("-y").args(input.arguments());
 
     // If a custom LUT is provided, use it for any pair of spaces.
-    if let Some(ref lut) = opts.lut_path {
+    if let Some(lut) = lut_path {
         cmd.arg("-vf")
             .arg(format!("lut3d={}", filter_option_path(lut)));
     } else {
         // No LUT: only spaces the colorspace filter models are honest here.
-        let (colorspace, primaries, trc) = ffmpeg_color_params(opts.target_space)
-            .ok_or_else(|| unsupported_err(opts.target_space))?;
-        let (in_colorspace, in_primaries, in_trc) = ffmpeg_color_params(opts.source_space)
-            .ok_or_else(|| unsupported_err(opts.source_space))?;
+        let (colorspace, primaries, trc) =
+            ffmpeg_color_params(target_space).ok_or_else(|| unsupported_err(target_space))?;
+        let (in_colorspace, in_primaries, in_trc) =
+            ffmpeg_color_params(source_space).ok_or_else(|| unsupported_err(source_space))?;
 
         let filter = format!(
             "colorspace=all={colorspace}:iall={in_colorspace}:iprimaries={in_primaries}:itrc={in_trc}:primaries={primaries}:trc={trc}"
@@ -81,11 +98,11 @@ pub fn convert_colour(opts: &ColourConvertOptions) -> std::io::Result<()> {
         cmd.arg("-vf").arg(filter);
     }
 
-    cmd.arg(&opts.output);
+    cmd.arg(output);
 
-    let output = cmd.output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let converted = cmd.output()?;
+    if !converted.status.success() {
+        let stderr = String::from_utf8_lossy(&converted.stderr);
         return Err(std::io::Error::other(format!(
             "ffmpeg colour conversion failed: {stderr}"
         )));
