@@ -1889,10 +1889,10 @@ pub fn initialize(_num_threads: u32) {}
     feature = "grok-ffi",
     any(test, target_os = "linux", target_os = "macos")
 ))]
-#[derive(Debug, Clone, Copy)]
-enum PackagedGpuPluginLayout<'a> {
+#[derive(Debug, Clone)]
+enum PackagedGpuPluginLayout {
     #[cfg(any(test, target_os = "linux"))]
-    LinuxApplicationLibraryDirectory { application_directory_name: &'a str },
+    LinuxApplicationLibraryDirectory { application_directory_name: String },
     #[cfg(any(test, target_os = "macos"))]
     MacOsBundleExecutableDirectory,
 }
@@ -1905,13 +1905,13 @@ const LINUX_LIBRARY_DIRECTORY_FROM_EXECUTABLE: &str = "../lib";
 const MACOS_GPU_PLUGIN_FILE_NAME: &str = "libgrokj2k_plugin.dylib";
 
 #[cfg(all(feature = "grok-ffi", target_os = "linux"))]
-fn packaged_gpu_plugin_layout(application_directory_name: &str) -> PackagedGpuPluginLayout<'_> {
+fn packaged_gpu_plugin_layout(application_directory_name: &str) -> PackagedGpuPluginLayout {
     PackagedGpuPluginLayout::LinuxApplicationLibraryDirectory {
-        application_directory_name,
+        application_directory_name: application_directory_name.to_string(),
     }
 }
 #[cfg(all(feature = "grok-ffi", target_os = "macos"))]
-fn packaged_gpu_plugin_layout(_application_directory_name: &str) -> PackagedGpuPluginLayout<'_> {
+fn packaged_gpu_plugin_layout(_application_directory_name: &str) -> PackagedGpuPluginLayout {
     PackagedGpuPluginLayout::MacOsBundleExecutableDirectory
 }
 
@@ -1919,7 +1919,7 @@ fn packaged_gpu_plugin_layout(_application_directory_name: &str) -> PackagedGpuP
     feature = "grok-ffi",
     any(test, target_os = "linux", target_os = "macos")
 ))]
-fn packaged_gpu_plugin_file_name(layout: PackagedGpuPluginLayout) -> &'static str {
+fn packaged_gpu_plugin_file_name(layout: &PackagedGpuPluginLayout) -> &'static str {
     match layout {
         #[cfg(any(test, target_os = "linux"))]
         PackagedGpuPluginLayout::LinuxApplicationLibraryDirectory { .. } => {
@@ -1935,7 +1935,7 @@ fn packaged_gpu_plugin_file_name(layout: PackagedGpuPluginLayout) -> &'static st
     any(test, target_os = "linux", target_os = "macos")
 ))]
 fn packaged_gpu_plugin_directory(
-    layout: PackagedGpuPluginLayout,
+    layout: &PackagedGpuPluginLayout,
     executable: &Path,
 ) -> Option<PathBuf> {
     let executable_directory = executable.parent()?;
@@ -1965,11 +1965,11 @@ pub fn set_packaged_gpu_plugin_path(application_directory_name: &str) {
         return;
     };
     let layout = packaged_gpu_plugin_layout(application_directory_name);
-    let Some(plugin_directory) = packaged_gpu_plugin_directory(layout, &executable) else {
+    let Some(plugin_directory) = packaged_gpu_plugin_directory(&layout, &executable) else {
         return;
     };
     if !plugin_directory
-        .join(packaged_gpu_plugin_file_name(layout))
+        .join(packaged_gpu_plugin_file_name(&layout))
         .is_file()
     {
         return;
@@ -2540,8 +2540,8 @@ mod tests {
         layout: PackagedGpuPluginLayout,
         executable: &str,
     ) -> Option<PathBuf> {
-        packaged_gpu_plugin_directory(layout, Path::new(executable))
-            .map(|directory| directory.join(packaged_gpu_plugin_file_name(layout)))
+        packaged_gpu_plugin_directory(&layout, Path::new(executable))
+            .map(|directory| directory.join(packaged_gpu_plugin_file_name(&layout)))
     }
 
     #[cfg(feature = "grok-ffi")]
@@ -2550,7 +2550,7 @@ mod tests {
         assert_eq!(
             packaged_gpu_plugin_path(
                 PackagedGpuPluginLayout::LinuxApplicationLibraryDirectory {
-                    application_directory_name: "dcpwizard",
+                    application_directory_name: "dcpwizard".to_string(),
                 },
                 "/usr/bin/dcpwizard",
             ),
