@@ -54,9 +54,10 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `subtitle_retime` | Subtitle timing conversion between framerates; standalone SRT parser |
 | `timecode` | SMPTE timecode and frame-rate math (drop-frame aware) |
 | `trailer` | Theatrical trailer packaging (ratings card + leader concatenated ahead of content) |
+| `transcode` | Cancellable ffmpeg runner and video to video transcode |
 | `upmix` | Stereo to 5.1 upmix (DoM upmixer A/B, windowed-sinc FIR) |
 | `version_tracker` | Content versioning database (delivery history) |
-| `watch` | Watch folder automation |
+| `watch` | Watch folder loop that hands each master to the caller once it stops changing |
 | `watermark` | Burns a visible text mark into each frame (not forensic/invisible) |
 | `wav_io` | WAV read/write to normalized interleaved f32 (shared DSP helper) |
 | `webhook` | HTTP webhook notifications on job completion/failure |

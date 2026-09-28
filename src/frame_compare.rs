@@ -4,7 +4,7 @@
 //! are the pooled/aggregate wrappers. ffmpeg stat output is parsed by
 //! whitespace splitting, no regex.
 
-use crate::ffmpeg_input::FfmpegInput;
+use crate::ffmpeg_input::{FfmpegInput, FrameSpan};
 use crate::filter_path::filter_option_path;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -47,17 +47,50 @@ fn stats_log_path(metric: &str) -> PathBuf {
     ))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComparisonInput {
+    pub input: FfmpegInput,
+    pub frame_span: Option<FrameSpan>,
+}
+
+impl ComparisonInput {
+    pub fn whole_file(path: &Path) -> Self {
+        Self {
+            input: FfmpegInput::File(path.to_path_buf()),
+            frame_span: None,
+        }
+    }
+
+    fn picture_stream(&self, input_index: usize, label: &str) -> String {
+        let filter = self
+            .frame_span
+            .map_or_else(|| "null".to_string(), FrameSpan::trim_filter);
+        format!("[{input_index}:v]{filter}[{label}];")
+    }
+}
+
+const REFERENCE_INPUT_INDEX: usize = 0;
+const DISTORTED_INPUT_INDEX: usize = 1;
+
+fn picture_streams(reference: &ComparisonInput, distorted: &ComparisonInput) -> String {
+    format!(
+        "{}{}",
+        reference.picture_stream(REFERENCE_INPUT_INDEX, "reference"),
+        distorted.picture_stream(DISTORTED_INPUT_INDEX, "distorted")
+    )
+}
+
 /// Compare two video files frame-by-frame using ffmpeg PSNR and SSIM filters.
 pub fn compare_frames(reference: &Path, distorted: &Path) -> Result<CompareResult, String> {
     compare_frame_inputs(
-        &FfmpegInput::File(reference.to_path_buf()),
-        &FfmpegInput::File(distorted.to_path_buf()),
+        &ComparisonInput::whole_file(reference),
+        &ComparisonInput::whole_file(distorted),
     )
 }
 
 pub fn compare_frame_inputs(
-    reference: &FfmpegInput,
-    distorted: &FfmpegInput,
+    reference: &ComparisonInput,
+    distorted: &ComparisonInput,
 ) -> Result<CompareResult, String> {
     let psnr_log = stats_log_path("psnr");
     let ssim_log = stats_log_path("ssim");
@@ -65,17 +98,18 @@ pub fn compare_frame_inputs(
     // Run ffmpeg with both PSNR and SSIM filters simultaneously
     let status = std::process::Command::new("ffmpeg")
         .arg("-y")
-        .args(reference.arguments())
-        .args(distorted.arguments())
+        .args(reference.input.arguments())
+        .args(distorted.input.arguments())
         .args([
             "-lavfi",
             // each input pad can only be consumed once, so split both before
             // feeding psnr and ssim; ssim's passthrough goes to a null sink and
             // psnr's is the graph output consumed by `-f null -`.
             &format!(
-                "[0:v]split=2[r0][r1];[1:v]split=2[d0][d1];\
+                "{}[reference]split=2[r0][r1];[distorted]split=2[d0][d1];\
                  [r1][d1]ssim=stats_file={}[s];[s]nullsink;\
                  [r0][d0]psnr=stats_file={}",
+                picture_streams(reference, distorted),
                 filter_option_path(&ssim_log),
                 filter_option_path(&psnr_log)
             ),
@@ -188,14 +222,14 @@ pub fn ffmpeg_has_libvmaf() -> bool {
 /// the local ffmpeg has no libvmaf.
 pub fn compute_vmaf(reference: &Path, distorted: &Path) -> Result<VmafScore, String> {
     compute_vmaf_inputs(
-        &FfmpegInput::File(reference.to_path_buf()),
-        &FfmpegInput::File(distorted.to_path_buf()),
+        &ComparisonInput::whole_file(reference),
+        &ComparisonInput::whole_file(distorted),
     )
 }
 
 pub fn compute_vmaf_inputs(
-    reference: &FfmpegInput,
-    distorted: &FfmpegInput,
+    reference: &ComparisonInput,
+    distorted: &ComparisonInput,
 ) -> Result<VmafScore, String> {
     if !ffmpeg_has_libvmaf() {
         return Err(
@@ -205,13 +239,14 @@ pub fn compute_vmaf_inputs(
 
     let log = std::env::temp_dir().join(format!("imfwizard_vmaf_{}.json", std::process::id()));
     let filter = format!(
-        "[1:v][0:v]libvmaf=log_path={}:log_fmt=json",
+        "{}[distorted][reference]libvmaf=log_path={}:log_fmt=json",
+        picture_streams(reference, distorted),
         filter_option_path(&log)
     );
     let out = std::process::Command::new("ffmpeg")
         .arg("-y")
-        .args(reference.arguments())
-        .args(distorted.arguments())
+        .args(reference.input.arguments())
+        .args(distorted.input.arguments())
         .args(["-lavfi", &filter, "-f", "null", "-"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -526,6 +561,44 @@ n:2 R:0.763922 G:0.730375 B:0.672471 All:0.722256 (5.563553)
             String::from_utf8_lossy(&run.stderr)
         );
         assert!(stats.is_file(), "no stats file at {}", stats.display());
+    }
+
+    #[test]
+    fn a_frame_span_limits_the_comparison_to_its_frames() {
+        const CLIP_FRAMES: &str = "6";
+        const SPAN: FrameSpan = FrameSpan {
+            entry_point: 2,
+            duration_frames: 3,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let clip = dir.path().join("clip.mkv");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=s=64x64:r=24",
+            ])
+            .args(["-frames:v", CLIP_FRAMES, "-c:v", "ffv1"])
+            .arg(&clip)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let spanned = ComparisonInput {
+            frame_span: Some(SPAN),
+            ..ComparisonInput::whole_file(&clip)
+        };
+
+        let result = compare_frame_inputs(&spanned, &spanned).unwrap();
+
+        assert_eq!(result.frames_compared, SPAN.duration_frames);
     }
 
     #[test]

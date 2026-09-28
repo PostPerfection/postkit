@@ -70,6 +70,7 @@ pub mod timed_text_descriptor;
 #[cfg(feature = "tms")]
 pub mod tms;
 pub mod trailer;
+pub mod transcode;
 pub mod upmix;
 pub mod version_tracker;
 pub mod watch;

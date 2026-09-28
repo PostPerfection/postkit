@@ -21,15 +21,21 @@ pub enum FfmpegInput {
 }
 
 impl FfmpegInput {
-    // a frame directory plays at `sequence_rate`, since stills carry no rate of their own
-    pub fn resolve(path: &Path, sequence_rate: FrameRate) -> Result<Self, String> {
+    pub fn resolve(path: &Path, sequence_rate: Option<FrameRate>) -> Result<Self, String> {
         if !path.is_dir() {
             return Ok(Self::File(path.to_path_buf()));
         }
         if detect_input_type(path) != InputType::ImageSequence {
             return Err(format!("{} holds no image frames", path.display()));
         }
-        ImageSequence::from_directory(path, sequence_rate).map(Self::ImageSequence)
+        let frame_rate = sequence_rate.ok_or_else(|| {
+            format!(
+                "{} is a frame directory, and a frame directory needs a frame rate: its \
+                 stills carry none",
+                path.display()
+            )
+        })?;
+        ImageSequence::from_directory(path, frame_rate).map(Self::ImageSequence)
     }
 
     pub fn arguments(&self) -> Vec<OsString> {
@@ -53,6 +59,24 @@ impl FfmpegInput {
             Self::File(_) => None,
             Self::ImageSequence(sequence) => Some(&sequence.extension),
         }
+    }
+}
+
+// a span that names no duration runs to the end of the input
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSpan {
+    pub entry_point: u64,
+    pub duration_frames: u64,
+}
+
+impl FrameSpan {
+    pub fn trim_filter(self) -> String {
+        let start = self.entry_point;
+        let trim = match self.duration_frames {
+            0 => format!("trim=start_frame={start}"),
+            frames => format!("trim=start_frame={start}:end_frame={}", start + frames),
+        };
+        format!("{trim},setpts=PTS-STARTPTS")
     }
 }
 
@@ -197,5 +221,63 @@ mod tests {
 
         assert!(refused.contains("f_0004.png"), "{refused}");
         assert!(refused.contains("frame 3"), "{refused}");
+    }
+
+    #[test]
+    fn a_frame_directory_without_a_rate_is_refused_naming_the_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        touch(directory.path(), &["f_0001.png", "f_0002.png"]);
+
+        let refused = FfmpegInput::resolve(directory.path(), None).unwrap_err();
+
+        assert!(
+            refused.contains(&directory.path().display().to_string()),
+            "{refused}"
+        );
+        assert!(refused.contains("needs a frame rate"), "{refused}");
+    }
+
+    #[test]
+    fn a_frame_directory_plays_at_the_rate_it_is_given() {
+        const FRAMES_PER_SECOND: u32 = 25;
+        let directory = tempfile::tempdir().unwrap();
+        touch(directory.path(), &["f_0001.png", "f_0002.png"]);
+
+        let resolved =
+            FfmpegInput::resolve(directory.path(), Some(FrameRate::whole(FRAMES_PER_SECOND)))
+                .unwrap();
+
+        let FfmpegInput::ImageSequence(sequence) = resolved else {
+            panic!("a frame directory resolved to {resolved:?}");
+        };
+        assert_eq!(sequence.frame_rate, FrameRate::whole(FRAMES_PER_SECOND));
+    }
+
+    #[test]
+    fn a_file_needs_no_rate() {
+        let file = Path::new("clip.mov");
+
+        assert_eq!(
+            FfmpegInput::resolve(file, None),
+            Ok(FfmpegInput::File(file.to_path_buf()))
+        );
+    }
+
+    #[test]
+    fn a_span_trims_from_its_entry_point_and_runs_to_the_end_without_a_duration() {
+        let bounded = FrameSpan {
+            entry_point: 2,
+            duration_frames: 3,
+        };
+        let open = FrameSpan {
+            entry_point: 2,
+            duration_frames: 0,
+        };
+
+        assert_eq!(
+            bounded.trim_filter(),
+            "trim=start_frame=2:end_frame=5,setpts=PTS-STARTPTS"
+        );
+        assert_eq!(open.trim_filter(), "trim=start_frame=2,setpts=PTS-STARTPTS");
     }
 }
