@@ -346,7 +346,7 @@ fn a_codestream_over_the_cap_ends_the_run_before_the_clip_is_encoded() {
     };
     assert!(
         error.contains(&format!(
-            "over the {UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
+            "{UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
         )),
         "{error}"
     );

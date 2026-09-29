@@ -1308,7 +1308,7 @@ pub fn compress_yuv422_frame(
         let codec = grk_compress_init(&mut stream_params, &mut cparams, image);
         if codec.is_null() {
             grk_object_unref(&mut (*image).obj);
-            return Err("Failed to initialize Grok compressor".to_string());
+            return Err(compressor_init_failure(params));
         }
         let compressed_len = grk_compress(codec, ptr::null_mut());
         grk_object_unref(codec);
@@ -1318,6 +1318,20 @@ pub fn compress_yuv422_frame(
         }
         output_buf.truncate(compressed_len as usize);
         Ok(output_buf)
+    }
+}
+
+// grok refuses to start when no layer can fit its byte budget
+#[cfg(feature = "grok-ffi")]
+fn compressor_init_failure(params: &CompressParams) -> String {
+    match params
+        .codestream_byte_cap
+        .or(params.target_codestream_bytes)
+    {
+        Some(cap) => {
+            format!("grok cannot fit a frame under the {cap} byte per-frame cap: lower the bitrate")
+        }
+        None => "Failed to initialize Grok compressor".to_string(),
     }
 }
 
@@ -1419,7 +1433,7 @@ fn compress_frame_once(
         let codec = grk_compress_init(&mut stream_params, &mut cparams, image);
         if codec.is_null() {
             grk_object_unref(&mut (*image).obj);
-            return Err("Failed to initialize Grok compressor".to_string());
+            return Err(compressor_init_failure(params));
         }
 
         let compressed_len = grk_compress(codec, ptr::null_mut());
@@ -3660,7 +3674,7 @@ mod tests {
         // what stops the run
         assert!(
             result.error.contains(&format!(
-                "over the {UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
+                "{UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
             )),
             "wrong refusal: {}",
             result.error
@@ -3676,7 +3690,7 @@ mod tests {
         assert!(!result.success, "a 100 byte target has to fail the encode");
         assert!(
             result.error.contains(&format!(
-                "over the {UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
+                "{UNMEETABLE_CAP} byte per-frame cap: lower the bitrate"
             )),
             "wrong refusal: {}",
             result.error
