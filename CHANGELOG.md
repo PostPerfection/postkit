@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Changed
-- **An encode threads setting sizes the encoder threads and the plugin's host threads**: `encode_threads` on `EncodeRunOptions`, `StreamEncodeOptions` and `CompressParams` sets the pipeline's encoder thread count and `use_gpu_with_authentication` takes a third argument passed to grok as `grk_plugin_init_info::num_threads`, 0 meaning automatic for both. `encode_thread_count` returns the count the pipeline resolves.
+- **An encode threads setting sizes the encoder threads and the plugin's host threads**: `encode_threads` on `EncodeRunOptions`, `StreamEncodeOptions`, `CompressParams` and `StillHold` sets the pipeline's encoder thread count and `use_gpu_with_authentication` takes a third argument passed to grok as `grk_plugin_init_info::num_threads`, 0 meaning automatic for both. `encode_thread_count` returns the count the pipeline resolves.
 - **`FfmpegInput::resolve` refuses a frame directory with no rate**: it takes `Option<FrameRate>`, a file ignores it as before, and a frame directory given `None` is refused naming the directory instead of playing at whatever rate the caller defaulted to.
 - **`compare_frame_inputs` and `compute_vmaf_inputs` take a `ComparisonInput`**: an input carries an optional `FrameSpan`, and `FrameSpan::trim_filter` cuts it with `trim=start_frame=..:end_frame=..,setpts=PTS-STARTPTS` before the comparison, the same trim the IMF Wizard ProRes export builds.
 - **`watch` holds the watch folder loop both wizards run**: `watch_directory` polls a folder and hands each master to the caller once two polls in a row measure it the same, and the unused `FileWatcher` with its `notify` dependency is gone.

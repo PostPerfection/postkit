@@ -90,6 +90,8 @@ pub struct StillHold<'a> {
     /// The Rsiz the held codestreams declare: cinema 2K, cinema 4K, or an IMF
     /// profile with its levels from [`crate::j2k::imf_rsiz`].
     pub rsiz: u16,
+    /// Encoder threads, 0 for one per available CPU
+    pub encode_threads: u32,
     /// Per-frame matrix for a source space the compressor's own transform does
     /// not model.
     pub colour_transform: Option<Arc<crate::colour::FrameColourTransform>>,
@@ -122,6 +124,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         filters,
         apply_xyz_transform,
         rsiz,
+        encode_threads,
         colour_transform,
         burn,
         watermark,
@@ -144,6 +147,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         edit_rate: fps,
         apply_xyz_transform: *apply_xyz_transform,
         profile: *rsiz,
+        encode_threads: *encode_threads,
         source_preparation: SourcePreparation {
             subtitle_burn: burn.clone(),
             watermark: watermark.clone(),
@@ -153,7 +157,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
     };
     let encoded = distinct_frames(burn.as_deref(), frames);
     let cancel = Arc::new(AtomicBool::new(false));
-    grok_encoder::initialize(0);
+    grok_encoder::initialize(*encode_threads);
     let mut next = encoded.iter().copied();
     let result = grok_encoder::encode_pipeline(
         out_dir,
@@ -274,6 +278,7 @@ mod tests {
             filters: &[],
             apply_xyz_transform: true,
             rsiz: crate::encode::default_rsiz(),
+            encode_threads: 0,
             colour_transform: None,
             burn: None,
             watermark: None,

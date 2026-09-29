@@ -232,6 +232,7 @@ fn a_held_still_is_encoded_under_the_imf_rsiz() {
         filters: &[],
         apply_xyz_transform,
         rsiz,
+        encode_threads: 0,
         colour_transform: None,
         burn: None,
         watermark: None,
