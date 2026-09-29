@@ -141,6 +141,8 @@ pub struct CompressParams {
     pub source_preparation: SourcePreparation,
     /// Threads per codec instance (set internally by pipeline)
     pub threads_per_codec: u32,
+    /// Encoder threads the pipeline runs, 0 for one per available CPU
+    pub encode_threads: u32,
 }
 
 /// Bits a sample carries in the packed rgb48 layout the burns read.
@@ -330,6 +332,7 @@ impl Default for CompressParams {
             apply_xyz_transform: false,
             source_preparation: SourcePreparation::default(),
             threads_per_codec: 1,
+            encode_threads: 0,
         }
     }
 }
@@ -521,6 +524,15 @@ impl FrameBufferPool {
     }
 }
 
+pub fn encode_thread_count(encode_threads: u32) -> usize {
+    if encode_threads != 0 {
+        return encode_threads as usize;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 /// Encode a sequence of raw XYZ frames using the in-process Grok FFI pipeline.
 ///
 /// This is the high-performance path: N encoder threads share a bounded queue,
@@ -597,9 +609,7 @@ where
         };
     }
 
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let num_threads = encode_thread_count(params.encode_threads);
 
     // grok >= 20.3.8 honors cparams.num_threads == 1 by giving each codec its
     // own inline executor, so n encoder threads => n independent single-thread
@@ -2063,7 +2073,7 @@ const ACCELERATOR_DEVICE_ID: i32 = 0;
 /// call rather than falling back.
 #[cfg(feature = "grok-ffi")]
 pub fn use_gpu() -> Result<(), String> {
-    use_gpu_with_authentication(None, None)
+    use_gpu_with_authentication(None, None, 0)
 }
 
 pub const GPU_LICENSE_VARIABLE: &str = "POSTKIT_GPU_LICENSE";
@@ -2073,13 +2083,14 @@ pub const GPU_REGISTRATION_URL_VARIABLE: &str = "POSTKIT_GPU_REGISTRATION_URL";
 pub fn use_gpu_from_environment() -> Result<(), String> {
     let license = std::env::var(GPU_LICENSE_VARIABLE).ok();
     let registration_url = std::env::var(GPU_REGISTRATION_URL_VARIABLE).ok();
-    use_gpu_with_authentication(license.as_deref(), registration_url.as_deref())
+    use_gpu_with_authentication(license.as_deref(), registration_url.as_deref(), 0)
 }
 
 #[cfg(feature = "grok-ffi")]
 pub fn use_gpu_with_authentication(
     license: Option<&str>,
     registration_url: Option<&str>,
+    encode_threads: u32,
 ) -> Result<(), String> {
     let license = license
         .filter(|value| !value.is_empty())
@@ -2091,16 +2102,21 @@ pub fn use_gpu_with_authentication(
         .map(std::ffi::CString::new)
         .transpose()
         .map_err(|_| "the Grok registration URL contains a null byte".to_string())?;
-    let init_info = grokj2k_sys::grk_plugin_init_info {
-        device_id: ACCELERATOR_DEVICE_ID,
-        verbose: false,
-        license: license
-            .as_ref()
-            .map_or(std::ptr::null(), |value| value.as_ptr()),
-        server: registration_url
-            .as_ref()
-            .map_or(std::ptr::null(), |value| value.as_ptr()),
-    };
+    let mut init_info: grokj2k_sys::grk_plugin_init_info = unsafe { std::mem::zeroed() };
+    init_info.device_id = ACCELERATOR_DEVICE_ID;
+    init_info.verbose = false;
+    init_info.license = license
+        .as_ref()
+        .map_or(std::ptr::null(), |value| value.as_ptr());
+    init_info.server = registration_url
+        .as_ref()
+        .map_or(std::ptr::null(), |value| value.as_ptr());
+    #[cfg(grok_plugin_num_threads)]
+    {
+        init_info.num_threads = encode_threads;
+    }
+    #[cfg(not(grok_plugin_num_threads))]
+    let _ = encode_threads;
     let (initialised, plugin_messages) =
         capture_grok_warnings(|| unsafe { grokj2k_sys::grk_plugin_init(init_info) });
     if !initialised {
@@ -2200,6 +2216,7 @@ pub fn use_gpu() -> Result<(), String> {
 pub fn use_gpu_with_authentication(
     _license: Option<&str>,
     _registration_url: Option<&str>,
+    _encode_threads: u32,
 ) -> Result<(), String> {
     Err("postkit was built without the grok-ffi feature".to_string())
 }

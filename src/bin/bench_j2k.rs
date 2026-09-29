@@ -64,6 +64,7 @@ fn base_params(res: &Res) -> CompressParams {
         apply_xyz_transform: false,
         source_preparation: Default::default(),
         threads_per_codec: 1,
+        encode_threads: 0,
     }
 }
 

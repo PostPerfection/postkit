@@ -99,7 +99,12 @@ the pipeline stays full instead of taking one frame at a time. The frame shape
 comes from the first frame, and a shape or a set of parameters the plugin
 declines puts the whole run back on the CPU. A decode still routes per call,
 and an encode with a PSNR target stays on the CPU, because a frame over the
-byte cap is compressed again by rate.
+byte cap is compressed again by rate. `EncodeRunOptions::encode_threads`,
+`StreamEncodeOptions::encode_threads` and `CompressParams::encode_threads` set
+how many encoder threads the pipeline runs, and the `encode_threads` argument of
+`grok_encoder::use_gpu_with_authentication` sets how many host threads the
+plugin runs, 0 meaning one per CPU the process may run on. A grok whose
+`grk_plugin_init_info` has no `num_threads` field ignores the plugin count.
 
 The player is the exception to per-call decode routing: `grok_player` runs its
 full-resolution decodes as one in-memory batch, the plugin's threads pull

@@ -2,12 +2,18 @@
 const MPV_LIB_DIR_ENV: &str = "MPV_LIB_DIR";
 
 const GROK_PLUGIN_BUILD_INFO_FUNCTION: &str = "grk_plugin_build_info";
+const GROK_PLUGIN_INIT_INFO_START: &str = "typedef struct _grk_plugin_init_info";
+const GROK_PLUGIN_INIT_INFO_END: &str = "} grk_plugin_init_info;";
+const GROK_PLUGIN_NUM_THREADS_FIELD: &str = "num_threads";
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(grok_plugin_build_info)");
+    println!("cargo::rustc-check-cfg=cfg(grok_plugin_num_threads)");
     if std::env::var_os("CARGO_FEATURE_GROK_FFI").is_some() {
-        detect_grok_plugin_build_info();
+        let header_text = read_grok_header();
+        detect_grok_plugin_build_info(&header_text);
+        detect_grok_plugin_num_threads(&header_text);
     }
     if std::env::var_os("CARGO_FEATURE_LIBMPV").is_none() {
         return;
@@ -21,8 +27,7 @@ fn main() {
     }
 }
 
-// grokj2k-sys has no binding for this function when built against an older grok.h
-fn detect_grok_plugin_build_info() {
+fn read_grok_header() -> String {
     let grok = pkg_config::Config::new()
         .cargo_metadata(false)
         .probe("libgrokj2k")
@@ -34,9 +39,24 @@ fn detect_grok_plugin_build_info() {
         .find(|header| header.exists())
         .expect("no grok.h in the libgrokj2k include paths");
     println!("cargo::rerun-if-changed={}", header.display());
-    let header_text = std::fs::read_to_string(&header).expect("grok.h is readable");
+    std::fs::read_to_string(&header).expect("grok.h is readable")
+}
+
+// grokj2k-sys has no binding for this function when built against an older grok.h
+fn detect_grok_plugin_build_info(header_text: &str) {
     if header_text.contains(GROK_PLUGIN_BUILD_INFO_FUNCTION) {
         println!("cargo::rustc-cfg=grok_plugin_build_info");
+    }
+}
+
+fn detect_grok_plugin_num_threads(header_text: &str) {
+    let init_info = header_text
+        .split_once(GROK_PLUGIN_INIT_INFO_START)
+        .and_then(|(_, rest)| rest.split_once(GROK_PLUGIN_INIT_INFO_END))
+        .map(|(init_info, _)| init_info)
+        .expect("grok.h declares grk_plugin_init_info");
+    if init_info.contains(GROK_PLUGIN_NUM_THREADS_FIELD) {
+        println!("cargo::rustc-cfg=grok_plugin_num_threads");
     }
 }
 

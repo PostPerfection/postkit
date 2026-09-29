@@ -1152,6 +1152,9 @@ pub struct StreamEncodeOptions {
     /// than the whole sequence.
     #[serde(default)]
     pub codestream_byte_cap: Option<u64>,
+    /// Encoder threads the pipeline runs, 0 for one per available CPU
+    #[serde(default)]
+    pub encode_threads: u32,
 }
 
 /// The cinema profile a DCP picture declares, written as 2K or 4K by each
@@ -1181,6 +1184,7 @@ impl Default for StreamEncodeOptions {
             subtitle_burn: None,
             watermark: None,
             codestream_byte_cap: None,
+            encode_threads: 0,
         }
     }
 }
@@ -1618,6 +1622,7 @@ fn compress_params(
         edit_rate: opts.fps,
         profile: opts.rsiz,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
+        encode_threads: opts.encode_threads,
         source_preparation: crate::grok_encoder::SourcePreparation {
             subtitle_burn: opts.subtitle_burn.clone(),
             watermark: opts.watermark.clone(),

@@ -180,6 +180,8 @@ pub struct EncodeRunOptions {
     /// source decodes. Anything but the identity takes an image sequence through
     /// ffmpeg, the way a burn does.
     pub picture: PictureProcessing,
+    /// Encoder threads the pipeline runs, 0 for one per available CPU
+    pub encode_threads: u32,
 }
 
 impl Default for EncodeRunOptions {
@@ -196,6 +198,7 @@ impl Default for EncodeRunOptions {
             codestream_byte_cap: None,
             subtitle_burn: None,
             picture: PictureProcessing::default(),
+            encode_threads: 0,
         }
     }
 }
@@ -414,6 +417,7 @@ fn run_encode_and_maybe_wrap(
                     subtitle_burn: options.subtitle_burn.clone(),
                     picture: options.picture.clone(),
                     codestream_byte_cap: options.codestream_byte_cap,
+                    encode_threads: options.encode_threads,
                     ..StreamEncodeOptions::default()
                 },
                 mxf_feed,
@@ -446,6 +450,7 @@ fn run_encode_and_maybe_wrap(
                 subtitle_burn: options.subtitle_burn.clone(),
                 picture: options.picture.clone(),
                 codestream_byte_cap: options.codestream_byte_cap,
+                encode_threads: options.encode_threads,
                 ..StreamEncodeOptions::default()
             };
             if sequence_needs_ffmpeg {
