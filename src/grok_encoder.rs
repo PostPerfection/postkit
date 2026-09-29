@@ -490,13 +490,45 @@ impl<T> BoundedQueue<T> {
     }
 }
 
+pub struct FrameBufferPool {
+    spare: Mutex<Vec<Vec<u8>>>,
+}
+
+impl FrameBufferPool {
+    fn new() -> Self {
+        Self {
+            spare: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn take(&self, len: usize) -> Vec<u8> {
+        let spare = self.spare.lock().unwrap().pop();
+        match spare {
+            Some(mut buffer) => {
+                buffer.resize(len, 0);
+                buffer
+            }
+            None => vec![0u8; len],
+        }
+    }
+
+    fn recycle(&self, frame: RawFrame) {
+        let buffer = match frame {
+            RawFrame::Packed { data, .. } | RawFrame::PlanarYuv { data, .. } => data,
+            RawFrame::Planar { .. } => return,
+        };
+        self.spare.lock().unwrap().push(buffer);
+    }
+}
+
 /// Encode a sequence of raw XYZ frames using the in-process Grok FFI pipeline.
 ///
 /// This is the high-performance path: N encoder threads share a bounded queue,
 /// each calling `grk_compress()` directly (no subprocess overhead). Encoded
 /// frames are written to disk by a dedicated writer thread.
 ///
-/// `frame_producer` is called repeatedly to produce frames. Return `None` when done.
+/// `frame_producer` is called repeatedly to produce frames, with the pool its
+/// buffers come back through. Return `None` when done.
 ///
 /// `phase_clocks` collects the preparation, compression and write time; the
 /// producer is the only one that can time its own wait on the decoder, so it
@@ -511,7 +543,7 @@ pub fn encode_pipeline<F, P>(
     on_progress: P,
 ) -> PipelineResult
 where
-    F: FnMut() -> Option<RawFrame>,
+    F: FnMut(&FrameBufferPool) -> Option<RawFrame>,
     P: FnMut(EncodeProgress),
 {
     encode_pipeline_with_mxf_feed(
@@ -552,7 +584,7 @@ pub fn encode_pipeline_with_mxf_feed<F, P>(
     mut on_progress: P,
 ) -> PipelineResult
 where
-    F: FnMut() -> Option<RawFrame>,
+    F: FnMut(&FrameBufferPool) -> Option<RawFrame>,
     P: FnMut(EncodeProgress),
 {
     if let Err(e) = std::fs::create_dir_all(output_dir) {
@@ -579,6 +611,7 @@ where
     // (each 2K frame ≈ 21MB in planar i32)
     let queue_capacity = (num_encoder_threads * 2).clamp(4, 32);
     let input_queue: Arc<BoundedQueue<RawFrame>> = Arc::new(BoundedQueue::new(queue_capacity));
+    let buffer_pool = Arc::new(FrameBufferPool::new());
 
     // Writer channel, bounded like the input queue: a disk that cannot keep up
     // blocks whoever is sending, the encoder threads or the plugin's callback
@@ -662,7 +695,7 @@ where
     let mut batch = None;
     if gpu_active()
         && params.quality_psnr.is_none()
-        && let Some(frame) = frame_producer()
+        && let Some(frame) = frame_producer(&buffer_pool)
     {
         match Batch::begin(
             &frame,
@@ -702,11 +735,13 @@ where
                 let cancel = cancel.clone();
                 let params = params.clone();
                 let phase_clocks = phase_clocks.clone();
+                let buffer_pool = buffer_pool.clone();
                 let slope_hint = &slope_hint;
 
                 s.spawn(move || {
                     encoder_thread_fn(
                         &input_queue,
+                        &buffer_pool,
                         &writer_tx,
                         &error_flag,
                         &first_error,
@@ -733,7 +768,10 @@ where
                 break;
             }
 
-            match pending_first_frame.take().or_else(&mut frame_producer) {
+            match pending_first_frame
+                .take()
+                .or_else(|| frame_producer(&buffer_pool))
+            {
                 Some(frame) => {
                     if !input_queue.push(frame) {
                         break;
@@ -851,6 +889,7 @@ fn fail_pipeline(
 #[allow(clippy::too_many_arguments)]
 fn encoder_thread_fn(
     input_queue: &BoundedQueue<RawFrame>,
+    buffer_pool: &FrameBufferPool,
     writer_tx: &std::sync::mpsc::SyncSender<EncodedFrame>,
     error_flag: &AtomicBool,
     first_error: &Mutex<String>,
@@ -895,12 +934,11 @@ fn encoder_thread_fn(
         };
         phase_clocks.add(EncodePhase::Jpeg2000, encode_start.elapsed());
 
+        let index = frame.index();
+        buffer_pool.recycle(frame);
         match compressed {
             Ok(Some(data)) => {
-                let encoded = EncodedFrame {
-                    data,
-                    index: frame.index(),
-                };
+                let encoded = EncodedFrame { data, index };
                 if writer_tx.send(encoded).is_err() {
                     break;
                 }
@@ -911,7 +949,7 @@ fn encoder_thread_fn(
                     error_flag,
                     first_error,
                     input_queue,
-                    format!("Encode failed frame {}: {e}", frame.index()),
+                    format!("Encode failed frame {index}: {e}"),
                 );
                 break;
             }
@@ -1874,10 +1912,27 @@ fn submit_frame_to_batch(_frame: &RawFrame, shape: BatchShape) -> Result<(), Str
 /// Safe to call multiple times (subsequent calls are no-ops).
 #[cfg(feature = "grok-ffi")]
 pub fn initialize(num_threads: u32) {
+    keep_freed_heap_memory();
     unsafe {
         grokj2k_sys::grk_initialize(std::ptr::null(), num_threads, std::ptr::null_mut());
     }
 }
+
+#[cfg(all(feature = "grok-ffi", target_os = "linux", target_env = "gnu"))]
+fn keep_freed_heap_memory() {
+    const NEVER_TRIM: libc::c_int = -1;
+    const TOP_PAD_BYTES: libc::c_int = 256 * 1024 * 1024;
+    unsafe {
+        libc::mallopt(libc::M_TRIM_THRESHOLD, NEVER_TRIM);
+        libc::mallopt(libc::M_TOP_PAD, TOP_PAD_BYTES);
+    }
+}
+
+#[cfg(all(
+    feature = "grok-ffi",
+    not(all(target_os = "linux", target_env = "gnu"))
+))]
+fn keep_freed_heap_memory() {}
 
 /// Stub when grok-ffi is not enabled.
 #[cfg(not(feature = "grok-ffi"))]
@@ -2464,11 +2519,11 @@ where
         &phase_clocks,
         mxf_feed,
         None,
-        || {
+        |buffer_pool| {
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            let mut buf = vec![0u8; frame_size];
+            let mut buf = buffer_pool.take(frame_size);
             let read_start = std::time::Instant::now();
             let read = stdout.read_exact(&mut buf);
             phase_clocks.add(EncodePhase::DecoderWait, read_start.elapsed());
@@ -3338,7 +3393,7 @@ mod tests {
                         3,
                         &cancel,
                         &phase_clocks,
-                        || {
+                        |_| {
                             if left == 0 {
                                 return None;
                             }
@@ -3390,7 +3445,7 @@ mod tests {
                 u64::MAX,
                 &pipeline_cancel,
                 &phase_clocks,
-                || {
+                |_| {
                     let index = pipeline_produced.fetch_add(1, Ordering::Relaxed);
                     Some(RawFrame::Packed {
                         data: vec![0u8; FRAME_BYTES],
@@ -3488,7 +3543,7 @@ mod tests {
             &phase_clocks,
             None,
             cap,
-            || {
+            |_| {
                 if next == total {
                     return None;
                 }
@@ -3642,7 +3697,7 @@ mod tests {
             &phase_clocks,
             None,
             None,
-            || {
+            |_| {
                 if next >= TOTAL {
                     return None;
                 }

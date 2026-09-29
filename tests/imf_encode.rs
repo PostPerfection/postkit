@@ -68,7 +68,7 @@ fn encode_one(rsiz: u16, apply_xyz_transform: bool, dir: &std::path::Path) -> Pi
         1,
         &Arc::new(AtomicBool::new(false)),
         &Arc::new(postkit::grok_encoder::PhaseClocks::default()),
-        || frame.take(),
+        |_| frame.take(),
         |_| {},
     )
 }

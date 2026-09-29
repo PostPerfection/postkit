@@ -161,7 +161,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         encoded.len() as u64,
         &cancel,
         &Arc::new(grok_encoder::PhaseClocks::default()),
-        || {
+        |_| {
             let index = next.next()?;
             Some(RawFrame::Packed {
                 data: data.clone(),

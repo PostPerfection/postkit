@@ -53,7 +53,7 @@ fn flat_codestreams(width: u32, height: u32, count: usize, profile: u16) -> Vec<
         count as u64,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         &std::sync::Arc::new(postkit::grok_encoder::PhaseClocks::default()),
-        || {
+        |_| {
             if next >= count {
                 return None;
             }

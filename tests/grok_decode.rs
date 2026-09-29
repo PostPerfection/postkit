@@ -61,7 +61,7 @@ fn encode_reversible(components: [Vec<i32>; 3]) -> Vec<u8> {
         1,
         &Arc::new(AtomicBool::new(false)),
         &Arc::new(PhaseClocks::default()),
-        || frame.take(),
+        |_| frame.take(),
         |_| {},
     );
     assert!(result.success, "encode failed: {}", result.error);

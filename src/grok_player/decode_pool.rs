@@ -1176,7 +1176,7 @@ mod tests {
             1,
             &Arc::new(std::sync::atomic::AtomicBool::new(false)),
             &Arc::new(crate::grok_encoder::PhaseClocks::default()),
-            || frame.take(),
+            |_| frame.take(),
             |_| {},
         );
         assert!(result.success, "fixture encode failed: {}", result.error);

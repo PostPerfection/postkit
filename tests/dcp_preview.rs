@@ -131,7 +131,7 @@ fn make_real_j2c(w: u32, h: u32, profile: u16) -> Vec<u8> {
         1,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         &std::sync::Arc::new(postkit::grok_encoder::PhaseClocks::default()),
-        || frame.take(),
+        |_| frame.take(),
         |_| {},
     );
     assert!(result.success, "fixture encode failed: {}", result.error);

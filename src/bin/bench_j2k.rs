@@ -144,7 +144,7 @@ fn run(
     let cancel = Arc::new(AtomicBool::new(false));
     let k = planar.len() as u64;
     let mut i: u64 = 0;
-    let mut producer = || {
+    let mut producer = |_: &grok_encoder::FrameBufferPool| {
         if i >= n {
             return None;
         }

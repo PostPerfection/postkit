@@ -140,7 +140,7 @@ fn encode_red_imf_frame() -> Vec<u8> {
         1,
         &Arc::new(AtomicBool::new(false)),
         &Arc::new(postkit::grok_encoder::PhaseClocks::default()),
-        || frame.take(),
+        |_| frame.take(),
         |_| {},
     );
     assert!(result.success, "IMF encode failed: {}", result.error);

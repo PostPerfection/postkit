@@ -1481,7 +1481,6 @@ where
 
     grok_encoder::initialize(0);
 
-    let mut frame_buf = vec![0u8; frame_size];
     let mut frame_index: u64 = 0;
     let mut decode_read_to_end = false;
     let encode_start = std::time::Instant::now();
@@ -1495,7 +1494,7 @@ where
         &phase_clocks,
         mxf_feed,
         opts.codestream_byte_cap,
-        || {
+        |buffer_pool| {
             while pause.load(Ordering::Relaxed) {
                 if cancel.load(Ordering::Relaxed) {
                     return None;
@@ -1505,6 +1504,7 @@ where
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
+            let mut frame_buf = buffer_pool.take(frame_size);
             let read_start = std::time::Instant::now();
             let read = read_exact_or_eof(&mut ffmpeg_stdout, &mut frame_buf);
             phase_clocks.add(grok_encoder::EncodePhase::DecoderWait, read_start.elapsed());
@@ -1525,7 +1525,7 @@ where
             // and the other two formats reach the plugin untouched
             Some(match pipe_format {
                 PipeFormat::PackedRgb(order) => RawFrame::Packed {
-                    data: frame_buf.clone(),
+                    data: frame_buf,
                     order,
                     width,
                     height,
@@ -1533,7 +1533,7 @@ where
                     index: idx,
                 },
                 PipeFormat::PlanarYuv(format) => RawFrame::PlanarYuv {
-                    data: frame_buf.clone(),
+                    data: frame_buf,
                     format,
                     width,
                     height,
@@ -1762,7 +1762,7 @@ where
             &phase_clocks,
             mxf_feed,
             opts.codestream_byte_cap,
-            || {
+            |_| {
                 while pause.load(Ordering::Relaxed) {
                     if cancel.load(Ordering::Relaxed) {
                         return None;

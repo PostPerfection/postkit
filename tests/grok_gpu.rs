@@ -77,7 +77,7 @@ fn encode_reversible_run(frames: u64) -> tempfile::TempDir {
         frames,
         &Arc::new(AtomicBool::new(false)),
         &Arc::new(PhaseClocks::default()),
-        || {
+        |_| {
             if next_index >= frames {
                 return None;
             }
@@ -170,7 +170,7 @@ fn a_device_encode_holds_the_byte_target() {
         FRAMES,
         &Arc::new(AtomicBool::new(false)),
         &Arc::new(PhaseClocks::default()),
-        || {
+        |_| {
             if next_index >= FRAMES {
                 return None;
             }
