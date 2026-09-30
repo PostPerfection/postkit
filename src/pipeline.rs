@@ -182,6 +182,7 @@ pub struct EncodeRunOptions {
     pub picture: PictureProcessing,
     /// Encoder threads the pipeline runs, 0 for one per available CPU
     pub encode_threads: u32,
+    pub detect_picture_findings: bool,
 }
 
 impl Default for EncodeRunOptions {
@@ -199,6 +200,7 @@ impl Default for EncodeRunOptions {
             subtitle_burn: None,
             picture: PictureProcessing::default(),
             encode_threads: 0,
+            detect_picture_findings: false,
         }
     }
 }
@@ -418,6 +420,7 @@ fn run_encode_and_maybe_wrap(
                     picture: options.picture.clone(),
                     codestream_byte_cap: options.codestream_byte_cap,
                     encode_threads: options.encode_threads,
+                    detect_picture_findings: options.detect_picture_findings,
                     ..StreamEncodeOptions::default()
                 },
                 mxf_feed,
@@ -451,6 +454,7 @@ fn run_encode_and_maybe_wrap(
                 picture: options.picture.clone(),
                 codestream_byte_cap: options.codestream_byte_cap,
                 encode_threads: options.encode_threads,
+                detect_picture_findings: options.detect_picture_findings,
                 ..StreamEncodeOptions::default()
             };
             if sequence_needs_ffmpeg {

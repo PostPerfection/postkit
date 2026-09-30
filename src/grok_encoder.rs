@@ -143,6 +143,7 @@ pub struct CompressParams {
     pub threads_per_codec: u32,
     /// Encoder threads the pipeline runs, 0 for one per available CPU
     pub encode_threads: u32,
+    pub detect_picture_findings: bool,
 }
 
 /// Bits a sample carries in the packed rgb48 layout the burns read.
@@ -333,6 +334,7 @@ impl Default for CompressParams {
             source_preparation: SourcePreparation::default(),
             threads_per_codec: 1,
             encode_threads: 0,
+            detect_picture_findings: false,
         }
     }
 }
@@ -2446,6 +2448,7 @@ where
             accelerator_active,
             quality_psnr: params.quality_psnr,
             postkit_prepares_the_frame: !params.source_preparation.is_empty(),
+            detect_picture_findings: params.detect_picture_findings,
         },
         width,
         height,

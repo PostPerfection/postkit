@@ -65,6 +65,7 @@ fn base_params(res: &Res) -> CompressParams {
         source_preparation: Default::default(),
         threads_per_codec: 1,
         encode_threads: 0,
+        detect_picture_findings: false,
     }
 }
 

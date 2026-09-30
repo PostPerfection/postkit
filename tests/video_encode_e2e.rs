@@ -6,6 +6,7 @@
 //! encode, and nothing else catches it.
 
 use postkit::encode::{FrameRange, FrameRate};
+use postkit::picture_findings::PictureFindings;
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_with_options};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -763,6 +764,32 @@ fn write_detection_clip(path: &std::path::Path) {
 }
 
 #[test]
+fn the_encode_reports_no_findings_unless_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mkv");
+    write_detection_clip(&video);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    let result = run_encode_with_options(
+        &video,
+        &dir.path().join("out"),
+        &EncodeRunOptions {
+            fps: FrameRate::whole(DETECTION_FPS),
+            ..Default::default()
+        },
+        &cancel,
+        &pause,
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    )
+    .expect("video encode");
+
+    assert_eq!(result.frames_encoded, DETECTION_SEGMENT_FRAMES * 3);
+    assert_eq!(result.picture_findings, PictureFindings::default());
+}
+
+#[test]
 fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("clip.mkv");
@@ -776,6 +803,7 @@ fn a_black_head_and_a_frozen_tail_are_reported_by_the_encode() {
         &output,
         &EncodeRunOptions {
             fps: FrameRate::whole(DETECTION_FPS),
+            detect_picture_findings: true,
             ..Default::default()
         },
         &cancel,
@@ -954,6 +982,7 @@ fn the_resumable_pipeline_reports_its_own_findings() {
         &dir.path().join("j2k"),
         &CompressParams {
             edit_rate: FrameRate::whole(DETECTION_FPS),
+            detect_picture_findings: true,
             ..CompressParams::default()
         },
         total_frames,
@@ -1061,6 +1090,7 @@ fn the_resumable_pipeline_converts_findings_at_the_exact_rate() {
         &dir.path().join("j2k"),
         &CompressParams {
             edit_rate: FrameRate::new(24000, 1001),
+            detect_picture_findings: true,
             ..CompressParams::default()
         },
         total_frames,

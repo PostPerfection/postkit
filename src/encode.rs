@@ -870,7 +870,7 @@ fn decode_filter_chain(
 ) -> String {
     let hdr = hdr_yuv_to_rgb_filter(source, source_colour);
     let filter = hdr.as_deref().unwrap_or(SIXTEEN_BIT_RGB_FILTER);
-    let chain = match pipe_format {
+    match pipe_format {
         PipeFormat::PlanarYuv(_) => picture.joined(),
         PipeFormat::PackedRgb(_)
             if hdr.is_some() || is_eight_bit_yuv_pixel_format(&source.pix_fmt) =>
@@ -881,8 +881,22 @@ fn decode_filter_chain(
             Some(position) => picture.with_format_filter_at(position, filter),
             None => picture.joined(),
         },
+    }
+}
+
+// ffmpeg refuses an empty -vf
+const PASSTHROUGH_FILTER: &str = "null";
+
+fn with_optional_detection_branch(picture_chain: String, detect_picture_findings: bool) -> String {
+    let picture_chain = if picture_chain.is_empty() {
+        PASSTHROUGH_FILTER.to_string()
+    } else {
+        picture_chain
     };
-    crate::picture_findings::with_detection_branch(&chain)
+    if !detect_picture_findings {
+        return picture_chain;
+    }
+    crate::picture_findings::with_detection_branch(&picture_chain)
 }
 
 const YUV_PIXEL_FORMAT_PREFIXES: [&str; 4] = ["yuv", "nv", "p0", "p2"];
@@ -984,6 +998,7 @@ pub(crate) struct DecodeChainInputs<'a> {
     /// postkit burns subtitles into the frame or converts its colour itself,
     /// and both need samples it can read
     pub postkit_prepares_the_frame: bool,
+    pub detect_picture_findings: bool,
 }
 
 /// What one decode runs.
@@ -991,7 +1006,7 @@ pub(crate) struct DecodeChain {
     /// every argument before `-i`
     pub input_args: Vec<String>,
     pub pipe_format: PipeFormat,
-    /// the whole `-vf` chain, detection branch included
+    /// the whole `-vf` chain
     pub filters: String,
 }
 
@@ -1013,7 +1028,10 @@ pub(crate) fn decode_chain(
             quality_psnr: inputs.quality_psnr,
             postkit_prepares_the_frame: inputs.postkit_prepares_the_frame,
             source_colour: inputs.source_colour,
-            filters: &crate::picture_findings::with_detection_branch(&picture.joined()),
+            filters: &with_optional_detection_branch(
+                picture.joined(),
+                inputs.detect_picture_findings,
+            ),
             source: inputs.source,
         },
         width,
@@ -1032,7 +1050,10 @@ pub(crate) fn decode_chain(
             inputs.accelerator_active,
         )?,
         pipe_format,
-        filters: decode_filter_chain(&picture, pipe_format, inputs.source, inputs.source_colour),
+        filters: with_optional_detection_branch(
+            decode_filter_chain(&picture, pipe_format, inputs.source, inputs.source_colour),
+            inputs.detect_picture_findings,
+        ),
     })
 }
 
@@ -1155,6 +1176,8 @@ pub struct StreamEncodeOptions {
     /// Encoder threads the pipeline runs, 0 for one per available CPU
     #[serde(default)]
     pub encode_threads: u32,
+    #[serde(default)]
+    pub detect_picture_findings: bool,
 }
 
 /// The cinema profile a DCP picture declares, written as 2K or 4K by each
@@ -1185,6 +1208,7 @@ impl Default for StreamEncodeOptions {
             watermark: None,
             codestream_byte_cap: None,
             encode_threads: 0,
+            detect_picture_findings: false,
         }
     }
 }
@@ -1418,6 +1442,7 @@ where
             accelerator_active,
             quality_psnr: opts.quality_psnr,
             postkit_prepares_the_frame: opts.subtitle_burn.is_some() || opts.watermark.is_some(),
+            detect_picture_findings: opts.detect_picture_findings,
         },
         width,
         height,
@@ -1623,6 +1648,7 @@ fn compress_params(
         profile: opts.rsiz,
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         encode_threads: opts.encode_threads,
+        detect_picture_findings: opts.detect_picture_findings,
         source_preparation: crate::grok_encoder::SourcePreparation {
             subtitle_burn: opts.subtitle_burn.clone(),
             watermark: opts.watermark.clone(),
@@ -2983,7 +3009,7 @@ mod tests {
 
     #[test]
     fn only_an_eight_bit_yuv_source_on_the_rgb_pipe_converts_to_sixteen_bits() {
-        let untouched = crate::picture_findings::with_detection_branch("fps=24");
+        let untouched = "fps=24";
         let plain = crate::picture_processing::PictureProcessing::default()
             .plan(1920, 1080)
             .unwrap();
@@ -3035,8 +3061,25 @@ mod tests {
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
-            crate::picture_findings::with_detection_branch("format=gbrp16le"),
+            "format=gbrp16le",
             "a decode with no picture filters of its own still converts"
+        );
+    }
+
+    #[test]
+    fn the_detectors_run_only_when_asked() {
+        assert_eq!(
+            with_optional_detection_branch("fps=24".to_string(), false),
+            "fps=24"
+        );
+        assert_eq!(with_optional_detection_branch(String::new(), false), "null");
+        assert!(
+            with_optional_detection_branch("fps=24".to_string(), true)
+                .starts_with("fps=24,split=2[picture][detect];[detect]blackdetect")
+        );
+        assert!(
+            with_optional_detection_branch(String::new(), true).starts_with("null,split=2"),
+            "the branch needs a picture chain to split"
         );
     }
 
@@ -3063,8 +3106,6 @@ mod tests {
     /// source gets covers its geometry as well.
     #[test]
     fn the_packed_rgb_pipe_converts_where_the_geometry_starts() {
-        let detectors = ",split=2[picture][detect];[detect]blackdetect=black_min_duration=2:\
-                         pixel_black_th=0.1,freezedetect=duration=2,nullsink;[picture]null";
         let simple = geometry_plan(false);
         let picture = planned(
             FrameRate::whole(24),
@@ -3079,10 +3120,8 @@ mod tests {
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
-            format!(
-                "format=gbrp16le,fps=24,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
-                 pad=w=2048:h=1080:x=0:y=112:color=black{detectors}"
-            )
+            "format=gbrp16le,fps=24,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
+                 pad=w=2048:h=1080:x=0:y=112:color=black"
         );
         assert_eq!(
             decode_filter_chain(
@@ -3091,10 +3130,8 @@ mod tests {
                 &source_pixel_format("rgb24"),
                 &SourceColour::DisplayRgb
             ),
-            format!(
-                "fps=24,format=gbrp16le,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
-                 pad=w=2048:h=1080:x=0:y=112:color=black{detectors}"
-            )
+            "fps=24,format=gbrp16le,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
+                 pad=w=2048:h=1080:x=0:y=112:color=black"
         );
 
         let window = FrameRange {
@@ -3115,12 +3152,9 @@ mod tests {
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
-            format!(
-                "format=gbrp16le,yadif,fps=24,trim=start_frame=10:end_frame=15,\
+            "format=gbrp16le,yadif,fps=24,trim=start_frame=10:end_frame=15,\
                  setpts=PTS-STARTPTS,hqdn3d,crop=1920:804:0:138,\
-                 scale=w=2048:h=856:flags=lanczos,pad=w=2048:h=1080:x=0:y=112:color=black\
-                 {detectors}"
-            )
+                 scale=w=2048:h=856:flags=lanczos,pad=w=2048:h=1080:x=0:y=112:color=black"
         );
         assert_eq!(
             decode_filter_chain(
@@ -3129,11 +3163,9 @@ mod tests {
                 &source_pixel_format("rgb24"),
                 &SourceColour::DisplayRgb
             ),
-            format!(
-                "yadif,fps=24,trim=start_frame=10:end_frame=15,setpts=PTS-STARTPTS,hqdn3d,\
+            "yadif,fps=24,trim=start_frame=10:end_frame=15,setpts=PTS-STARTPTS,hqdn3d,\
                  format=gbrp16le,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
-                 pad=w=2048:h=1080:x=0:y=112:color=black{detectors}"
-            )
+                 pad=w=2048:h=1080:x=0:y=112:color=black"
         );
 
         let planar_yuv = PipeFormat::PlanarYuv(YuvFrameFormat {
