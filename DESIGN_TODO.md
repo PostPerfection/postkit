@@ -1,5 +1,40 @@
 # Planned
 
+- In-process decode for every video encode (decided 2026-10-01). The ffmpeg
+  pipe caps a real 4K encode at 50 fps on hercules (RTX 2080 Ti, Threadripper
+  3960X) where frames fed from memory reach 110 fps on the device. ffmpeg's one
+  muxer thread writes each 35 MB padded frame in 32 KB pieces: a bare reader gets
+  74 fps, 99 without the pad, and pipe size or `-avioflags direct` change nothing.
+  Decisions:
+  - CPU and GPU encodes both decode in process through ffmpeg-next 9 (ffmpeg-sys-next
+    for gaps). The pipe code is deleted, with no fallback.
+  - FFmpeg 8.1.3, LGPL, built by us, because the closed GPU plugin shares the
+    process. FFmpeg 9 is a later bump on its own.
+  - Only the picture decode, its filter chain and the probing behind them move.
+    Audio demux and every other feature keep running the user's ffmpeg program,
+    several of them need x264, x265 or GPL-only filters.
+  - Denoise switches from hqdn3d, which needs a GPL build, to atadenoise. Both run
+    about 28 fps on 4K on hercules, so a denoised encode stays CPU bound. A device
+    denoiser of our own, written from scratch, is a later slice.
+  - The pad filter stays in the in-process graph. Padding on the device is a later
+    measured optimisation.
+  - Gate before the pipe code goes: byte-identical codestreams against the pipe on
+    the encode fixtures (CPU and GPU, every pipe format and filter except denoise),
+    every suite green, and at least 99 fps on hercules for the 60 s Toms clip.
+  - The LGPL FFmpeg and libmpv come from one recipe in a public
+    PostPerfection/ffmpeg-mpv-builds repo: source builds on all three platforms, a
+    link closure licence check in its CI, pinned releases carrying the source
+    tarballs and one third-party licence file per platform, installed by its own
+    setup action. Every package bundles them, the deb and rpm drop the distro
+    libmpv dependency, and setup-libmpv is archived after the switch.
+  - Linux is one build on ubuntu-24.04 shared by the deb, rpm and AppImage. It
+    bundles libplacebo too, because its soname is its API version (.351 on Fedora
+    43, .360 on 44, .338 on Ubuntu 24.04), and links only system libraries whose
+    sonames stay put. Windows and macOS take the rest of the closure from MSYS2
+    and Homebrew.
+  - Order: the build repo and in-process decode start together, decode pushes
+    once the build repo has a release, the installer switch follows the build repo.
+
 - Stereoscopic JPEG 2000 stays on libmpv. `GrokPlayer::accepts` returns false for
   `EssenceType::Jpeg2000Stereo` and `load` refuses it by name, because the mono
   AS-DCP reader cannot read it. Needs asdcplib's stereo reader.
