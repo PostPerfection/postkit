@@ -45,6 +45,14 @@ pub fn migrate_preferences(json: &str, migrations: &[PrefsMigration]) -> String 
 
     let mut sorted: Vec<&PrefsMigration> = migrations.iter().collect();
     sorted.sort_by_key(|m| m.version);
+    for pair in sorted.windows(2) {
+        assert!(
+            pair[1].version == pair[0].version + 1,
+            "preferences migrations jump from version {} to version {}",
+            pair[0].version,
+            pair[1].version
+        );
+    }
 
     let mut latest = current;
     for m in sorted {
@@ -225,6 +233,24 @@ mod tests {
         assert_eq!(prefs_version(&result), 3);
         assert!(result.contains("\"colour\""));
         assert!(result.contains("\"gpu\""));
+    }
+
+    #[test]
+    #[should_panic(expected = "jump from version 2 to version 4")]
+    fn migrate_refuses_a_table_with_a_gap() {
+        let migrations = vec![
+            PrefsMigration {
+                version: 2,
+                description: "add colour field".to_string(),
+                apply: Box::new(|j| j.to_string()),
+            },
+            PrefsMigration {
+                version: 4,
+                description: "add gpu field".to_string(),
+                apply: Box::new(|j| j.to_string()),
+            },
+        ];
+        migrate_preferences(r#"{"version": 1}"#, &migrations);
     }
 
     #[test]
