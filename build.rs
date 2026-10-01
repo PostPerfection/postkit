@@ -1,5 +1,7 @@
 /// Directory holding the mpv import library on windows, which has no pkg-config.
 const MPV_LIB_DIR_ENV: &str = "MPV_LIB_DIR";
+// the FFmpeg install ffmpeg-sys-next builds against
+const FFMPEG_DIR_ENV: &str = "FFMPEG_DIR";
 
 const GROK_PLUGIN_BUILD_INFO_FUNCTION: &str = "grk_plugin_build_info";
 const GROK_PLUGIN_INIT_INFO_START: &str = "typedef struct _grk_plugin_init_info";
@@ -15,6 +17,9 @@ fn main() {
         detect_grok_plugin_build_info(&header_text);
         detect_grok_plugin_num_threads(&header_text);
     }
+    if std::env::var_os("CARGO_FEATURE_FFMPEG_DECODE").is_some() {
+        put_ffmpeg_dir_first();
+    }
     if std::env::var_os("CARGO_FEATURE_LIBMPV").is_none() {
         return;
     }
@@ -24,6 +29,18 @@ fn main() {
         link_unix();
     } else if families.contains(&"windows") {
         link_windows();
+    }
+}
+
+// another crate's /usr/lib64 would otherwise link a system FFmpeg under FFMPEG_DIR's headers
+fn put_ffmpeg_dir_first() {
+    println!("cargo::rerun-if-env-changed={FFMPEG_DIR_ENV}");
+    if let Some(directory) = std::env::var_os(FFMPEG_DIR_ENV) {
+        let library_directory = std::path::Path::new(&directory).join("lib");
+        println!(
+            "cargo::rustc-link-search=native={}",
+            library_directory.display()
+        );
     }
 }
 

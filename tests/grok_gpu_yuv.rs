@@ -39,7 +39,7 @@ struct Case {
     name: &'static str,
     options: StreamEncodeOptions,
     /// what ffmpeg has to write to the pipe once the plugin is on
-    pipe_pixel_format: &'static str,
+    encoder_input_pixel_format: &'static str,
     /// the raster both paths encode, which is the plan's output
     raster: (u32, u32),
 }
@@ -102,7 +102,7 @@ fn psnr_db(left: &[i32], left_precision: u8, right: &[i32], right_precision: u8)
 
 /// Encode the case into a subdirectory named after the path that ran, checking
 /// the pipe carried the format that path takes, and hand back that directory.
-fn encode(case: &Case, path: &str, pipe_pixel_format: &str) -> PathBuf {
+fn encode(case: &Case, path: &str, encoder_input_pixel_format: &str) -> PathBuf {
     let label = format!("{} on the {path}", case.name);
     let options = StreamEncodeOptions {
         output_dir: case.options.output_dir.join(path),
@@ -117,8 +117,8 @@ fn encode(case: &Case, path: &str, pipe_pixel_format: &str) -> PathBuf {
 
     assert!(result.success, "{label}: encode failed: {}", result.error);
     assert_eq!(
-        result.pipe_pixel_format.as_deref(),
-        Some(pipe_pixel_format),
+        result.encoder_input_pixel_format.as_deref(),
+        Some(encoder_input_pixel_format),
         "{label}: the pipe format is what says which path ran"
     );
     assert_eq!(result.frames_encoded, FRAMES, "{label}");
@@ -218,7 +218,7 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
                 num_resolutions: 3,
                 ..StreamEncodeOptions::default()
             },
-            pipe_pixel_format: "yuv420p",
+            encoder_input_pixel_format: "yuv420p",
             raster: (WIDTH, HEIGHT),
         },
         // the same clip as a DCP frame, which is the path dcpwizard takes: the
@@ -232,7 +232,7 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
                 compression_ratio: 1.0,
                 ..StreamEncodeOptions::default()
             },
-            pipe_pixel_format: "yuv420p",
+            encoder_input_pixel_format: "yuv420p",
             raster: (WIDTH, HEIGHT),
         },
         // a crop on the source's own planes on its way to the plugin, against
@@ -256,7 +256,7 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
                 },
                 ..StreamEncodeOptions::default()
             },
-            pipe_pixel_format: "yuv420p",
+            encoder_input_pixel_format: "yuv420p",
             raster: (WIDTH - 2 * CROP_EDGE, HEIGHT - 2 * CROP_EDGE),
         },
         Case {
@@ -269,7 +269,7 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
                 num_resolutions: 3,
                 ..StreamEncodeOptions::default()
             },
-            pipe_pixel_format: "yuv422p10le",
+            encoder_input_pixel_format: "yuv422p10le",
             raster: (WIDTH, HEIGHT),
         },
     ];
@@ -279,7 +279,7 @@ fn a_yuv_source_reaches_the_plugin_as_planes() {
     }
     let device_runs: Vec<PathBuf> = cases
         .iter()
-        .map(|case| encode(case, "device", case.pipe_pixel_format))
+        .map(|case| encode(case, "device", case.encoder_input_pixel_format))
         .collect();
 
     postkit::grok_encoder::use_cpu();

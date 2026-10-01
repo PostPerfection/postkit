@@ -16,6 +16,7 @@ cosmic-text = { version = "0.17", default-features = false, features = ["std", "
 dirs = "6"
 dolby_vision = { version = "3.4", features = ["xml"] }
 ebur128 = "0.1.10"
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "filter"], optional = true }
 grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", tag = "v20.4.3", optional = true }
 hevc_parser = "0.6"
 hex = "0.4"
@@ -55,6 +56,7 @@ pkg-config = "0.3"
 [features]
 default = []
 async = ["dep:tokio"]
+ffmpeg-decode = ["dep:ffmpeg-next"]
 grok-ffi = ["dep:grokj2k-sys", "dep:cpal"]
 grok-gpu = ["grok-ffi"]
 icc = ["dep:lcms2"]
@@ -118,6 +120,10 @@ required-features = ["grok-ffi"]
 [[test]]
 name = "app2e_conformance"
 required-features = ["grok-ffi"]
+
+[[test]]
+name = "decode_parity"
+required-features = ["grok-ffi", "ffmpeg-decode"]
 
 [[test]]
 name = "grok_gpu"

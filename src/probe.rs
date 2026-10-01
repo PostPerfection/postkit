@@ -201,17 +201,17 @@ const HALF_TURN_DEGREES: i64 = 180;
 
 // the stream side data ffmpeg's decode applies before any filter runs
 #[derive(Default)]
-struct DisplaySideData {
-    crop_top: u32,
-    crop_bottom: u32,
-    crop_left: u32,
-    crop_right: u32,
-    rotation_degrees: i64,
+pub(crate) struct DisplaySideData {
+    pub crop_top: u32,
+    pub crop_bottom: u32,
+    pub crop_left: u32,
+    pub crop_right: u32,
+    pub rotation_degrees: i64,
 }
 
 impl DisplaySideData {
     // the container crop comes first, then a quarter turn swaps the axes
-    fn applied_to(&self, width: u32, height: u32) -> (u32, u32) {
+    pub(crate) fn applied_to(&self, width: u32, height: u32) -> (u32, u32) {
         let cropped_width = width.saturating_sub(self.crop_left + self.crop_right);
         let cropped_height = height.saturating_sub(self.crop_top + self.crop_bottom);
         if self.rotation_degrees.rem_euclid(HALF_TURN_DEGREES) == QUARTER_TURN_DEGREES {
@@ -288,7 +288,7 @@ fn frame_count(path: &Path, fps_num: u32, fps_den: u32) -> u32 {
 
 /// Whole frames in `duration` seconds at `fps_num / fps_den`, rounded, since
 /// a container duration carries the frame count with a timescale rounding.
-fn frames_in(duration: f64, fps_num: u32, fps_den: u32) -> u32 {
+pub(crate) fn frames_in(duration: f64, fps_num: u32, fps_den: u32) -> u32 {
     if fps_num == 0 || fps_den == 0 {
         return 0;
     }

@@ -2283,7 +2283,6 @@ where
         total_frames,
         width,
         height,
-        &crate::probe::probe_pixel_format(input_video),
         cancel,
         false,
         None,
@@ -2336,7 +2335,6 @@ pub fn encode_video_pipeline_resumable<P>(
     total_frames: u64,
     width: u32,
     height: u32,
-    source: &crate::probe::PixelFormatInfo,
     cancel: &Arc<AtomicBool>,
     resume: bool,
     video_filter: Option<&str>,
@@ -2353,7 +2351,6 @@ where
         total_frames,
         width,
         height,
-        source,
         &crate::encode::SourceColour::DisplayRgb,
         cancel,
         resume,
@@ -2377,7 +2374,6 @@ pub fn encode_video_pipeline_resumable_with_mxf_feed<P>(
     total_frames: u64,
     width: u32,
     height: u32,
-    source: &crate::probe::PixelFormatInfo,
     // decides the decode's own colour step, the transform itself rides in params
     source_colour: &crate::encode::SourceColour,
     cancel: &Arc<AtomicBool>,
@@ -2394,30 +2390,26 @@ pub fn encode_video_pipeline_resumable_with_mxf_feed<P>(
 where
     P: FnMut(EncodeProgress),
 {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-
-    if let Some(range) = frame_range {
-        let (_, _, source_frames) = crate::encode::probe_video(input_video);
-        if let Err(e) = range.check_against_probe(source_frames) {
-            return PipelineResult {
-                success: false,
-                error: e,
-                frames_encoded: 0,
-                output_dir: output_dir.to_path_buf(),
-                picture_findings: crate::picture_findings::PictureFindings::default(),
-            };
-        }
+    let failed = |error: String| PipelineResult {
+        success: false,
+        error,
+        frames_encoded: 0,
+        output_dir: output_dir.to_path_buf(),
+        picture_findings: crate::picture_findings::PictureFindings::default(),
+    };
+    let (source, source_frames) =
+        match crate::encode::probe_resumable_source(input_video, frame_range.is_some()) {
+            Ok(probed) => probed,
+            Err(e) => return failed(e),
+        };
+    if let Some(range) = frame_range
+        && let Err(e) = range.check_against_probe(source_frames)
+    {
+        return failed(e);
     }
 
     if let Err(e) = std::fs::create_dir_all(output_dir) {
-        return PipelineResult {
-            success: false,
-            error: format!("Failed to create output directory: {e}"),
-            frames_encoded: 0,
-            output_dir: output_dir.to_path_buf(),
-            picture_findings: crate::picture_findings::PictureFindings::default(),
-        };
+        return failed(format!("Failed to create output directory: {e}"));
     }
 
     // resume: re-encode from the last-but-one existing frame (the last is
@@ -2431,10 +2423,7 @@ where
     if resume && total_frames > 0 && start_frame >= total_frames {
         return PipelineResult {
             success: true,
-            error: String::new(),
-            frames_encoded: 0,
-            output_dir: output_dir.to_path_buf(),
-            picture_findings: crate::picture_findings::PictureFindings::default(),
+            ..failed(String::new())
         };
     }
 
@@ -2446,7 +2435,7 @@ where
             read_source_at: None,
             picture: crate::encode::PictureFilters::Given(&picture_filters),
             source_colour,
-            source,
+            source: &source,
             accelerator_active,
             quality_psnr: params.quality_psnr,
             postkit_prepares_the_frame: !params.source_preparation.is_empty(),
@@ -2458,90 +2447,26 @@ where
         &on_log,
     ) {
         Ok(chain) => chain,
-        Err(e) => {
-            return PipelineResult {
-                success: false,
-                error: e,
-                frames_encoded: 0,
-                output_dir: output_dir.to_path_buf(),
-                picture_findings: crate::picture_findings::PictureFindings::default(),
-            };
-        }
+        Err(e) => return failed(e),
     };
-    let pipe_format = chain.pipe_format;
-    let filters = chain.filters;
+    let input_format = chain.input_format;
+    let frame_size = input_format.frame_bytes(width, height);
+    let mut reader =
+        match crate::encode::FrameReader::start(&chain, input_video, frame_range, width, height) {
+            Ok(reader) => reader,
+            Err(e) => return failed(e),
+        };
 
-    let mut command = Command::new("ffmpeg");
-    command
-        .arg("-y")
-        // the progress line carries no newline, so the reader would hold the
-        // whole run in one string
-        .arg("-nostats")
-        .args(&chain.input_args);
-    command
-        .arg("-i")
-        .arg(input_video)
-        .arg("-vf")
-        .arg(&filters)
-        .arg("-pix_fmt")
-        .arg(pipe_format.ffmpeg_pixel_format())
-        .arg("-f")
-        .arg("rawvideo");
-    if let Some(range) = frame_range {
-        command.args(range.frame_limit_args());
-    }
-    let mut child = match command
-        .arg("pipe:1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return PipelineResult {
-                success: false,
-                error: format!("Failed to spawn ffmpeg: {e}"),
-                frames_encoded: 0,
-                output_dir: output_dir.to_path_buf(),
-                picture_findings: crate::picture_findings::PictureFindings::default(),
-            };
-        }
-    };
-
-    let detection_reader = child
-        .stderr
-        .take()
-        .map(crate::picture_findings::read_detection_lines);
-
-    let frame_size = pipe_format.frame_bytes(width, height);
-    let mut stdout = child.stdout.take().unwrap();
-
-    // discard the already-encoded prefix so ffmpeg stays frame-aligned.
+    // discard the already-encoded prefix so the decode stays frame-aligned.
     let mut frame_index: u64 = 0;
-    let mut decode_read_to_end = false;
     if start_frame > 0 {
-        let mut skip_buf = vec![0u8; frame_size];
-        let mut aligned = true;
-        while frame_index < start_frame {
-            if stdout.read_exact(&mut skip_buf).is_err() {
-                aligned = false;
-                break;
-            }
-            frame_index += 1;
+        if !reader.skip(start_frame, frame_size) {
+            let _ = reader.finish(params.edit_rate.as_f64(), 0);
+            return failed(format!(
+                "resume: source has fewer than {start_frame} frames, cannot skip the encoded prefix"
+            ));
         }
-        if !aligned {
-            let _ = child.kill();
-            let _ = child.wait();
-            return PipelineResult {
-                success: false,
-                error: format!(
-                    "resume: source has fewer than {start_frame} frames, cannot skip the encoded prefix"
-                ),
-                frames_encoded: 0,
-                output_dir: output_dir.to_path_buf(),
-                picture_findings: crate::picture_findings::PictureFindings::default(),
-            };
-        }
+        frame_index = start_frame;
     }
 
     // progress total is the remaining frames so the pipeline's completion check
@@ -2562,48 +2487,21 @@ where
             }
             let mut buf = buffer_pool.take(frame_size);
             let read_start = std::time::Instant::now();
-            let read = stdout.read_exact(&mut buf);
+            let read = reader.read_into(&mut buf);
             phase_clocks.add(EncodePhase::DecoderWait, read_start.elapsed());
-            match read {
-                Ok(()) => {
-                    let idx = frame_index;
-                    frame_index += 1;
-                    Some(match pipe_format {
-                        crate::encode::PipeFormat::PackedRgb(order) => RawFrame::Packed {
-                            data: buf,
-                            order,
-                            width,
-                            height,
-                            precision: crate::encode::PACKED_RGB_PRECISION,
-                            index: idx,
-                        },
-                        crate::encode::PipeFormat::PlanarYuv(format) => RawFrame::PlanarYuv {
-                            data: buf,
-                            format,
-                            width,
-                            height,
-                            index: idx,
-                        },
-                    })
-                }
-                Err(e) => {
-                    decode_read_to_end = e.kind() == std::io::ErrorKind::UnexpectedEof;
-                    None // EOF or error — no more frames
-                }
+            if let crate::encode::FrameRead::Ended = read {
+                return None;
             }
+            let index = frame_index;
+            frame_index += 1;
+            Some(input_format.raw_frame(buf, width, height, index))
         },
         &mut on_progress,
     );
 
-    // the detection timestamps are on ffmpeg's whole output, which after a
+    // the detection timestamps are on the decode's whole output, which after a
     // resume is longer than the frames this run encoded
-    let decode = crate::picture_findings::finish_detection(
-        &mut child,
-        detection_reader,
-        decode_read_to_end,
-        params.edit_rate.as_f64(),
-        frame_index,
-    );
+    let decode = reader.finish(params.edit_rate.as_f64(), frame_index);
 
     let expected_frames = total_frames.saturating_sub(start_frame);
     let mut success = result.success;

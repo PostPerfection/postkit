@@ -65,7 +65,7 @@ struct Case {
     label: &'static str,
     rsiz: u16,
     source_colour: SourceColour,
-    pipe_pixel_format: &'static str,
+    encoder_input_pixel_format: &'static str,
     /// Whether the two runs are held to the same picture. The plugin's per-call
     /// compress writes a different picture from the host's for a cinema code
     /// stream at 12 bits out of a 16-bit source with the transform off, which
@@ -81,7 +81,7 @@ fn cases() -> Vec<Case> {
             label: "cinema with the X'Y'Z' transform on",
             rsiz: default_rsiz(),
             source_colour: SourceColour::DisplayRgb,
-            pipe_pixel_format: "rgb48le",
+            encoder_input_pixel_format: "rgb48le",
             same_picture: true,
         },
         // the plugin declines a batch over a 16-bit source at 12 bits with the
@@ -91,14 +91,14 @@ fn cases() -> Vec<Case> {
             label: "cinema with the X'Y'Z' transform off",
             rsiz: default_rsiz(),
             source_colour: SourceColour::AlreadyPq,
-            pipe_pixel_format: "rgb48be",
+            encoder_input_pixel_format: "rgb48be",
             same_picture: false,
         },
         Case {
             label: "imf",
             rsiz: imf_rsiz(profile, levels),
             source_colour: SourceColour::KeepRgb,
-            pipe_pixel_format: "rgb48be",
+            encoder_input_pixel_format: "rgb48be",
             same_picture: true,
         },
     ]
@@ -248,8 +248,8 @@ fn an_interleaved_rgb_source_reaches_the_plugin_as_one_buffer() {
             case.label, result.error
         );
         assert_eq!(
-            result.pipe_pixel_format.as_deref(),
-            Some(case.pipe_pixel_format),
+            result.encoder_input_pixel_format.as_deref(),
+            Some(case.encoder_input_pixel_format),
             "{}: the decode wrote the wrong byte order for what the plugin takes",
             case.label
         );
@@ -291,7 +291,7 @@ fn an_interleaved_rgb_source_reaches_the_plugin_as_one_buffer() {
             case.label, result.error
         );
         assert_eq!(
-            result.pipe_pixel_format.as_deref(),
+            result.encoder_input_pixel_format.as_deref(),
             Some("rgb48be"),
             "{}: a host run deinterleaves the frames itself",
             case.label

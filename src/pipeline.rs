@@ -700,7 +700,7 @@ mod tests {
 
     #[cfg(feature = "grok-ffi")]
     #[test]
-    fn the_video_encode_logs_the_pipe_format_it_decodes_to() {
+    fn the_video_encode_logs_the_pixel_format_it_decodes_to() {
         let directory = tempfile::tempdir().unwrap();
         let video = directory.path().join("clip.mp4");
         let made = std::process::Command::new("ffmpeg")
@@ -729,7 +729,7 @@ mod tests {
         let lines = lines.into_inner().unwrap();
         assert!(
             lines.iter().any(|line| {
-                line.starts_with("[ENCODE] decoding to the pipe pixel_format=")
+                line.starts_with("[ENCODE] decoding to pixel_format=")
                     && line.ends_with(" hardware_decode=false")
             }),
             "{lines:#?}"

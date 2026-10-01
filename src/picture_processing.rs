@@ -26,8 +26,9 @@ const PAD_COLOUR: &str = "black";
 /// ffmpeg filter that turns fields into progressive frames.
 const DEINTERLACE_FILTER: &str = "yadif";
 
-/// ffmpeg denoiser, at its own defaults.
-const DENOISE_FILTER: &str = "hqdn3d";
+/// The denoiser the ffmpeg program runs, at its own defaults. It needs a GPL
+/// build, so the in-process decode swaps it for its own.
+pub(crate) const FFMPEG_PROGRAM_DENOISE_FILTER: &str = "hqdn3d";
 
 /// Detected crop edges are a multiple of this, which is the finest cropdetect
 /// offers that still keeps both dimensions even.
@@ -285,7 +286,7 @@ impl PictureProcessing {
         }
         let fps_position = filters.len();
         if self.denoise {
-            filters.push(DENOISE_FILTER.to_string());
+            filters.push(FFMPEG_PROGRAM_DENOISE_FILTER.to_string());
         }
         let geometry_format_position = filters.len();
         if !crop.is_none() {

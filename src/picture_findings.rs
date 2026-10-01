@@ -102,6 +102,15 @@ pub(crate) fn with_detection_branch(picture_filters: &str) -> String {
     )
 }
 
+// the same branch ending in a labelled output, for a graph built in process
+#[cfg(feature = "ffmpeg-decode")]
+pub(crate) fn with_detection_sink(picture_filters: &str, sink_label: &str) -> String {
+    format!(
+        "{picture_filters},split=2[picture][detect];[detect]{}[{sink_label}];[picture]null",
+        detection_filters()
+    )
+}
+
 /// Run the detectors over finished picture essence, for a package this process
 /// did not encode.
 ///

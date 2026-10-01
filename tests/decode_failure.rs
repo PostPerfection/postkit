@@ -154,7 +154,6 @@ fn the_resumable_encode_runs_its_decode_lut() {
         FRAMES,
         WIDTH,
         HEIGHT,
-        &postkit::probe::probe_pixel_format(&readable),
         &SourceColour::DciLut(lut),
         &Arc::new(AtomicBool::new(false)),
         false,

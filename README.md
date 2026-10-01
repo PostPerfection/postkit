@@ -70,9 +70,9 @@ cargo build --release
 cargo test
 ```
 
-Cargo features: `grok-ffi` (J2K encoder), `async` (tokio), `icc`
-(monitor-ICC display path in `preview`/`colour`, needs liblcms2). All off by
-default.
+Cargo features: `grok-ffi` (J2K encoder), `ffmpeg-decode` (in-process picture
+decode), `async` (tokio), `icc` (monitor-ICC display path in `preview`/`colour`,
+needs liblcms2). All off by default.
 
 `grok-ffi` links libgrokj2k (grok >= 20.4.3) found via pkg-config, so build and
 install grok first (cmake, e.g. to `~/bin/grok`), then put its `lib/pkgconfig` on
@@ -85,6 +85,21 @@ without it. macOS CI (and local macOS) uses the pinned arm64 9.0.1 zip from
 `https://ffmpeg.martin-riedl.de/download/macos/arm64/1787073674_9.0.1`
 (`ffmpeg.zip` / `ffprobe.zip`); Linux and Windows CI use BtbN's n8.1 gpl
 builds. Put that `ffmpeg` first on `PATH` — `brew shellenv` otherwise wins.
+
+The `ffmpeg-decode` feature decodes the stream encode's picture in process
+through the FFmpeg 8 libraries (ffmpeg-next 9). Build with `FFMPEG_DIR` naming an
+LGPL FFmpeg install holding `include` and `lib`, with libclang present for
+bindgen, and put `$FFMPEG_DIR/lib` on the library path at run time. A system
+FFmpeg's development files on the link path can win over `FFMPEG_DIR`, which
+postkit refuses at the first decode by comparing the loaded library versions
+with its headers. Put the matching libmpv's `lib/pkgconfig` first on
+`PKG_CONFIG_PATH` so the `libmpv` feature links from the same install. Until the
+pipe is removed, `POSTKIT_DECODE_IN_PROCESS=1` switches both stream encodes to
+the in-process decode, and `tests/decode_parity.rs` compares the two byte for
+byte, with an ffmpeg program built from the same FFmpeg source first on `PATH`.
+`POSTKIT_DECODE_MEASURE_CLIP`, `POSTKIT_DECODE_MEASURE_FILTERS` and
+`POSTKIT_DECODE_MEASURE_SIZE` drive the ignored throughput test in
+`ffmpeg_decode`.
 
 grok's accelerator plugin runs the wavelet and T1 on a device. grok looks for
 `libgrokj2k_plugin` under `GRK_PLUGIN_PATH`, then in the working directory, then

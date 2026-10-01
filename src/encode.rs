@@ -73,7 +73,7 @@ pub struct EncodeResult {
     /// no pipe at all. A planar YUV name here is a run whose frames reached
     /// grok's accelerator plugin unconverted.
     #[serde(default)]
-    pub pipe_pixel_format: Option<String>,
+    pub encoder_input_pixel_format: Option<String>,
 }
 
 /// Image format detected from file extension.
@@ -716,7 +716,7 @@ pub struct YuvFrameFormat {
 
 /// What ffmpeg writes to the pipe for a stream encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipeFormat {
+pub enum EncoderInputFormat {
     /// Packed 16-bit RGB in that byte order. The compressor converts the
     /// colour either way: postkit deinterleaves the big-endian layout, and
     /// grok's accelerator plugin takes the little-endian one interleaved.
@@ -726,31 +726,60 @@ pub enum PipeFormat {
     PlanarYuv(YuvFrameFormat),
 }
 
-impl PipeFormat {
+impl EncoderInputFormat {
     pub fn ffmpeg_pixel_format(&self) -> &'static str {
         match self {
-            PipeFormat::PackedRgb(SampleOrder::Big) => PACKED_RGB_BIG_ENDIAN_PIXEL_FORMAT,
-            PipeFormat::PackedRgb(SampleOrder::Little) => PACKED_RGB_LITTLE_ENDIAN_PIXEL_FORMAT,
-            PipeFormat::PlanarYuv(format) => format.pixel_format.ffmpeg_name(),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big) => PACKED_RGB_BIG_ENDIAN_PIXEL_FORMAT,
+            EncoderInputFormat::PackedRgb(SampleOrder::Little) => {
+                PACKED_RGB_LITTLE_ENDIAN_PIXEL_FORMAT
+            }
+            EncoderInputFormat::PlanarYuv(format) => format.pixel_format.ffmpeg_name(),
+        }
+    }
+
+    // one decoded frame's bytes, handed to the compressor as they were read
+    pub(crate) fn raw_frame(
+        &self,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+        index: u64,
+    ) -> crate::grok_encoder::RawFrame {
+        match *self {
+            EncoderInputFormat::PackedRgb(order) => crate::grok_encoder::RawFrame::Packed {
+                data,
+                order,
+                width,
+                height,
+                precision: PACKED_RGB_PRECISION,
+                index,
+            },
+            EncoderInputFormat::PlanarYuv(format) => crate::grok_encoder::RawFrame::PlanarYuv {
+                data,
+                format,
+                width,
+                height,
+                index,
+            },
         }
     }
 
     /// Bytes one frame takes on the pipe.
     pub fn frame_bytes(&self, width: u32, height: u32) -> usize {
         match self {
-            PipeFormat::PackedRgb(_) => {
+            EncoderInputFormat::PackedRgb(_) => {
                 width as usize * height as usize * PACKED_RGB_BYTES_PER_PIXEL
             }
-            PipeFormat::PlanarYuv(format) => {
+            EncoderInputFormat::PlanarYuv(format) => {
                 format.pixel_format.plane_layout(width, height).frame_bytes
             }
         }
     }
 }
 
-/// Everything [`choose_pipe_format`] reads, from the run's options and from
+/// Everything [`choose_encoder_input_format`] reads, from the run's options and from
 /// ffprobe.
-pub(crate) struct PipeFormatInputs<'a> {
+pub(crate) struct FormatChoiceInputs<'a> {
     /// grok's accelerator plugin is switched on, so the encode runs as a batch
     pub accelerator_active: bool,
     pub quality_psnr: Option<f64>,
@@ -772,10 +801,10 @@ pub(crate) struct PipeFormatInputs<'a> {
 /// geometry work, which ffmpeg does in its own pixel format. A PSNR target
 /// re-encodes a frame that overshoots the byte cap, which a batch cannot do, so
 /// that run never reaches the plugin either.
-pub(crate) fn choose_pipe_format(
-    inputs: &PipeFormatInputs,
+pub(crate) fn choose_encoder_input_format(
+    inputs: &FormatChoiceInputs,
     plugin_takes_planar_yuv: bool,
-) -> PipeFormat {
+) -> EncoderInputFormat {
     let postkit_reads_the_samples = inputs.postkit_prepares_the_frame
         || matches!(
             inputs.source_colour,
@@ -785,7 +814,7 @@ pub(crate) fn choose_pipe_format(
         )
         || inputs.source_colour.decode_lut().is_some();
     let Some(pixel_format) = PlanarYuvPixelFormat::from_ffmpeg_name(&inputs.source.pix_fmt) else {
-        return PipeFormat::PackedRgb(SampleOrder::Big);
+        return EncoderInputFormat::PackedRgb(SampleOrder::Big);
     };
     if !inputs.accelerator_active
         || !plugin_takes_planar_yuv
@@ -793,9 +822,9 @@ pub(crate) fn choose_pipe_format(
         || postkit_reads_the_samples
         || filters_change_the_colour(inputs.filters)
     {
-        return PipeFormat::PackedRgb(SampleOrder::Big);
+        return EncoderInputFormat::PackedRgb(SampleOrder::Big);
     }
-    PipeFormat::PlanarYuv(YuvFrameFormat {
+    EncoderInputFormat::PlanarYuv(YuvFrameFormat {
         pixel_format,
         matrix: YuvMatrix::for_ffprobe_color_space(&inputs.source.color_space),
         full_range: inputs.source.color_range == FULL_RANGE_TAG,
@@ -825,20 +854,20 @@ pub(crate) fn packed_rgb_sample_order(
     }
 }
 
-/// The pixel format one run's decode writes: what [`choose_pipe_format`] allows,
+/// The pixel format one run's decode writes: what [`choose_encoder_input_format`] allows,
 /// then grok's accelerator plugin asked about the frames that source would send
 /// it.
 ///
 /// The plugin is asked last, and only about a source everything else already
 /// allows through, because each ask starts a batch. A run asks at most twice: a
 /// declined YUV source falls back to packed RGB, which is asked about in turn.
-pub(crate) fn pipe_format_for_run(
-    inputs: &PipeFormatInputs,
+pub(crate) fn encoder_input_format_for_run(
+    inputs: &FormatChoiceInputs,
     width: u32,
     height: u32,
     params: &crate::grok_encoder::CompressParams,
-) -> PipeFormat {
-    if let PipeFormat::PlanarYuv(format) = choose_pipe_format(inputs, true) {
+) -> EncoderInputFormat {
+    if let EncoderInputFormat::PlanarYuv(format) = choose_encoder_input_format(inputs, true) {
         let shape_only = crate::grok_encoder::RawFrame::PlanarYuv {
             data: Vec::new(),
             format,
@@ -847,10 +876,10 @@ pub(crate) fn pipe_format_for_run(
             index: 0,
         };
         if crate::grok_encoder::plugin_takes_frame(&shape_only, params) {
-            return PipeFormat::PlanarYuv(format);
+            return EncoderInputFormat::PlanarYuv(format);
         }
     }
-    PipeFormat::PackedRgb(packed_rgb_sample_order(width, height, params))
+    EncoderInputFormat::PackedRgb(packed_rgb_sample_order(width, height, params))
 }
 
 /// The whole filter chain one decode runs: the picture filters with the
@@ -868,20 +897,20 @@ pub(crate) fn pipe_format_for_run(
 /// format filter at all and the geometry runs on the planes.
 fn decode_filter_chain(
     picture: &DecodeFilters,
-    pipe_format: PipeFormat,
+    input_format: EncoderInputFormat,
     source: &crate::probe::PixelFormatInfo,
     source_colour: &SourceColour,
 ) -> String {
     let hdr = hdr_yuv_to_rgb_filter(source, source_colour);
     let filter = hdr.as_deref().unwrap_or(SIXTEEN_BIT_RGB_FILTER);
-    match pipe_format {
-        PipeFormat::PlanarYuv(_) => picture.joined(),
-        PipeFormat::PackedRgb(_)
+    match input_format {
+        EncoderInputFormat::PlanarYuv(_) => picture.joined(),
+        EncoderInputFormat::PackedRgb(_)
             if hdr.is_some() || is_eight_bit_yuv_pixel_format(&source.pix_fmt) =>
         {
             picture.with_format_filter_at(0, filter)
         }
-        PipeFormat::PackedRgb(_) => match picture.geometry_format_position {
+        EncoderInputFormat::PackedRgb(_) => match picture.geometry_format_position {
             Some(position) => picture.with_format_filter_at(position, filter),
             None => picture.joined(),
         },
@@ -891,12 +920,15 @@ fn decode_filter_chain(
 // ffmpeg refuses an empty -vf
 const PASSTHROUGH_FILTER: &str = "null";
 
+fn passthrough_if_empty(picture_chain: String) -> String {
+    if picture_chain.is_empty() {
+        return PASSTHROUGH_FILTER.to_string();
+    }
+    picture_chain
+}
+
 fn with_optional_detection_branch(picture_chain: String, detect_picture_findings: bool) -> String {
-    let picture_chain = if picture_chain.is_empty() {
-        PASSTHROUGH_FILTER.to_string()
-    } else {
-        picture_chain
-    };
+    let picture_chain = passthrough_if_empty(picture_chain);
     if !detect_picture_findings {
         return picture_chain;
     }
@@ -1009,9 +1041,20 @@ pub(crate) struct DecodeChainInputs<'a> {
 pub(crate) struct DecodeChain {
     /// every argument before `-i`
     pub input_args: Vec<String>,
-    pub pipe_format: PipeFormat,
+    pub input_format: EncoderInputFormat,
     /// the whole `-vf` chain
     pub filters: String,
+    // the chain without the detection branch, which the in-process graph adds itself
+    #[cfg(feature = "ffmpeg-decode")]
+    pub picture_filters: String,
+    #[cfg(feature = "ffmpeg-decode")]
+    pub decode_source: DecodeSource,
+    #[cfg(feature = "ffmpeg-decode")]
+    pub read_source_at: Option<FrameRate>,
+    #[cfg(feature = "ffmpeg-decode")]
+    pub hardware_decode: bool,
+    #[cfg(feature = "ffmpeg-decode")]
+    pub detect_picture_findings: bool,
 }
 
 /// Everything one stream decode runs: the arguments before `-i`, the pixel
@@ -1024,16 +1067,19 @@ pub(crate) fn decode_chain(
     params: &crate::grok_encoder::CompressParams,
     on_log: &dyn Fn(&str),
 ) -> Result<DecodeChain, String> {
-    if let Some(lut) = inputs.source_colour.decode_lut()
-        && !lut.is_file()
-    {
-        return Err(format!("decode LUT not found: {}", lut.display()));
+    if let Some(lut) = inputs.source_colour.decode_lut() {
+        if !lut.is_file() {
+            return Err(format!("decode LUT not found: {}", lut.display()));
+        }
+        if std::fs::metadata(lut).is_ok_and(|metadata| metadata.len() == 0) {
+            return Err(format!("the decode LUT {} is empty", lut.display()));
+        }
     }
     let picture = decode_filters(&inputs.picture, inputs.source_colour);
-    let pipe_format = pipe_format_for_run(
+    let input_format = encoder_input_format_for_run(
         // the pipe format is decided on the chain the caller asked for, so the
         // pixel format filter that chain gets afterwards cannot move the choice
-        &PipeFormatInputs {
+        &FormatChoiceInputs {
             accelerator_active: inputs.accelerator_active,
             quality_psnr: inputs.quality_psnr,
             postkit_prepares_the_frame: inputs.postkit_prepares_the_frame,
@@ -1048,15 +1094,21 @@ pub(crate) fn decode_chain(
         height,
         params,
     );
-    let pixel_format = pipe_format.ffmpeg_pixel_format();
+    let pixel_format = input_format.ffmpeg_pixel_format();
     tracing::info!(
         pixel_format,
         hardware_decode = inputs.accelerator_active,
-        "decoding to the pipe"
+        "decoding for the encoder"
     );
     on_log(&format!(
-        "[ENCODE] decoding to the pipe pixel_format={pixel_format} hardware_decode={}",
+        "[ENCODE] decoding to pixel_format={pixel_format} hardware_decode={}",
         inputs.accelerator_active
+    ));
+    let picture_filters = passthrough_if_empty(decode_filter_chain(
+        &picture,
+        input_format,
+        inputs.source,
+        inputs.source_colour,
     ));
     Ok(DecodeChain {
         input_args: decode_input_args(
@@ -1064,11 +1116,21 @@ pub(crate) fn decode_chain(
             inputs.read_source_at,
             inputs.accelerator_active,
         )?,
-        pipe_format,
+        input_format,
         filters: with_optional_detection_branch(
-            decode_filter_chain(&picture, pipe_format, inputs.source, inputs.source_colour),
+            picture_filters.clone(),
             inputs.detect_picture_findings,
         ),
+        #[cfg(feature = "ffmpeg-decode")]
+        picture_filters,
+        #[cfg(feature = "ffmpeg-decode")]
+        decode_source: inputs.decode_source,
+        #[cfg(feature = "ffmpeg-decode")]
+        read_source_at: inputs.read_source_at,
+        #[cfg(feature = "ffmpeg-decode")]
+        hardware_decode: inputs.accelerator_active,
+        #[cfg(feature = "ffmpeg-decode")]
+        detect_picture_findings: inputs.detect_picture_findings,
     })
 }
 
@@ -1078,14 +1140,14 @@ pub(crate) fn decode_chain(
 /// decoding the rest of the source.
 pub(crate) fn decode_output_args(
     filters: &str,
-    pipe_format: PipeFormat,
+    input_format: EncoderInputFormat,
     frame_range: Option<FrameRange>,
 ) -> Vec<String> {
     let mut args: Vec<String> = [
         "-vf",
         filters,
         "-pix_fmt",
-        pipe_format.ffmpeg_pixel_format(),
+        input_format.ffmpeg_pixel_format(),
         "-f",
         "rawvideo",
         "-an",
@@ -1387,10 +1449,20 @@ pub fn stream_encode_inprocess_with_mxf_feed<F>(
 where
     F: FnMut(StreamProgress),
 {
-    use crate::grok_encoder::{self, RawFrame};
+    use crate::grok_encoder;
 
+    let probed = match probe_for_decode(&opts.input, opts.decode_source) {
+        Ok(probed) => probed,
+        Err(e) => {
+            return EncodeResult {
+                success: false,
+                error: e,
+                ..Default::default()
+            };
+        }
+    };
     let (source_width, source_height, source_frames) =
-        probe_decode_source(&opts.input, opts.decode_source);
+        (probed.width, probed.height, probed.frame_count);
     if source_width == 0 || source_height == 0 {
         return EncodeResult {
             success: false,
@@ -1442,7 +1514,7 @@ where
         }
     };
 
-    let source = probe_decode_pixel_format(&opts.input, opts.decode_source);
+    let source = probed.pixel_format;
     let accelerator_active = grok_encoder::gpu_active();
     let chain = match decode_chain(
         &DecodeChainInputs {
@@ -1474,52 +1546,15 @@ where
             };
         }
     };
-    let DecodeChain {
-        input_args,
-        pipe_format,
-        filters,
-        ..
-    } = chain;
-    let frame_size = pipe_format.frame_bytes(width, height);
-    tracing::debug!(
-        "ffmpeg -y {} -i {} -vf {filters}",
-        input_args.join(" "),
-        opts.input.display()
-    );
-    let mut ffmpeg = match std::process::Command::new("ffmpeg")
-        .arg("-y")
-        // the progress line carries no newline, so the reader would hold the
-        // whole run in one string
-        .arg("-nostats")
-        .args(&input_args)
-        .arg("-i")
-        .arg(&opts.input)
-        .args(decode_output_args(&filters, pipe_format, opts.frame_range))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+    let input_format = chain.input_format;
+    let frame_size = input_format.frame_bytes(width, height);
+    let mut reader = match FrameReader::start(&chain, &opts.input, opts.frame_range, width, height)
     {
-        Ok(c) => c,
+        Ok(reader) => reader,
         Err(e) => {
             return EncodeResult {
                 success: false,
-                error: format!("Failed to start ffmpeg: {e}"),
-                ..Default::default()
-            };
-        }
-    };
-
-    let detection_reader = ffmpeg
-        .stderr
-        .take()
-        .map(crate::picture_findings::read_detection_lines);
-
-    let mut ffmpeg_stdout = match ffmpeg.stdout.take() {
-        Some(s) => s,
-        None => {
-            return EncodeResult {
-                success: false,
-                error: "Failed to capture ffmpeg stdout".to_string(),
+                error: e,
                 ..Default::default()
             };
         }
@@ -1528,7 +1563,6 @@ where
     grok_encoder::initialize(0);
 
     let mut frame_index: u64 = 0;
-    let mut decode_read_to_end = false;
     let encode_start = std::time::Instant::now();
     let phase_clocks = Arc::new(grok_encoder::PhaseClocks::default());
 
@@ -1552,40 +1586,14 @@ where
             }
             let mut frame_buf = buffer_pool.take(frame_size);
             let read_start = std::time::Instant::now();
-            let read = read_exact_or_eof(&mut ffmpeg_stdout, &mut frame_buf);
+            let read = reader.read_into(&mut frame_buf);
             phase_clocks.add(grok_encoder::EncodePhase::DecoderWait, read_start.elapsed());
-            match read {
-                ReadResult::Ok => {}
-                ReadResult::Eof => {
-                    decode_read_to_end = true;
-                    return None;
-                }
-                ReadResult::Err(_) => return None,
+            if let FrameRead::Ended = read {
+                return None;
             }
-
-            let idx = frame_index;
+            let index = frame_index;
             frame_index += 1;
-
-            // Pass the bytes on as they came off the pipe: the encoder threads
-            // deinterleave big-endian packed RGB into grok's component buffers,
-            // and the other two formats reach the plugin untouched
-            Some(match pipe_format {
-                PipeFormat::PackedRgb(order) => RawFrame::Packed {
-                    data: frame_buf,
-                    order,
-                    width,
-                    height,
-                    precision: PACKED_RGB_PRECISION,
-                    index: idx,
-                },
-                PipeFormat::PlanarYuv(format) => RawFrame::PlanarYuv {
-                    data: frame_buf,
-                    format,
-                    width,
-                    height,
-                    index: idx,
-                },
-            })
+            Some(input_format.raw_frame(frame_buf, width, height, index))
         },
         |progress| {
             let elapsed = encode_start.elapsed().as_secs_f64();
@@ -1602,13 +1610,7 @@ where
         },
     );
 
-    let decode = crate::picture_findings::finish_detection(
-        &mut ffmpeg,
-        detection_reader,
-        decode_read_to_end,
-        opts.fps.as_f64(),
-        result.frames_encoded,
-    );
+    let decode = reader.finish(opts.fps.as_f64(), result.frames_encoded);
 
     let mut success = result.success;
     let mut error = result.error;
@@ -1623,21 +1625,274 @@ where
         frames_encoded: result.frames_encoded,
         output_dir: opts.output_dir.clone(),
         picture_findings: decode.findings,
-        pipe_pixel_format: Some(pipe_format.ffmpeg_pixel_format().to_string()),
+        encoder_input_pixel_format: Some(input_format.ffmpeg_pixel_format().to_string()),
     }
 }
 
-// ffmpeg's exit status only means something when it exited on its own: postkit kills a run it stopped early
+// ─── the reader both stream decodes take their frames from ─────────────────
+
+// temporary: picks the reader until the byte comparison passes and the pipe goes
+const DECODE_IN_PROCESS_VARIABLE: &str = "POSTKIT_DECODE_IN_PROCESS";
+
+static DECODE_IN_PROCESS: std::sync::LazyLock<AtomicBool> = std::sync::LazyLock::new(|| {
+    AtomicBool::new(std::env::var(DECODE_IN_PROCESS_VARIABLE).is_ok_and(|value| value == "1"))
+});
+
+// temporary, for the byte comparison against the pipe
+#[doc(hidden)]
+pub fn read_decode_in_process(in_process: bool) {
+    DECODE_IN_PROCESS.store(in_process, Ordering::Relaxed);
+}
+
+pub(crate) fn decode_reads_in_process() -> bool {
+    DECODE_IN_PROCESS.load(Ordering::Relaxed)
+}
+
+pub(crate) struct DecodeProbe {
+    pub width: u32,
+    pub height: u32,
+    pub frame_count: u64,
+    pub pixel_format: crate::probe::PixelFormatInfo,
+}
+
+pub(crate) fn probe_for_decode(input: &Path, source: DecodeSource) -> Result<DecodeProbe, String> {
+    if decode_reads_in_process() {
+        return probe_in_process(input, source);
+    }
+    let (width, height, frame_count) = probe_decode_source(input, source);
+    Ok(DecodeProbe {
+        width,
+        height,
+        frame_count,
+        pixel_format: probe_decode_pixel_format(input, source),
+    })
+}
+
+#[cfg(feature = "ffmpeg-decode")]
+fn probe_in_process(input: &Path, source: DecodeSource) -> Result<DecodeProbe, String> {
+    let probed = crate::ffmpeg_decode::probe(input, source)?;
+    Ok(DecodeProbe {
+        width: probed.width,
+        height: probed.height,
+        frame_count: probed.frame_count,
+        pixel_format: probed.pixel_format,
+    })
+}
+
+#[cfg(not(feature = "ffmpeg-decode"))]
+fn probe_in_process(_input: &Path, _source: DecodeSource) -> Result<DecodeProbe, String> {
+    Err(WITHOUT_FFMPEG_DECODE.to_string())
+}
+
+#[cfg(not(feature = "ffmpeg-decode"))]
+const WITHOUT_FFMPEG_DECODE: &str = "postkit was built without the ffmpeg-decode feature";
+
+// the tags the resumable chain is decided on, and the frame count a window is checked against
+pub(crate) fn probe_resumable_source(
+    input: &Path,
+    counts_frames: bool,
+) -> Result<(crate::probe::PixelFormatInfo, u64), String> {
+    if decode_reads_in_process() {
+        let probed = probe_in_process(input, DecodeSource::Video)?;
+        return Ok((probed.pixel_format, probed.frame_count));
+    }
+    let frame_count = if counts_frames {
+        probe_video(input).2
+    } else {
+        0
+    };
+    Ok((crate::probe::probe_pixel_format(input), frame_count))
+}
+
+pub(crate) struct DecodeOutcome {
+    pub findings: crate::picture_findings::PictureFindings,
+    pub failure: Option<String>,
+    pub stderr_tail: String,
+}
+
+pub(crate) enum FrameRead {
+    Frame,
+    Ended,
+}
+
+pub(crate) enum FrameReader {
+    Pipe {
+        child: std::process::Child,
+        stdout: std::process::ChildStdout,
+        detection: Option<std::thread::JoinHandle<crate::picture_findings::DecodeStderr>>,
+        read_to_end: bool,
+    },
+    #[cfg(feature = "ffmpeg-decode")]
+    InProcess(crate::ffmpeg_decode::FrameDecoder),
+}
+
+impl FrameReader {
+    pub(crate) fn start(
+        chain: &DecodeChain,
+        input: &Path,
+        frame_range: Option<FrameRange>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        if decode_reads_in_process() {
+            return Self::start_in_process(chain, input, frame_range, width, height);
+        }
+        tracing::debug!(
+            "ffmpeg -y {} -i {} -vf {}",
+            chain.input_args.join(" "),
+            input.display(),
+            chain.filters
+        );
+        let mut child = std::process::Command::new("ffmpeg")
+            .arg("-y")
+            // the progress line carries no newline, so the reader would hold the
+            // whole run in one string
+            .arg("-nostats")
+            .args(&chain.input_args)
+            .arg("-i")
+            .arg(input)
+            .args(decode_output_args(
+                &chain.filters,
+                chain.input_format,
+                frame_range,
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
+        let detection = child
+            .stderr
+            .take()
+            .map(crate::picture_findings::read_detection_lines);
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to capture ffmpeg stdout".to_string())?;
+        Ok(Self::Pipe {
+            child,
+            stdout,
+            detection,
+            read_to_end: false,
+        })
+    }
+
+    #[cfg(feature = "ffmpeg-decode")]
+    fn start_in_process(
+        chain: &DecodeChain,
+        input: &Path,
+        frame_range: Option<FrameRange>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        crate::ffmpeg_decode::FrameDecoder::start(&crate::ffmpeg_decode::DecodeRequest {
+            input,
+            decode_source: chain.decode_source,
+            read_source_at: chain.read_source_at,
+            hardware_decode: chain.hardware_decode,
+            picture_filters: &chain.picture_filters,
+            input_format: chain.input_format,
+            width,
+            height,
+            frame_limit: frame_range.map(|range| range.frame_count),
+            detect_picture_findings: chain.detect_picture_findings,
+        })
+        .map(Self::InProcess)
+    }
+
+    #[cfg(not(feature = "ffmpeg-decode"))]
+    fn start_in_process(
+        _chain: &DecodeChain,
+        _input: &Path,
+        _frame_range: Option<FrameRange>,
+        _width: u32,
+        _height: u32,
+    ) -> Result<Self, String> {
+        Err(WITHOUT_FFMPEG_DECODE.to_string())
+    }
+
+    // `buffer` already holds one frame's bytes
+    pub(crate) fn read_into(&mut self, buffer: &mut [u8]) -> FrameRead {
+        match self {
+            Self::Pipe {
+                stdout,
+                read_to_end,
+                ..
+            } => match read_exact_or_eof(stdout, buffer) {
+                ReadResult::Ok => FrameRead::Frame,
+                ReadResult::Eof => {
+                    *read_to_end = true;
+                    FrameRead::Ended
+                }
+                ReadResult::Err(_) => FrameRead::Ended,
+            },
+            #[cfg(feature = "ffmpeg-decode")]
+            Self::InProcess(decoder) => match decoder.read_into(buffer) {
+                crate::ffmpeg_decode::NextFrame::Copied => FrameRead::Frame,
+                crate::ffmpeg_decode::NextFrame::Ended => FrameRead::Ended,
+            },
+        }
+    }
+
+    // throws away the next `frames` frames, false when the source ends first
+    pub(crate) fn skip(&mut self, frames: u64, frame_bytes: usize) -> bool {
+        match self {
+            Self::Pipe { stdout, .. } => {
+                let mut skipped = vec![0u8; frame_bytes];
+                (0..frames).all(|_| stdout.read_exact(&mut skipped).is_ok())
+            }
+            #[cfg(feature = "ffmpeg-decode")]
+            Self::InProcess(decoder) => decoder.skip(frames).is_ok(),
+        }
+    }
+
+    pub(crate) fn finish(self, fps: f64, frame_count: u64) -> DecodeOutcome {
+        match self {
+            Self::Pipe {
+                mut child,
+                detection,
+                read_to_end,
+                ..
+            } => {
+                // ffmpeg's exit status only means something when it exited on its own
+                let decode = crate::picture_findings::finish_detection(
+                    &mut child,
+                    detection,
+                    read_to_end,
+                    fps,
+                    frame_count,
+                );
+                DecodeOutcome {
+                    findings: decode.findings,
+                    failure: decode
+                        .exit_status
+                        .filter(|status| !status.success())
+                        .map(|status| format!("ffmpeg failed ({status})")),
+                    stderr_tail: decode.stderr_tail,
+                }
+            }
+            #[cfg(feature = "ffmpeg-decode")]
+            Self::InProcess(decoder) => {
+                let decode = decoder.finish(fps, frame_count);
+                DecodeOutcome {
+                    findings: decode.findings,
+                    failure: decode.failure,
+                    stderr_tail: String::new(),
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn decode_failure(
-    decode: &crate::picture_findings::FinishedDecode,
+    decode: &DecodeOutcome,
     frames_encoded: u64,
     expected_frames: u64,
 ) -> Option<String> {
-    let reason = match decode.exit_status.filter(|status| !status.success()) {
-        Some(status) => format!("ffmpeg failed ({status})"),
+    let reason = match &decode.failure {
+        Some(failure) => failure.clone(),
         // a zero expected_frames is a probe that read no count, not an empty source
         None if frames_encoded == 0 && expected_frames > 0 => {
-            "ffmpeg decoded no frames".to_string()
+            "the decode produced no frames".to_string()
         }
         None => return None,
     };
@@ -1852,7 +2107,7 @@ where
         frames_encoded: result.frames_encoded,
         output_dir: opts.output_dir.clone(),
         picture_findings: crate::picture_findings::PictureFindings::default(),
-        pipe_pixel_format: None,
+        encoder_input_pixel_format: None,
     }
 }
 
@@ -2176,7 +2431,11 @@ mod tests {
     #[test]
     fn a_frame_window_stops_ffmpeg_at_its_end() {
         assert_eq!(
-            decode_output_args("fps=24", PipeFormat::PackedRgb(SampleOrder::Big), None),
+            decode_output_args(
+                "fps=24",
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                None
+            ),
             vec![
                 "-vf", "fps=24", "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1"
             ]
@@ -2184,7 +2443,7 @@ mod tests {
         assert_eq!(
             decode_output_args(
                 "fps=24",
-                PipeFormat::PackedRgb(SampleOrder::Big),
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
                 Some(FrameRange {
                     first_frame: 10,
                     frame_count: 5,
@@ -2614,7 +2873,7 @@ mod tests {
     #[test]
     fn an_hdr_master_decodes_through_its_own_matrix_and_range() {
         let picture = decode_filters(&PictureFilters::Given(""), &SourceColour::DisplayRgb);
-        let packed_rgb = PipeFormat::PackedRgb(SampleOrder::Big);
+        let packed_rgb = EncoderInputFormat::PackedRgb(SampleOrder::Big);
         let hdr = hdr10_source();
         let chain = |source: &crate::probe::PixelFormatInfo| {
             decode_filter_chain(&picture, packed_rgb, source, &hdr)
@@ -2662,8 +2921,8 @@ mod tests {
         let source = hdr10_pixel_format("yuv420p10le", "tv");
         let hdr = hdr10_source();
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     accelerator_active: true,
                     quality_psnr: None,
                     postkit_prepares_the_frame: false,
@@ -2673,7 +2932,7 @@ mod tests {
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "postkit reads every sample of an HDR master, so the planes cannot go to the plugin"
         );
     }
@@ -2682,7 +2941,7 @@ mod tests {
     fn the_yuv_pipe_needs_every_condition_at_once() {
         let source = source_pixel_format("yuv420p");
         let display_rgb = SourceColour::DisplayRgb;
-        let accelerated = PipeFormatInputs {
+        let accelerated = FormatChoiceInputs {
             accelerator_active: true,
             quality_psnr: None,
             postkit_prepares_the_frame: false,
@@ -2692,76 +2951,76 @@ mod tests {
         };
         assert!(
             matches!(
-                choose_pipe_format(&accelerated, true),
-                PipeFormat::PlanarYuv(_)
+                choose_encoder_input_format(&accelerated, true),
+                EncoderInputFormat::PlanarYuv(_)
             ),
             "an accelerated run over an untouched yuv420p source takes the planes"
         );
 
         assert_eq!(
-            choose_pipe_format(&accelerated, false),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            choose_encoder_input_format(&accelerated, false),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "a plugin that will not take the planes leaves the run on RGB"
         );
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     accelerator_active: false,
                     ..accelerated
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "nothing but the plugin reads the planes"
         );
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     quality_psnr: Some(50.0),
                     ..accelerated
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "a PSNR target keeps the run off the batch"
         );
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     postkit_prepares_the_frame: true,
                     ..accelerated
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "a burn needs samples postkit can write into"
         );
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     filters: "fps=24,format=gbrp16le,crop=1998:1080:0:0",
                     ..accelerated
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "a caller's own pixel format filter leaves nothing of the source's planes"
         );
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     filters: "fps=24,lut3d=\\'/luts/hdr_to_dci.cube\\'",
                     ..accelerated
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "a colour filter in the chain leaves nothing of the source's own planes"
         );
         assert!(
             matches!(
-                choose_pipe_format(
-                    &PipeFormatInputs {
+                choose_encoder_input_format(
+                    &FormatChoiceInputs {
                         filters: "yadif,fps=24,crop=1998:1080:0:0,scale=w=1998:h=1080,\
                                   split=2[picture][detect];[detect]blackdetect,nullsink;\
                                   [picture]null",
@@ -2769,33 +3028,33 @@ mod tests {
                     },
                     true
                 ),
-                PipeFormat::PlanarYuv(_)
+                EncoderInputFormat::PlanarYuv(_)
             ),
             "geometry and the detection branch keep the pixel format"
         );
 
         let wide_gamut = SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3);
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     source_colour: &wide_gamut,
                     ..accelerated
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "postkit converts this source itself and needs RGB"
         );
         let to_rec709 = SourceColour::KeepRgbFrom(crate::colour::ColourSpace::P3);
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     source_colour: &to_rec709,
                     ..accelerated
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "postkit converts this source to Rec.709 itself and needs RGB"
         );
         for lut in [
@@ -2803,14 +3062,14 @@ mod tests {
             SourceColour::KeepRgbAfterLut(PathBuf::from("/luts/to_rec709.cube")),
         ] {
             assert_eq!(
-                choose_pipe_format(
-                    &PipeFormatInputs {
+                choose_encoder_input_format(
+                    &FormatChoiceInputs {
                         source_colour: &lut,
                         ..accelerated
                     },
                     true
                 ),
-                PipeFormat::PackedRgb(SampleOrder::Big),
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
                 "lut3d puts RGB on the pipe"
             );
         }
@@ -2818,14 +3077,14 @@ mod tests {
         for already_transformed in [SourceColour::AlreadyPq, SourceColour::KeepRgb] {
             assert!(
                 matches!(
-                    choose_pipe_format(
-                        &PipeFormatInputs {
+                    choose_encoder_input_format(
+                        &FormatChoiceInputs {
                             source_colour: &already_transformed,
                             ..accelerated
                         },
                         true
                     ),
-                    PipeFormat::PlanarYuv(_)
+                    EncoderInputFormat::PlanarYuv(_)
                 ),
                 "{already_transformed:?} leaves the frame alone, so the planes can go through"
             );
@@ -2833,14 +3092,14 @@ mod tests {
 
         let rgb_source = source_pixel_format("gbrp12le");
         assert_eq!(
-            choose_pipe_format(
-                &PipeFormatInputs {
+            choose_encoder_input_format(
+                &FormatChoiceInputs {
                     source: &rgb_source,
                     ..accelerated
                 },
                 true
             ),
-            PipeFormat::PackedRgb(SampleOrder::Big),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big),
             "a source that is not one of the four planar YUV formats stays on RGB"
         );
     }
@@ -2854,8 +3113,8 @@ mod tests {
             color_range: "pc".to_string(),
             ..Default::default()
         };
-        let chosen = choose_pipe_format(
-            &PipeFormatInputs {
+        let chosen = choose_encoder_input_format(
+            &FormatChoiceInputs {
                 accelerator_active: true,
                 quality_psnr: None,
                 postkit_prepares_the_frame: false,
@@ -2867,7 +3126,7 @@ mod tests {
         );
         assert_eq!(
             chosen,
-            PipeFormat::PlanarYuv(YuvFrameFormat {
+            EncoderInputFormat::PlanarYuv(YuvFrameFormat {
                 pixel_format: PlanarYuvPixelFormat::Yuv422p10le,
                 matrix: YuvMatrix::Bt2020,
                 full_range: true,
@@ -2936,19 +3195,19 @@ mod tests {
     #[test]
     fn a_pipe_format_names_its_pixel_format_and_sizes_its_frame() {
         assert_eq!(
-            PipeFormat::PackedRgb(SampleOrder::Big).ffmpeg_pixel_format(),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big).ffmpeg_pixel_format(),
             "rgb48be"
         );
         assert_eq!(
-            PipeFormat::PackedRgb(SampleOrder::Little).ffmpeg_pixel_format(),
+            EncoderInputFormat::PackedRgb(SampleOrder::Little).ffmpeg_pixel_format(),
             "rgb48le"
         );
         assert_eq!(
-            PipeFormat::PackedRgb(SampleOrder::Big).frame_bytes(64, 48),
+            EncoderInputFormat::PackedRgb(SampleOrder::Big).frame_bytes(64, 48),
             64 * 48 * 6
         );
         assert_eq!(
-            PipeFormat::PackedRgb(SampleOrder::Little).frame_bytes(64, 48),
+            EncoderInputFormat::PackedRgb(SampleOrder::Little).frame_bytes(64, 48),
             64 * 48 * 6
         );
         for (pixel_format, name) in [
@@ -2962,7 +3221,7 @@ mod tests {
                 PlanarYuvPixelFormat::from_ffmpeg_name(name),
                 Some(pixel_format)
             );
-            let pipe = PipeFormat::PlanarYuv(YuvFrameFormat {
+            let pipe = EncoderInputFormat::PlanarYuv(YuvFrameFormat {
                 pixel_format,
                 matrix: YuvMatrix::Bt709,
                 full_range: false,
@@ -2981,7 +3240,7 @@ mod tests {
 
     #[test]
     fn a_yuv_pipe_reaches_ffmpeg_as_its_own_pixel_format() {
-        let pipe = PipeFormat::PlanarYuv(YuvFrameFormat {
+        let pipe = EncoderInputFormat::PlanarYuv(YuvFrameFormat {
             pixel_format: PlanarYuvPixelFormat::Yuv420p10le,
             matrix: YuvMatrix::Bt709,
             full_range: false,
@@ -3080,7 +3339,7 @@ mod tests {
             &plain,
             None,
         );
-        let planar_yuv = PipeFormat::PlanarYuv(YuvFrameFormat {
+        let planar_yuv = EncoderInputFormat::PlanarYuv(YuvFrameFormat {
             pixel_format: PlanarYuvPixelFormat::Yuv420p,
             matrix: YuvMatrix::Bt601,
             full_range: false,
@@ -3098,7 +3357,7 @@ mod tests {
         assert_eq!(
             decode_filter_chain(
                 &picture,
-                PipeFormat::PackedRgb(SampleOrder::Big),
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
                 &source_pixel_format("yuv420p10le"),
                 &SourceColour::DisplayRgb
             ),
@@ -3108,7 +3367,7 @@ mod tests {
         assert_eq!(
             decode_filter_chain(
                 &picture,
-                PipeFormat::PackedRgb(SampleOrder::Big),
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
                 &source_pixel_format("gbrp"),
                 &SourceColour::DisplayRgb
             ),
@@ -3118,7 +3377,7 @@ mod tests {
         assert_eq!(
             decode_filter_chain(
                 &decode_filters(&PictureFilters::Given(""), &SourceColour::DisplayRgb),
-                PipeFormat::PackedRgb(SampleOrder::Little),
+                EncoderInputFormat::PackedRgb(SampleOrder::Little),
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
@@ -3177,7 +3436,7 @@ mod tests {
         assert_eq!(
             decode_filter_chain(
                 &picture,
-                PipeFormat::PackedRgb(SampleOrder::Big),
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
@@ -3187,7 +3446,7 @@ mod tests {
         assert_eq!(
             decode_filter_chain(
                 &picture,
-                PipeFormat::PackedRgb(SampleOrder::Big),
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
                 &source_pixel_format("rgb24"),
                 &SourceColour::DisplayRgb
             ),
@@ -3209,7 +3468,7 @@ mod tests {
         assert_eq!(
             decode_filter_chain(
                 &picture,
-                PipeFormat::PackedRgb(SampleOrder::Big),
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
@@ -3220,7 +3479,7 @@ mod tests {
         assert_eq!(
             decode_filter_chain(
                 &picture,
-                PipeFormat::PackedRgb(SampleOrder::Big),
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
                 &source_pixel_format("rgb24"),
                 &SourceColour::DisplayRgb
             ),
@@ -3229,7 +3488,7 @@ mod tests {
                  pad=w=2048:h=1080:x=0:y=112:color=black"
         );
 
-        let planar_yuv = PipeFormat::PlanarYuv(YuvFrameFormat {
+        let planar_yuv = EncoderInputFormat::PlanarYuv(YuvFrameFormat {
             pixel_format: PlanarYuvPixelFormat::Yuv420p,
             matrix: YuvMatrix::Bt601,
             full_range: false,
@@ -3340,13 +3599,13 @@ mod tests {
     /// The middle pixel of the first frame the decode writes to the pipe, which
     /// is inside the picture whether or not the chain pads it.
     fn middle_pixel_on_the_pipe(clip: &Path, filters: &str) -> [u16; 3] {
-        let pipe_format = PipeFormat::PackedRgb(SampleOrder::Big);
+        let input_format = EncoderInputFormat::PackedRgb(SampleOrder::Big);
         let run = std::process::Command::new("ffmpeg")
             .args(["-v", "error", "-y"])
             .args(decode_input_args(DecodeSource::Video, None, false).unwrap())
             .arg("-i")
             .arg(clip)
-            .args(decode_output_args(filters, pipe_format, None))
+            .args(decode_output_args(filters, input_format, None))
             .output()
             .unwrap();
         assert!(
@@ -3354,7 +3613,7 @@ mod tests {
             "{filters}: {}",
             String::from_utf8_lossy(&run.stderr)
         );
-        let frame_bytes = pipe_format.frame_bytes(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE);
+        let frame_bytes = input_format.frame_bytes(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE);
         assert!(
             run.stdout.len() >= frame_bytes,
             "{filters}: the pipe carried {} bytes of a {frame_bytes} byte frame",
@@ -3375,7 +3634,7 @@ mod tests {
         let source = crate::probe::probe_pixel_format(&clip);
         assert_eq!(source.pix_fmt, "yuv420p");
         let exact = exact_bt601_rgb(sample);
-        let packed_rgb = PipeFormat::PackedRgb(SampleOrder::Big);
+        let packed_rgb = EncoderInputFormat::PackedRgb(SampleOrder::Big);
 
         let plain = crate::picture_processing::PictureProcessing::default()
             .plan(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE)
