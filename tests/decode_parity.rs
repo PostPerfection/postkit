@@ -1,5 +1,4 @@
-// temporary: compares the in-process decode with the ffmpeg pipe, byte for byte,
-// and goes with the pipe
+// temporary: goes with the pipe it compares the in-process decode against
 
 use postkit::encode::{
     DecodeSource, EncodeResult, FrameRange, FrameRate, SourceColour, StreamEncodeOptions,

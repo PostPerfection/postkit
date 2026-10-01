@@ -15,7 +15,7 @@ const DECODED_FRAMES_QUEUED: usize = 4;
 // frames waiting between the graph thread and the encoder's producer
 const FILTERED_FRAMES_QUEUED: usize = 4;
 
-// the ffmpeg program's policy is to drop an undecodable frame and go on
+// false takes the ffmpeg program's policy of dropping an undecodable frame
 const FAIL_ON_FIRST_DECODE_ERROR: bool = true;
 // under the ffmpeg program's policy a run fails past this share of bad frames
 const MAX_DECODE_ERROR_RATE: f64 = 2.0 / 3.0;
@@ -218,8 +218,7 @@ fn open_input(path: &Path, source: DecodeSource) -> Result<ffmpeg::format::conte
     opened.map_err(|e| format!("cannot open {}: {e}", shown(path)))
 }
 
-// the ffmpeg program's own pick: the largest picture, a default stream
-// weighed up, an attached cover image last
+// the ffmpeg program's pick: the largest picture, a cover image last
 fn chosen_video_stream(input: &ffmpeg::format::context::Input) -> Option<usize> {
     const DEFAULT_STREAM_WEIGHT: i64 = 5_000_000;
     const NEW_PACKETS_WEIGHT: i64 = 100_000_000;
@@ -362,8 +361,7 @@ fn packet_count(path: &Path, source: DecodeSource, stream_index: usize) -> Resul
     }
 }
 
-// the same raster, count and tags the ffprobe probes report, read from the
-// stream the decode opens
+// what the ffprobe probes report, read from the stream the decode opens
 pub(crate) fn probe(path: &Path, source: DecodeSource) -> Result<SourceProbe, String> {
     ready()?;
     let input = open_input(path, source)?;
@@ -439,8 +437,7 @@ fn shared_device() -> Result<&'static SharedDevice, String> {
         .map_err(Clone::clone)
 }
 
-// the ffmpeg program's choice: the device's format when the codec decodes on
-// it, the first software format otherwise
+// the ffmpeg program's choice: the device when the codec decodes there, else software
 unsafe extern "C" fn device_or_software_format(
     context: *mut ffi::AVCodecContext,
     formats: *const ffi::AVPixelFormat,
@@ -836,8 +833,7 @@ fn display_matrix(frame: &ffi::AVFrame) -> Option<[i32; 9]> {
     }
 }
 
-// the filters the ffmpeg program puts in front of the caller's chain to turn
-// the picture upright
+// what the ffmpeg program puts before the caller's chain to turn the picture upright
 fn upright_filters(matrix: &[i32; 9]) -> Vec<(&'static str, Option<String>)> {
     let mut theta = -unsafe { ffi::av_display_rotation_get(matrix.as_ptr()) }.round();
     theta -= 360.0 * (theta / 360.0 + 0.9 / 360.0).floor();
@@ -871,8 +867,7 @@ fn upright_filters(matrix: &[i32; 9]) -> Vec<(&'static str, Option<String>)> {
     filters
 }
 
-// each filter name in a chain, read past labels, quotes and escapes the way
-// libavfilter's parser reads them
+// each filter name in a chain, read the way libavfilter's parser reads it
 fn filter_names(chain: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut characters = chain.chars().peekable();
@@ -967,8 +962,7 @@ struct GraphSettings {
 }
 
 impl GraphSettings {
-    // built in the ffmpeg program's order, since the order filters sit in the
-    // graph decides where format negotiation puts each conversion
+    // the order filters sit in decides where format negotiation puts conversions
     fn build(&self, frame: &ffmpeg::frame::Video) -> Result<Graph, String> {
         let raw = unsafe { &*frame.as_ptr() };
         let input = GraphInput::of(frame);
@@ -1293,8 +1287,7 @@ impl ConstantRate {
     }
 }
 
-// what blackdetect and freezedetect left on the frames, as the lines the
-// ffmpeg program would have logged
+// the detections left on the frames, as the lines the ffmpeg program logs
 struct Detections {
     lines: Vec<String>,
     black_start: Option<(i64, String)>,
