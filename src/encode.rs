@@ -1018,6 +1018,7 @@ pub(crate) fn decode_chain(
     width: u32,
     height: u32,
     params: &crate::grok_encoder::CompressParams,
+    on_log: &dyn Fn(&str),
 ) -> Result<DecodeChain, String> {
     let picture = decode_filters(&inputs.picture, inputs.source_colour);
     let pipe_format = pipe_format_for_run(
@@ -1038,11 +1039,16 @@ pub(crate) fn decode_chain(
         height,
         params,
     );
+    let pixel_format = pipe_format.ffmpeg_pixel_format();
     tracing::info!(
-        pixel_format = pipe_format.ffmpeg_pixel_format(),
+        pixel_format,
         hardware_decode = inputs.accelerator_active,
         "decoding to the pipe"
     );
+    on_log(&format!(
+        "[ENCODE] decoding to the pipe pixel_format={pixel_format} hardware_decode={}",
+        inputs.accelerator_active
+    ));
     Ok(DecodeChain {
         input_args: decode_input_args(
             inputs.decode_source,
@@ -1345,7 +1351,7 @@ pub fn stream_encode_inprocess<F>(
 where
     F: FnMut(StreamProgress),
 {
-    stream_encode_inprocess_with_mxf_feed(opts, cancel, pause, None, on_progress)
+    stream_encode_inprocess_with_mxf_feed(opts, cancel, pause, None, on_progress, |_| {})
 }
 
 /// Like [`stream_encode_inprocess`], but each codestream also goes to `mxf_feed`
@@ -1357,6 +1363,7 @@ pub fn stream_encode_inprocess_with_mxf_feed<F>(
     pause: &Arc<AtomicBool>,
     mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
     mut on_progress: F,
+    on_log: impl Fn(&str),
 ) -> EncodeResult
 where
     F: FnMut(StreamProgress),
@@ -1447,6 +1454,7 @@ where
         width,
         height,
         &params,
+        &on_log,
     ) {
         Ok(chain) => chain,
         Err(e) => {

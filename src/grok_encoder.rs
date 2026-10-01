@@ -2361,6 +2361,7 @@ where
         frame_range,
         None,
         on_progress,
+        |_| {},
     )
 }
 
@@ -2388,6 +2389,7 @@ pub fn encode_video_pipeline_resumable_with_mxf_feed<P>(
     frame_range: Option<crate::encode::FrameRange>,
     mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
     mut on_progress: P,
+    on_log: impl Fn(&str),
 ) -> PipelineResult
 where
     P: FnMut(EncodeProgress),
@@ -2453,6 +2455,7 @@ where
         width,
         height,
         params,
+        &on_log,
     ) {
         Ok(chain) => chain,
         Err(e) => {

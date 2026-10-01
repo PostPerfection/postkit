@@ -396,7 +396,7 @@ fn run_encode_and_maybe_wrap(
     // a cloned feed would keep the wrap waiting after the encoder returns
     let run_stream = |opts: &StreamEncodeOptions, mxf_feed| {
         report_start();
-        stream_encode_inprocess_with_mxf_feed(opts, cancel, pause, mxf_feed, report_frame)
+        stream_encode_inprocess_with_mxf_feed(opts, cancel, pause, mxf_feed, report_frame, &on_log)
     };
 
     match input_type {
@@ -696,6 +696,44 @@ mod tests {
         assert_eq!(format_minutes_seconds(0.0), "0s");
         assert_eq!(format_minutes_seconds(59.6), "1m0s");
         assert_eq!(format_minutes_seconds(3600.0), "60m0s");
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn the_video_encode_logs_the_pipe_format_it_decodes_to() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = directory.path().join("clip.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=64x48:rate=24:duration=1")
+            .args(["-frames:v", "2", "-pix_fmt", "yuv420p"])
+            .arg(&video)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let lines = std::sync::Mutex::new(Vec::new());
+        run_encode_with_options(
+            &video,
+            &directory.path().join("out"),
+            &EncodeRunOptions::default(),
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            |_| {},
+            |line| lines.lock().unwrap().push(line.to_string()),
+        )
+        .unwrap();
+        let lines = lines.into_inner().unwrap();
+        assert!(
+            lines.iter().any(|line| {
+                line.starts_with("[ENCODE] decoding to the pipe pixel_format=")
+                    && line.ends_with(" hardware_decode=false")
+            }),
+            "{lines:#?}"
+        );
     }
 
     #[test]

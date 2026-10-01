@@ -35,6 +35,7 @@ pub mod hints;
 pub mod j2k;
 pub mod job_queue;
 pub mod loudness;
+pub mod machine_info;
 pub mod mca;
 pub mod metadata_edit;
 pub mod mid_side;

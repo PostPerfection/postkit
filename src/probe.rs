@@ -7,6 +7,8 @@ use crate::timecode::parse_frame_rate;
 /// Video stream metadata from ffprobe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoInfo {
+    #[serde(default = "untagged")]
+    pub codec_name: String,
     pub width: u32,
     pub height: u32,
     pub fps_num: u32,
@@ -171,6 +173,7 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
     let pixel_format = probe_pixel_format(path);
 
     Some(VideoInfo {
+        codec_name: ffprobe_video_field(path, "codec_name", &[]).unwrap_or_else(untagged),
         width,
         height,
         fps_num,
@@ -312,6 +315,21 @@ mod tests {
         assert_eq!(info.pix_fmt, "yuv420p");
         assert_eq!(info.color_space, "unknown");
         assert_eq!(info.color_range, "unknown");
+    }
+
+    #[test]
+    fn the_video_probe_names_the_codec() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = probe_video(&clip(dir.path(), "codec.mp4", "yuv420p", &[])).unwrap();
+        assert_eq!(info.codec_name, "h264");
+    }
+
+    #[test]
+    fn a_saved_probe_without_a_codec_reads_back_as_unknown() {
+        let saved = r#"{"width":64,"height":48,"fps_num":24,"fps_den":1,"has_audio":false,
+            "total_frames":4,"pix_fmt":"yuv420p","color_space":"bt709","color_range":"tv"}"#;
+        let info: VideoInfo = serde_json::from_str(saved).unwrap();
+        assert_eq!(info.codec_name, "unknown");
     }
 
     #[test]
