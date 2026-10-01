@@ -385,7 +385,7 @@ use std::io::Write as _;
 
 /// Largest picture frame we read into. DCI caps a 4K frame at 500 Mbps / 24 fps
 /// (~2.6 MB); 8 MB leaves comfortable headroom.
-const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PreviewError {

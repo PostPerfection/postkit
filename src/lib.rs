@@ -44,6 +44,7 @@ pub mod mid_side;
 pub mod mpv;
 #[cfg(feature = "libmpv")]
 pub mod mpv_render;
+pub mod mxf_unwrap;
 pub mod mxf_wrap;
 pub mod otioz_import;
 pub mod package_edit;

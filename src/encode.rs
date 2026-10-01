@@ -94,6 +94,7 @@ pub enum InputType {
     Video,
     ImageSequence,
     J2kSequence,
+    PictureMxf,
     Unknown,
 }
 
@@ -125,6 +126,7 @@ pub fn detect_input_type(path: &Path) -> InputType {
             .map(|e| e.to_lowercase())
             .unwrap_or_default();
         match ext.as_str() {
+            "mxf" if crate::mxf_unwrap::is_picture_mxf(path) => InputType::PictureMxf,
             "mp4" | "mkv" | "mov" | "avi" | "mxf" | "webm" | "ts" | "m2ts" => InputType::Video,
             "tif" | "tiff" | "dpx" | "exr" | "bmp" | "jpg" | "jpeg" | "png" => {
                 InputType::ImageSequence
@@ -181,6 +183,10 @@ pub(crate) fn first_source_frame(directory: &Path) -> Result<PathBuf, String> {
 pub fn source_raster(picture: &Path) -> Result<(u32, u32), String> {
     let measured = match detect_input_type(picture) {
         InputType::ImageSequence if picture.is_dir() => first_source_frame(picture)?,
+        InputType::PictureMxf => {
+            let info = crate::mxf_unwrap::probe_picture_mxf(picture)?;
+            return Ok((info.width, info.height));
+        }
         _ => picture.to_path_buf(),
     };
     if detect_image_format(&measured) == ImageFormat::Tiff {
@@ -2807,6 +2813,35 @@ mod tests {
         std::fs::write(dir.path().join("shot_0001.jpeg"), b"not really a jpeg").unwrap();
         assert_eq!(detect_input_type(dir.path()), InputType::ImageSequence);
         assert_eq!(find_source_frames(dir.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn only_a_jpeg_2000_picture_mxf_is_a_picture_mxf() {
+        let dir = tempfile::tempdir().unwrap();
+        let (picture, _) = crate::mxf_unwrap::tests::wrapped_picture_mxf(dir.path());
+        assert_eq!(detect_input_type(&picture), InputType::PictureMxf);
+        let upper_case = dir.path().join("PICTURE.MXF");
+        std::fs::copy(&picture, &upper_case).unwrap();
+        assert_eq!(detect_input_type(&upper_case), InputType::PictureMxf);
+
+        let mpeg2 = dir.path().join("mpeg2.mxf");
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-y", "-f", "lavfi", "-i", "testsrc=s=720x576:r=25"])
+            .args(["-frames:v", "2", "-c:v", "mpeg2video"])
+            .arg(&mpeg2)
+            .output()
+            .expect("this test needs the ffmpeg program on PATH to write an MPEG-2 MXF");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(detect_input_type(&mpeg2), InputType::Video);
+
+        assert_eq!(
+            detect_input_type(Path::new("/clips/a.mov")),
+            InputType::Video
+        );
     }
 
     #[test]

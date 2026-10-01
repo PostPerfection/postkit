@@ -112,7 +112,10 @@ fn find_masters(watch_dir: &Path) -> Vec<PathBuf> {
         let input_type = crate::encode::detect_input_type(&path);
         if matches!(
             input_type,
-            InputType::Video | InputType::ImageSequence | InputType::J2kSequence
+            InputType::Video
+                | InputType::ImageSequence
+                | InputType::J2kSequence
+                | InputType::PictureMxf
         ) {
             masters.push(path);
         }

@@ -54,6 +54,8 @@ impl PipelineProgress {
     }
 }
 
+pub(crate) const CANCELLED: &str = "Cancelled";
+
 const SECONDS_PER_MINUTE: u64 = 60;
 
 fn format_minutes_seconds(seconds: f64) -> String {
@@ -301,7 +303,7 @@ fn run_encode_and_maybe_wrap(
     let decodes_through_ffmpeg = match input_type {
         InputType::Video => true,
         InputType::ImageSequence => sequence_needs_ffmpeg,
-        InputType::J2kSequence | InputType::Unknown => false,
+        InputType::J2kSequence | InputType::PictureMxf | InputType::Unknown => false,
     };
     if options.read_source_at.is_some() && input_type != InputType::Video {
         return Err(format!(
@@ -321,7 +323,7 @@ fn run_encode_and_maybe_wrap(
     }
 
     let mut overlapped_wrap = match wrap {
-        Some(wrap) if input_type == InputType::J2kSequence => {
+        Some(wrap) if matches!(input_type, InputType::J2kSequence | InputType::PictureMxf) => {
             return Err(format!(
                 "a J2K sequence is never encoded here, so it hands postkit no codestream to \
                  wrap while it encodes: wrap {} from the sequence instead",
@@ -491,6 +493,40 @@ fn run_encode_and_maybe_wrap(
         InputType::J2kSequence => {
             on_log("Input is already J2K, skipping encode");
         }
+        InputType::PictureMxf => {
+            report_start();
+            let unwrap_start = std::time::Instant::now();
+            let info = crate::mxf_unwrap::unwrap_picture_mxf(
+                video,
+                &j2k_dir,
+                cancel,
+                &mut |frame, total_frames| {
+                    let elapsed_secs = unwrap_start.elapsed().as_secs_f64();
+                    report_frame(StreamProgress {
+                        frame,
+                        total_frames,
+                        fps: frame as f64 / elapsed_secs,
+                        elapsed_secs,
+                        decode_wait_secs: 0.0,
+                        prepare_secs: 0.0,
+                        encode_secs: 0.0,
+                        write_secs: 0.0,
+                    })
+                },
+            )
+            .inspect_err(|error| {
+                if error == CANCELLED {
+                    on_log("=== CANCELLED ===");
+                }
+            })?;
+            on_log(&format!(
+                "[ENCODE] Unwrapped {} frames at {}/{} fps from {}, skipping encode",
+                info.frames,
+                info.edit_rate_num,
+                info.edit_rate_den,
+                video.display()
+            ));
+        }
         InputType::Unknown => {
             return Err(format!("Cannot determine input type: {}", video.display()));
         }
@@ -498,7 +534,7 @@ fn run_encode_and_maybe_wrap(
 
     if cancel.load(Ordering::Relaxed) {
         on_log("=== CANCELLED ===");
-        return Err("Cancelled".to_string());
+        return Err(CANCELLED.to_string());
     }
 
     let final_j2k_dir = match input_type {
@@ -506,9 +542,9 @@ fn run_encode_and_maybe_wrap(
         _ => j2k_dir,
     };
 
-    // only a J2K sequence is unchecked by the encoder
+    // only J2K input is unchecked by the encoder
     if let Some(cap) = options.codestream_byte_cap
-        && input_type == InputType::J2kSequence
+        && matches!(input_type, InputType::J2kSequence | InputType::PictureMxf)
     {
         check_codestream_dir(&final_j2k_dir, cap)?;
     }
@@ -569,6 +605,7 @@ fn reject_unsupported_colour_path(
     source_colour: &SourceColour,
     decodes_through_ffmpeg: bool,
 ) -> Result<(), String> {
+    let already_compressed = matches!(input_type, InputType::J2kSequence | InputType::PictureMxf);
     if let Some(lut) = source_colour.decode_lut() {
         if input_type == InputType::ImageSequence && !decodes_through_ffmpeg {
             return Err(format!(
@@ -577,23 +614,23 @@ fn reject_unsupported_colour_path(
                 lut.display()
             ));
         }
-        if input_type == InputType::J2kSequence {
+        if already_compressed {
             return Err(format!(
                 "J2K input is already compressed, so the 3D LUT {} cannot be applied",
                 lut.display()
             ));
         }
     }
-    match (input_type, source_colour) {
-        (InputType::J2kSequence, SourceColour::DisplayRgbIn(space)) => Err(format!(
+    match source_colour {
+        SourceColour::DisplayRgbIn(space) if already_compressed => Err(format!(
             "J2K input is already compressed, so a {space:?} source cannot be converted to \
              X'Y'Z' any more"
         )),
-        (InputType::J2kSequence, SourceColour::KeepRgbFrom(space)) => Err(format!(
+        SourceColour::KeepRgbFrom(space) if already_compressed => Err(format!(
             "J2K input is already compressed, so a {space:?} source cannot be converted to \
              Rec.709 RGB any more"
         )),
-        (InputType::J2kSequence, SourceColour::HdrDcdm { source, .. }) => Err(format!(
+        SourceColour::HdrDcdm { source, .. } if already_compressed => Err(format!(
             "J2K input is already compressed, so a {source:?} master cannot be converted to \
              the DCI HDR Addendum's X\"Y\"Z\" any more"
         )),
@@ -609,7 +646,7 @@ fn reject_unsupported_burn(
     source_colour: &SourceColour,
 ) -> Result<(), String> {
     match (input_type, source_colour) {
-        (InputType::J2kSequence, _) => Err(
+        (InputType::J2kSequence | InputType::PictureMxf, _) => Err(
             "J2K input is already compressed, so there are no frames to burn subtitles onto"
                 .to_string(),
         ),
@@ -634,7 +671,7 @@ fn reject_unsupported_burn(
 /// Refuse a frame range on an input the encode never compresses.
 fn reject_unsupported_frame_range(input_type: InputType) -> Result<(), String> {
     match input_type {
-        InputType::J2kSequence => Err(
+        InputType::J2kSequence | InputType::PictureMxf => Err(
             "a J2K sequence is never encoded here, so a frame range has nothing to narrow: link \
              the codestreams you want instead"
                 .to_string(),
@@ -648,7 +685,7 @@ fn reject_unsupported_frame_range(input_type: InputType) -> Result<(), String> {
 /// picture to process.
 fn reject_unsupported_picture(input_type: InputType) -> Result<(), String> {
     match input_type {
-        InputType::J2kSequence => Err(
+        InputType::J2kSequence | InputType::PictureMxf => Err(
             "J2K input is already compressed, so there are no frames to crop, rotate or fit"
                 .to_string(),
         ),
@@ -894,6 +931,30 @@ mod tests {
         assert!(reject_unsupported_picture(InputType::ImageSequence).is_ok());
         let compressed = reject_unsupported_picture(InputType::J2kSequence).unwrap_err();
         assert!(compressed.contains("no frames to crop"), "{compressed}");
+    }
+
+    #[test]
+    fn a_picture_mxf_is_refused_like_a_j2k_sequence() {
+        let compressed = [InputType::J2kSequence, InputType::PictureMxf];
+        let [sequence, mxf] = compressed.map(reject_unsupported_frame_range);
+        assert_eq!(mxf, sequence);
+        let [sequence, mxf] = compressed.map(reject_unsupported_picture);
+        assert_eq!(mxf, sequence);
+        let [sequence, mxf] =
+            compressed.map(|input| reject_unsupported_burn(input, &SourceColour::DisplayRgb));
+        assert_eq!(mxf, sequence);
+        let colours = [
+            hdr10_source(),
+            SourceColour::DisplayRgbIn(crate::colour::ColourSpace::P3),
+            SourceColour::KeepRgbFrom(crate::colour::ColourSpace::P3),
+            SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+        ];
+        for colour in colours {
+            let [sequence, mxf] = compressed
+                .map(|input| reject_unsupported_colour_path(input, &colour, READ_BY_POSTKIT));
+            assert!(sequence.is_err(), "{colour:?}");
+            assert_eq!(mxf, sequence, "{colour:?}");
+        }
     }
 
     #[test]
