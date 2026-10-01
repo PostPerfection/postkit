@@ -397,29 +397,40 @@ impl DecodeFilters {
     }
 }
 
-/// The ffmpeg filter chain for a stream decode: the picture plan, the output
-/// frame rate at the position the plan names, the frame window right after that
-/// rate, plus the HDR-to-DCI LUT last when the source needs one, so the LUT sees
-/// the finished picture.
+/// The ffmpeg filter chain for a stream decode: the caller's own chain, or the
+/// picture plan with the output frame rate at the position the plan names and
+/// the frame window right after that rate, plus the HDR-to-DCI LUT last when the
+/// source needs one, so the LUT sees the finished picture.
 fn decode_filters(picture: &PictureFilters, source_colour: &SourceColour) -> DecodeFilters {
-    let (plan, fps, frame_range) = match picture {
-        PictureFilters::Given(given) => {
-            return DecodeFilters {
-                items: if given.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![(*given).to_string()]
-                },
-                geometry_format_position: None,
-            };
-        }
+    let mut filters = match picture {
+        PictureFilters::Given(given) => DecodeFilters {
+            items: if given.is_empty() {
+                Vec::new()
+            } else {
+                vec![(*given).to_string()]
+            },
+            geometry_format_position: None,
+        },
         PictureFilters::Planned {
             plan,
             fps,
             frame_range,
-        } => (plan, fps, frame_range),
+        } => planned_filters(plan, *fps, *frame_range),
     };
+    if let Some(lut) = source_colour.decode_lut() {
+        filters.items.push(format!(
+            "lut3d={}",
+            crate::burnin::filter_argument(&lut.to_string_lossy())
+        ));
+    }
+    filters
+}
 
+fn planned_filters(
+    plan: &crate::picture_processing::PicturePlan,
+    fps: FrameRate,
+    frame_range: Option<FrameRange>,
+) -> DecodeFilters {
     let mut items = plan.filters.clone();
     items.insert(
         plan.fps_position,
@@ -434,13 +445,6 @@ fn decode_filters(picture: &PictureFilters, source_colour: &SourceColour) -> Dec
         items.splice(after_fps..after_fps, trims);
     }
     let geometry_position = plan.geometry_format_position + inserted;
-
-    if let Some(lut) = source_colour.decode_lut() {
-        items.push(format!(
-            "lut3d={}",
-            crate::burnin::filter_argument(&lut.to_string_lossy())
-        ));
-    }
     DecodeFilters {
         items,
         geometry_format_position: plan.changes_geometry.then_some(geometry_position),
@@ -1020,6 +1024,11 @@ pub(crate) fn decode_chain(
     params: &crate::grok_encoder::CompressParams,
     on_log: &dyn Fn(&str),
 ) -> Result<DecodeChain, String> {
+    if let Some(lut) = inputs.source_colour.decode_lut()
+        && !lut.is_file()
+    {
+        return Err(format!("decode LUT not found: {}", lut.display()));
+    }
     let picture = decode_filters(&inputs.picture, inputs.source_colour);
     let pipe_format = pipe_format_for_run(
         // the pipe format is decided on the chain the caller asked for, so the
@@ -1275,7 +1284,12 @@ pub fn probe_decode_source(input: &Path, source: DecodeSource) -> (u32, u32, u64
             let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
             let parts: Vec<&str> = s.split('x').collect();
             if parts.len() == 2 {
-                (parts[0].parse().unwrap_or(0), parts[1].parse().unwrap_or(0))
+                crate::probe::displayed_raster(
+                    input,
+                    demuxer,
+                    parts[0].parse().unwrap_or(0),
+                    parts[1].parse().unwrap_or(0),
+                )
             } else {
                 (0, 0)
             }
@@ -1307,6 +1321,11 @@ pub fn probe_decode_source(input: &Path, source: DecodeSource) -> (u32, u32, u64
     };
 
     (width, height, frame_count)
+}
+
+// a concat list only opens with its demuxer arguments
+fn probe_decode_pixel_format(input: &Path, source: DecodeSource) -> crate::probe::PixelFormatInfo {
+    crate::probe::probe_pixel_format_with_demuxer(input, source.demuxer_args())
 }
 
 pub(crate) enum ReadResult {
@@ -1370,16 +1389,6 @@ where
 {
     use crate::grok_encoder::{self, RawFrame};
 
-    if let Some(lut) = opts.source_colour.decode_lut()
-        && !lut.is_file()
-    {
-        return EncodeResult {
-            success: false,
-            error: format!("decode LUT not found: {}", lut.display()),
-            ..Default::default()
-        };
-    }
-
     let (source_width, source_height, source_frames) =
         probe_decode_source(&opts.input, opts.decode_source);
     if source_width == 0 || source_height == 0 {
@@ -1433,7 +1442,7 @@ where
         }
     };
 
-    let source = crate::probe::probe_pixel_format(&opts.input);
+    let source = probe_decode_pixel_format(&opts.input, opts.decode_source);
     let accelerator_active = grok_encoder::gpu_active();
     let chain = match decode_chain(
         &DecodeChainInputs {
@@ -2465,6 +2474,50 @@ mod tests {
             .joined(),
             "yadif,fps=24,hqdn3d,crop=1920:804:0:138,lut3d=\\'/luts/hdr_to_dci.cube\\'",
             "the pixel format filter is the pipe's, not the plan's"
+        );
+    }
+
+    #[test]
+    fn an_image_list_probes_the_pixel_format_of_its_stills() {
+        let dir = tempfile::tempdir().unwrap();
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc=s=64x48:d=1:r=2",
+                "-pix_fmt",
+                "yuvj420p",
+            ])
+            .arg(dir.path().join("still_%02d.jpg"))
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let stills = find_source_frames(dir.path()).unwrap();
+        let list = dir.path().join("stills.ffconcat");
+        write_image_concat_list(&stills, FrameRate::whole(24), &list).unwrap();
+        let probed = probe_decode_pixel_format(&list, DecodeSource::ImageList);
+        assert_eq!(probed.pix_fmt, "yuvj420p");
+        assert_eq!(probed.color_range, "pc");
+    }
+
+    #[test]
+    fn a_callers_own_chain_keeps_the_decode_lut_last() {
+        let lut = SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube"));
+        assert_eq!(
+            decode_filters(&PictureFilters::Given("fade=t=in:st=0:d=1"), &lut).joined(),
+            "fade=t=in:st=0:d=1,lut3d=\\'/luts/hdr_to_dci.cube\\'"
+        );
+        assert_eq!(
+            decode_filters(&PictureFilters::Given(""), &lut).joined(),
+            "lut3d=\\'/luts/hdr_to_dci.cube\\'"
         );
     }
 

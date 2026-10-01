@@ -76,11 +76,18 @@ impl Default for PixelFormatInfo {
 /// Read the first video stream's pixel format and colour tags. A file ffprobe
 /// cannot read comes back with every field untagged.
 pub fn probe_pixel_format(path: &Path) -> PixelFormatInfo {
+    probe_pixel_format_with_demuxer(path, &[])
+}
+
+pub(crate) fn probe_pixel_format_with_demuxer(
+    path: &Path,
+    demuxer_args: &[&str],
+) -> PixelFormatInfo {
     let mut info = PixelFormatInfo::default();
     let output = std::process::Command::new("ffprobe")
+        .args(["-v", "error"])
+        .args(demuxer_args)
         .args([
-            "-v",
-            "error",
             "-select_streams",
             "v:0",
             "-show_entries",
@@ -144,8 +151,8 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
         return None;
     }
 
-    let width: u32 = parts[0].parse().ok()?;
-    let height: u32 = parts[1].parse().ok()?;
+    let (width, height) =
+        displayed_raster(path, &[], parts[0].parse().ok()?, parts[1].parse().ok()?);
     let (fps_num, fps_den) = parse_frame_rate(parts[2])?;
 
     // Check for audio stream
@@ -187,6 +194,79 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
         color_primaries: pixel_format.color_primaries,
         bit_rate: ffprobe_video_field(path, "bit_rate", &[]).and_then(|value| value.parse().ok()),
     })
+}
+
+const QUARTER_TURN_DEGREES: i64 = 90;
+const HALF_TURN_DEGREES: i64 = 180;
+
+// the stream side data ffmpeg's decode applies before any filter runs
+#[derive(Default)]
+struct DisplaySideData {
+    crop_top: u32,
+    crop_bottom: u32,
+    crop_left: u32,
+    crop_right: u32,
+    rotation_degrees: i64,
+}
+
+impl DisplaySideData {
+    // the container crop comes first, then a quarter turn swaps the axes
+    fn applied_to(&self, width: u32, height: u32) -> (u32, u32) {
+        let cropped_width = width.saturating_sub(self.crop_left + self.crop_right);
+        let cropped_height = height.saturating_sub(self.crop_top + self.crop_bottom);
+        if self.rotation_degrees.rem_euclid(HALF_TURN_DEGREES) == QUARTER_TURN_DEGREES {
+            return (cropped_height, cropped_width);
+        }
+        (cropped_width, cropped_height)
+    }
+}
+
+// the raster ffmpeg's decode hands the filters: container crop removed, a quarter turn upright
+pub(crate) fn displayed_raster(
+    path: &Path,
+    demuxer_args: &[&str],
+    width: u32,
+    height: u32,
+) -> (u32, u32) {
+    let output = std::process::Command::new("ffprobe")
+        .args(["-v", "error"])
+        .args(demuxer_args)
+        .args([
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream_side_data=rotation,crop_top,crop_bottom,crop_left,crop_right",
+            "-of",
+            "default=noprint_wrappers=1",
+        ])
+        .arg(path)
+        .output();
+    let Ok(output) = output else {
+        return (width, height);
+    };
+    if !output.status.success() {
+        return (width, height);
+    }
+    let mut side_data = DisplaySideData::default();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let crop = match key.trim() {
+            "rotation" => {
+                side_data.rotation_degrees = value.parse().unwrap_or(0);
+                continue;
+            }
+            "crop_top" => &mut side_data.crop_top,
+            "crop_bottom" => &mut side_data.crop_bottom,
+            "crop_left" => &mut side_data.crop_left,
+            "crop_right" => &mut side_data.crop_right,
+            _ => continue,
+        };
+        *crop = value.parse().unwrap_or(0);
+    }
+    side_data.applied_to(width, height)
 }
 
 /// How many frames the video stream holds. ffprobe's `-count_frames` decodes
@@ -315,6 +395,118 @@ mod tests {
         assert_eq!(info.pix_fmt, "yuv420p");
         assert_eq!(info.color_space, "unknown");
         assert_eq!(info.color_range, "unknown");
+    }
+
+    fn remuxed(dir: &Path, source: &Path, name: &str, input_args: &[&str]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y"])
+            .args(input_args)
+            .arg("-i")
+            .arg(source)
+            .args(["-c", "copy"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "remux failed: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        path
+    }
+
+    const BOX_HEADER_BYTES: usize = 8;
+    // a sample description box carries a version, flags and an entry count
+    const SAMPLE_DESCRIPTION_HEADER_BYTES: usize = BOX_HEADER_BYTES + 8;
+    // the fixed fields of a visual sample entry before its child boxes
+    const VISUAL_SAMPLE_ENTRY_HEADER_BYTES: usize = BOX_HEADER_BYTES + 78;
+
+    fn box_in(data: &[u8], start: usize, end: usize, kind: &[u8; 4]) -> (usize, usize) {
+        let mut at = start;
+        while at < end {
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+            if &data[at + 4..at + BOX_HEADER_BYTES] == kind {
+                return (at, size);
+            }
+            at += size;
+        }
+        panic!("no {} box", String::from_utf8_lossy(kind));
+    }
+
+    // ffmpeg cannot write a container crop, so a clap box is spliced into the sample entry
+    fn with_clean_aperture(source: &Path, cropped: &Path, aperture: (u32, u32)) {
+        let mut data = std::fs::read(source).unwrap();
+        let path: [(&[u8; 4], usize); 7] = [
+            (b"moov", BOX_HEADER_BYTES),
+            (b"trak", BOX_HEADER_BYTES),
+            (b"mdia", BOX_HEADER_BYTES),
+            (b"minf", BOX_HEADER_BYTES),
+            (b"stbl", BOX_HEADER_BYTES),
+            (b"stsd", SAMPLE_DESCRIPTION_HEADER_BYTES),
+            (b"avc1", VISUAL_SAMPLE_ENTRY_HEADER_BYTES),
+        ];
+        let mut ancestors = Vec::new();
+        let (mut start, mut end) = (0, data.len());
+        for (kind, header) in path {
+            let (at, size) = box_in(&data, start, end, kind);
+            ancestors.push(at);
+            (start, end) = (at + header, at + size);
+        }
+        let mut clap = Vec::new();
+        let fields = [aperture.0, 1, aperture.1, 1, 0, 1, 0, 1];
+        let clap_size = (BOX_HEADER_BYTES + 4 * fields.len()) as u32;
+        clap.extend(clap_size.to_be_bytes());
+        clap.extend(b"clap");
+        for field in fields {
+            clap.extend(field.to_be_bytes());
+        }
+        data.splice(end..end, clap);
+        for at in ancestors {
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) + clap_size;
+            data[at..at + 4].copy_from_slice(&size.to_be_bytes());
+        }
+        std::fs::write(cropped, data).unwrap();
+    }
+
+    #[test]
+    fn a_quarter_turned_source_probes_at_the_raster_it_displays() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = clip(dir.path(), "stored.mp4", "yuv420p", &[]);
+        let turned = remuxed(
+            dir.path(),
+            &stored,
+            "turned.mp4",
+            &["-display_rotation", "90"],
+        );
+        let info = probe_video(&turned).unwrap();
+        assert_eq!((info.width, info.height), (48, 64));
+        let half_turn = remuxed(
+            dir.path(),
+            &stored,
+            "half.mp4",
+            &["-display_rotation", "180"],
+        );
+        let info = probe_video(&half_turn).unwrap();
+        assert_eq!((info.width, info.height), (64, 48));
+    }
+
+    #[test]
+    fn a_container_crop_probes_at_the_cropped_raster_and_then_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let stored = clip(dir.path(), "stored.mp4", "yuv420p", &[]);
+        let cropped = dir.path().join("cropped.mp4");
+        with_clean_aperture(&stored, &cropped, (48, 40));
+        let info = probe_video(&cropped).unwrap();
+        assert_eq!((info.width, info.height), (48, 40));
+        let turned = remuxed(
+            dir.path(),
+            &cropped,
+            "turned.mp4",
+            &["-display_rotation", "-90"],
+        );
+        let info = probe_video(&turned).unwrap();
+        assert_eq!((info.width, info.height), (40, 48));
     }
 
     #[test]

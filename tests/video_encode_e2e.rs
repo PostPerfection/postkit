@@ -82,6 +82,65 @@ fn a_video_source_encodes_to_one_codestream_per_frame() {
     );
 }
 
+#[test]
+fn a_quarter_turned_source_encodes_at_the_raster_it_displays() {
+    const STORED_WIDTH: u32 = 128;
+    const STORED_HEIGHT: u32 = 72;
+    let dir = tempfile::tempdir().unwrap();
+    let stored = dir.path().join("stored.mp4");
+    let turned = dir.path().join("turned.mp4");
+    let made = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+        .arg(format!(
+            "testsrc=s={STORED_WIDTH}x{STORED_HEIGHT}:d=1:r={FRAME_COUNT}"
+        ))
+        .args(["-frames:v", &FRAME_COUNT.to_string(), "-pix_fmt", "yuv420p"])
+        .arg(&stored)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let remuxed = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-display_rotation", "90", "-i"])
+        .arg(&stored)
+        .args(["-c", "copy"])
+        .arg(&turned)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        remuxed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remuxed.stderr)
+    );
+
+    let result = run_encode_with_options(
+        &turned,
+        &dir.path().join("out"),
+        &EncodeRunOptions {
+            fps: FrameRate::whole(FRAME_COUNT as u32),
+            ..Default::default()
+        },
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(AtomicBool::new(false)),
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    )
+    .expect("video encode");
+
+    assert_eq!(result.frames_encoded, FRAME_COUNT);
+    let first = result.j2k_dir.join("frame_00000000.j2c");
+    let header =
+        postkit::j2k::parse_j2k_header(&std::fs::read(&first).unwrap()).expect("a J2K codestream");
+    assert_eq!(
+        (header.width, header.height),
+        (STORED_HEIGHT, STORED_WIDTH),
+        "ffmpeg turns the picture upright, so the codestream has to be the turned raster"
+    );
+}
+
 /// 500 is the shortest clip where the two rates disagree: 500 frames at
 /// 24000/1001 run 20.854 s, which an `fps=24` filter resamples to 501 frames,
 /// so a wrong-by-a-frame composition shows up as a codestream count.

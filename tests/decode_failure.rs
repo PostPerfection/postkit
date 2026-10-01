@@ -135,3 +135,42 @@ fn a_source_ffmpeg_reads_encodes_as_it_did() {
     assert_eq!(result.frames_encoded, FRAMES);
     assert!(result.error.is_empty(), "{}", result.error);
 }
+
+#[test]
+fn the_resumable_encode_runs_its_decode_lut() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let readable = clip(dir.path());
+    let lut = dir.path().join("broken.cube");
+    std::fs::write(&lut, "this is not a cube file\n").expect("the LUT has to be written");
+
+    let result = postkit::grok_encoder::encode_video_pipeline_resumable_with_mxf_feed(
+        &readable,
+        &dir.path().join("j2k"),
+        &postkit::grok_encoder::CompressParams {
+            edit_rate: FrameRate::whole(FRAME_RATE),
+            apply_xyz_transform: false,
+            ..postkit::grok_encoder::CompressParams::default()
+        },
+        FRAMES,
+        WIDTH,
+        HEIGHT,
+        &postkit::probe::probe_pixel_format(&readable),
+        &SourceColour::DciLut(lut),
+        &Arc::new(AtomicBool::new(false)),
+        false,
+        None,
+        None,
+        None,
+        |_| {},
+        |_| {},
+    );
+    assert!(
+        !result.success,
+        "a LUT ffmpeg cannot read has to fail the encode, or the LUT never ran"
+    );
+    assert!(
+        result.error.contains("3D LUT is empty"),
+        "the error has to carry what ffmpeg wrote to stderr: {}",
+        result.error
+    );
+}
