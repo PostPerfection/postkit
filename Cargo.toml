@@ -126,6 +126,10 @@ name = "decode_parity"
 required-features = ["grok-ffi", "ffmpeg-decode"]
 
 [[test]]
+name = "in_process_decode_memory"
+required-features = ["grok-ffi", "ffmpeg-decode"]
+
+[[test]]
 name = "grok_gpu"
 required-features = ["grok-gpu"]
 

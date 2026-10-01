@@ -351,8 +351,8 @@ pub(crate) struct SourceProbe {
 fn packet_count(path: &Path, source: DecodeSource, stream_index: usize) -> Result<u64, String> {
     let mut input = open_input(path, source)?;
     let mut count = 0u64;
-    let mut packet = ffmpeg::Packet::empty();
     loop {
+        let mut packet = ffmpeg::Packet::empty();
         match packet.read(&mut input) {
             Ok(()) if packet.stream() == stream_index => count += 1,
             Ok(()) | Err(ffmpeg::Error::InvalidData) => {}
@@ -748,11 +748,11 @@ impl Source {
     }
 
     fn run(&mut self, frames: &SyncSender<SourceItem>, stop: &AtomicBool) -> Result<(), String> {
-        let mut packet = ffmpeg::Packet::empty();
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            let mut packet = ffmpeg::Packet::empty();
             match packet.read(&mut self.input) {
                 Ok(()) => {}
                 Err(ffmpeg::Error::Eof) => break,
