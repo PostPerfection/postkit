@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Essence type for MXF wrapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,6 +690,7 @@ pub struct IncrementalWrapOptions {
 /// there cannot be read.
 pub struct IncrementalJ2kWrap {
     output: PathBuf,
+    part_written_output: PathBuf,
     standard: MxfStandard,
     fps_num: u32,
     fps_den: u32,
@@ -707,6 +708,7 @@ impl IncrementalJ2kWrap {
         check_as02_picture_colour(options.standard, options.hdr.as_ref())?;
         let crypto = setup_encryption(&mut info, &options.encryption)?;
         Ok(Self {
+            part_written_output: part_written_path(&options.output),
             output: options.output,
             standard: options.standard,
             fps_num: options.fps_num,
@@ -733,7 +735,7 @@ impl IncrementalJ2kWrap {
             let mut writer = J2kWriter::new(self.standard);
             writer
                 .open_write(
-                    &self.output.to_string_lossy(),
+                    &self.part_written_output.to_string_lossy(),
                     &self.info,
                     &desc,
                     self.hdr.as_ref(),
@@ -750,7 +752,8 @@ impl IncrementalJ2kWrap {
         Ok(())
     }
 
-    /// Write the footer and the duration, then hash the finished MXF.
+    /// Write the footer and the duration, move the MXF to its final path, then
+    /// hash it.
     pub fn finish(mut self) -> Result<MxfTrackFile, String> {
         let Some(writer) = self.writer.as_mut() else {
             return Err("no frames reached the wrap".to_string());
@@ -758,8 +761,15 @@ impl IncrementalJ2kWrap {
         writer
             .finalize()
             .map_err(|e| format!("JP2K finalize failed: {e}"))?;
-        // close the file before hashing it
+        // close the file before renaming it
         self.writer = None;
+        std::fs::rename(&self.part_written_output, &self.output).map_err(|e| {
+            format!(
+                "could not rename {} to {}: {e}",
+                self.part_written_output.display(),
+                self.output.display()
+            )
+        })?;
         self.finished = true;
         let (hash, size) = compute_hash_and_size(&self.output);
         Ok(MxfTrackFile {
@@ -784,8 +794,44 @@ impl Drop for IncrementalJ2kWrap {
         // asdcplib closes the file when the writer goes, which has to happen
         // before the file can be removed on windows
         self.writer = None;
-        let _ = std::fs::remove_file(&self.output);
+        let _ = std::fs::remove_file(&self.part_written_output);
     }
+}
+
+const PART_WRITTEN_SUFFIX: &str = ".part";
+
+fn part_written_path(output: &Path) -> PathBuf {
+    let mut path = output.as_os_str().to_owned();
+    path.push(PART_WRITTEN_SUFFIX);
+    PathBuf::from(path)
+}
+
+fn is_part_written_mxf_name(name: &str) -> bool {
+    name.strip_suffix(PART_WRITTEN_SUFFIX)
+        .and_then(|final_name| Path::new(final_name).extension())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mxf"))
+}
+
+pub fn remove_part_written_mxfs(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut removed = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let is_part_written_mxf = entry
+            .file_name()
+            .to_str()
+            .is_some_and(is_part_written_mxf_name);
+        if !is_part_written_mxf || !entry.file_type()?.is_file() {
+            continue;
+        }
+        std::fs::remove_file(entry.path())?;
+        removed.push(entry.path());
+    }
+    Ok(removed)
 }
 
 /// Frames arriving out of order, released as the contiguous run they form.
@@ -2284,6 +2330,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_incremental_wrap_writes_a_part_file_and_renames_it_on_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("picture.mxf");
+        let part_written = dir.path().join("picture.mxf.part");
+        let frames = indexed_frames(2);
+
+        let mut wrap = IncrementalJ2kWrap::new(overlapped_opts(output.clone())).unwrap();
+        wrap.write_frame(&frames[0]).unwrap();
+        assert!(part_written.exists(), "frames should go to the .part file");
+        assert!(
+            !output.exists(),
+            "an unfinished MXF must not sit at the final path"
+        );
+
+        wrap.write_frame(&frames[1]).unwrap();
+        let track = wrap.finish().unwrap();
+        assert_eq!(track.path, output);
+        assert!(output.exists());
+        assert!(!part_written.exists());
+        assert_eq!(read_j2k_essence(&output, None), frames);
+    }
+
+    #[test]
+    fn dropping_an_unfinished_incremental_wrap_leaves_no_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("picture.mxf");
+        let part_written = dir.path().join("picture.mxf.part");
+
+        let mut wrap = IncrementalJ2kWrap::new(overlapped_opts(output.clone())).unwrap();
+        wrap.write_frame(&indexed_frames(1)[0]).unwrap();
+        assert!(part_written.exists());
+        drop(wrap);
+        assert!(!part_written.exists());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn remove_part_written_mxfs_removes_only_part_written_mxfs() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_written = dir.path().join("a.mxf.part");
+        let finished = dir.path().join("b.mxf");
+        let other = dir.path().join("c.txt");
+        let other_part_written = dir.path().join("c.txt.part");
+        let subdirectory = dir.path().join("d.mxf.part");
+        std::fs::write(&part_written, b"unfinished").unwrap();
+        std::fs::write(&finished, b"finished").unwrap();
+        std::fs::write(&other, b"other").unwrap();
+        std::fs::write(&other_part_written, b"other").unwrap();
+        std::fs::create_dir(&subdirectory).unwrap();
+        std::fs::write(subdirectory.join("e.mxf.part"), b"nested").unwrap();
+
+        let removed = remove_part_written_mxfs(dir.path()).unwrap();
+        assert_eq!(removed, vec![part_written.clone()]);
+        assert!(!part_written.exists());
+        assert!(finished.exists());
+        assert!(other.exists());
+        assert!(other_part_written.exists());
+        assert!(subdirectory.join("e.mxf.part").exists());
+
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            remove_part_written_mxfs(&missing).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+    }
+
     /// The overlapped wrap has to produce the essence the batch wrap does, even
     /// when the encoder finishes the frames out of order, or the two paths make
     /// different DCPs.
@@ -2375,19 +2488,21 @@ mod tests {
         let output = dir.path().join("cancelled.mxf");
         let frames = indexed_frames(2);
 
+        let part_written = part_written_path(&output);
+
         let mut wrap = OverlappedJ2kWrap::start(overlapped_opts(output.clone())).unwrap();
         let sender = wrap.sender();
         sender.send(0, frames[0].clone()).unwrap();
         // the file has to exist before the abandon, or its deletion proves nothing
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !output.exists() && std::time::Instant::now() < deadline {
+        while !part_written.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(output.exists(), "the wrap never opened the MXF");
+        assert!(part_written.exists(), "the wrap never opened the MXF");
         drop(sender);
         assert_eq!(wrap.abandon(), None, "abandoning is not itself an error");
         assert!(
-            !output.exists(),
+            !part_written.exists() && !output.exists(),
             "an MXF with no footer cannot be read, so it must not be left behind"
         );
     }
@@ -2407,6 +2522,7 @@ mod tests {
         let error = wrap.finish(2).expect_err("only one frame reached the wrap");
         assert!(error.contains("1 of the 2 encoded frames"), "{error}");
         assert!(!output.exists(), "the short MXF must be deleted");
+        assert!(!part_written_path(&output).exists());
     }
 
     #[test]

@@ -34,6 +34,15 @@
     and Homebrew.
   - Order: the build repo and in-process decode start together, decode pushes
     once the build repo has a release, the installer switch follows the build repo.
+  - When the wizards turn `ffmpeg-decode` on, every binary and test crate that
+    links postkit emits `FFMPEG_DIR/lib` as a link search path from its own build
+    script (one shared helper). Cargo sorts dependency link paths by package
+    name after the crate's own, every pkg-config crate emits `/usr/lib64`, and
+    `alsa-sys` sorts before `ffmpeg-sys-next` and `postkit`, so on a box with a
+    distro FFmpeg the wizard binary links the distro `libavcodec` (seen on Fedora
+    43: the GUI carried both `libavcodec.so.61` and `.so.62`). postkit's own guard
+    in build.rs only covers postkit's own test binaries. Verified 2026-10-01: the
+    GUI's build script emitting the path links only the `FFMPEG_DIR` libraries.
 
 - Stereoscopic JPEG 2000 stays on libmpv. `GrokPlayer::accepts` returns false for
   `EssenceType::Jpeg2000Stereo` and `load` refuses it by name, because the mono

@@ -232,6 +232,12 @@ fn a_cancelled_overlapped_wrap_leaves_the_codestreams_and_no_mxf() {
         "the part-written MXF was left behind at {}",
         mxf.display()
     );
+    let part_written = output_dir.join("picture.mxf.part");
+    assert!(
+        !part_written.exists(),
+        "the part-written MXF was left behind at {}",
+        part_written.display()
+    );
 
     let j2k_dir = output_dir.join("j2k");
     let finished = postkit::grok_encoder::contiguous_encoded_frames(&j2k_dir);
