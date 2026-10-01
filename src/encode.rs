@@ -2820,7 +2820,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (picture, _) = crate::mxf_unwrap::tests::wrapped_picture_mxf(dir.path());
         assert_eq!(detect_input_type(&picture), InputType::PictureMxf);
-        let upper_case = dir.path().join("PICTURE.MXF");
+        let upper_case = dir.path().join("UPPER_CASE.MXF");
         std::fs::copy(&picture, &upper_case).unwrap();
         assert_eq!(detect_input_type(&upper_case), InputType::PictureMxf);
 
