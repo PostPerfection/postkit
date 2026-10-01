@@ -22,7 +22,7 @@ pub enum MidSideError {
     #[error("sample count {len} is not a whole number of {channels}-channel frames")]
     RaggedBuffer { len: usize, channels: usize },
     #[error("wav i/o: {0}")]
-    Wav(#[from] hound::Error),
+    Wav(#[from] std::io::Error),
 }
 
 /// Decode a mid-side pair in place within an interleaved multi-channel buffer.

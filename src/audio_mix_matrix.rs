@@ -5,7 +5,7 @@
 // `LaneVocabulary`. The `IN:OUT@GAIN` spec grammar lives here so a CLI flag and
 // a GUI matrix widget cannot drift apart.
 
-use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
+use crate::wav_io::{SampleFormat, WavReader, WavSpec, WavWriter};
 use std::path::{Path, PathBuf};
 
 const DECIBEL_BASE: f64 = 10.0;
@@ -367,7 +367,7 @@ fn integer_sample_limits(bits_per_sample: u16) -> (f64, f64) {
 }
 
 fn read_frame(
-    sources: &mut [Box<dyn Iterator<Item = Result<f64, hound::Error>>>],
+    sources: &mut [Box<dyn Iterator<Item = Result<f64, std::io::Error>>>],
     shapes: &[InputShape],
     frame_index: usize,
     input_frame: &mut [f64],
@@ -457,16 +457,16 @@ pub fn mix_wav_files(
     };
     let frames = shapes.iter().map(|shape| shape.frames).max().unwrap_or(0);
 
-    let mut sources: Vec<Box<dyn Iterator<Item = Result<f64, hound::Error>>>> = readers
+    let mut sources: Vec<Box<dyn Iterator<Item = Result<f64, std::io::Error>>>> = readers
         .into_iter()
         .map(|reader| match spec.sample_format {
             SampleFormat::Int => Box::new(reader.into_samples::<i32>().map(|s| s.map(f64::from)))
-                as Box<dyn Iterator<Item = Result<f64, hound::Error>>>,
+                as Box<dyn Iterator<Item = Result<f64, std::io::Error>>>,
             SampleFormat::Float => Box::new(reader.into_samples::<f32>().map(|s| s.map(f64::from))),
         })
         .collect();
 
-    let mut writer = WavWriter::create(output, output_spec)
+    let mut writer = WavWriter::create(output, output_spec, frames as u64)
         .map_err(|error| format!("{}: {error}", output.display()))?;
     let contributions = matrix.contributions_by_output();
     let (minimum_sample, maximum_sample) = integer_sample_limits(spec.bits_per_sample);

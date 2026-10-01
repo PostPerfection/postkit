@@ -1,5 +1,5 @@
 use crate::preview::{PictureReader, read_j2c_frame};
-use hound::{SampleFormat, WavSpec, WavWriter};
+use crate::wav_io::{SampleFormat, WavSpec, WavWriter};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -87,7 +87,10 @@ pub enum RestoreError {
         source: std::io::Error,
     },
     #[error("{path}: {source}")]
-    Wav { path: PathBuf, source: hound::Error },
+    Wav {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 pub fn restore_package(
@@ -210,9 +213,13 @@ fn restore_sound(
     let layout = SoundLayout::read(track_file, &descriptor)?;
     let directory = track_directory(track_file, output)?;
     let wav = directory.join(format!("{}.wav", stem(track_file)));
-    let mut writer = WavWriter::create(&wav, layout.spec).map_err(|source| RestoreError::Wav {
-        path: wav.clone(),
-        source,
+    let expected_frames = descriptor.container_duration as u64
+        * (layout.bytes_per_edit_unit / layout.block_align) as u64;
+    let mut writer = WavWriter::create(&wav, layout.spec, expected_frames).map_err(|source| {
+        RestoreError::Wav {
+            path: wav.clone(),
+            source,
+        }
     })?;
 
     let mut essence = vec![0u8; layout.bytes_per_edit_unit];

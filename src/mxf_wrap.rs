@@ -991,114 +991,29 @@ struct WavFormat {
     data_len: u64,
 }
 
-const WAVE_FORMAT_PCM: u16 = 0x0001;
-const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
-
-/// A `fmt ` chunk is 16 to 40 bytes, so a larger one is a corrupt header.
-const MAXIMUM_FMT_CHUNK_BYTES: u32 = 4096;
-
-const RIFF_HEADER_BYTES: usize = 12;
-const CHUNK_HEADER_BYTES: usize = 8;
-
-fn le_u16(d: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes([d[off], d[off + 1]])
-}
-
-fn le_u32(d: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes([d[off], d[off + 1], d[off + 2], d[off + 3]])
-}
-
-/// Parse a RIFF/WAVE header: read the `fmt ` chunk and locate the `data` chunk,
-/// seeking past every chunk body so a feature-length file is never read here.
+/// Parse a RIFF or RF64 WAVE header: read the `fmt ` chunk and locate the `data`
+/// chunk, seeking past every chunk body so a feature-length file is never read here.
 ///
 /// Only linear PCM is accepted (tag 1, or WAVE_FORMAT_EXTENSIBLE whose subformat
 /// is PCM). Anything malformed or non-PCM is an error rather than a wrong MXF.
 fn parse_wav<R: std::io::Read + std::io::Seek>(reader: &mut R) -> Result<WavFormat, String> {
-    use std::io::SeekFrom;
-
-    let file_len = reader
-        .seek(SeekFrom::End(0))
-        .map_err(|e| format!("cannot size the WAV: {e}"))?;
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|e| format!("cannot seek the WAV: {e}"))?;
-
-    let mut riff = [0u8; RIFF_HEADER_BYTES];
-    if reader.read_exact(&mut riff).is_err() || &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
-        return Err("not a RIFF/WAVE file".into());
+    let layout = crate::wav_io::WavLayout::parse(reader).map_err(|e| e.to_string())?;
+    let spec = layout.spec;
+    if spec.sample_format != crate::wav_io::SampleFormat::Int {
+        return Err("float samples are not linear PCM".into());
     }
-
-    let mut fmt: Option<(u16, u16, u32, u16)> = None; // (tag, channels, rate, bits)
-    let mut data_chunk: Option<(u64, u64)> = None;
-
-    // Chunks start after the 12-byte RIFF/WAVE header; each is an 8-byte header
-    // (4-byte id + 4-byte LE size) followed by size bytes, padded to even.
-    let mut pos = RIFF_HEADER_BYTES as u64;
-    let mut chunk_header = [0u8; CHUNK_HEADER_BYTES];
-    while pos + CHUNK_HEADER_BYTES as u64 <= file_len {
-        reader
-            .seek(SeekFrom::Start(pos))
-            .map_err(|e| format!("cannot seek the WAV: {e}"))?;
-        reader
-            .read_exact(&mut chunk_header)
-            .map_err(|e| format!("cannot read a WAV chunk header: {e}"))?;
-        let id = &chunk_header[0..4];
-        let size = le_u32(&chunk_header, 4);
-        let body = pos + CHUNK_HEADER_BYTES as u64;
-        if body + size as u64 > file_len {
-            return Err(format!(
-                "chunk '{}' claims {size} bytes past end of file",
-                String::from_utf8_lossy(id)
-            ));
-        }
-
-        if id == b"fmt " {
-            if size < 16 {
-                return Err("fmt chunk is too short".into());
-            }
-            if size > MAXIMUM_FMT_CHUNK_BYTES {
-                return Err(format!("fmt chunk claims {size} bytes"));
-            }
-            let mut chunk = vec![0u8; size as usize];
-            reader
-                .read_exact(&mut chunk)
-                .map_err(|e| format!("cannot read the fmt chunk: {e}"))?;
-            let mut tag = le_u16(&chunk, 0);
-            let channels = le_u16(&chunk, 2);
-            let sample_rate = le_u32(&chunk, 4);
-            let bits = le_u16(&chunk, 14);
-            // WAVE_FORMAT_EXTENSIBLE stores the real tag in the SubFormat GUID.
-            if tag == WAVE_FORMAT_EXTENSIBLE {
-                if size < 40 {
-                    return Err("extensible fmt chunk is too short for a SubFormat".into());
-                }
-                tag = le_u16(&chunk, 24);
-            }
-            fmt = Some((tag, channels, sample_rate, bits));
-        } else if id == b"data" {
-            data_chunk = Some((body, size as u64));
-        }
-
-        pos = body + size as u64 + (size & 1) as u64;
-    }
-
-    let (tag, channels, sample_rate, bits) = fmt.ok_or("no fmt chunk")?;
-    if tag != WAVE_FORMAT_PCM {
-        return Err(format!("audio format {tag:#06x} is not linear PCM"));
-    }
-    if channels == 0 || sample_rate == 0 || bits == 0 || bits % 8 != 0 {
+    if layout.bytes_per_sample * 8 != spec.bits_per_sample {
         return Err(format!(
-            "unusable PCM parameters: {channels} channels, {sample_rate} Hz, {bits} bits"
+            "unusable PCM parameters: {} bits in {} byte samples",
+            spec.bits_per_sample, layout.bytes_per_sample
         ));
     }
-    let (data_offset, data_len) = data_chunk.ok_or("no data chunk")?;
-
     Ok(WavFormat {
-        channels,
-        sample_rate,
-        bits_per_sample: bits,
-        data_offset,
-        data_len,
+        channels: spec.channels,
+        sample_rate: spec.sample_rate,
+        bits_per_sample: spec.bits_per_sample,
+        data_offset: layout.data.body_offset(),
+        data_len: layout.data.size,
     })
 }
 
@@ -1901,6 +1816,8 @@ mod tests {
 
     use super::*;
 
+    const WAVE_FORMAT_PCM: u16 = 0x0001;
+
     /// Build a minimal PCM WAV (fmt + data chunks) with the given parameters.
     fn make_wav(channels: u16, sample_rate: u32, bits: u16, sample_frames: u32) -> Vec<u8> {
         let block_align = (bits / 8) as u32 * channels as u32;
@@ -1982,6 +1899,60 @@ mod tests {
         assert_eq!(desc.audio_sampling_rate.numerator, 96000, "sample rate");
         assert_eq!(desc.quantization_bits, 16, "bit depth");
         assert_eq!(desc.block_align, 4, "block align = 2ch * 16-bit");
+    }
+
+    #[test]
+    fn wrap_pcm_carries_an_rf64_wav_sample_for_sample() {
+        use std::io::{Read, Seek};
+        let dir = tempfile::tempdir().unwrap();
+        let wav_path = dir.path().join("rf64.wav");
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("sine=frequency=997:sample_rate=48000:duration=1")
+            .args(["-ac", "6", "-c:a", "pcm_s24le", "-rf64", "always"])
+            .arg(&wav_path)
+            .status()
+            .expect("ffmpeg has to run");
+        assert!(status.success(), "ffmpeg could not write the RF64 WAV");
+        let out = dir.path().join("out.mxf");
+
+        let opts = MxfWrapOptions {
+            input_files: vec![wav_path.clone()],
+            output: out.clone(),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::AsDcp,
+            fps_num: 24,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: None,
+            resource_ids: vec![],
+            hdr: None,
+            asset_uuid: None,
+            timed_text_duration_frames: None,
+        };
+        let result = wrap_pcm(&opts);
+        assert!(result.success, "wrap failed: {}", result.error);
+        assert_eq!(result.duration, 24);
+
+        let layout = crate::wav_io::WavLayout::read(&wav_path).unwrap();
+        let edit_unit_bytes = 2000 * 6 * 3;
+        let mut expected = vec![0u8; edit_unit_bytes];
+        let mut wav = std::fs::File::open(&wav_path).unwrap();
+        wav.seek(std::io::SeekFrom::Start(
+            layout.data.body_offset() + 23 * edit_unit_bytes as u64,
+        ))
+        .unwrap();
+        wav.read_exact(&mut expected).unwrap();
+        assert!(expected.iter().any(|&b| b != 0), "the tone is silent");
+
+        let mut reader = asdcplib::pcm::MxfReader::new();
+        reader.open_read(&out.to_string_lossy()).unwrap();
+        assert_eq!(reader.audio_descriptor().unwrap().container_duration, 24);
+        let mut essence = vec![0u8; edit_unit_bytes];
+        let read = reader.read_frame(23, &mut essence, None, None).unwrap();
+        assert_eq!(read, edit_unit_bytes);
+        assert_eq!(essence, expected, "the last edit unit differs from the WAV");
     }
 
     #[test]

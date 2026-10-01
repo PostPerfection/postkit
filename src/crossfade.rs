@@ -28,7 +28,7 @@ pub enum CrossfadeError {
     #[error("format mismatch: {0}")]
     Mismatch(String),
     #[error("wav i/o: {0}")]
-    Wav(#[from] hound::Error),
+    Wav(#[from] std::io::Error),
 }
 
 /// Join interleaved `a` and `b` with an equal-power crossfade of

@@ -23,7 +23,7 @@ pub enum UpmixError {
     #[error("wav input must be 2-channel stereo, got {channels}")]
     NotStereoWav { channels: u16 },
     #[error("wav i/o: {0}")]
-    Wav(#[from] hound::Error),
+    Wav(#[from] std::io::Error),
 }
 
 /// Which DCP-o-matic upmixer variant to use.

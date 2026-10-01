@@ -1,5 +1,5 @@
+use crate::wav_io::{SampleFormat, WavLayout, WavReader, WavSpec, WavWriter};
 use ebur128::{EbuR128, Mode};
-use hound::{SampleFormat, WavReader, WavSpec, WavWriter};
 use rustfft::{FftPlanner, num_complex::Complex};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Seek};
@@ -239,14 +239,11 @@ fn stream_true_peak(
     })
 }
 
-// raw data bytes, only when the chunk is exactly the counted samples at their natural width
+// raw data bytes, only when the samples sit at their natural width
 struct PackedData {
     reader: std::io::BufReader<std::fs::File>,
     byte_count: usize,
 }
-
-// hound's only signal that a file carries no riff header at all
-const HOUND_NO_RIFF_TAG: &str = "no RIFF tag found";
 
 // where the interleaved samples come from and how many of them there are
 enum PcmContainer {
@@ -264,9 +261,9 @@ struct PcmInput {
 }
 
 fn open_pcm(input: &Path) -> Result<PcmInput, AdjustError> {
-    let (spec, frames, container) = match WavReader::open(input) {
-        Ok(reader) => (reader.spec(), reader.duration() as u64, PcmContainer::Wav),
-        Err(hound::Error::FormatError(HOUND_NO_RIFF_TAG)) => open_pcm_mxf(input)?,
+    let (spec, frames, container) = match WavLayout::read(input) {
+        Ok(layout) => (layout.spec, layout.frames(), PcmContainer::Wav),
+        Err(_) if !crate::wav_io::has_wave_form_type(input)? => open_pcm_mxf(input)?,
         Err(error) => return Err(error.into()),
     };
     if spec.channels == 0 || frames == 0 {
@@ -363,16 +360,16 @@ fn widen_samples(spec: WavSpec) -> Option<WidenSamples> {
 }
 
 fn packed_data(input: &Path, spec: WavSpec) -> Result<Option<PackedData>, AdjustError> {
-    let parsed = WavReader::open(input)?;
-    let sample_count = parsed.len() as usize;
-    let mut reader = parsed.into_inner();
-    let data_start = reader.stream_position().map_err(hound::Error::from)?;
-    let file_length = std::fs::metadata(input).map_err(hound::Error::from)?.len();
-    let byte_count = (file_length - data_start) as usize;
-    if byte_count != sample_count * (spec.bits_per_sample as usize / 8) {
+    let mut file = std::fs::File::open(input)?;
+    let layout = WavLayout::parse(&mut file)?;
+    if layout.bytes_per_sample * 8 != spec.bits_per_sample {
         return Ok(None);
     }
-    Ok(Some(PackedData { reader, byte_count }))
+    file.seek(std::io::SeekFrom::Start(layout.data.body_offset()))?;
+    Ok(Some(PackedData {
+        reader: std::io::BufReader::new(file),
+        byte_count: (layout.frames() * layout.block_align()) as usize,
+    }))
 }
 
 fn read_blocks(
@@ -422,7 +419,7 @@ fn read_mxf_blocks(
     Ok(())
 }
 
-// hound's per sample iterator is the fallback for what the byte path will not claim
+// the per sample iterator is the fallback for what the byte path will not claim
 fn read_wav_blocks(
     input: &Path,
     spec: WavSpec,
@@ -439,10 +436,7 @@ fn read_wav_blocks(
         let mut left = packed.byte_count;
         while left > 0 {
             let wanted = left.min(bytes.len());
-            packed
-                .reader
-                .read_exact(&mut bytes[..wanted])
-                .map_err(hound::Error::from)?;
+            packed.reader.read_exact(&mut bytes[..wanted])?;
             left -= wanted;
             samples.clear();
             widen(&bytes[..wanted], &mut samples);
@@ -754,7 +748,7 @@ pub struct GainPlan {
 #[derive(Debug, thiserror::Error)]
 pub enum AdjustError {
     #[error("wav i/o: {0}")]
-    Wav(#[from] hound::Error),
+    Wav(#[from] std::io::Error),
     #[error("mxf pcm i/o: {0}")]
     Mxf(#[from] asdcplib::Error),
     #[error("{0}-bit pcm is not a depth the loudness readers widen")]
@@ -887,7 +881,8 @@ pub fn plan_gain(
 pub fn apply_gain(input: &Path, output: &Path, gain_db: f64) -> Result<(), AdjustError> {
     let (spec, pcm) = load_pcm(input)?;
     let scale = 10f64.powf(gain_db / 20.0);
-    let mut writer = WavWriter::create(output, spec)?;
+    let frames = pcm.frame_count(spec.channels as usize) as u64;
+    let mut writer = WavWriter::create(output, spec, frames)?;
     match pcm {
         Pcm::Int(samples) => {
             for s in samples {
@@ -923,6 +918,7 @@ pub fn adjust_loudness(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hound::WavWriter;
     use std::f32::consts::PI;
     use std::process::Command;
 
@@ -1437,6 +1433,45 @@ mod tests {
         assert!(
             (peak_from_mxf - peak_from_wav).abs() < 0.01,
             "mxf {peak_from_mxf} dBTP, wav {peak_from_wav} dBTP"
+        );
+    }
+
+    #[test]
+    fn an_rf64_wav_measures_and_adjusts_like_its_riff_twin() {
+        let dir = tempfile::tempdir().unwrap();
+        let make = |name: &str, rf64: &str| {
+            let path = dir.path().join(name);
+            let status = Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+                .arg("sine=frequency=1000:sample_rate=48000:duration=3")
+                .args(["-af", "volume=0.5", "-ac", "6", "-c:a", "pcm_s24le"])
+                .args(["-rf64", rf64])
+                .arg(&path)
+                .status()
+                .expect("ffmpeg has to run");
+            assert!(status.success(), "ffmpeg could not write {name}");
+            path
+        };
+        let riff = make("riff.wav", "never");
+        let rf64 = make("rf64.wav", "always");
+
+        let riff_loudness = measure_loudness(&riff);
+        let rf64_loudness = measure_loudness(&rf64);
+        assert!(rf64_loudness.success, "{}", rf64_loudness.error);
+        assert_eq!(rf64_loudness.integrated_lufs, riff_loudness.integrated_lufs);
+        assert_eq!(
+            measure_true_peak_dbtp(&rf64).unwrap(),
+            measure_true_peak_dbtp(&riff).unwrap()
+        );
+
+        let target = LoudnessTarget::IntegratedLufs(-27.0);
+        let adjusted = dir.path().join("adjusted.wav");
+        adjust_loudness(&rf64, &adjusted, target, DEFAULT_TRUE_PEAK_CEILING_DBTP).unwrap();
+        let remeasured = measure_loudness(&adjusted);
+        assert!(
+            (remeasured.integrated_lufs - (-27.0)).abs() < 0.3,
+            "re-measured {} LUFS, target -27",
+            remeasured.integrated_lufs
         );
     }
 
