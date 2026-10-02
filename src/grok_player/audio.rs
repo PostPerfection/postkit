@@ -3,7 +3,7 @@
 //! Grok's player is picture-only. A DCP still names a sound MXF, so this reads
 //! it with asdcplib and feeds a stereo downmix to the default output device.
 //! Missing sound, a missing device, or a failed stream leaves the picture
-//! running; load never fails for audio.
+//! running. Encrypted sound with no key for it is the one sound that fails load.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -13,10 +13,13 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use asdcplib::crypto::AesDecContext;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SampleRate, Stream};
+use zeroize::Zeroize;
 
 use crate::composition_timeline::{SegmentTrim, SoundSegment};
+use crate::content_keys::ContentKeys;
 
 const STEREO_CHANNELS: usize = 2;
 const CENTRE_AND_SURROUND: f32 = 0.707;
@@ -38,6 +41,51 @@ struct SoundReel {
     first_frame: u64,
     frame_count: u64,
     entry_edit_unit: u32,
+    key: Option<SoundContentKey>,
+}
+
+pub(super) struct SoundContentKey([u8; 16]);
+
+impl Drop for SoundContentKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl std::fmt::Debug for SoundContentKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SoundContentKey(<redacted>)")
+    }
+}
+
+pub(super) struct KeyedSoundSegment {
+    pub(super) segment: SoundSegment,
+    pub(super) key: Option<SoundContentKey>,
+}
+
+// an unreadable reel is left for reels_of to skip with a warning
+pub(super) fn sound_content_key(
+    path: &Path,
+    keys: Option<&ContentKeys>,
+) -> Result<Option<SoundContentKey>, String> {
+    let mut reader = asdcplib::pcm::MxfReader::new();
+    if reader.open_read(&path.to_string_lossy()).is_err() {
+        return Ok(None);
+    }
+    let Ok(info) = reader.writer_info() else {
+        return Ok(None);
+    };
+    if !info.encrypted_essence {
+        return Ok(None);
+    }
+    let Some(keys) = keys else {
+        return Err(format!(
+            "{} is encrypted sound and the preview holds no content key for it",
+            path.display()
+        ));
+    };
+    let key = keys.covering_key(&info, "sound")?;
+    Ok(Some(SoundContentKey(*key)))
 }
 
 struct Shared {
@@ -96,7 +144,7 @@ impl Output {
         }
     }
 
-    pub(super) fn load(&self, segments: &[SoundSegment], fps: f64) {
+    pub(super) fn load(&self, segments: Vec<KeyedSoundSegment>, fps: f64) {
         let reels = reels_of(segments, fps);
         if reels.is_empty() {
             let _ = self.commands.send(Command::Stop);
@@ -155,10 +203,10 @@ impl Drop for Output {
     }
 }
 
-fn reels_of(segments: &[SoundSegment], fps: f64) -> Vec<SoundReel> {
+fn reels_of(segments: Vec<KeyedSoundSegment>, fps: f64) -> Vec<SoundReel> {
     let mut first_frame = 0u64;
     let mut reels = Vec::new();
-    for segment in segments {
+    for KeyedSoundSegment { segment, key } in segments {
         let (entry, stated) = trim_in_frames(segment.trim.as_ref(), fps);
         let duration = match open_layout(&segment.path) {
             Ok(layout) => layout.edit_units.saturating_sub(entry),
@@ -172,10 +220,11 @@ fn reels_of(segments: &[SoundSegment], fps: f64) -> Vec<SoundReel> {
             continue;
         }
         reels.push(SoundReel {
-            path: segment.path.clone(),
+            path: segment.path,
             first_frame,
             frame_count: frames,
             entry_edit_unit: entry,
+            key,
         });
         first_frame += frames;
     }
@@ -293,13 +342,19 @@ fn write_i16(shared: &Shared, dest: &mut [i16]) {
 struct Feeder {
     shared: Arc<Shared>,
     reels: Vec<SoundReel>,
-    reader: Option<(PathBuf, asdcplib::pcm::MxfReader, AudioLayout)>,
+    reader: Option<(PathBuf, SoundReader)>,
     next_frame: u64,
     seek_frame: Option<u64>,
     fps: f64,
     pcm_sample_rate: u32,
     resampler: Option<Resampler>,
     stream: Option<Stream>,
+}
+
+struct SoundReader {
+    reader: asdcplib::pcm::MxfReader,
+    layout: AudioLayout,
+    decrypt: Option<AesDecContext>,
 }
 
 struct AudioLayout {
@@ -343,7 +398,7 @@ impl Feeder {
         let Some(first) = reels.first() else {
             return;
         };
-        let (reader, layout) = match open_reader(&first.path) {
+        let opened = match open_reader(&first.path, first.key.as_ref()) {
             Ok(open) => open,
             Err(error) => {
                 tracing::warn!("preview sound: {error}");
@@ -352,13 +407,13 @@ impl Feeder {
         };
         eprintln!(
             "[preview] sound: {}ch {}-bit {} Hz from {}",
-            layout.channels,
-            layout.bits,
-            layout.sample_rate,
+            opened.layout.channels,
+            opened.layout.bits,
+            opened.layout.sample_rate,
             first.path.display()
         );
-        self.pcm_sample_rate = layout.sample_rate;
-        self.reader = Some((first.path.clone(), reader, layout));
+        self.pcm_sample_rate = opened.layout.sample_rate;
+        self.reader = Some((first.path.clone(), opened));
         self.fps = fps;
         self.next_frame = 0;
         self.seek_frame = Some(0);
@@ -436,17 +491,21 @@ impl Feeder {
     }
 
     fn push_edit_unit(&mut self) -> bool {
-        let Some((path, entry)) = self.location(self.next_frame) else {
+        let Some((reel, entry)) = self.location(self.next_frame) else {
             return false;
         };
-        if !self.ensure_reader(&path) {
+        if !self.ensure_reader(reel) {
             return false;
         }
-        let Some((_, reader, layout)) = self.reader.as_mut() else {
+        let Some((_, open)) = self.reader.as_mut() else {
             return false;
         };
+        let layout = &open.layout;
         let mut essence = vec![0u8; layout.bytes_per_edit_unit];
-        let read = match reader.read_frame(entry, &mut essence, None, None) {
+        let read = match open
+            .reader
+            .read_frame(entry, &mut essence, open.decrypt.as_mut(), None)
+        {
             Ok(read) => read,
             Err(error) => {
                 tracing::warn!("preview sound: {error}");
@@ -475,8 +534,8 @@ impl Feeder {
         true
     }
 
-    fn location(&self, frame: u64) -> Option<(PathBuf, u32)> {
-        for reel in &self.reels {
+    fn location(&self, frame: u64) -> Option<(usize, u32)> {
+        for (index, reel) in self.reels.iter().enumerate() {
             if frame < reel.first_frame {
                 continue;
             }
@@ -485,22 +544,23 @@ impl Feeder {
                 continue;
             }
             let entry = reel.entry_edit_unit.saturating_add(into as u32);
-            return Some((reel.path.clone(), entry));
+            return Some((index, entry));
         }
         None
     }
 
-    fn ensure_reader(&mut self, path: &Path) -> bool {
+    fn ensure_reader(&mut self, reel: usize) -> bool {
+        let reel = &self.reels[reel];
         if self
             .reader
             .as_ref()
-            .is_some_and(|(open, _, _)| open == path)
+            .is_some_and(|(open, _)| open == &reel.path)
         {
             return true;
         }
-        match open_reader(path) {
-            Ok((reader, layout)) => {
-                self.reader = Some((path.to_path_buf(), reader, layout));
+        match open_reader(&reel.path, reel.key.as_ref()) {
+            Ok(opened) => {
+                self.reader = Some((reel.path.clone(), opened));
                 true
             }
             Err(error) => {
@@ -565,11 +625,10 @@ impl Resampler {
 }
 
 fn open_layout(path: &Path) -> Result<AudioLayout, String> {
-    let (_, layout) = open_reader(path)?;
-    Ok(layout)
+    Ok(open_reader(path, None)?.layout)
 }
 
-fn open_reader(path: &Path) -> Result<(asdcplib::pcm::MxfReader, AudioLayout), String> {
+fn open_reader(path: &Path, key: Option<&SoundContentKey>) -> Result<SoundReader, String> {
     let mut reader = asdcplib::pcm::MxfReader::new();
     reader
         .open_read(&path.to_string_lossy())
@@ -580,9 +639,19 @@ fn open_reader(path: &Path) -> Result<(asdcplib::pcm::MxfReader, AudioLayout), S
     if descriptor.channel_count == 0 || descriptor.block_align == 0 {
         return Err(format!("{} names no pcm", path.display()));
     }
-    Ok((
+    let decrypt = match key {
+        Some(SoundContentKey(key)) => {
+            let mut decrypt = AesDecContext::new();
+            decrypt
+                .init_key(key)
+                .map_err(|error| format!("AES key init failed: {error}"))?;
+            Some(decrypt)
+        }
+        None => None,
+    };
+    Ok(SoundReader {
         reader,
-        AudioLayout {
+        layout: AudioLayout {
             channels: descriptor.channel_count as u16,
             bits: descriptor.quantization_bits as u16,
             bytes_per_edit_unit: descriptor.block_align as usize
@@ -590,7 +659,8 @@ fn open_reader(path: &Path) -> Result<(asdcplib::pcm::MxfReader, AudioLayout), S
             edit_units: descriptor.container_duration,
             sample_rate: sample_rate_of(&descriptor),
         },
-    ))
+        decrypt,
+    })
 }
 
 fn sample_rate_of(descriptor: &asdcplib::pcm::AudioDescriptor) -> u32 {
@@ -662,7 +732,182 @@ fn downmix(src: &[f32], channels: usize, stereo: &mut Vec<f32>) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::timeline::Timeline;
+    use super::super::timeline::tests::content_keys;
     use super::*;
+    use crate::mxf_unwrap::tests::{FRAME_COUNT, wrap, write_frames};
+    use crate::mxf_wrap::{EssenceType, MxfEncryption, MxfStandard, MxfWrapOptions, mxf_wrap};
+    use crate::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
+
+    const SOUND_KEY: [u8; 16] = [0x33; 16];
+    const SOUND_KEY_ID: [u8; 16] = [0x44; 16];
+    const SOUND_CHANNELS: u16 = 2;
+    const SOUND_BITS: u16 = 16;
+    const EDIT_UNITS_PER_SECOND: u32 = 24;
+    const SAMPLE_FRAMES_PER_EDIT_UNIT: usize = 2_000;
+    const SOUND_SECONDS: u32 = 1;
+    const CPL_ID: &str = "cc10cc10-0000-4000-8000-000000000000";
+    const PICTURE_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const SOUND_ID: &str = "55555555-5555-4555-8555-555555555555";
+    const PICTURE_SIZE: u32 = 64;
+
+    fn sample(index: usize) -> i16 {
+        const SAMPLE_STEP: usize = 37;
+        ((index * SAMPLE_STEP) % usize::from(u16::MAX)) as i16
+    }
+
+    // returns the package and the pcm bytes its first sound edit unit holds
+    fn package_with_encrypted_sound(directory: &Path) -> (PathBuf, Vec<u8>) {
+        let package = directory.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        let (frames, _) = write_frames(directory, "picture");
+        wrap(frames, package.join("picture.mxf"), None);
+
+        let wav = directory.join("sound.wav");
+        let spec = hound::WavSpec {
+            channels: SOUND_CHANNELS,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            bits_per_sample: SOUND_BITS,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+        let samples = (DEFAULT_SAMPLE_RATE * SOUND_SECONDS) as usize * usize::from(SOUND_CHANNELS);
+        for index in 0..samples {
+            writer.write_sample(sample(index)).unwrap();
+        }
+        writer.finalize().unwrap();
+        let first_edit_unit: Vec<u8> = (0..SAMPLE_FRAMES_PER_EDIT_UNIT
+            * usize::from(SOUND_CHANNELS))
+            .flat_map(|index| sample(index).to_le_bytes())
+            .collect();
+
+        let track = mxf_wrap(&MxfWrapOptions {
+            input_files: vec![wav],
+            output: package.join("sound.mxf"),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::AsDcp,
+            fps_num: EDIT_UNITS_PER_SECOND,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: Some(MxfEncryption {
+                content_key: SOUND_KEY,
+                key_id: SOUND_KEY_ID,
+            }),
+            mca_config: None,
+            resource_ids: Vec::new(),
+            hdr: None,
+            asset_uuid: None,
+            timed_text_duration_frames: None,
+        });
+        assert!(track.success, "sound wrap failed: {}", track.error);
+
+        let asset = |id: &str, path: &str| AssetMapAsset {
+            id: id.into(),
+            path: path.into(),
+            ..Default::default()
+        };
+        std::fs::write(
+            package.join("ASSETMAP.xml"),
+            AssetMap {
+                uuid: "bbbbbbbb-0000-4000-8000-000000000000".into(),
+                namespace: ns::AM_SMPTE.into(),
+                assets: vec![
+                    asset(CPL_ID, "CPL.xml"),
+                    asset(PICTURE_ID, "picture.mxf"),
+                    asset(SOUND_ID, "sound.mxf"),
+                ],
+                ..Default::default()
+            }
+            .to_xml(),
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("CPL.xml"),
+            DcpCpl {
+                uuid: CPL_ID.into(),
+                namespace: ns::CPL_SMPTE.into(),
+                title: "Encrypted Sound".into(),
+                reels: vec![DcpCplReel {
+                    reel_id: "aaaaaaaa-0000-4000-8000-000000000000".into(),
+                    picture_id: PICTURE_ID.into(),
+                    picture_edit_rate_num: EDIT_UNITS_PER_SECOND,
+                    picture_edit_rate_den: 1,
+                    picture_duration: FRAME_COUNT as u64,
+                    picture_width: PICTURE_SIZE,
+                    picture_height: PICTURE_SIZE,
+                    sound_id: Some(SOUND_ID.into()),
+                    sound_edit_rate_num: EDIT_UNITS_PER_SECOND,
+                    sound_edit_rate_den: 1,
+                    sound_duration: FRAME_COUNT as u64,
+                    sound_key_id: Some(uuid::Uuid::from_bytes(SOUND_KEY_ID).to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+            .to_xml(),
+        )
+        .unwrap();
+        (package, first_edit_unit)
+    }
+
+    #[test]
+    fn encrypted_sound_reads_back_through_the_feeder_with_its_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let (package, first_edit_unit) = package_with_encrypted_sound(directory.path());
+        let keys = content_keys(directory.path(), &[(SOUND_KEY_ID, SOUND_KEY)]);
+
+        let timeline = Timeline::open(&package, Some(&keys)).unwrap();
+        let [sound] = timeline.sound.as_slice() else {
+            panic!("the package names one sound reel");
+        };
+        let mut opened = open_reader(&sound.segment.path, sound.key.as_ref()).unwrap();
+        assert!(
+            opened.decrypt.is_some(),
+            "the feeder builds no decrypt context"
+        );
+        let mut essence = vec![0u8; opened.layout.bytes_per_edit_unit];
+        let read = opened
+            .reader
+            .read_frame(0, &mut essence, opened.decrypt.as_mut(), None)
+            .unwrap();
+        assert!(
+            essence[..read] == first_edit_unit,
+            "the first edit unit differs from the WAV"
+        );
+    }
+
+    #[test]
+    fn encrypted_sound_with_no_keys_fails_the_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let (package, _) = package_with_encrypted_sound(directory.path());
+        let error = Timeline::open(&package, None)
+            .err()
+            .expect("the sound has no key");
+        assert_eq!(
+            error,
+            format!(
+                "{} is encrypted sound and the preview holds no content key for it",
+                package.join("sound.mxf").display()
+            )
+        );
+    }
+
+    #[test]
+    fn keys_that_do_not_cover_the_sound_name_its_key_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let (package, _) = package_with_encrypted_sound(directory.path());
+        let keys = content_keys(directory.path(), &[([0x66; 16], SOUND_KEY)]);
+        let error = Timeline::open(&package, Some(&keys))
+            .err()
+            .expect("the keys do not cover the sound");
+        assert_eq!(
+            error,
+            format!(
+                "KDM/keys do not cover sound KeyId {}",
+                uuid::Uuid::from_bytes(SOUND_KEY_ID)
+            )
+        );
+    }
 
     #[test]
     fn five_point_one_puts_centre_on_both_ears() {

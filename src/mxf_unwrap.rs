@@ -102,7 +102,7 @@ pub fn unwrap_picture_mxf(
             return Err(CANCELLED.to_string());
         }
         let size = reader
-            .read_frame(frame, &mut codestream, None)
+            .read_frame(frame, &mut codestream, None, None)
             .map_err(|error| format!("cannot read frame {frame} of {}: {error}", mxf.display()))?;
         let path = out_dir.join(format!("frame_{frame:08}.j2c"));
         std::fs::write(&path, &codestream[..size])
@@ -122,7 +122,7 @@ pub(crate) mod tests {
     };
     use std::path::PathBuf;
 
-    const FRAME_COUNT: usize = 4;
+    pub(crate) const FRAME_COUNT: usize = 4;
     const EDIT_RATE_NUM: u32 = 24;
     const EDIT_RATE_DEN: u32 = 1;
     const FIXTURE_SIZE: u32 = 64;
@@ -134,7 +134,7 @@ pub(crate) mod tests {
         .unwrap()
     }
 
-    fn write_frames(dir: &Path, name: &str) -> (Vec<PathBuf>, Vec<Vec<u8>>) {
+    pub(crate) fn write_frames(dir: &Path, name: &str) -> (Vec<PathBuf>, Vec<Vec<u8>>) {
         let frames: Vec<Vec<u8>> = (0..FRAME_COUNT)
             .map(|index| {
                 let mut frame = cinema_codestream();
@@ -154,7 +154,7 @@ pub(crate) mod tests {
         (paths, frames)
     }
 
-    fn wrap(
+    pub(crate) fn wrap(
         input_files: Vec<PathBuf>,
         output: PathBuf,
         encryption: Option<MxfEncryption>,

@@ -165,7 +165,7 @@ fn restore_picture(
 
     let directory = track_directory(track_file, output)?;
     for frame in 0..frames {
-        let codestream = read_j2c_frame(&mut reader, frame, decrypt.as_mut())
+        let codestream = read_j2c_frame(&mut reader, frame, decrypt.as_mut(), None)
             .map_err(|error| mxf_error(track_file, error))?;
         let path = directory.join(format!("{frame:0FRAME_NUMBER_DIGITS$}.j2c"));
         std::fs::write(&path, codestream).map_err(|source| RestoreError::Io { path, source })?;

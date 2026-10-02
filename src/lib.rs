@@ -7,6 +7,7 @@ pub mod colour;
 pub mod component_versions;
 pub mod composition_timeline;
 pub mod conform;
+pub mod content_keys;
 pub mod cpl_annotation;
 pub mod cpl_xml;
 pub mod crossfade;

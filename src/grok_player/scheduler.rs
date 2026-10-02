@@ -12,6 +12,7 @@ use super::{
     Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, Rgba8Frame, Shared, Status,
     SubtitleSlot,
 };
+use crate::content_keys::ContentKeys;
 use crate::subtitle_formats::{StyledCue, StyledRun, VAlign};
 
 // a worker finishing a frame wakes the scheduler sooner than this
@@ -365,8 +366,8 @@ impl Scheduler {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Load(source, reply) => {
-                let outcome = self.load(&source);
+            Command::Load(source, keys, reply) => {
+                let outcome = self.load(&source, keys);
                 // the caller reads duration and size the moment load returns
                 self.publish_status();
                 let _ = reply.send(outcome);
@@ -408,12 +409,13 @@ impl Scheduler {
         }
     }
 
-    fn load(&mut self, source: &Path) -> Result<(), String> {
+    fn load(&mut self, source: &Path, keys: Option<ContentKeys>) -> Result<(), String> {
         self.stop();
-        let timeline = Timeline::open(source)?;
+        let mut timeline = Timeline::open(source, keys.as_ref())?;
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
-        self.sound.load(&timeline.sound, timeline.fps);
+        self.sound
+            .load(std::mem::take(&mut timeline.sound), timeline.fps);
         self.timeline = Some(timeline);
         self.current_frame = 0;
         self.needs_publish = true;

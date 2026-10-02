@@ -14,6 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::content_keys::ContentKeys;
+
 pub use presenter::PictureRectangle;
 
 // the signature libmpv's mpv_opengl_init_params takes, declared here so this player needs no libmpv
@@ -164,7 +166,7 @@ struct Status {
 type UpdateCallback = Box<dyn Fn() + Send + 'static>;
 
 enum Command {
-    Load(PathBuf, Sender<Result<(), String>>),
+    Load(PathBuf, Option<ContentKeys>, Sender<Result<(), String>>),
     Stop,
     SetPaused(bool),
     TogglePause,
@@ -382,9 +384,9 @@ impl GrokPlayer {
 
     // ─── transport ─────────────────────────────────────────────────────────
 
-    pub fn load(&self, source: &Path) -> Result<(), String> {
+    pub fn load(&self, source: &Path, keys: Option<ContentKeys>) -> Result<(), String> {
         let (reply, answer) = channel();
-        self.send(Command::Load(source.to_path_buf(), reply))?;
+        self.send(Command::Load(source.to_path_buf(), keys, reply))?;
         answer
             .recv()
             .map_err(|_| "the decode thread is gone".to_string())?

@@ -380,7 +380,7 @@ pub fn render_to_sequence(input: &Path, output_dir: &Path, format: Option<&str>)
 // ─── DCP-native preview: resolve → decrypt → decode → colour-manage ────────
 
 use crate::colour::{RenderingIntent, XyzToSrgb};
-use asdcplib::crypto::AesDecContext;
+use asdcplib::crypto::{AesDecContext, HmacContext};
 use std::io::Write as _;
 
 /// Largest picture frame we read into. DCI caps a 4K frame at 500 Mbps / 24 fps
@@ -509,10 +509,11 @@ impl PictureReader {
         frame: u32,
         buf: &mut [u8],
         dec: Option<&mut AesDecContext>,
+        hmac: Option<&mut HmacContext>,
     ) -> Result<usize, PreviewError> {
         match self {
-            PictureReader::AsDcp(r) => r.read_frame(frame, buf, dec, None),
-            PictureReader::As02(r) => r.read_frame(frame, buf, dec, None),
+            PictureReader::AsDcp(r) => r.read_frame(frame, buf, dec, hmac),
+            PictureReader::As02(r) => r.read_frame(frame, buf, dec, hmac),
         }
         .map_err(|e| PreviewError::Mxf(format!("read frame {frame}: {e}")))
     }
@@ -741,9 +742,10 @@ pub(crate) fn read_j2c_frame(
     reader: &mut PictureReader,
     frame: u32,
     dec: Option<&mut AesDecContext>,
+    hmac: Option<&mut HmacContext>,
 ) -> Result<Vec<u8>, PreviewError> {
     let mut buf = vec![0u8; MAX_FRAME_BYTES];
-    let size = reader.read_frame(frame, &mut buf, dec)?;
+    let size = reader.read_frame(frame, &mut buf, dec, hmac)?;
     buf.truncate(size);
     // truncate keeps the whole MAX_FRAME_BYTES allocation
     buf.shrink_to_fit();
@@ -762,7 +764,7 @@ fn read_picture_codestream(
 ) -> Result<Vec<u8>, PreviewError> {
     let mut dec = dec_context(resolved, key)?;
     let mut reader = PictureReader::open(&resolved.mxf, resolved.as02)?;
-    let j2c = read_j2c_frame(&mut reader, frame, dec.as_mut())?;
+    let j2c = read_j2c_frame(&mut reader, frame, dec.as_mut(), None)?;
     reader.close();
     Ok(j2c)
 }
@@ -859,7 +861,7 @@ fn decode_dcp_frame(
     display: &Display,
     mxf: &Path,
 ) -> Result<Rgb8Frame, PreviewError> {
-    let j2c = read_j2c_frame(reader, frame, dec)?;
+    let j2c = read_j2c_frame(reader, frame, dec, None)?;
     display_frame_from_codestream(
         j2c,
         0,

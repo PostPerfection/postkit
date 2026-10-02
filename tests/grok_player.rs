@@ -205,7 +205,7 @@ fn lowest_cached_until(player: &GrokPlayer, what: &str, mut ready: impl FnMut() 
 fn loaded_player(source: &Path) -> GrokPlayer {
     let player = GrokPlayer::new();
     player.init_software().unwrap();
-    player.load(source).expect("load");
+    player.load(source, None).expect("load");
     // load clears whatever was on screen before it, so wait for a real frame
     wait_until("the first frame was composed", || {
         player.frame_size().is_some()
@@ -798,7 +798,7 @@ fn encrypted_essence_will_not_load_without_a_key() {
     let player = GrokPlayer::new();
     player.init_software().unwrap();
     let error = player
-        .load(&mxf)
+        .load(&mxf, None)
         .expect_err("encrypted essence has no key here");
     assert!(
         error.contains("key"),
