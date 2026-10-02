@@ -17,8 +17,12 @@ const FRAMES: u64 = 1;
 const INVALID_DATA: &str = "Invalid data found when processing input";
 
 fn assert_names_the_unreadable_lut(error: &str, lut: &Path) {
+    // the filter string escapes the path's backslashes, so match the file name
+    let lut_name = lut.file_name().unwrap().to_string_lossy();
     assert!(
-        error.contains("cannot run on") && error.contains(&format!("lut3d=\\'{}", lut.display())),
+        error.contains("cannot run on")
+            && error.contains("lut3d=")
+            && error.contains(lut_name.as_ref()),
         "the error has to name the LUT filter that cannot run: {error}"
     );
     assert!(
