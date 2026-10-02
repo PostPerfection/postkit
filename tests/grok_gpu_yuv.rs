@@ -1,10 +1,10 @@
-//! ffmpeg writing the source's own planar YUV to the pipe and grok's
+//! The decode handing over the source's own planar YUV and grok's
 //! accelerator plugin taking those planes, measured against the same clip
 //! encoded from packed RGB on the CPU.
 //!
 //! The two paths convert the colour in different places: the plugin upsamples
-//! the chroma and converts on the device, while swscale converts to RGB on the
-//! pipe and grok converts on the host. A smooth source keeps the two chroma
+//! the chroma and converts on the device, while swscale converts to RGB in the
+//! decode and grok converts on the host. A smooth source keeps the two chroma
 //! filters from separating, so what is left is the colour pipeline, and the
 //! decoded samples have to agree.
 //!
@@ -31,14 +31,14 @@ const PSNR_FLOOR_DB: f64 = 50.0;
 /// What the crop case takes off each side, which leaves an even raster on the
 /// chroma grid.
 const CROP_EDGE: u32 = 16;
-/// What the packed RGB path writes to the pipe.
+/// What the packed RGB path decodes to.
 const PACKED_RGB: &str = "rgb48be";
 
 /// One clip encoded both ways.
 struct Case {
     name: &'static str,
     options: StreamEncodeOptions,
-    /// what ffmpeg has to write to the pipe once the plugin is on
+    /// what the decode has to hand over once the plugin is on
     encoder_input_pixel_format: &'static str,
     /// the raster both paths encode, which is the plan's output
     raster: (u32, u32),
@@ -75,7 +75,7 @@ fn gradients_clip(dir: &Path, name: &str, codec_args: &[&str]) -> PathBuf {
 /// PSNR in dB between two decoded components.
 ///
 /// Each side is divided by its own peak first: the plugin writes 12-bit
-/// samples where a plain code stream from packed RGB keeps the pipe's 16, and
+/// samples where a plain code stream from packed RGB keeps the decode's 16, and
 /// both hold the same normalised value.
 fn psnr_db(left: &[i32], left_precision: u8, right: &[i32], right_precision: u8) -> f64 {
     assert_eq!(
@@ -101,7 +101,7 @@ fn psnr_db(left: &[i32], left_precision: u8, right: &[i32], right_precision: u8)
 }
 
 /// Encode the case into a subdirectory named after the path that ran, checking
-/// the pipe carried the format that path takes, and hand back that directory.
+/// the decode handed over the format that path takes, and hand back that directory.
 fn encode(case: &Case, path: &str, encoder_input_pixel_format: &str) -> PathBuf {
     let label = format!("{} on the {path}", case.name);
     let options = StreamEncodeOptions {
@@ -119,7 +119,7 @@ fn encode(case: &Case, path: &str, encoder_input_pixel_format: &str) -> PathBuf 
     assert_eq!(
         result.encoder_input_pixel_format.as_deref(),
         Some(encoder_input_pixel_format),
-        "{label}: the pipe format is what says which path ran"
+        "{label}: the encoder input format is what says which path ran"
     );
     assert_eq!(result.frames_encoded, FRAMES, "{label}");
     options.output_dir

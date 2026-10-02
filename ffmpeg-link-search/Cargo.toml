@@ -1,0 +1,8 @@
+[package]
+name = "postkit-ffmpeg-link-search"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Build script helper that puts FFMPEG_DIR/lib first on the link path"
+
+[dependencies]

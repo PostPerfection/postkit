@@ -1,4 +1,4 @@
-//! ffmpeg writing interleaved 16-bit little-endian RGB to the pipe, and TIFF
+//! The decode handing over interleaved 16-bit little-endian RGB, and TIFF
 //! stills packed the same way, with grok's accelerator plugin taking those
 //! buffers as one batch source.
 //!

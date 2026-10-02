@@ -35,6 +35,10 @@ jobs:
           echo "OPENSSL_DIR=$(brew --prefix openssl)" >> $GITHUB_ENV
           echo "CMAKE_PREFIX_PATH=$(brew --prefix xerces-c):$(brew --prefix openssl)" >> $GITHUB_ENV
 
+      - uses: PostPerfection/ffmpeg-mpv-builds@v1.0.0
+        with:
+          release: v1.0.0
+
       - name: Install ffmpeg (macOS)
         if: runner.os == 'macOS'
         shell: bash
@@ -112,12 +116,6 @@ jobs:
         uses: PostPerfection/setup-grok@v1.1.3
         with:
           grok-ref: v20.4.14
-
-      - name: Setup libmpv
-        uses: PostPerfection/setup-libmpv@v1
-        with:
-          mpv-release: 20260828
-          mpv-archive: mpv-dev-x86_64-20260828-git-182fa6ca49.7z
 
       - name: Check test tools
         shell: bash

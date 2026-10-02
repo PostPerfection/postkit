@@ -69,9 +69,9 @@ pub struct EncodeResult {
     /// nothing decoded through ffmpeg there.
     #[serde(default)]
     pub picture_findings: crate::picture_findings::PictureFindings,
-    /// The pixel format ffmpeg wrote to the pipe, `None` for a run that decoded
-    /// no pipe at all. A planar YUV name here is a run whose frames reached
-    /// grok's accelerator plugin unconverted.
+    /// The pixel format the decode handed the encoder, `None` for a run that
+    /// decoded nothing through FFmpeg. A planar YUV name here is a run whose
+    /// frames reached grok's accelerator plugin unconverted.
     #[serde(default)]
     pub encoder_input_pixel_format: Option<String>,
 }
@@ -198,10 +198,9 @@ pub fn source_raster(picture: &Path) -> Result<(u32, u32), String> {
     Ok((info.width, info.height))
 }
 
-// ─── Streaming encode (ffmpeg → raw pipe → in-process grok) ────────────────
+// ─── Streaming encode (FFmpeg libraries → raw frames → in-process grok) ─────
 
 use std::io::Read;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -346,12 +345,6 @@ impl FrameRange {
         Ok(&frames[self.first_frame as usize..self.end_frame() as usize])
     }
 
-    /// The ffmpeg output option that stops the decode at the window's end
-    /// instead of running the source out.
-    pub(crate) fn frame_limit_args(&self) -> [String; 2] {
-        ["-frames:v".to_string(), self.frame_count.to_string()]
-    }
-
     /// The ffmpeg filters that drop everything outside the window and restamp
     /// the kept frames from zero.
     pub(crate) fn trim_filters(&self) -> [String; 2] {
@@ -383,7 +376,7 @@ pub enum PictureFilters<'a> {
 struct DecodeFilters {
     /// the items in order, with no pixel format filter of postkit's own
     items: Vec<String>,
-    /// where a pixel format filter goes for a pipe that needs the geometry run
+    /// where a pixel format filter goes for a frame that needs the geometry run
     /// in another format, `None` when the plan has no geometry
     geometry_format_position: Option<usize>,
 }
@@ -494,15 +487,7 @@ impl DecodeSource {
     }
 }
 
-// ─── the pixel format ffmpeg writes to the pipe ───────────────────────────────
-
-/// Decode on the GPU and bring the frames back to system memory. Without
-/// `-hwaccel_output_format` ffmpeg downloads them itself, and a codec the device
-/// cannot decode falls back to software decoding with no error.
-#[cfg(not(target_os = "macos"))]
-const HARDWARE_DECODE_ARGS: [&str; 2] = ["-hwaccel", "cuda"];
-#[cfg(target_os = "macos")]
-const HARDWARE_DECODE_ARGS: [&str; 2] = ["-hwaccel", "videotoolbox"];
+// ─── the pixel format the decode hands the encoder ────────────────────────────
 
 /// Packed 16-bit RGB: three components per pixel, six bytes. postkit
 /// deinterleaves the big-endian layout itself and hands the little-endian one to
@@ -518,12 +503,12 @@ pub(crate) const PACKED_RGB_PRECISION: u8 = 16;
 /// value.
 const SIXTEEN_BIT_RGB_FILTER: &str = "format=gbrp16le";
 
-/// ffmpeg filters that change the pixel format or the colour, so the picture on
-/// the pipe is no longer the source's own planes. `format=` is how a caller's
+/// ffmpeg filters that change the pixel format or the colour, so the decoded
+/// picture is no longer the source's own planes. `format=` is how a caller's
 /// own chain spells a conversion: postkit's own pixel format filters are added
-/// after the pipe format is decided. Geometry filters are not here: cropping,
-/// scaling, padding, rotating, deinterlacing and denoising all keep the pixel
-/// format they were given.
+/// after the encoder input format is decided. Geometry filters are not here:
+/// cropping, scaling, padding, rotating, deinterlacing and denoising all keep the
+/// pixel format they were given.
 const COLOUR_CHANGING_FILTERS: [&str; 10] = [
     "format=",
     "lut3d",
@@ -563,7 +548,7 @@ pub(crate) fn is_eight_bit_yuv_pixel_format(pix_fmt: &str) -> bool {
 }
 
 /// A planar YUV pixel format postkit passes to grok's accelerator plugin as it
-/// comes off the pipe. The name is ffprobe's and `-pix_fmt`'s.
+/// comes off the decode. The name is ffprobe's and `-pix_fmt`'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanarYuvPixelFormat {
     Yuv420p,
@@ -637,7 +622,7 @@ impl PlanarYuvPixelFormat {
         self.properties().chroma_is_half_height
     }
 
-    /// Bytes one sample takes on the pipe. A 10-bit sample arrives in a
+    /// Bytes one sample takes in a decoded frame. A 10-bit sample arrives in a
     /// little-endian 16-bit container.
     pub fn bytes_per_sample(self) -> usize {
         if self.properties().bit_depth > 8 {
@@ -647,7 +632,8 @@ impl PlanarYuvPixelFormat {
         }
     }
 
-    /// Where the three planes of one frame sit in the bytes ffmpeg writes.
+    /// Where the three planes of one frame sit in the bytes the decode copies
+    /// out.
     pub fn plane_layout(self, width: u32, height: u32) -> YuvPlaneLayout {
         let chroma_width = width.div_ceil(2);
         let chroma_height = if self.properties().chroma_is_half_height {
@@ -672,8 +658,8 @@ impl PlanarYuvPixelFormat {
     }
 }
 
-/// Where each plane of one frame starts in the bytes ffmpeg's rawvideo muxer
-/// writes, and how big it is. rawvideo pads nothing, so each plane's row stride
+/// Where each plane of one frame starts in the bytes the decode copies out, and
+/// how big it is. The copy pads nothing, so each plane's row stride
 /// in samples is its own width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct YuvPlaneLayout {
@@ -699,7 +685,7 @@ pub enum YuvMatrix {
 impl YuvMatrix {
     /// The matrix for what ffprobe reported as the stream's colour space. An
     /// untagged stream is BT.601, which is what swscale converts one as on the
-    /// packed RGB path, so both pipe formats give the same picture.
+    /// packed RGB path, so both encoder input formats give the same picture.
     pub fn for_ffprobe_color_space(color_space: &str) -> Self {
         match color_space {
             "bt709" => Self::Bt709,
@@ -709,7 +695,7 @@ impl YuvMatrix {
     }
 }
 
-/// Everything about the planar YUV frames on the pipe that grok's plugin needs
+/// Everything about the decoded planar YUV frames that grok's plugin needs
 /// and that is the same for every frame of the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct YuvFrameFormat {
@@ -720,7 +706,7 @@ pub struct YuvFrameFormat {
     pub full_range: bool,
 }
 
-/// What ffmpeg writes to the pipe for a stream encode.
+/// What the decode hands the encoder for a stream encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderInputFormat {
     /// Packed 16-bit RGB in that byte order. The compressor converts the
@@ -770,7 +756,7 @@ impl EncoderInputFormat {
         }
     }
 
-    /// Bytes one frame takes on the pipe.
+    /// Bytes one decoded frame takes.
     pub fn frame_bytes(&self, width: u32, height: u32) -> usize {
         match self {
             EncoderInputFormat::PackedRgb(_) => {
@@ -798,8 +784,8 @@ pub(crate) struct FormatChoiceInputs<'a> {
     pub source: &'a crate::probe::PixelFormatInfo,
 }
 
-/// Whether the decode writes the source's own planar YUV to the pipe or the
-/// packed RGB postkit converts itself.
+/// Whether the decode hands over the source's own planar YUV or the packed RGB
+/// postkit converts itself.
 ///
 /// Planar YUV only reaches grok's plugin untouched, so anything that reads or
 /// rewrites the samples on the way keeps the run on packed RGB:
@@ -889,7 +875,7 @@ pub(crate) fn encoder_input_format_for_run(
 }
 
 /// The whole filter chain one decode runs: the picture filters with the
-/// detectors split off them, and the pixel format filter a packed RGB pipe
+/// detectors split off them, and the pixel format filter a packed RGB frame
 /// needs where it belongs.
 ///
 /// An 8-bit YUV source converts at the head, which covers the geometry too, so
@@ -898,7 +884,7 @@ pub(crate) fn encoder_input_format_for_run(
 /// about two codes of 255 off, and `lut3d` and `haldclut` take RGB, which ffmpeg
 /// would otherwise hand them at 8 bits. Any other source converts where the
 /// geometry starts, because a subsampled source rounds a crop offset to the
-/// chroma grid and mixes pad black with neighbouring chroma. A planar YUV pipe
+/// chroma grid and mixes pad black with neighbouring chroma. A planar YUV frame
 /// carries the source's own planes to grok's plugin, so it takes no pixel
 /// format filter at all and the geometry runs on the planes.
 fn decode_filter_chain(
@@ -993,41 +979,23 @@ fn hdr_yuv_to_rgb_filter(
     ))
 }
 
-/// Every ffmpeg argument that goes before `-i` for a stream decode: what the
-/// demuxer needs, the hardware decoder when the accelerator is running, plus the
-/// input rate when the caller reads the source at a rate other than its own.
-pub(crate) fn decode_input_args(
+fn check_read_rate(
     decode_source: DecodeSource,
     read_source_at: Option<FrameRate>,
-    hardware_decode: bool,
-) -> Result<Vec<String>, String> {
-    let mut args: Vec<String> = decode_source
-        .demuxer_args()
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .collect();
-    if hardware_decode {
-        args.extend(HARDWARE_DECODE_ARGS.iter().map(|arg| (*arg).to_string()));
-    }
-    let Some(rate) = read_source_at else {
-        return Ok(args);
-    };
-    if decode_source == DecodeSource::ImageList {
-        return Err(format!(
+) -> Result<(), String> {
+    match (decode_source, read_source_at) {
+        (DecodeSource::ImageList, Some(rate)) => Err(format!(
             "a concat list of stills already holds each frame for one period, so it cannot also \
              be read at {} fps",
             rate.ffmpeg_filter_value()
-        ));
+        )),
+        _ => Ok(()),
     }
-    args.push("-r".to_string());
-    args.push(rate.ffmpeg_filter_value());
-    Ok(args)
 }
 
 // ─── the decode chain one run takes ───────────────────────────────────────────
 
-/// Everything one decode's arguments, pipe format and filter chain are decided
-/// from.
+/// Everything one decode's pixel format and filter chain are decided from.
 pub(crate) struct DecodeChainInputs<'a> {
     pub decode_source: DecodeSource,
     pub read_source_at: Option<FrameRate>,
@@ -1045,26 +1013,17 @@ pub(crate) struct DecodeChainInputs<'a> {
 
 /// What one decode runs.
 pub(crate) struct DecodeChain {
-    /// every argument before `-i`
-    pub input_args: Vec<String>,
     pub input_format: EncoderInputFormat,
-    /// the whole `-vf` chain
-    pub filters: String,
-    // the chain without the detection branch, which the in-process graph adds itself
-    #[cfg(feature = "ffmpeg-decode")]
+    // the chain without the detection branch, which the graph adds itself
     pub picture_filters: String,
-    #[cfg(feature = "ffmpeg-decode")]
     pub decode_source: DecodeSource,
-    #[cfg(feature = "ffmpeg-decode")]
     pub read_source_at: Option<FrameRate>,
-    #[cfg(feature = "ffmpeg-decode")]
     pub hardware_decode: bool,
-    #[cfg(feature = "ffmpeg-decode")]
     pub detect_picture_findings: bool,
 }
 
-/// Everything one stream decode runs: the arguments before `-i`, the pixel
-/// format on the pipe and the whole filter chain. Both the stream encode and
+/// Everything one stream decode runs: the source, the pixel format it writes
+/// and the whole filter chain. Both the stream encode and
 /// the resumable video encode decide here, so neither can drift from the other.
 pub(crate) fn decode_chain(
     inputs: &DecodeChainInputs,
@@ -1081,9 +1040,10 @@ pub(crate) fn decode_chain(
             return Err(format!("the decode LUT {} is empty", lut.display()));
         }
     }
+    check_read_rate(inputs.decode_source, inputs.read_source_at)?;
     let picture = decode_filters(&inputs.picture, inputs.source_colour);
     let input_format = encoder_input_format_for_run(
-        // the pipe format is decided on the chain the caller asked for, so the
+        // the input format is decided on the chain the caller asked for, so the
         // pixel format filter that chain gets afterwards cannot move the choice
         &FormatChoiceInputs {
             accelerator_active: inputs.accelerator_active,
@@ -1117,55 +1077,13 @@ pub(crate) fn decode_chain(
         inputs.source_colour,
     ));
     Ok(DecodeChain {
-        input_args: decode_input_args(
-            inputs.decode_source,
-            inputs.read_source_at,
-            inputs.accelerator_active,
-        )?,
         input_format,
-        filters: with_optional_detection_branch(
-            picture_filters.clone(),
-            inputs.detect_picture_findings,
-        ),
-        #[cfg(feature = "ffmpeg-decode")]
         picture_filters,
-        #[cfg(feature = "ffmpeg-decode")]
         decode_source: inputs.decode_source,
-        #[cfg(feature = "ffmpeg-decode")]
         read_source_at: inputs.read_source_at,
-        #[cfg(feature = "ffmpeg-decode")]
         hardware_decode: inputs.accelerator_active,
-        #[cfg(feature = "ffmpeg-decode")]
         detect_picture_findings: inputs.detect_picture_findings,
     })
-}
-
-/// Every ffmpeg argument after `-i` for a stream decode: the filter chain, the
-/// pixel format the frames reach postkit in and the raw output on stdout, plus a
-/// frame limit for a window so ffmpeg stops at the window's end instead of
-/// decoding the rest of the source.
-pub(crate) fn decode_output_args(
-    filters: &str,
-    input_format: EncoderInputFormat,
-    frame_range: Option<FrameRange>,
-) -> Vec<String> {
-    let mut args: Vec<String> = [
-        "-vf",
-        filters,
-        "-pix_fmt",
-        input_format.ffmpeg_pixel_format(),
-        "-f",
-        "rawvideo",
-        "-an",
-    ]
-    .iter()
-    .map(|arg| (*arg).to_string())
-    .collect();
-    if let Some(range) = frame_range {
-        args.extend(range.frame_limit_args());
-    }
-    args.push("pipe:1".to_string());
-    args
 }
 
 /// Write an ffmpeg concat list holding every frame of an image sequence for one
@@ -1306,8 +1224,8 @@ pub struct StreamProgress {
     pub total_frames: u64,
     pub fps: f64,
     pub elapsed_secs: f64,
-    /// Time the frame reader spent blocked waiting for the next frame, on
-    /// ffmpeg's pipe or on the TIFF loader threads.
+    /// Time the frame reader spent blocked waiting for the next frame, on the
+    /// decoder or on the TIFF loader threads.
     pub decode_wait_secs: f64,
     /// Time spent burning subtitles and converting colour, summed over the
     /// encoder threads, so it can exceed `elapsed_secs`.
@@ -1391,11 +1309,6 @@ pub fn probe_decode_source(input: &Path, source: DecodeSource) -> (u32, u32, u64
     (width, height, frame_count)
 }
 
-// a concat list only opens with its demuxer arguments
-fn probe_decode_pixel_format(input: &Path, source: DecodeSource) -> crate::probe::PixelFormatInfo {
-    crate::probe::probe_pixel_format_with_demuxer(input, source.demuxer_args())
-}
-
 pub(crate) enum ReadResult {
     Ok,
     Eof,
@@ -1423,11 +1336,11 @@ pub(crate) fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> ReadR
     ReadResult::Ok
 }
 
-// ─── In-process stream encode (video → ffmpeg pipe → Grok FFI) ─────────────
+// ─── In-process stream encode (video → FFmpeg libraries → Grok FFI) ─────────
 
 /// Stream-encode a video file to J2K using in-process Grok FFI.
 ///
-/// Uses ffmpeg to decode the video to raw 16-bit RGB frames, then compresses
+/// Decodes the video in process with the FFmpeg libraries, then compresses
 /// each frame in-process via the bounded-queue pipeline in `grok_encoder`.
 pub fn stream_encode_inprocess<F>(
     opts: &StreamEncodeOptions,
@@ -1457,7 +1370,7 @@ where
 {
     use crate::grok_encoder;
 
-    let probed = match probe_for_decode(&opts.input, opts.decode_source) {
+    let probed = match crate::ffmpeg_decode::probe(&opts.input, opts.decode_source) {
         Ok(probed) => probed,
         Err(e) => {
             return EncodeResult {
@@ -1554,7 +1467,7 @@ where
     };
     let input_format = chain.input_format;
     let frame_size = input_format.frame_bytes(width, height);
-    let mut reader = match FrameReader::start(&chain, &opts.input, opts.frame_range, width, height)
+    let mut reader = match start_frame_decoder(&chain, &opts.input, opts.frame_range, width, height)
     {
         Ok(reader) => reader,
         Err(e) => {
@@ -1594,7 +1507,7 @@ where
             let read_start = std::time::Instant::now();
             let read = reader.read_into(&mut frame_buf);
             phase_clocks.add(grok_encoder::EncodePhase::DecoderWait, read_start.elapsed());
-            if let FrameRead::Ended = read {
+            if let crate::ffmpeg_decode::NextFrame::Ended = read {
                 return None;
             }
             let index = frame_index;
@@ -1635,277 +1548,40 @@ where
     }
 }
 
-// ─── the reader both stream decodes take their frames from ─────────────────
+// ─── the decoder both stream decodes take their frames from ─────────────────
 
-// temporary: picks the reader until the byte comparison passes and the pipe goes
-const DECODE_IN_PROCESS_VARIABLE: &str = "POSTKIT_DECODE_IN_PROCESS";
-
-static DECODE_IN_PROCESS: std::sync::LazyLock<AtomicBool> = std::sync::LazyLock::new(|| {
-    AtomicBool::new(std::env::var(DECODE_IN_PROCESS_VARIABLE).is_ok_and(|value| value == "1"))
-});
-
-// temporary, for the byte comparison against the pipe
-#[doc(hidden)]
-pub fn read_decode_in_process(in_process: bool) {
-    DECODE_IN_PROCESS.store(in_process, Ordering::Relaxed);
-}
-
-pub(crate) fn decode_reads_in_process() -> bool {
-    DECODE_IN_PROCESS.load(Ordering::Relaxed)
-}
-
-pub(crate) struct DecodeProbe {
-    pub width: u32,
-    pub height: u32,
-    pub frame_count: u64,
-    pub pixel_format: crate::probe::PixelFormatInfo,
-}
-
-pub(crate) fn probe_for_decode(input: &Path, source: DecodeSource) -> Result<DecodeProbe, String> {
-    if decode_reads_in_process() {
-        return probe_in_process(input, source);
-    }
-    let (width, height, frame_count) = probe_decode_source(input, source);
-    Ok(DecodeProbe {
+pub(crate) fn start_frame_decoder(
+    chain: &DecodeChain,
+    input: &Path,
+    frame_range: Option<FrameRange>,
+    width: u32,
+    height: u32,
+) -> Result<crate::ffmpeg_decode::FrameDecoder, String> {
+    crate::ffmpeg_decode::FrameDecoder::start(&crate::ffmpeg_decode::DecodeRequest {
+        input,
+        decode_source: chain.decode_source,
+        read_source_at: chain.read_source_at,
+        hardware_decode: chain.hardware_decode,
+        picture_filters: &chain.picture_filters,
+        input_format: chain.input_format,
         width,
         height,
-        frame_count,
-        pixel_format: probe_decode_pixel_format(input, source),
+        frame_limit: frame_range.map(|range| range.frame_count),
+        detect_picture_findings: chain.detect_picture_findings,
     })
-}
-
-#[cfg(feature = "ffmpeg-decode")]
-fn probe_in_process(input: &Path, source: DecodeSource) -> Result<DecodeProbe, String> {
-    let probed = crate::ffmpeg_decode::probe(input, source)?;
-    Ok(DecodeProbe {
-        width: probed.width,
-        height: probed.height,
-        frame_count: probed.frame_count,
-        pixel_format: probed.pixel_format,
-    })
-}
-
-#[cfg(not(feature = "ffmpeg-decode"))]
-fn probe_in_process(_input: &Path, _source: DecodeSource) -> Result<DecodeProbe, String> {
-    Err(WITHOUT_FFMPEG_DECODE.to_string())
-}
-
-#[cfg(not(feature = "ffmpeg-decode"))]
-const WITHOUT_FFMPEG_DECODE: &str = "postkit was built without the ffmpeg-decode feature";
-
-// the tags the resumable chain is decided on, and the frame count a window is checked against
-pub(crate) fn probe_resumable_source(
-    input: &Path,
-    counts_frames: bool,
-) -> Result<(crate::probe::PixelFormatInfo, u64), String> {
-    if decode_reads_in_process() {
-        let probed = probe_in_process(input, DecodeSource::Video)?;
-        return Ok((probed.pixel_format, probed.frame_count));
-    }
-    let frame_count = if counts_frames {
-        probe_video(input).2
-    } else {
-        0
-    };
-    Ok((crate::probe::probe_pixel_format(input), frame_count))
-}
-
-pub(crate) struct DecodeOutcome {
-    pub findings: crate::picture_findings::PictureFindings,
-    pub failure: Option<String>,
-    pub stderr_tail: String,
-}
-
-pub(crate) enum FrameRead {
-    Frame,
-    Ended,
-}
-
-pub(crate) enum FrameReader {
-    Pipe {
-        child: std::process::Child,
-        stdout: std::process::ChildStdout,
-        detection: Option<std::thread::JoinHandle<crate::picture_findings::DecodeStderr>>,
-        read_to_end: bool,
-    },
-    #[cfg(feature = "ffmpeg-decode")]
-    InProcess(crate::ffmpeg_decode::FrameDecoder),
-}
-
-impl FrameReader {
-    pub(crate) fn start(
-        chain: &DecodeChain,
-        input: &Path,
-        frame_range: Option<FrameRange>,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, String> {
-        if decode_reads_in_process() {
-            return Self::start_in_process(chain, input, frame_range, width, height);
-        }
-        tracing::debug!(
-            "ffmpeg -y {} -i {} -vf {}",
-            chain.input_args.join(" "),
-            input.display(),
-            chain.filters
-        );
-        let mut child = std::process::Command::new("ffmpeg")
-            .arg("-y")
-            // the progress line carries no newline, so the reader would hold the
-            // whole run in one string
-            .arg("-nostats")
-            .args(&chain.input_args)
-            .arg("-i")
-            .arg(input)
-            .args(decode_output_args(
-                &chain.filters,
-                chain.input_format,
-                frame_range,
-            ))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("Failed to start ffmpeg: {e}"))?;
-        let detection = child
-            .stderr
-            .take()
-            .map(crate::picture_findings::read_detection_lines);
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Failed to capture ffmpeg stdout".to_string())?;
-        Ok(Self::Pipe {
-            child,
-            stdout,
-            detection,
-            read_to_end: false,
-        })
-    }
-
-    #[cfg(feature = "ffmpeg-decode")]
-    fn start_in_process(
-        chain: &DecodeChain,
-        input: &Path,
-        frame_range: Option<FrameRange>,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, String> {
-        crate::ffmpeg_decode::FrameDecoder::start(&crate::ffmpeg_decode::DecodeRequest {
-            input,
-            decode_source: chain.decode_source,
-            read_source_at: chain.read_source_at,
-            hardware_decode: chain.hardware_decode,
-            picture_filters: &chain.picture_filters,
-            input_format: chain.input_format,
-            width,
-            height,
-            frame_limit: frame_range.map(|range| range.frame_count),
-            detect_picture_findings: chain.detect_picture_findings,
-        })
-        .map(Self::InProcess)
-    }
-
-    #[cfg(not(feature = "ffmpeg-decode"))]
-    fn start_in_process(
-        _chain: &DecodeChain,
-        _input: &Path,
-        _frame_range: Option<FrameRange>,
-        _width: u32,
-        _height: u32,
-    ) -> Result<Self, String> {
-        Err(WITHOUT_FFMPEG_DECODE.to_string())
-    }
-
-    // `buffer` already holds one frame's bytes
-    pub(crate) fn read_into(&mut self, buffer: &mut [u8]) -> FrameRead {
-        match self {
-            Self::Pipe {
-                stdout,
-                read_to_end,
-                ..
-            } => match read_exact_or_eof(stdout, buffer) {
-                ReadResult::Ok => FrameRead::Frame,
-                ReadResult::Eof => {
-                    *read_to_end = true;
-                    FrameRead::Ended
-                }
-                ReadResult::Err(_) => FrameRead::Ended,
-            },
-            #[cfg(feature = "ffmpeg-decode")]
-            Self::InProcess(decoder) => match decoder.read_into(buffer) {
-                crate::ffmpeg_decode::NextFrame::Copied => FrameRead::Frame,
-                crate::ffmpeg_decode::NextFrame::Ended => FrameRead::Ended,
-            },
-        }
-    }
-
-    // throws away the next `frames` frames, false when the source ends first
-    pub(crate) fn skip(&mut self, frames: u64, frame_bytes: usize) -> bool {
-        match self {
-            Self::Pipe { stdout, .. } => {
-                let mut skipped = vec![0u8; frame_bytes];
-                (0..frames).all(|_| stdout.read_exact(&mut skipped).is_ok())
-            }
-            #[cfg(feature = "ffmpeg-decode")]
-            Self::InProcess(decoder) => decoder.skip(frames).is_ok(),
-        }
-    }
-
-    pub(crate) fn finish(self, fps: f64, frame_count: u64) -> DecodeOutcome {
-        match self {
-            Self::Pipe {
-                mut child,
-                detection,
-                read_to_end,
-                ..
-            } => {
-                // ffmpeg's exit status only means something when it exited on its own
-                let decode = crate::picture_findings::finish_detection(
-                    &mut child,
-                    detection,
-                    read_to_end,
-                    fps,
-                    frame_count,
-                );
-                DecodeOutcome {
-                    findings: decode.findings,
-                    failure: decode
-                        .exit_status
-                        .filter(|status| !status.success())
-                        .map(|status| format!("ffmpeg failed ({status})")),
-                    stderr_tail: decode.stderr_tail,
-                }
-            }
-            #[cfg(feature = "ffmpeg-decode")]
-            Self::InProcess(decoder) => {
-                let decode = decoder.finish(fps, frame_count);
-                DecodeOutcome {
-                    findings: decode.findings,
-                    failure: decode.failure,
-                    stderr_tail: String::new(),
-                }
-            }
-        }
-    }
 }
 
 pub(crate) fn decode_failure(
-    decode: &DecodeOutcome,
+    decode: &crate::ffmpeg_decode::FinishedDecode,
     frames_encoded: u64,
     expected_frames: u64,
 ) -> Option<String> {
-    let reason = match &decode.failure {
-        Some(failure) => failure.clone(),
-        // a zero expected_frames is a probe that read no count, not an empty source
-        None if frames_encoded == 0 && expected_frames > 0 => {
-            "the decode produced no frames".to_string()
-        }
-        None => return None,
-    };
-    Some(match decode.stderr_tail.trim() {
-        "" => reason,
-        tail => format!("{reason}: {tail}"),
-    })
+    if let Some(failure) = &decode.failure {
+        return Some(failure.clone());
+    }
+    // a zero expected_frames is a probe that read no count, not an empty source
+    (frames_encoded == 0 && expected_frames > 0)
+        .then(|| "the decode produced no frames".to_string())
 }
 
 /// The compressor settings a stream encode asks for, with the source's frame
@@ -2435,43 +2111,6 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_window_stops_ffmpeg_at_its_end() {
-        assert_eq!(
-            decode_output_args(
-                "fps=24",
-                EncoderInputFormat::PackedRgb(SampleOrder::Big),
-                None
-            ),
-            vec![
-                "-vf", "fps=24", "-pix_fmt", "rgb48be", "-f", "rawvideo", "-an", "pipe:1"
-            ]
-        );
-        assert_eq!(
-            decode_output_args(
-                "fps=24",
-                EncoderInputFormat::PackedRgb(SampleOrder::Big),
-                Some(FrameRange {
-                    first_frame: 10,
-                    frame_count: 5,
-                })
-            ),
-            vec![
-                "-vf",
-                "fps=24",
-                "-pix_fmt",
-                "rgb48be",
-                "-f",
-                "rawvideo",
-                "-an",
-                "-frames:v",
-                "5",
-                "pipe:1"
-            ],
-            "ffmpeg has to stop at the window instead of decoding to the end"
-        );
-    }
-
-    #[test]
     fn a_window_past_the_end_of_the_source_is_refused() {
         let window = FrameRange {
             first_frame: 10,
@@ -2568,21 +2207,11 @@ mod tests {
     }
 
     #[test]
-    fn a_source_read_rate_reaches_ffmpeg_as_an_input_rate() {
-        assert_eq!(
-            decode_input_args(DecodeSource::Video, None, false).unwrap(),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24)), false).unwrap(),
-            vec!["-r", "24"]
-        );
-        assert_eq!(
-            decode_input_args(DecodeSource::ImageList, None, false).unwrap(),
-            vec!["-f", "concat", "-safe", "0"]
-        );
-        let refused = decode_input_args(DecodeSource::ImageList, Some(FrameRate::whole(24)), false)
-            .unwrap_err();
+    fn an_image_list_cannot_also_be_read_at_a_rate() {
+        assert!(check_read_rate(DecodeSource::Video, Some(FrameRate::whole(24))).is_ok());
+        assert!(check_read_rate(DecodeSource::ImageList, None).is_ok());
+        let refused =
+            check_read_rate(DecodeSource::ImageList, Some(FrameRate::whole(24))).unwrap_err();
         assert!(refused.contains("concat list"), "{refused}");
     }
 
@@ -2738,7 +2367,7 @@ mod tests {
             )
             .joined(),
             "yadif,fps=24,hqdn3d,crop=1920:804:0:138,lut3d=\\'/luts/hdr_to_dci.cube\\'",
-            "the pixel format filter is the pipe's, not the plan's"
+            "the pixel format filter is the encoder input format's, not the plan's"
         );
     }
 
@@ -2768,7 +2397,9 @@ mod tests {
         let stills = find_source_frames(dir.path()).unwrap();
         let list = dir.path().join("stills.ffconcat");
         write_image_concat_list(&stills, FrameRate::whole(24), &list).unwrap();
-        let probed = probe_decode_pixel_format(&list, DecodeSource::ImageList);
+        let probed = crate::ffmpeg_decode::probe(&list, DecodeSource::ImageList)
+            .unwrap()
+            .pixel_format;
         assert_eq!(probed.pix_fmt, "yuvj420p");
         assert_eq!(probed.color_range, "pc");
     }
@@ -3105,7 +2736,7 @@ mod tests {
                     true
                 ),
                 EncoderInputFormat::PackedRgb(SampleOrder::Big),
-                "lut3d puts RGB on the pipe"
+                "lut3d hands the encoder RGB"
             );
         }
 
@@ -3256,14 +2887,14 @@ mod tests {
                 PlanarYuvPixelFormat::from_ffmpeg_name(name),
                 Some(pixel_format)
             );
-            let pipe = EncoderInputFormat::PlanarYuv(YuvFrameFormat {
+            let input_format = EncoderInputFormat::PlanarYuv(YuvFrameFormat {
                 pixel_format,
                 matrix: YuvMatrix::Bt709,
                 full_range: false,
             });
-            assert_eq!(pipe.ffmpeg_pixel_format(), name);
+            assert_eq!(input_format.ffmpeg_pixel_format(), name);
             assert_eq!(
-                pipe.frame_bytes(64, 48),
+                input_format.frame_bytes(64, 48),
                 pixel_format.plane_layout(64, 48).frame_bytes,
                 "the producer's buffer is the layout's frame"
             );
@@ -3271,69 +2902,6 @@ mod tests {
         assert_eq!(PlanarYuvPixelFormat::from_ffmpeg_name("rgb48be"), None);
         assert_eq!(PlanarYuvPixelFormat::Yuv420p.bit_depth(), 8);
         assert_eq!(PlanarYuvPixelFormat::Yuv422p10le.bit_depth(), 10);
-    }
-
-    #[test]
-    fn a_yuv_pipe_reaches_ffmpeg_as_its_own_pixel_format() {
-        let pipe = EncoderInputFormat::PlanarYuv(YuvFrameFormat {
-            pixel_format: PlanarYuvPixelFormat::Yuv420p10le,
-            matrix: YuvMatrix::Bt709,
-            full_range: false,
-        });
-        assert_eq!(
-            decode_output_args("fps=24", pipe, None),
-            vec![
-                "-vf",
-                "fps=24",
-                "-pix_fmt",
-                "yuv420p10le",
-                "-f",
-                "rawvideo",
-                "-an",
-                "pipe:1"
-            ]
-        );
-    }
-
-    #[test]
-    fn an_accelerated_decode_asks_for_the_hardware_decoder() {
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(
-                decode_input_args(DecodeSource::Video, None, true).unwrap(),
-                vec!["-hwaccel", "cuda"]
-            );
-            assert_eq!(
-                decode_input_args(DecodeSource::ImageList, None, true).unwrap(),
-                vec!["-f", "concat", "-safe", "0", "-hwaccel", "cuda"]
-            );
-            assert_eq!(
-                decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24)), true).unwrap(),
-                vec!["-hwaccel", "cuda", "-r", "24"],
-                "the hardware decoder goes before -i with the rest of the input arguments"
-            );
-        }
-        #[cfg(target_os = "macos")]
-        {
-            assert_eq!(
-                decode_input_args(DecodeSource::Video, None, true).unwrap(),
-                vec!["-hwaccel", "videotoolbox"]
-            );
-            assert_eq!(
-                decode_input_args(DecodeSource::ImageList, None, true).unwrap(),
-                vec!["-f", "concat", "-safe", "0", "-hwaccel", "videotoolbox"]
-            );
-            assert_eq!(
-                decode_input_args(DecodeSource::Video, Some(FrameRate::whole(24)), true).unwrap(),
-                vec!["-hwaccel", "videotoolbox", "-r", "24"],
-                "the hardware decoder goes before -i with the rest of the input arguments"
-            );
-        }
-        assert_eq!(
-            decode_input_args(DecodeSource::Video, None, false).unwrap(),
-            Vec::<String>::new(),
-            "the CPU path's arguments do not change"
-        );
     }
 
     #[test]
@@ -3571,7 +3139,7 @@ mod tests {
         rgb.map(|value| value * SIXTEEN_BIT_PEAK / EIGHT_BIT_PEAK)
     }
 
-    /// How far off the exact conversion a sample on the pipe may sit, in codes
+    /// How far off the exact conversion a decoded sample may sit, in codes
     /// of 65535. swscale rounds the studio range expansion at 16 bits, which
     /// costs under 200 codes, while its 8-bit conversion of the same colour is
     /// 280 codes or more low.
@@ -3631,34 +3199,43 @@ mod tests {
         )
     }
 
-    /// The middle pixel of the first frame the decode writes to the pipe, which
-    /// is inside the picture whether or not the chain pads it.
-    fn middle_pixel_on_the_pipe(clip: &Path, filters: &str) -> [u16; 3] {
+    /// The middle pixel of the first frame the decode writes, which is inside
+    /// the picture whether or not the chain pads it.
+    fn middle_decoded_pixel(clip: &Path, filters: &str) -> [u16; 3] {
         let input_format = EncoderInputFormat::PackedRgb(SampleOrder::Big);
-        let run = std::process::Command::new("ffmpeg")
-            .args(["-v", "error", "-y"])
-            .args(decode_input_args(DecodeSource::Video, None, false).unwrap())
-            .arg("-i")
-            .arg(clip)
-            .args(decode_output_args(filters, input_format, None))
-            .output()
-            .unwrap();
+        let mut decoder =
+            crate::ffmpeg_decode::FrameDecoder::start(&crate::ffmpeg_decode::DecodeRequest {
+                input: clip,
+                decode_source: DecodeSource::Video,
+                read_source_at: None,
+                hardware_decode: false,
+                picture_filters: filters,
+                input_format,
+                width: SOLID_COLOUR_SIZE,
+                height: SOLID_COLOUR_SIZE,
+                frame_limit: None,
+                detect_picture_findings: false,
+            })
+            .unwrap_or_else(|error| panic!("{filters}: {error}"));
+        let mut frame = vec![0u8; input_format.frame_bytes(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE)];
         assert!(
-            run.status.success(),
-            "{filters}: {}",
-            String::from_utf8_lossy(&run.stderr)
+            matches!(
+                decoder.read_into(&mut frame),
+                crate::ffmpeg_decode::NextFrame::Copied
+            ),
+            "{filters}: the decode wrote no frame"
         );
-        let frame_bytes = input_format.frame_bytes(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE);
+        let finished = decoder.finish(1.0, 1);
         assert!(
-            run.stdout.len() >= frame_bytes,
-            "{filters}: the pipe carried {} bytes of a {frame_bytes} byte frame",
-            run.stdout.len()
+            finished.failure.is_none(),
+            "{filters}: {:?}",
+            finished.failure
         );
         let middle = SOLID_COLOUR_SIZE as usize / 2;
         let offset = (middle * SOLID_COLOUR_SIZE as usize + middle) * PACKED_RGB_BYTES_PER_PIXEL;
         [0, 1, 2].map(|component| {
             let at = offset + component * 2;
-            u16::from_be_bytes([run.stdout[at], run.stdout[at + 1]])
+            u16::from_be_bytes([frame[at], frame[at + 1]])
         })
     }
 
@@ -3675,7 +3252,7 @@ mod tests {
             .plan(SOLID_COLOUR_SIZE, SOLID_COLOUR_SIZE)
             .unwrap();
         // what a subtitle burn to a DCI raster decodes through: postkit reads
-        // the samples, so the pipe is packed RGB and the geometry runs on it
+        // the samples, so the frames are packed RGB and the geometry runs on them
         let burn = crate::picture_processing::PictureProcessing {
             fit: Some(crate::picture_processing::Fit {
                 box_width: 48,
@@ -3729,12 +3306,12 @@ mod tests {
                 filters.starts_with("format=gbrp16le,"),
                 "{name}: the conversion has to run before everything else: {filters}"
             );
-            let pixel = middle_pixel_on_the_pipe(&clip, &filters);
+            let pixel = middle_decoded_pixel(&clip, &filters);
             for (component, (measured, exact)) in pixel.iter().zip(exact).enumerate() {
                 let error = f64::from(*measured) - exact;
                 assert!(
                     error.abs() <= EXACT_TOLERANCE_CODES,
-                    "{name}: component {component} came off the pipe at {measured} against the \
+                    "{name}: component {component} decoded at {measured} against the \
                      exact {exact:.0}, {error:.0} codes out"
                 );
             }

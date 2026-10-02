@@ -13,6 +13,19 @@ const WIDTH: u32 = 128;
 const HEIGHT: u32 = 72;
 const FRAME_RATE: u32 = 24;
 const FRAMES: u64 = 1;
+// AVERROR_INVALIDDATA as av_strerror spells it
+const INVALID_DATA: &str = "Invalid data found when processing input";
+
+fn assert_names_the_unreadable_lut(error: &str, lut: &Path) {
+    assert!(
+        error.contains("cannot run on") && error.contains(&format!("lut3d=\\'{}", lut.display())),
+        "the error has to name the LUT filter that cannot run: {error}"
+    );
+    assert!(
+        error.contains(INVALID_DATA),
+        "the error has to carry the filter's reason: {error}"
+    );
+}
 
 /// A one frame lossless clip, which ffprobe reads a size and a packet count
 /// from whatever happens to its picture afterwards.
@@ -50,7 +63,7 @@ fn clip_with_unreadable_picture(dir: &Path) -> PathBuf {
     assert_eq!(
         (width, height, frames),
         (WIDTH, HEIGHT, FRAMES),
-        "the probe has to still read the source, or the encode fails before ffmpeg runs"
+        "the probe has to still read the source, or the encode fails before the decode runs"
     );
     corrupt
 }
@@ -84,13 +97,15 @@ fn a_source_ffmpeg_cannot_decode_fails_the_encode() {
         result.error
     );
     assert!(
-        result.error.contains("ffmpeg failed"),
-        "the error has to name ffmpeg's exit: {}",
+        result
+            .error
+            .contains(&format!("cannot decode frame 0 of {}", corrupt.display())),
+        "the error has to name the frame and the source: {}",
         result.error
     );
     assert!(
-        result.error.contains("Decoding error"),
-        "the error has to carry what ffmpeg wrote to stderr: {}",
+        result.error.contains(INVALID_DATA),
+        "the error has to carry the decoder's reason: {}",
         result.error
     );
 }
@@ -105,7 +120,7 @@ fn a_filter_chain_ffmpeg_rejects_fails_the_encode() {
     let result = encode(
         &readable,
         &dir.path().join("j2k"),
-        SourceColour::DciLut(lut),
+        SourceColour::DciLut(lut.clone()),
     );
     assert_eq!(result.frames_encoded, 0);
     assert!(
@@ -113,16 +128,7 @@ fn a_filter_chain_ffmpeg_rejects_fails_the_encode() {
         "an encode that wrote nothing cannot report success: {}",
         result.error
     );
-    assert!(
-        result.error.contains("ffmpeg failed"),
-        "the error has to name ffmpeg's exit: {}",
-        result.error
-    );
-    assert!(
-        result.error.contains("3D LUT is empty"),
-        "the error has to carry what ffmpeg wrote to stderr: {}",
-        result.error
-    );
+    assert_names_the_unreadable_lut(&result.error, &lut);
 }
 
 #[test]
@@ -154,7 +160,7 @@ fn the_resumable_encode_runs_its_decode_lut() {
         FRAMES,
         WIDTH,
         HEIGHT,
-        &SourceColour::DciLut(lut),
+        &SourceColour::DciLut(lut.clone()),
         &Arc::new(AtomicBool::new(false)),
         false,
         None,
@@ -167,9 +173,5 @@ fn the_resumable_encode_runs_its_decode_lut() {
         !result.success,
         "a LUT ffmpeg cannot read has to fail the encode, or the LUT never ran"
     );
-    assert!(
-        result.error.contains("3D LUT is empty"),
-        "the error has to carry what ffmpeg wrote to stderr: {}",
-        result.error
-    );
+    assert_names_the_unreadable_lut(&result.error, &lut);
 }

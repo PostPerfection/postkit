@@ -5,7 +5,7 @@
 //! Every operation is planned as pure arithmetic first ([`PictureProcessing::plan`])
 //! and only then spelled as ffmpeg filters, so the sizes a caller shows in a GUI
 //! and the sizes the decode really produces come from one place. The plan also
-//! carries the frame size the encoder has to slice out of ffmpeg's raw stream.
+//! carries the frame size the encoder expects from the decode.
 //!
 //! Nothing here composites: a subtitle burn and the source colour transform run
 //! on the decoded frame, after these filters, so they already see the processed
@@ -345,8 +345,8 @@ pub struct PicturePlan {
     pub rotated_height: u32,
     pub scaled_width: u32,
     pub scaled_height: u32,
-    /// Size of the frame ffmpeg emits, which is what the encoder slices and what
-    /// the codestream declares.
+    /// Size of the frame the decode hands the encoder, which is also what the
+    /// codestream declares.
     pub output_width: u32,
     pub output_height: u32,
     /// Where the scaled picture sits on the output raster, on the chroma grid.
@@ -361,7 +361,7 @@ pub struct PicturePlan {
     /// fields into frames, so it has to run before any rate conversion, and
     /// everything else runs after it.
     pub fps_position: usize,
-    /// Where a pixel format filter belongs in `filters` for a pipe that needs
+    /// Where a pixel format filter belongs in `filters` for a frame that needs
     /// the geometry run in another format: after the deinterlace and the
     /// denoise, which keep whatever format they are given.
     pub geometry_format_position: usize,

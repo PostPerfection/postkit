@@ -17,7 +17,6 @@ pub mod dolby_compliance;
 pub mod dolby_vision;
 pub mod edl_import;
 pub mod encode;
-#[cfg(feature = "ffmpeg-decode")]
 mod ffmpeg_decode;
 pub mod ffmpeg_input;
 pub mod file_uri;

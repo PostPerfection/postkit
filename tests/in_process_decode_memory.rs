@@ -1,8 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use postkit::encode::{
-    FrameRange, FrameRate, StreamEncodeOptions, read_decode_in_process, stream_encode_inprocess,
-};
+use postkit::encode::{FrameRange, FrameRate, StreamEncodeOptions, stream_encode_inprocess};
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -72,7 +70,6 @@ fn the_in_process_decode_frees_each_packet_it_reads() {
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("raw.nut");
     make_source(&source);
-    read_decode_in_process(true);
 
     encode(
         &source,

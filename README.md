@@ -70,33 +70,43 @@ cargo build --release
 cargo test
 ```
 
-Cargo features: `grok-ffi` (J2K encoder), `ffmpeg-decode` (in-process picture
-decode), `async` (tokio), `icc` (monitor-ICC display path in `preview`/`colour`,
-needs liblcms2). All off by default.
+Cargo features: `grok-ffi` (J2K encoder), `libmpv` (embedded player), `async`
+(tokio), `icc` (monitor-ICC display path in `preview`/`colour`, needs liblcms2).
+All off by default.
+
+Every build links the FFmpeg 8.1.3 LGPL libraries through ffmpeg-next 9, and
+the `libmpv` feature links libmpv. Both come from one
+[PostPerfection/ffmpeg-mpv-builds](https://github.com/PostPerfection/ffmpeg-mpv-builds)
+release. Unpack the archive for the platform and point the build at it the way
+its setup action does: on Linux and macOS put its `lib/pkgconfig` first on
+`PKG_CONFIG_PATH` and its `lib` on `LD_LIBRARY_PATH` or `DYLD_LIBRARY_PATH`, on
+Windows set `FFMPEG_DIR` to the unpacked directory and `MPV_LIB_DIR` to its
+`lib`, and put its `bin` on `PATH`. bindgen needs libclang. CI installs v1.0.0
+with `PostPerfection/ffmpeg-mpv-builds@v1.0.0`. On a box with a distro FFmpeg,
+set `FFMPEG_DIR` on Linux and macOS too, so `$FFMPEG_DIR/lib` goes first on the
+link path. postkit refuses libraries whose major versions differ from its
+headers at the first decode.
+
+A binary crate that links postkit adds `postkit-ffmpeg-link-search` as a
+build-dependency by path (`postkit/ffmpeg-link-search`) and calls
+`postkit_ffmpeg_link_search::emit_ffmpeg_link_search()` from its build.rs.
+Cargo puts dependency link paths after the binary crate's own, and a pkg-config
+crate that sorts before `ffmpeg-sys-next` can put `/usr/lib64` first, so
+without it the binary links the distro FFmpeg.
 
 `grok-ffi` links libgrokj2k (grok >= 20.4.3) found via pkg-config, so build and
 install grok first (cmake, e.g. to `~/bin/grok`), then put its `lib/pkgconfig` on
 `PKG_CONFIG_PATH` and its `lib` on `LD_LIBRARY_PATH`. CI does this in a cached
 "Setup grok" step; see `.github/workflows/ci.yml`.
 
-The stream encode runs ffmpeg 8 or later from `PATH`, built with libzimg: the
-HDR decode chain uses its `zscale` filter. Homebrew and conda-forge build
-without it. macOS CI (and local macOS) uses the pinned arm64 9.0.1 zip from
+The stills, sound, DCDM and Dolby Vision paths, the probes and the test fixtures
+run the ffmpeg and ffprobe programs, 8 or later, from `PATH`, built with libzimg
+for the `zscale` filter. Homebrew and conda-forge build without it. macOS CI
+(and local macOS) uses the pinned arm64 9.0.1 zip from
 `https://ffmpeg.martin-riedl.de/download/macos/arm64/1787073674_9.0.1`
 (`ffmpeg.zip` / `ffprobe.zip`); Linux and Windows CI use BtbN's n8.1 gpl
-builds. Put that `ffmpeg` first on `PATH` — `brew shellenv` otherwise wins.
+builds. Put that `ffmpeg` first on `PATH`, `brew shellenv` otherwise wins.
 
-The `ffmpeg-decode` feature decodes the stream encode's picture in process
-through the FFmpeg 8 libraries (ffmpeg-next 9). Build with `FFMPEG_DIR` naming an
-LGPL FFmpeg install holding `include` and `lib`, with libclang present for
-bindgen, and put `$FFMPEG_DIR/lib` on the library path at run time. A system
-FFmpeg's development files on the link path can win over `FFMPEG_DIR`, which
-postkit refuses at the first decode by comparing the loaded library versions
-with its headers. Put the matching libmpv's `lib/pkgconfig` first on
-`PKG_CONFIG_PATH` so the `libmpv` feature links from the same install. Until the
-pipe is removed, `POSTKIT_DECODE_IN_PROCESS=1` switches both stream encodes to
-the in-process decode, and `tests/decode_parity.rs` compares the two byte for
-byte, with an ffmpeg program built from the same FFmpeg source first on `PATH`.
 `POSTKIT_DECODE_MEASURE_CLIP`, `POSTKIT_DECODE_MEASURE_FILTERS` and
 `POSTKIT_DECODE_MEASURE_SIZE` drive the ignored throughput test in
 `ffmpeg_decode`.
@@ -136,24 +146,24 @@ when a batch begins. A 4096x1716 DCP sustains 32.7 frames a second on an RTX
 A 4096x2160 12-bit App 2E IMP sustains 21.0 frames a second with its transform
 on the device, against 11.8 with the host running it.
 
-With the plugin on, ffmpeg decodes with `-hwaccel cuda` on Linux/Windows and
-`-hwaccel videotoolbox` on macOS. Frames reach the batch in the layout the
+With the plugin on, the decode runs on CUDA on Linux/Windows and on
+VideoToolbox on macOS. Frames reach the batch in the layout the
 plugin takes (planar YUV when it can) rather than the one postkit converts
-itself. A yuv420p, yuv422p, yuv420p10le or yuv422p10le source goes to the pipe
+itself. A yuv420p, yuv422p, yuv420p10le or yuv422p10le source goes to the encoder
 as its own three planes and the device upsamples the chroma, converts YUV to
 RGB and runs the X'Y'Z' transform. Every other source goes as packed 16-bit
 RGB, little-endian when the plugin takes the interleaved buffer as it comes off
-the pipe and big-endian when postkit deinterleaves it into grok's component
+the decode and big-endian when postkit deinterleaves it into grok's component
 buffers. postkit asks the plugin which of those it takes before starting the
-decoder, since the answer decides what ffmpeg writes. A subtitle burn,
+decoder, since the answer decides what the decode hands over. A subtitle burn,
 postkit's own P3 or Rec.2020 transform, the HDR-to-DCI LUT, a filter that
 changes the pixel format or the colour, and a PSNR target each keep a run on
-packed RGB. An 8-bit YUV source on that pipe decodes through `format=gbrp16le`
+packed RGB. An 8-bit YUV source on packed RGB decodes through `format=gbrp16le`
 first, because swscale converts 8-bit YUV straight to rgb48 at 8 bits and lands
 about two codes of 255 off the exact colour.
 
-A crop, a scale or a pad runs on whatever the pipe carries, so on the planar
-pipe it runs on the source's own planes: 6.3 CPU seconds over the bare decode
+A crop, a scale or a pad runs on whatever the decode hands over, so on planar
+YUV it runs on the source's own planes: 6.3 CPU seconds over the bare decode
 on 1442 frames of 2048x872 yuv420p, against 73.0 for the same plan converted to
 16-bit RGB first.
 

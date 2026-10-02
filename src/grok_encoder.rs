@@ -21,7 +21,7 @@ pub enum SampleOrder {
 }
 
 /// A raw frame ready for JPEG 2000 compression.
-/// Can be either planar (from TIFF loader) or packed interleaved (from ffmpeg pipe).
+/// Can be either planar (from TIFF loader) or packed interleaved (from the decode).
 pub enum RawFrame {
     /// Planar component buffers: [R, G, B], each with width*height i32 values
     Planar {
@@ -42,7 +42,7 @@ pub enum RawFrame {
         precision: u8,
         index: u64,
     },
-    /// The source's own planar YUV exactly as ffmpeg's rawvideo muxer wrote it:
+    /// The source's own planar YUV exactly as the decode copied it out:
     /// the whole luma plane, then blue chroma, then red chroma, laid out by
     /// [`crate::encode::PlanarYuvPixelFormat::plane_layout`]. Only grok's
     /// accelerator plugin takes these: it upsamples the chroma and converts the
@@ -87,8 +87,8 @@ impl RawFrame {
     }
 
     /// The depth of the samples the compressor sees, which for a planar YUV
-    /// frame is what the plugin's conversion writes rather than what the pipe
-    /// carried.
+    /// frame is what the plugin's conversion writes rather than what the decode
+    /// handed over.
     pub fn precision(&self) -> u8 {
         match self {
             RawFrame::Planar { precision, .. } | RawFrame::Packed { precision, .. } => *precision,
@@ -382,7 +382,7 @@ pub struct EncodeProgress {
     pub total_frames: u64,
     pub fps: f64,
     pub elapsed_secs: f64,
-    /// Time blocked on the decoder's pipe.
+    /// Time blocked on the decoder.
     pub decode_wait_secs: f64,
     /// Time burning subtitles and converting colour, summed over the encoder
     /// threads, so it can exceed `elapsed_secs`.
@@ -2253,13 +2253,13 @@ pub fn accelerated_frames() -> u64 {
     0
 }
 
-// ─── Video-to-J2K in-process pipeline (ffmpeg pipe → Grok FFI) ─────────────────
+// ─── Video-to-J2K in-process pipeline (FFmpeg libraries → Grok FFI) ─────────────
 
-/// High-performance video-to-J2K pipeline: decodes video with ffmpeg and encodes
-/// each frame in-process via Grok FFI. No intermediate files on disk.
+/// High-performance video-to-J2K pipeline: decodes video with the FFmpeg
+/// libraries and encodes each frame in-process via Grok FFI. No intermediate
+/// files on disk.
 ///
-/// Pipeline: `ffmpeg -i input -pix_fmt rgb48be -f rawvideo pipe:1`
-///           → read raw frame buffers from stdout
+/// Pipeline: decode and filter in process to raw frame buffers
 ///           → bounded queue → N encoder threads (1-thread Grok per frame)
 ///           → writer thread → .j2c files on disk
 #[allow(clippy::too_many_arguments)]
@@ -2320,7 +2320,7 @@ fn window_filter_chain(
 /// Like [`encode_video_pipeline`], but when `resume` is true it skips frames
 /// already encoded on disk (dom#344: an interrupted encode picks up where it
 /// left off). The already-present contiguous prefix is decoded-and-discarded so
-/// ffmpeg stays frame-aligned, then encoding continues from the next index. The
+/// the decode stays frame-aligned, then encoding continues from the next index. The
 /// last existing frame is always re-encoded in case it was truncated by the
 /// interruption.
 ///
@@ -2378,8 +2378,8 @@ pub fn encode_video_pipeline_resumable_with_mxf_feed<P>(
     source_colour: &crate::encode::SourceColour,
     cancel: &Arc<AtomicBool>,
     resume: bool,
-    // ffmpeg -vf chain applied while decoding, for fades and the like. It must
-    // not change the frame size or count: the reader slices stdout into fixed
+    // filter chain applied while decoding, for fades and the like. It must
+    // not change the frame size or count: the reader copies fixed
     // width*height frames and the CPL already declares the count.
     video_filter: Option<&str>,
     frame_range: Option<crate::encode::FrameRange>,
@@ -2397,13 +2397,14 @@ where
         output_dir: output_dir.to_path_buf(),
         picture_findings: crate::picture_findings::PictureFindings::default(),
     };
-    let (source, source_frames) =
-        match crate::encode::probe_resumable_source(input_video, frame_range.is_some()) {
-            Ok(probed) => probed,
-            Err(e) => return failed(e),
-        };
+    let probed = match crate::ffmpeg_decode::probe(input_video, crate::encode::DecodeSource::Video)
+    {
+        Ok(probed) => probed,
+        Err(e) => return failed(e),
+    };
+    let source = probed.pixel_format;
     if let Some(range) = frame_range
-        && let Err(e) = range.check_against_probe(source_frames)
+        && let Err(e) = range.check_against_probe(probed.frame_count)
     {
         return failed(e);
     }
@@ -2452,7 +2453,7 @@ where
     let input_format = chain.input_format;
     let frame_size = input_format.frame_bytes(width, height);
     let mut reader =
-        match crate::encode::FrameReader::start(&chain, input_video, frame_range, width, height) {
+        match crate::encode::start_frame_decoder(&chain, input_video, frame_range, width, height) {
             Ok(reader) => reader,
             Err(e) => return failed(e),
         };
@@ -2460,7 +2461,7 @@ where
     // discard the already-encoded prefix so the decode stays frame-aligned.
     let mut frame_index: u64 = 0;
     if start_frame > 0 {
-        if !reader.skip(start_frame, frame_size) {
+        if reader.skip(start_frame).is_err() {
             let _ = reader.finish(params.edit_rate.as_f64(), 0);
             return failed(format!(
                 "resume: source has fewer than {start_frame} frames, cannot skip the encoded prefix"
@@ -2489,7 +2490,7 @@ where
             let read_start = std::time::Instant::now();
             let read = reader.read_into(&mut buf);
             phase_clocks.add(EncodePhase::DecoderWait, read_start.elapsed());
-            if let crate::encode::FrameRead::Ended = read {
+            if let crate::ffmpeg_decode::NextFrame::Ended = read {
                 return None;
             }
             let index = frame_index;
@@ -2600,8 +2601,6 @@ mod tests {
                  trim=start_frame=10:end_frame=15,setpts=PTS-STARTPTS"
             )
         );
-
-        assert_eq!(window.frame_limit_args(), ["-frames:v", "5"]);
     }
 
     #[test]

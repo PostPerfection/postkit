@@ -1745,6 +1745,7 @@ dependencies = [
  "libc",
  "pkg-config",
  "png",
+ "postkit-ffmpeg-link-search",
  "quick-xml",
  "rcgen",
  "regex",
@@ -1771,6 +1772,10 @@ dependencies = [
  "x509-parser",
  "zeroize",
 ]
+
+[[package]]
+name = "postkit-ffmpeg-link-search"
+version = "0.1.0"
 
 [[package]]
 name = "powerfmt"

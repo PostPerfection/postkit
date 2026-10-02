@@ -1673,7 +1673,7 @@ impl FrameDecoder {
         Some(frame)
     }
 
-    // copies the next frame into `buffer` in the layout the pipe carried
+    // copies the next frame into `buffer` in the encoder input format's layout
     pub(crate) fn read_into(&mut self, buffer: &mut [u8]) -> NextFrame {
         let Some(frame) = self.next() else {
             return NextFrame::Ended;
