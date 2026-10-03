@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 /// Byte order of the 16-bit samples in a packed rgb48 frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,6 +736,7 @@ where
 
     // every encoder thread narrows its rate search from whichever frame finished last
     let slope_hint = AtomicU16::new(0);
+    let latest_raised = LatestRaisedCodestream::default();
 
     let frames_produced = std::thread::scope(|s| {
         let encoder_handles: Vec<_> = (0..num_encoder_threads)
@@ -749,6 +750,7 @@ where
                 let phase_clocks = phase_clocks.clone();
                 let buffer_pool = buffer_pool.clone();
                 let slope_hint = &slope_hint;
+                let latest_raised = &latest_raised;
 
                 s.spawn(move || {
                     encoder_thread_fn(
@@ -762,6 +764,7 @@ where
                         &phase_clocks,
                         batch_shape,
                         slope_hint,
+                        latest_raised,
                     );
                 })
             })
@@ -910,6 +913,7 @@ fn encoder_thread_fn(
     phase_clocks: &PhaseClocks,
     batch_shape: Option<BatchShape>,
     slope_hint: &AtomicU16,
+    latest_raised: &LatestRaisedCodestream,
 ) {
     // Pre-allocate output buffer once per thread and reuse across frames
     let buf_size = 2048 * 1080 * 3 * 2; // max 2K frame uncompressed size
@@ -942,7 +946,8 @@ fn encoder_thread_fn(
         let encode_start = std::time::Instant::now();
         let compressed = match batch_shape {
             Some(shape) => submit_frame_to_batch(&frame, shape).map(|()| None),
-            None => compress_frame_grok(&frame, params, slope_hint, &mut output_buf).map(Some),
+            None => compress_frame_grok(&frame, params, slope_hint, latest_raised, &mut output_buf)
+                .map(Some),
         };
         phase_clocks.add(EncodePhase::Jpeg2000, encode_start.elapsed());
 
@@ -1033,10 +1038,11 @@ fn compress_frame_grok(
     frame: &RawFrame,
     params: &CompressParams,
     slope_hint: &AtomicU16,
+    latest_raised: &LatestRaisedCodestream,
     output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     let codestream = compress_frame_at_any_size(frame, params, slope_hint, output_buf)?;
-    raise_to_minimum_cinema_size(codestream, params)
+    raise_to_minimum_cinema_size(codestream, params, latest_raised)
 }
 
 #[cfg(feature = "grok-ffi")]
@@ -1076,6 +1082,9 @@ fn compress_frame_at_any_size(
 // a Dolby DSS200 crashes on a cinema frame smaller than this
 #[cfg(feature = "grok-ffi")]
 const MINIMUM_CINEMA_CODESTREAM_BYTES: usize = 16384;
+
+// every frame of a black run compresses to the same codestream
+type LatestRaisedCodestream = Mutex<Option<(Vec<u8>, Arc<OnceLock<Result<Vec<u8>, String>>>)>>;
 
 #[cfg(feature = "grok-ffi")]
 const SMALLEST_NOISE_RANGE: u32 = 2;
@@ -1121,6 +1130,7 @@ fn add_noise(components: &mut [Vec<i32>; 3], range: u32, highest: i32) {
 fn raise_to_minimum_cinema_size(
     codestream: Vec<u8>,
     params: &CompressParams,
+    latest_raised: &LatestRaisedCodestream,
 ) -> Result<Vec<u8>, String> {
     let is_cinema = matches!(
         crate::j2k::J2kProfile::from(params.profile),
@@ -1132,6 +1142,28 @@ fn raise_to_minimum_cinema_size(
         return Ok(codestream);
     }
 
+    let raised = {
+        let mut latest = latest_raised.lock().unwrap();
+        match latest.as_ref() {
+            Some((undersized, raised)) if *undersized == codestream => raised.clone(),
+            _ => {
+                let raised = Arc::new(OnceLock::new());
+                *latest = Some((codestream.clone(), raised.clone()));
+                raised
+            }
+        }
+    };
+    // threads holding the same codestream wait here for the first one's result
+    raised
+        .get_or_init(|| add_noise_up_to_minimum_cinema_size(codestream, params))
+        .clone()
+}
+
+#[cfg(feature = "grok-ffi")]
+fn add_noise_up_to_minimum_cinema_size(
+    codestream: Vec<u8>,
+    params: &CompressParams,
+) -> Result<Vec<u8>, String> {
     // the plugin's YUV frames cannot be compressed on the CPU
     let decoded = crate::grok_decoder::decode_with_threads(codestream.clone(), 0, 1)?;
     let (width, height, precision) = (decoded.width, decoded.height, decoded.precision);
@@ -1568,6 +1600,7 @@ fn compress_frame_grok(
     _frame: &RawFrame,
     _params: &CompressParams,
     _slope_hint: &AtomicU16,
+    _latest_raised: &LatestRaisedCodestream,
     _output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     Err("grok-ffi feature not enabled — cannot use in-process encoder".to_string())
@@ -1597,6 +1630,7 @@ enum BatchShape {}
 #[cfg(feature = "grok-ffi")]
 struct BatchCollector {
     params: CompressParams,
+    latest_raised: LatestRaisedCodestream,
     writer_tx: std::sync::mpsc::SyncSender<EncodedFrame>,
     error_flag: Arc<AtomicBool>,
     first_error: Arc<Mutex<String>>,
@@ -1637,7 +1671,8 @@ unsafe extern "C" fn batch_frame_callback(
     }
 
     let data = unsafe { std::slice::from_raw_parts(codestream, length) }.to_vec();
-    let data = match raise_to_minimum_cinema_size(data, &collector.params) {
+    let data = match raise_to_minimum_cinema_size(data, &collector.params, &collector.latest_raised)
+    {
         Ok(data) => data,
         Err(e) => {
             fail_pipeline(
@@ -1686,6 +1721,7 @@ impl Batch {
         let mut parameters = Box::new(build_cparameters(params, rsiz, by_rate));
         let collector = Box::new(BatchCollector {
             params: params.clone(),
+            latest_raised: LatestRaisedCodestream::default(),
             writer_tx: writer_tx.clone(),
             error_flag: error_flag.clone(),
             first_error: first_error.clone(),
@@ -3118,7 +3154,13 @@ mod tests {
         let start = std::time::Instant::now();
         let n = 10;
         for _ in 0..n {
-            let result = compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut output_buf);
+            let result = compress_frame_grok(
+                &frame,
+                &params,
+                &AtomicU16::new(0),
+                &LatestRaisedCodestream::default(),
+                &mut output_buf,
+            );
             assert!(result.is_ok(), "compress failed: {:?}", result.err());
         }
         let elapsed = start.elapsed();
@@ -3152,6 +3194,7 @@ mod tests {
             &frame,
             &CompressParams::default(),
             &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
             &mut buf,
         )
         .unwrap();
@@ -3183,6 +3226,7 @@ mod tests {
             &grey_frame(4096, 2160),
             &CompressParams::default(),
             &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
             &mut buf,
         )
         .expect("a 4K frame compresses under the default profile");
@@ -3210,6 +3254,7 @@ mod tests {
             &grey_frame(4096, 2160),
             &CompressParams::default(),
             &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
             &mut buf,
         )
         .expect("a 4K frame compresses");
@@ -3229,6 +3274,7 @@ mod tests {
             &grey_frame(4097, 2160),
             &CompressParams::default(),
             &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
             &mut buf,
         )
         .expect_err("no cinema profile holds a frame wider than 4096");
@@ -3256,9 +3302,15 @@ mod tests {
             ..CompressParams::default()
         };
         let mut buf = Vec::new();
-        compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut buf)
-            .unwrap()
-            .len() as u64
+        compress_frame_grok(
+            &frame,
+            &params,
+            &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
+            &mut buf,
+        )
+        .unwrap()
+        .len() as u64
     }
 
     #[cfg(feature = "grok-ffi")]
@@ -3314,9 +3366,15 @@ mod tests {
             ..CompressParams::default()
         };
         let mut buf = Vec::new();
-        let bytes = compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut buf)
-            .unwrap()
-            .len() as u64;
+        let bytes = compress_frame_grok(
+            &frame,
+            &params,
+            &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
+            &mut buf,
+        )
+        .unwrap()
+        .len() as u64;
         assert!(
             bytes <= DEFAULT_TARGET_BYTES,
             "{bytes} bytes exceeds the {DEFAULT_TARGET_BYTES} byte target"
@@ -3351,6 +3409,7 @@ mod tests {
             &noise_frame(0, 2048, 1080, 12),
             &params,
             &slope_hint,
+            &LatestRaisedCodestream::default(),
             &mut buf,
         )
         .unwrap();
@@ -3363,6 +3422,7 @@ mod tests {
             &noise_frame(1, 2048, 1080, 12),
             &params,
             &slope_hint,
+            &LatestRaisedCodestream::default(),
             &mut buf,
         )
         .unwrap()
@@ -3398,9 +3458,15 @@ mod tests {
         let frame = noise_frame(0, 2048, 1080, 12);
         let slope_hint = AtomicU16::new(0);
         let mut buf = Vec::new();
-        let baseline = compress_frame_grok(&frame, &params, &slope_hint, &mut buf)
-            .unwrap()
-            .len() as u64;
+        let baseline = compress_frame_grok(
+            &frame,
+            &params,
+            &slope_hint,
+            &LatestRaisedCodestream::default(),
+            &mut buf,
+        )
+        .unwrap()
+        .len() as u64;
         let threshold = slope_hint.load(Ordering::Relaxed);
         assert!(
             threshold > 1024,
@@ -3411,9 +3477,15 @@ mod tests {
                 continue;
             };
             slope_hint.store(hint, Ordering::Relaxed);
-            let bytes = compress_frame_grok(&frame, &params, &slope_hint, &mut buf)
-                .unwrap()
-                .len() as u64;
+            let bytes = compress_frame_grok(
+                &frame,
+                &params,
+                &slope_hint,
+                &LatestRaisedCodestream::default(),
+                &mut buf,
+            )
+            .unwrap()
+            .len() as u64;
             assert_eq!(
                 bytes, baseline,
                 "offset {offset} hint {hint} gave {bytes} bytes instead of the {baseline} byte baseline"
@@ -3830,7 +3902,14 @@ mod tests {
         let mut buf = Vec::new();
         let unpadded =
             compress_frame_at_any_size(frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
-        let padded = compress_frame_grok(frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
+        let padded = compress_frame_grok(
+            frame,
+            &params,
+            &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
+            &mut buf,
+        )
+        .unwrap();
         (unpadded, padded)
     }
 
@@ -3876,6 +3955,53 @@ mod tests {
     const HIGHEST_NOISE_ON_BLACK: i32 = 8;
 
     #[cfg(feature = "grok-ffi")]
+    fn compress_flat_frame_after(byte: u8, latest_raised: &LatestRaisedCodestream) -> Vec<u8> {
+        initialize(0);
+        let params = CompressParams {
+            target_codestream_bytes: Some(DEFAULT_TARGET_BYTES),
+            ..CompressParams::default()
+        };
+        compress_frame_grok(
+            &flat_frame(2048, 1080, byte),
+            &params,
+            &AtomicU16::new(0),
+            latest_raised,
+            &mut Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_repeated_small_frame_is_raised_once() {
+        let latest_raised = LatestRaisedCodestream::default();
+        let first = compress_flat_frame_after(0, &latest_raised);
+        let raised_by_first = latest_raised.lock().unwrap().as_ref().unwrap().1.clone();
+
+        let second = compress_flat_frame_after(0, &latest_raised);
+        let raised_by_second = latest_raised.lock().unwrap().as_ref().unwrap().1.clone();
+
+        assert!(Arc::ptr_eq(&raised_by_first, &raised_by_second));
+        assert_eq!(first, second);
+        assert!(first.len() >= MINIMUM_CINEMA_CODESTREAM_BYTES);
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_different_small_frame_is_not_given_the_previous_frames_codestream() {
+        let latest_raised = LatestRaisedCodestream::default();
+        compress_flat_frame_after(0, &latest_raised);
+        let saturated = compress_flat_frame_after(0xff, &latest_raised);
+
+        let decoded = crate::grok_decoder::decode(saturated, 0).unwrap();
+        let darkest = decoded.components.iter().flatten().min().unwrap();
+        assert!(
+            *darkest > HIGHEST_NOISE_ON_BLACK,
+            "a saturated frame decoded to {darkest} after a black one"
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
     #[test]
     fn a_frame_whose_rate_budget_is_under_the_minimum_keeps_its_size() {
         initialize(0);
@@ -3887,7 +4013,14 @@ mod tests {
         let mut buf = Vec::new();
         let unpadded =
             compress_frame_at_any_size(&frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
-        let bytes = compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
+        let bytes = compress_frame_grok(
+            &frame,
+            &params,
+            &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
+            &mut buf,
+        )
+        .unwrap();
         assert_eq!(bytes, unpadded);
     }
 
@@ -3905,6 +4038,7 @@ mod tests {
             &flat_frame(2048, 1080, 0),
             &params,
             &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
             &mut buf,
         )
         .unwrap();
@@ -3934,7 +4068,14 @@ mod tests {
             ..CompressParams::default()
         };
         let mut buf = Vec::new();
-        let bytes = compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
+        let bytes = compress_frame_grok(
+            &frame,
+            &params,
+            &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
+            &mut buf,
+        )
+        .unwrap();
         assert!(
             bytes.len() < MINIMUM_CINEMA_CODESTREAM_BYTES,
             "a black IMF frame is {} bytes",
@@ -3959,6 +4100,7 @@ mod tests {
             &frame,
             &CompressParams::default(),
             &AtomicU16::new(0),
+            &LatestRaisedCodestream::default(),
             &mut output,
         )
         .expect_err("compression should require grok-ffi");
