@@ -902,6 +902,9 @@ const QUALITY_FPS: u32 = 24;
 const QUALITY_FRAMES: u64 = 4;
 const NOISE_WIDTH: u32 = 512;
 const NOISE_HEIGHT: u32 = 270;
+// a smaller frame at PSNR 40 is under the minimum cinema codestream size
+const QUALITY_WIDTH: u32 = 1024;
+const QUALITY_HEIGHT: u32 = 540;
 /// Well under what PSNR 60 needs for noise, so the fallback to rate allocation
 /// is the only thing that can hold the run to it.
 const NOISE_BYTE_CAP: u64 = 60_000;
@@ -975,7 +978,7 @@ fn a_higher_psnr_target_makes_larger_codestreams() {
     let video = dir.path().join("clip.mkv");
     write_lavfi_clip(
         &video,
-        &format!("testsrc=s={NOISE_WIDTH}x{NOISE_HEIGHT}:r={QUALITY_FPS}:d=1"),
+        &format!("testsrc=s={QUALITY_WIDTH}x{QUALITY_HEIGHT}:r={QUALITY_FPS}:d=1"),
         "format=yuv444p",
     );
 

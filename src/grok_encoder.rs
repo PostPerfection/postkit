@@ -998,11 +998,8 @@ const BITS_PER_BYTE: u64 = 8;
 /// The cinema profiles encode 3 components at 12 bits, and grok measures its
 /// compression ratio against that rather than against the samples it was given.
 #[cfg(feature = "grok-ffi")]
-fn cinema_raw_frame_bytes(frame: &RawFrame) -> u64 {
-    frame.width() as u64
-        * frame.height() as u64
-        * GROK_IMAGE_COMPONENTS
-        * CINEMA_SAMPLE_PRECISION as u64
+fn cinema_raw_frame_bytes(width: u32, height: u32) -> u64 {
+    width as u64 * height as u64 * GROK_IMAGE_COMPONENTS * CINEMA_SAMPLE_PRECISION as u64
         / BITS_PER_BYTE
 }
 
@@ -1038,6 +1035,17 @@ fn compress_frame_grok(
     slope_hint: &AtomicU16,
     output_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>, String> {
+    let codestream = compress_frame_at_any_size(frame, params, slope_hint, output_buf)?;
+    raise_to_minimum_cinema_size(codestream, params)
+}
+
+#[cfg(feature = "grok-ffi")]
+fn compress_frame_at_any_size(
+    frame: &RawFrame,
+    params: &CompressParams,
+    slope_hint: &AtomicU16,
+    output_buf: &mut Vec<u8>,
+) -> Result<Vec<u8>, String> {
     let Some(psnr) = params.quality_psnr else {
         let by_rate = rate_allocation(frame, params)?;
         return compress_frame_once(frame, params, by_rate, slope_hint, output_buf);
@@ -1059,10 +1067,112 @@ fn compress_frame_grok(
     // grok holds to max_cs_size by rate but ignores it by quality, so a frame
     // the quality target cannot fit is compressed again by rate
     let by_ratio = Allocation::Ratio {
-        ratio: cinema_raw_frame_bytes(frame) as f64 / cap as f64,
+        ratio: cinema_raw_frame_bytes(frame.width(), frame.height()) as f64 / cap as f64,
         max_bytes: cap,
     };
     compress_frame_once(frame, params, by_ratio, slope_hint, output_buf)
+}
+
+// a Dolby DSS200 crashes on a cinema frame smaller than this
+#[cfg(feature = "grok-ffi")]
+const MINIMUM_CINEMA_CODESTREAM_BYTES: usize = 16384;
+
+#[cfg(feature = "grok-ffi")]
+const SMALLEST_NOISE_RANGE: u32 = 2;
+#[cfg(feature = "grok-ffi")]
+const NOISE_RANGE_LIMIT: u32 = 16;
+
+#[cfg(feature = "grok-ffi")]
+const NOISE_SEED: u32 = 42;
+#[cfg(feature = "grok-ffi")]
+const NOISE_MULTIPLIER: u32 = 1_664_525;
+#[cfg(feature = "grok-ffi")]
+const NOISE_INCREMENT: u32 = 1_013_904_223;
+// the low bits of this generator repeat every few samples
+#[cfg(feature = "grok-ffi")]
+const NOISE_LOW_BITS_DROPPED: u32 = 16;
+
+#[cfg(feature = "grok-ffi")]
+fn rate_budget_bytes(width: u32, height: u32, params: &CompressParams) -> u64 {
+    let by_rate = params.target_codestream_bytes.unwrap_or(
+        (cinema_raw_frame_bytes(width, height) as f64 / params.compression_ratio) as u64,
+    );
+    params
+        .codestream_byte_cap
+        .map_or(by_rate, |cap| cap.min(by_rate))
+}
+
+#[cfg(feature = "grok-ffi")]
+fn add_noise(components: &mut [Vec<i32>; 3], range: u32, highest: i32) {
+    let mut state = NOISE_SEED;
+    for component in components {
+        for sample in component.iter_mut() {
+            state = state
+                .wrapping_mul(NOISE_MULTIPLIER)
+                .wrapping_add(NOISE_INCREMENT);
+            let noise = ((state >> NOISE_LOW_BITS_DROPPED) % range) as i32;
+            let room_above = *sample + noise <= highest;
+            *sample += if room_above { noise } else { -noise };
+        }
+    }
+}
+
+#[cfg(feature = "grok-ffi")]
+fn raise_to_minimum_cinema_size(
+    codestream: Vec<u8>,
+    params: &CompressParams,
+) -> Result<Vec<u8>, String> {
+    let is_cinema = matches!(
+        crate::j2k::J2kProfile::from(params.profile),
+        crate::j2k::J2kProfile::Cinema2k | crate::j2k::J2kProfile::Cinema4k
+    );
+    // a reversible encode is asked for the exact samples
+    let takes_noise = is_cinema && params.irreversible;
+    if !takes_noise || codestream.len() >= MINIMUM_CINEMA_CODESTREAM_BYTES {
+        return Ok(codestream);
+    }
+
+    // the plugin's YUV frames cannot be compressed on the CPU
+    let decoded = crate::grok_decoder::decode_with_threads(codestream.clone(), 0, 1)?;
+    let (width, height, precision) = (decoded.width, decoded.height, decoded.precision);
+    if rate_budget_bytes(width, height, params) < MINIMUM_CINEMA_CODESTREAM_BYTES as u64 {
+        return Ok(codestream);
+    }
+    let clean: [Vec<i32>; 3] = decoded
+        .components
+        .try_into()
+        .map_err(|_| "a cinema codestream decoded to more than three components".to_string())?;
+
+    let noise_params = CompressParams {
+        apply_xyz_transform: false,
+        ..params.clone()
+    };
+    let highest = (1i32 << precision) - 1;
+    let mut output_buf = Vec::new();
+    for range in SMALLEST_NOISE_RANGE..NOISE_RANGE_LIMIT {
+        let mut components = clean.clone();
+        add_noise(&mut components, range, highest);
+        let frame = RawFrame::Planar {
+            components,
+            width,
+            height,
+            precision,
+            index: 0,
+        };
+        let padded = compress_frame_once(
+            &frame,
+            &noise_params,
+            rate_allocation(&frame, &noise_params)?,
+            &AtomicU16::new(0),
+            &mut output_buf,
+        )?;
+        if padded.len() >= MINIMUM_CINEMA_CODESTREAM_BYTES {
+            return Ok(padded);
+        }
+    }
+    Err(format!(
+        "no amount of noise brought the codestream up to {MINIMUM_CINEMA_CODESTREAM_BYTES} bytes"
+    ))
 }
 
 /// The bit depth IMF App 2E picture is written at.
@@ -1486,6 +1596,7 @@ enum BatchShape {}
 /// writer thread. One of these is shared by every callback thread.
 #[cfg(feature = "grok-ffi")]
 struct BatchCollector {
+    params: CompressParams,
     writer_tx: std::sync::mpsc::SyncSender<EncodedFrame>,
     error_flag: Arc<AtomicBool>,
     first_error: Arc<Mutex<String>>,
@@ -1526,6 +1637,18 @@ unsafe extern "C" fn batch_frame_callback(
     }
 
     let data = unsafe { std::slice::from_raw_parts(codestream, length) }.to_vec();
+    let data = match raise_to_minimum_cinema_size(data, &collector.params) {
+        Ok(data) => data,
+        Err(e) => {
+            fail_pipeline(
+                &collector.error_flag,
+                &collector.first_error,
+                &collector.input_queue,
+                format!("Encode failed frame {index}: {e}"),
+            );
+            return;
+        }
+    };
     count_batch_accelerated_frame();
     let _ = collector.writer_tx.send(EncodedFrame { data, index });
 }
@@ -1562,6 +1685,7 @@ impl Batch {
         let by_rate = rate_allocation(frame, params)?;
         let mut parameters = Box::new(build_cparameters(params, rsiz, by_rate));
         let collector = Box::new(BatchCollector {
+            params: params.clone(),
             writer_tx: writer_tx.clone(),
             error_flag: error_flag.clone(),
             first_error: first_error.clone(),
@@ -3682,6 +3806,140 @@ mod tests {
                 without.display()
             );
         }
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    fn flat_frame(width: u32, height: u32, byte: u8) -> RawFrame {
+        RawFrame::Packed {
+            data: vec![byte; (width * height * 6) as usize],
+            order: SampleOrder::Big,
+            width,
+            height,
+            precision: 16,
+            index: 0,
+        }
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    fn compress_flat_frame_both_ways(frame: &RawFrame) -> (Vec<u8>, Vec<u8>) {
+        initialize(0);
+        let params = CompressParams {
+            target_codestream_bytes: Some(DEFAULT_TARGET_BYTES),
+            ..CompressParams::default()
+        };
+        let mut buf = Vec::new();
+        let unpadded =
+            compress_frame_at_any_size(frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
+        let padded = compress_frame_grok(frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
+        (unpadded, padded)
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_black_cinema_frame_is_raised_to_the_minimum_size() {
+        for (width, height) in [(2048u32, 1080u32), (2048, 858), (4096, 2160)] {
+            let (unpadded, padded) = compress_flat_frame_both_ways(&flat_frame(width, height, 0));
+            assert!(
+                unpadded.len() < MINIMUM_CINEMA_CODESTREAM_BYTES,
+                "a black {width}x{height} frame is {} bytes before any noise",
+                unpadded.len()
+            );
+            assert!(
+                padded.len() >= MINIMUM_CINEMA_CODESTREAM_BYTES,
+                "a black {width}x{height} frame is {} bytes",
+                padded.len()
+            );
+
+            let decoded = crate::grok_decoder::decode(padded, 0).unwrap();
+            assert_eq!((decoded.width, decoded.height), (width, height));
+            let brightest = decoded.components.iter().flatten().max().unwrap();
+            assert!(
+                *brightest <= HIGHEST_NOISE_ON_BLACK,
+                "the noise reached {brightest} on a black frame"
+            );
+        }
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_frame_at_the_highest_sample_value_is_raised_to_the_minimum_size() {
+        let (_, padded) = compress_flat_frame_both_ways(&flat_frame(2048, 1080, 0xff));
+        assert!(
+            padded.len() >= MINIMUM_CINEMA_CODESTREAM_BYTES,
+            "a saturated frame is {} bytes",
+            padded.len()
+        );
+    }
+
+    // noise below this on a 12-bit black frame cannot be seen
+    #[cfg(feature = "grok-ffi")]
+    const HIGHEST_NOISE_ON_BLACK: i32 = 8;
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_frame_whose_rate_budget_is_under_the_minimum_keeps_its_size() {
+        initialize(0);
+        let frame = flat_frame(2048, 1080, 0);
+        let params = CompressParams {
+            target_codestream_bytes: Some(MINIMUM_CINEMA_CODESTREAM_BYTES as u64 / 2),
+            ..CompressParams::default()
+        };
+        let mut buf = Vec::new();
+        let unpadded =
+            compress_frame_at_any_size(&frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
+        let bytes = compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
+        assert_eq!(bytes, unpadded);
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_reversible_cinema_frame_keeps_its_exact_samples() {
+        initialize(0);
+        let params = CompressParams {
+            irreversible: false,
+            compression_ratio: 1.0,
+            ..CompressParams::default()
+        };
+        let mut buf = Vec::new();
+        let bytes = compress_frame_grok(
+            &flat_frame(2048, 1080, 0),
+            &params,
+            &AtomicU16::new(0),
+            &mut buf,
+        )
+        .unwrap();
+        let decoded = crate::grok_decoder::decode(bytes, 0).unwrap();
+        assert!(
+            decoded
+                .components
+                .iter()
+                .flatten()
+                .all(|sample| *sample == 0)
+        );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn an_imf_frame_is_left_at_its_size() {
+        initialize(0);
+        let frame = flat_frame(1920, 1080, 0);
+        let params = CompressParams {
+            profile: crate::j2k::imf_rsiz(
+                crate::j2k::ImfProfile::Imf2k,
+                crate::j2k::ImfLevels {
+                    main_level: 5,
+                    sub_level: 2,
+                },
+            ),
+            ..CompressParams::default()
+        };
+        let mut buf = Vec::new();
+        let bytes = compress_frame_grok(&frame, &params, &AtomicU16::new(0), &mut buf).unwrap();
+        assert!(
+            bytes.len() < MINIMUM_CINEMA_CODESTREAM_BYTES,
+            "a black IMF frame is {} bytes",
+            bytes.len()
+        );
     }
 
     #[cfg(not(feature = "grok-ffi"))]
