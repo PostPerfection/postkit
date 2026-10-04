@@ -627,6 +627,84 @@ pub(crate) fn nits_from_pq_signal(signal: f64) -> f64 {
     ((encoded - PQ_C1).max(0.0) / (PQ_C2 - PQ_C3 * encoded)).powf(1.0 / PQ_M1) * PQ_PEAK_NITS
 }
 
+fn pq_code_from_nits(nits: f64, max_code: u16) -> u16 {
+    (0.5 + f64::from(max_code) * pq_signal_from_nits(nits)).floor() as u16
+}
+
+const NEARBY_CODE_FLOAT_BITS_DROPPED: u32 = 12;
+// 2^-20 cd/m², far under the first 16-bit code
+const NEARBY_CODE_LOWEST_NITS: f32 = 1.0 / 1_048_576.0;
+const PQ_CODE_SEARCH_CEILING_NITS: f64 = 2.0 * PQ_PEAK_NITS;
+
+// the two powf a channel in pq_code_from_nits are most of a 16-bit frame's conversion time
+struct SixteenBitPqCodes {
+    lowest_nits_of_code: Vec<f64>,
+    // the code at the low edge of each run of f32 values sharing their high bits
+    nearby_code: Vec<u16>,
+    first_nearby_bin: usize,
+}
+
+impl SixteenBitPqCodes {
+    fn new() -> Self {
+        let mut lowest_nits_of_code = vec![f64::NEG_INFINITY];
+        let mut below = 0.0f64;
+        for code in 1..=u16::MAX {
+            let mut at_or_above = PQ_CODE_SEARCH_CEILING_NITS;
+            loop {
+                let middle = below + (at_or_above - below) / 2.0;
+                if middle <= below || middle >= at_or_above {
+                    break;
+                }
+                if pq_code_from_nits(middle, u16::MAX) >= code {
+                    at_or_above = middle;
+                } else {
+                    below = middle;
+                }
+            }
+            lowest_nits_of_code.push(at_or_above);
+            below = at_or_above;
+        }
+
+        let bin = |nits: f32| (nits.to_bits() >> NEARBY_CODE_FLOAT_BITS_DROPPED) as usize;
+        let first_nearby_bin = bin(NEARBY_CODE_LOWEST_NITS);
+        let nearby_code = (first_nearby_bin..=bin(PQ_PEAK_NITS as f32))
+            .map(|bin| {
+                let low_edge = f32::from_bits((bin as u32) << NEARBY_CODE_FLOAT_BITS_DROPPED);
+                pq_code_from_nits(f64::from(low_edge), u16::MAX)
+            })
+            .collect();
+        Self {
+            lowest_nits_of_code,
+            nearby_code,
+            first_nearby_bin,
+        }
+    }
+
+    fn code(&self, nits: f64) -> u16 {
+        let bin = ((nits as f32).to_bits() >> NEARBY_CODE_FLOAT_BITS_DROPPED) as usize;
+        let nearby = bin
+            .checked_sub(self.first_nearby_bin)
+            .and_then(|index| self.nearby_code.get(index));
+        let Some(&nearby) = nearby else {
+            return self
+                .lowest_nits_of_code
+                .partition_point(|lowest| *lowest <= nits)
+                .saturating_sub(1) as u16;
+        };
+        let mut code = usize::from(nearby);
+        while self.lowest_nits_of_code[code] > nits {
+            code -= 1;
+        }
+        while code < usize::from(u16::MAX) && self.lowest_nits_of_code[code + 1] <= nits {
+            code += 1;
+        }
+        code as u16
+    }
+}
+
+static SIXTEEN_BIT_PQ_CODES: std::sync::LazyLock<SixteenBitPqCodes> =
+    std::sync::LazyLock::new(SixteenBitPqCodes::new);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HdrSource {
     Hdr10,
@@ -779,9 +857,11 @@ impl HdrDcdmTransform {
 
     pub fn pixel(&self, rgb: [u16; 3], max_code: u16) -> [u16; 3] {
         let xyz = multiply_matrix(&self.source_to_xyz, self.display_linear(rgb));
-        let max = f64::from(max_code);
-        self.fitted_into_the_volume(xyz)
-            .map(|value| (0.5 + max * pq_signal_from_nits(value)).floor() as u16)
+        let fitted = self.fitted_into_the_volume(xyz);
+        if max_code == u16::MAX {
+            return fitted.map(|value| SIXTEEN_BIT_PQ_CODES.code(value));
+        }
+        fitted.map(|value| pq_code_from_nits(value, max_code))
     }
 
     pub fn frame_rgb48le(&self, rgb: &[u8], max_code: u16, out: &mut [u16]) {
@@ -1765,6 +1845,27 @@ mod tests_hdr_dcdm {
                 transform.pixel([code; 3], TWELVE_BIT_MAX_CODE),
                 ADDENDUM_MINIMUM_BLACK_CODES,
                 "{source:?} white at {DCI_HDR_MINIMUM_BLACK_NITS} cd/m²"
+            );
+        }
+    }
+
+    #[test]
+    fn the_sixteen_bit_code_table_agrees_with_the_pq_formula() {
+        const STEPS_PER_DOUBLING: i32 = 64;
+        let codes = SixteenBitPqCodes::new();
+        let mut checked = vec![0.0, -1.0, f64::NAN, 1e-9, PQ_PEAK_NITS, 3.0 * PQ_PEAK_NITS];
+        for lowest in &codes.lowest_nits_of_code[1..] {
+            checked.extend([*lowest, lowest.next_down(), lowest.next_up()]);
+        }
+        checked.extend(
+            (-30 * STEPS_PER_DOUBLING..=15 * STEPS_PER_DOUBLING)
+                .map(|step| 2f64.powf(f64::from(step) / f64::from(STEPS_PER_DOUBLING))),
+        );
+        for nits in checked {
+            assert_eq!(
+                codes.code(nits),
+                pq_code_from_nits(nits, u16::MAX),
+                "{nits} cd/m²"
             );
         }
     }
