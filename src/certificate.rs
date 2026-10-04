@@ -2840,10 +2840,12 @@ mod tests {
         in_days(1)
     }
 
+    const KDM_TIMESTAMP_FORMAT: &str = "%Y-%m-%dT%H:%M:%S+00:00";
+
     /// An ST 430-1 timestamp that many days from now.
     fn in_days(days: i64) -> String {
         (chrono::Utc::now() + chrono::Duration::days(days))
-            .format("%Y-%m-%dT%H:%M:%S+00:00")
+            .format(KDM_TIMESTAMP_FORMAT)
             .to_string()
     }
 
@@ -3405,7 +3407,11 @@ mod tests {
     fn a_window_starting_the_day_the_signer_does_is_rejected() {
         let f = fixtures();
         let mut config = test_config(f, PathBuf::from("unused"));
-        config.valid_from = "now".to_string();
+        // "now" is the next day when the run crosses midnight UTC
+        config.valid_from = certificate_validity(&config.signer_cert_file)
+            .not_before
+            .format(KDM_TIMESTAMP_FORMAT)
+            .to_string();
         let err = build_kdm(&config).expect_err("a same-day start must be refused");
         assert!(err.contains("starts on"), "got: {err}");
     }
