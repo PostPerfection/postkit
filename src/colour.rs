@@ -459,7 +459,7 @@ fn transformed_pixel(
     out
 }
 
-fn map_rgb48le_into(rgb: &[u8], out: &mut [u16], pixel: impl Fn([u16; 3]) -> [u16; 3]) {
+fn map_rgb48le_into(rgb: &[u8], out: &mut [u16], mut pixel: impl FnMut([u16; 3]) -> [u16; 3]) {
     for (px, codes) in rgb
         .as_chunks::<6>()
         .0
@@ -474,7 +474,11 @@ fn map_rgb48le_into(rgb: &[u8], out: &mut [u16], pixel: impl Fn([u16; 3]) -> [u1
     }
 }
 
-fn map_rgb48_inplace(buf: &mut [u8], order: SampleOrder, pixel: impl Fn([u16; 3]) -> [u16; 3]) {
+fn map_rgb48_inplace(
+    buf: &mut [u8],
+    order: SampleOrder,
+    mut pixel: impl FnMut([u16; 3]) -> [u16; 3],
+) {
     for px in buf.as_chunks_mut::<6>().0 {
         let read = |bytes: [u8; 2]| match order {
             SampleOrder::Big => u16::from_be_bytes(bytes),
@@ -781,11 +785,34 @@ impl HdrDcdmTransform {
     }
 
     pub fn frame_rgb48le(&self, rgb: &[u8], max_code: u16, out: &mut [u16]) {
-        map_rgb48le_into(rgb, out, |codes| self.pixel(codes, max_code));
+        map_rgb48le_into(
+            rgb,
+            out,
+            reusing_a_repeated_pixel(|codes| self.pixel(codes, max_code)),
+        );
     }
 
     pub fn frame_rgb48_inplace(&self, buf: &mut [u8], order: SampleOrder) {
-        map_rgb48_inplace(buf, order, |rgb| self.pixel(rgb, u16::MAX));
+        map_rgb48_inplace(
+            buf,
+            order,
+            reusing_a_repeated_pixel(|rgb| self.pixel(rgb, u16::MAX)),
+        );
+    }
+}
+
+// a black frame is one pixel repeated, and the slowest one to convert
+fn reusing_a_repeated_pixel(
+    pixel: impl Fn([u16; 3]) -> [u16; 3],
+) -> impl FnMut([u16; 3]) -> [u16; 3] {
+    let mut previous: Option<([u16; 3], [u16; 3])> = None;
+    move |rgb| match previous {
+        Some((source, converted)) if source == rgb => converted,
+        _ => {
+            let converted = pixel(rgb);
+            previous = Some((rgb, converted));
+            converted
+        }
     }
 }
 
@@ -1740,6 +1767,38 @@ mod tests_hdr_dcdm {
                 "{source:?} white at {DCI_HDR_MINIMUM_BLACK_NITS} cd/m²"
             );
         }
+    }
+
+    #[test]
+    fn a_frame_with_repeated_pixels_converts_each_pixel_like_a_lone_one() {
+        const GREY: [u16; 3] = [30000; 3];
+        const BLACK: [u16; 3] = [0; 3];
+        let pixels = [BLACK, BLACK, GREY, BLACK, GREY, GREY];
+        let transform =
+            HdrDcdmTransform::new(HdrSource::Hdr10, HdrSource::DEFAULT_PEAK_NITS).unwrap();
+
+        let mut frame: Vec<u8> = pixels
+            .iter()
+            .flatten()
+            .flat_map(|code| code.to_be_bytes())
+            .collect();
+        transform.frame_rgb48_inplace(&mut frame, SampleOrder::Big);
+
+        let converted: Vec<u16> = frame
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|bytes| u16::from_be_bytes(*bytes))
+            .collect();
+        let expected: Vec<u16> = pixels
+            .iter()
+            .flat_map(|rgb| transform.pixel(*rgb, u16::MAX))
+            .collect();
+        assert_eq!(converted, expected);
+        assert_ne!(
+            transform.pixel(BLACK, u16::MAX),
+            transform.pixel(GREY, u16::MAX)
+        );
     }
 
     #[test]
