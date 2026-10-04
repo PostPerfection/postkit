@@ -1247,18 +1247,28 @@ fn frame_encoding_shape(
 }
 
 /// A planar 32-bit grok image carrying the frame's samples shifted down by
-/// `bits_to_drop`. The caller unrefs it.
+/// `bits_to_drop`, to the nearest value under `rounds_dropped_bits`. The
+/// caller unrefs it.
 #[cfg(feature = "grok-ffi")]
 unsafe fn build_grok_image(
     frame: &RawFrame,
     precision: u8,
     bits_to_drop: u8,
+    rounds_dropped_bits: bool,
 ) -> Result<*mut grokj2k_sys::grk_image, String> {
     use grokj2k_sys::*;
     use std::ptr;
 
     let width = frame.width();
     let height = frame.height();
+    let half = if rounds_dropped_bits && bits_to_drop > 0 {
+        1i32 << (bits_to_drop - 1)
+    } else {
+        0
+    };
+    // rounding the highest samples up would carry them past the precision
+    let highest = (1i32 << precision) - 1;
+    let reduced = |sample: i32| ((sample + half) >> bits_to_drop).min(highest);
 
     unsafe {
         // Set up image components
@@ -1306,7 +1316,7 @@ unsafe fn build_grok_image(
                             continue;
                         }
                         for (x, &sample) in src_row.iter().enumerate() {
-                            *dst_row.add(x) = sample >> bits_to_drop;
+                            *dst_row.add(x) = reduced(sample);
                         }
                     }
                 }
@@ -1339,9 +1349,9 @@ unsafe fn build_grok_image(
                         let r = sample([data[off], data[off + 1]]);
                         let g = sample([data[off + 2], data[off + 3]]);
                         let b = sample([data[off + 4], data[off + 5]]);
-                        *r_data.add(row_offset + x) = r >> bits_to_drop;
-                        *g_data.add(row_offset + x) = g >> bits_to_drop;
-                        *b_data.add(row_offset + x) = b >> bits_to_drop;
+                        *r_data.add(row_offset + x) = reduced(r);
+                        *g_data.add(row_offset + x) = reduced(g);
+                        *b_data.add(row_offset + x) = reduced(b);
                     }
                 }
             }
@@ -1564,7 +1574,7 @@ fn compress_frame_once(
     let carries_slope_hint = rate_control_runs && params.num_layers == 1;
 
     unsafe {
-        let image = build_grok_image(frame, precision, bits_to_drop)?;
+        let image = build_grok_image(frame, precision, bits_to_drop, false)?;
         let mut cparams = build_cparameters(params, rsiz, allocation);
         if carries_slope_hint {
             cparams.rate_control_slope_hint = slope_hint.load(Ordering::Relaxed);
@@ -1619,6 +1629,7 @@ struct BatchShape {
     image_precision: u8,
     /// how far a source sample is shifted down to reach `image_precision`
     bits_to_drop: u8,
+    rounds_dropped_bits: bool,
 }
 
 #[cfg(not(feature = "grok-ffi"))]
@@ -1707,7 +1718,7 @@ enum Batch {}
 #[cfg(feature = "grok-ffi")]
 impl Batch {
     /// Start a batch shaped by `frame`. `Ok(None)` means the plugin declined
-    /// these parameters and the caller compresses on the CPU.
+    /// these parameters and the caller compresses each frame with its own call.
     fn begin(
         frame: &RawFrame,
         params: &CompressParams,
@@ -1716,7 +1727,24 @@ impl Batch {
         first_error: &Arc<Mutex<String>>,
         input_queue: &Arc<BoundedQueue<RawFrame>>,
     ) -> Result<Option<Self>, String> {
-        let (rsiz, image_precision, bits_to_drop) = frame_encoding_shape(frame, params)?;
+        let (rsiz, mut image_precision, mut bits_to_drop) = frame_encoding_shape(frame, params)?;
+        let postkit_builds_the_planes = !matches!(
+            frame,
+            RawFrame::PlanarYuv { .. }
+                | RawFrame::Packed {
+                    order: SampleOrder::Little,
+                    ..
+                }
+        );
+        let batch_precision = grok_image_precision(rsiz, image_precision);
+        // the plugin takes deeper samples only together with its own X'Y'Z' transform
+        let rounds_dropped_bits = postkit_builds_the_planes
+            && !params.apply_xyz_transform
+            && image_precision > batch_precision;
+        if rounds_dropped_bits {
+            bits_to_drop = image_precision - batch_precision;
+            image_precision = batch_precision;
+        }
         let by_rate = rate_allocation(frame, params)?;
         let mut parameters = Box::new(build_cparameters(params, rsiz, by_rate));
         let collector = Box::new(BatchCollector {
@@ -1781,6 +1809,7 @@ impl Batch {
                         height: frame.height(),
                         image_precision,
                         bits_to_drop,
+                        rounds_dropped_bits,
                     },
                     _parameters: parameters,
                     _collector: collector,
@@ -1794,7 +1823,7 @@ impl Batch {
                     precision = grok_image_precision(rsiz, image_precision),
                     rsiz = format!("{rsiz:#06x}"),
                     "grok's accelerator plugin does not handle this frame shape or these \
-                     compression parameters as a batch, compressing on the CPU"
+                     compression parameters as a batch, compressing each frame with its own call"
                 );
                 Ok(None)
             }
@@ -2075,7 +2104,12 @@ fn submit_frame_to_batch(frame: &RawFrame, shape: BatchShape) -> Result<(), Stri
                 precision,
                 ..
             } => build_rgb48le_grok_image(data, *width, *height, *precision)?,
-            _ => build_grok_image(frame, shape.image_precision, shape.bits_to_drop)?,
+            _ => build_grok_image(
+                frame,
+                shape.image_precision,
+                shape.bits_to_drop,
+                shape.rounds_dropped_bits,
+            )?,
         };
         let frame_user = frame.index() as usize as *mut std::ffi::c_void;
         let submitted = grokj2k_sys::grk_plugin_batch_memory_submit(image, frame_user);
@@ -3948,6 +3982,38 @@ mod tests {
             "a saturated frame is {} bytes",
             padded.len()
         );
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn dropped_bits_round_to_the_nearest_value_and_stop_at_the_highest() {
+        const BITS_TO_DROP: u8 = 4;
+        let samples: [u16; 3] = [0x0007, 0x0008, 0xffff];
+        let frame = RawFrame::Packed {
+            data: samples.iter().flat_map(|s| s.to_be_bytes()).collect(),
+            order: SampleOrder::Big,
+            width: 1,
+            height: 1,
+            precision: 16,
+            index: 0,
+        };
+        initialize(0);
+        let first_sample_of_each_component = |rounds_dropped_bits| unsafe {
+            let image = build_grok_image(
+                &frame,
+                CINEMA_SAMPLE_PRECISION,
+                BITS_TO_DROP,
+                rounds_dropped_bits,
+            )
+            .unwrap();
+            let samples: Vec<i32> = (0..3)
+                .map(|component| *((*(*image).comps.add(component)).data as *const i32))
+                .collect();
+            grokj2k_sys::grk_object_unref(&mut (*image).obj);
+            samples
+        };
+        assert_eq!(first_sample_of_each_component(true), [0, 1, 4095]);
+        assert_eq!(first_sample_of_each_component(false), [0, 0, 4095]);
     }
 
     // noise below this on a 12-bit black frame cannot be seen
