@@ -344,6 +344,7 @@ impl Scheduler {
         self.generation += 1;
         self.in_flight.clear();
         self.pool.rebase(finished.frame_count, self.generation);
+        self.pool.measure_capacity_from(self.generation);
         self.hand_off_sound(&finished, &mut timeline);
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
@@ -700,6 +701,7 @@ impl Scheduler {
         self.generation += 1;
         self.in_flight.clear();
         self.pool.discard_queued_jobs();
+        self.pool.measure_capacity_from(self.generation);
         if !self.playing {
             self.needs_publish = true;
         }
@@ -709,6 +711,7 @@ impl Scheduler {
         self.generation += 1;
         self.in_flight.clear();
         self.pool.restart(self.generation);
+        self.pool.measure_capacity_from(self.generation);
         if self.timeline.is_some() {
             self.needs_publish = true;
         }
@@ -834,6 +837,7 @@ impl Scheduler {
             dropped_frames_scheduler_late: self.dropped_frames_scheduler_late,
             delayed_frames: self.delayed_frames,
             decoder_fps: self.playback_rate(),
+            decode_capacity_fps: self.pool.decode_capacity_fps(),
             container_fps: timeline.map(|timeline| timeline.fps),
             eof: self.eof && self.queued.is_none(),
             stereoscopic: timeline.is_some_and(|timeline| timeline.stereoscopic),

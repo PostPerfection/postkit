@@ -974,6 +974,74 @@ fn metadata_field(player: &GrokPlayer, field: &str) -> serde_json::Value {
     metadata[field].clone()
 }
 
+fn decode_capacity(player: &GrokPlayer) -> Option<f64> {
+    metadata_field(player, "decode_capacity_fps").as_f64()
+}
+
+// the first reading after a change, once enough decodes are timed
+fn measured_capacity(player: &GrokPlayer) -> f64 {
+    wait_until("the decode capacity was measured", || {
+        decode_capacity(player).is_some()
+    });
+    decode_capacity(player).unwrap()
+}
+
+// the paused frame comes back after the change, by then the measurement has restarted
+fn capacity_after(player: &GrokPlayer, change: impl Fn(&GrokPlayer)) -> f64 {
+    forget_frames(player);
+    change(player);
+    wait_for_frame(player);
+    measured_capacity(player)
+}
+
+// other tests decode at the same time, so one reading against one other is noisy
+const CAPACITY_ROUNDS: usize = 3;
+
+fn median_capacity_ratio(
+    player: &GrokPlayer,
+    base: impl Fn(&GrokPlayer),
+    changed: impl Fn(&GrokPlayer),
+) -> (f64, Vec<(f64, f64)>) {
+    // the player starts in the base state, so each round changes away from it first
+    let mut readings: Vec<(f64, f64)> = (0..CAPACITY_ROUNDS)
+        .map(|_| {
+            let changed_reading = capacity_after(player, &changed);
+            (capacity_after(player, &base), changed_reading)
+        })
+        .collect();
+    readings.sort_by(|a, b| (a.1 / a.0).total_cmp(&(b.1 / b.0)));
+    let (base_reading, changed_reading) = readings[CAPACITY_ROUNDS / 2];
+    (changed_reading / base_reading, readings)
+}
+
+#[test]
+fn the_decode_capacity_reads_once_playback_starts_and_rises_at_half_scale() {
+    const SIZE: u32 = 512;
+    const FRAMES: usize = 72;
+    let directory = tempfile::tempdir().unwrap();
+    let frame = flat_codestreams(SIZE, SIZE, 1, CINEMA_2K_PROFILE).remove(0);
+    let mxf = directory.path().join("picture.mxf");
+    write_mxf(&mxf, &vec![frame; FRAMES], None, SIZE, SIZE);
+
+    let player = GrokPlayer::new();
+    player.init_software().unwrap();
+    player.load(&mxf, None).expect("load");
+    player.set_paused(false);
+    let full_scale = measured_capacity(&player);
+    assert!(full_scale > 0.0, "{full_scale}");
+
+    player.set_paused(true);
+    let (ratio, readings) = median_capacity_ratio(
+        &player,
+        |player| player.set_decode_scale(DecodeScale::Full),
+        |player| player.set_decode_scale(DecodeScale::Half),
+    );
+    assert!(
+        ratio > 1.3,
+        "half scale against full scale, fps: {readings:?}"
+    );
+}
+
 #[test]
 fn a_queued_source_plays_on_from_the_last_frame_with_no_gap() {
     const SIZE: u32 = 64;
@@ -1918,6 +1986,29 @@ mod stereoscopic {
     }
 
     #[test]
+    fn decoding_both_eyes_halves_the_decode_capacity() {
+        const EYE_SIZE: u32 = 512;
+        const FRAMES: usize = 40;
+        let directory = tempfile::tempdir().unwrap();
+        let mxf = stereo_mxf(directory.path(), "stereo.mxf", EYE_SIZE, EYE_SIZE, FRAMES);
+        let player = GrokPlayer::new();
+        player.init_software().unwrap();
+        player.load(&mxf, None).expect("load");
+        wait_until("the first frame was composed", || {
+            player.frame_size().is_some()
+        });
+        let (ratio, readings) = median_capacity_ratio(
+            &player,
+            |player| player.set_stereo_output(StereoOutput::LeftEye),
+            |player| player.set_stereo_output(StereoOutput::SideBySide),
+        );
+        assert!(
+            (0.3..0.75).contains(&ratio),
+            "left eye against side by side, fps: {readings:?}"
+        );
+    }
+
+    #[test]
     fn a_stereo_output_change_during_playback_drops_no_frames() {
         const FRAMES: usize = 72;
         let directory = tempfile::tempdir().unwrap();
@@ -1970,6 +2061,11 @@ mod stereoscopic {
                 left_half.push(colour);
             }
             std::thread::sleep(POLL);
+        }
+        // eof is flagged on the tick that presents the last frame
+        let last = at(&player, QUARTER, QUARTER);
+        if left_half.last() != Some(&last) {
+            left_half.push(last);
         }
 
         // the stereo source's left eyes are colours 0 and 1 again

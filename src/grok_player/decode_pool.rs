@@ -5,6 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::decode_capacity::DecodeCapacity;
 use super::stereo::{EyeArrangement, StereoHalf};
 use super::timeline::DisplayRender;
 use super::{Command, OPAQUE_ALPHA, RGBA_BYTES_PER_PIXEL, Rgba8Frame};
@@ -362,6 +363,7 @@ pub(super) struct DecodePool {
     workers: Vec<JoinHandle<()>>,
     device_thread: Option<JoinHandle<()>>,
     cache: Arc<Mutex<FrameCache>>,
+    capacity: Arc<Mutex<DecodeCapacity>>,
     last_logged_decoder: Mutex<Option<PlaybackDecoder>>,
     pub worker_count: usize,
 }
@@ -373,21 +375,24 @@ impl DecodePool {
             .unwrap_or(FALLBACK_WORKER_COUNT);
         let cpu_queue = JobQueue::new();
         let cache = Arc::new(Mutex::new(FrameCache::new()));
+        let capacity = Arc::new(Mutex::new(DecodeCapacity::new(worker_count)));
         let workers = (0..worker_count)
             .map(|_| {
                 let queue = cpu_queue.clone();
                 let cache = cache.clone();
+                let capacity = capacity.clone();
                 let finished = finished.clone();
-                std::thread::spawn(move || run_worker(&queue, &cache, &finished))
+                std::thread::spawn(move || run_worker(&queue, &cache, &capacity, &finished))
             })
             .collect();
-        let (device_queue, device_thread) = device::start(&cpu_queue, &cache, &finished);
+        let (device_queue, device_thread) = device::start(&cpu_queue, &cache, &capacity, &finished);
         DecodePool {
             cpu_queue,
             device_queue,
             workers,
             device_thread,
             cache,
+            capacity,
             last_logged_decoder: Mutex::new(None),
             worker_count,
         }
@@ -431,6 +436,14 @@ impl DecodePool {
         if let Some(device_queue) = &self.device_queue {
             device_queue.discard_queued();
         }
+    }
+
+    pub fn decode_capacity_fps(&self) -> Option<f64> {
+        self.capacity.lock().unwrap().frames_per_second()
+    }
+
+    pub fn measure_capacity_from(&self, generation: u64) {
+        self.capacity.lock().unwrap().restart(generation);
     }
 
     pub fn rerender_from(&self, generation: u64) {
@@ -509,14 +522,25 @@ impl Drop for DecodePool {
     }
 }
 
-fn run_worker(queue: &JobQueue<DecodeJob>, cache: &Mutex<FrameCache>, finished: &Sender<Command>) {
+fn run_worker(
+    queue: &JobQueue<DecodeJob>,
+    cache: &Mutex<FrameCache>,
+    capacity: &Mutex<DecodeCapacity>,
+    finished: &Sender<Command>,
+) {
     while let Some(job) = queue.pop() {
         if !cache.lock().unwrap().accepts(job.generation) {
             continue;
         }
         let reduce = job.reduce;
+        let started = Instant::now();
         let rendered = decode_job(job.codestream, reduce, job.render, &job.mxf, &job.display)
             .map(|frame| Rgba8Frame::from_rgb8(&frame));
+        capacity.lock().unwrap().record_cpu(
+            job.generation,
+            started.elapsed().as_secs_f64(),
+            jobs_per_frame(job.stereo.as_ref()),
+        );
         let Some(decoded) = cached_frame(job.stereo.as_ref(), rendered) else {
             continue;
         };
@@ -528,6 +552,10 @@ fn run_worker(queue: &JobQueue<DecodeJob>, cache: &Mutex<FrameCache>, finished: 
             return;
         }
     }
+}
+
+fn jobs_per_frame(stereo: Option<&StereoHalf>) -> usize {
+    if stereo.is_some() { 2 } else { 1 }
 }
 
 // one eye waits for the other, None until both are in
@@ -623,6 +651,7 @@ mod device {
     pub(super) fn start(
         cpu_queue: &Arc<JobQueue<DecodeJob>>,
         cache: &Arc<Mutex<FrameCache>>,
+        capacity: &Arc<Mutex<DecodeCapacity>>,
         finished: &Sender<Command>,
     ) -> (Option<Arc<JobQueue<DecodeJob>>>, Option<JoinHandle<()>>) {
         let queue = JobQueue::new();
@@ -631,6 +660,7 @@ mod device {
                 queue: queue.clone(),
                 cpu_queue: cpu_queue.clone(),
                 cache: cache.clone(),
+                capacity: capacity.clone(),
                 finished: finished.clone(),
                 pull_open: AtomicBool::new(false),
                 rgb8_on_device: AtomicBool::new(false),
@@ -654,6 +684,7 @@ mod device {
         queue: Arc<JobQueue<DecodeJob>>,
         cpu_queue: Arc<JobQueue<DecodeJob>>,
         cache: Arc<Mutex<FrameCache>>,
+        capacity: Arc<Mutex<DecodeCapacity>>,
         finished: Sender<Command>,
         // false makes every pull return false, which ends the plugin's workers
         pull_open: AtomicBool,
@@ -1066,6 +1097,14 @@ mod device {
             if rendered.is_ok() {
                 crate::grok_encoder::count_batch_accelerated_frame();
             }
+            // the plugin holds its last frames back while no pull has more for it
+            let more_work = !state.queue.is_empty();
+            state.capacity.lock().unwrap().record_device_return(
+                context.generation,
+                Instant::now(),
+                jobs_per_frame(context.stereo.as_ref()),
+                more_work,
+            );
             if let Some(cached) = cached_frame(context.stereo.as_ref(), rendered) {
                 state.cache.lock().unwrap().store(
                     context.generation,
@@ -1972,20 +2011,31 @@ mod tests {
                     });
                 }
             }
+            // a device batch holds its last frames until it drains, which the full count includes
+            const MOST_FRAMES_PERCENT: u64 = 90;
+            let most_frames = frames * MOST_FRAMES_PERCENT / 100;
             let mut first_frame_after = None;
+            let mut most_frames_after = None;
             while (pool.cached_frame_count() as u64) < frames {
-                if first_frame_after.is_none() && pool.cached_frame_count() > 0 {
+                let cached = pool.cached_frame_count() as u64;
+                if first_frame_after.is_none() && cached > 0 {
                     first_frame_after = Some(start.elapsed().as_secs_f64());
+                }
+                if most_frames_after.is_none() && cached >= most_frames {
+                    most_frames_after = Some(start.elapsed().as_secs_f64());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
             let elapsed = start.elapsed().as_secs_f64();
             let first = first_frame_after.unwrap_or(elapsed);
+            let most = most_frames_after.unwrap_or(elapsed);
             println!(
-                "{label}: {frames} frames in {elapsed:.2} s, {:.1} frames a second on {} workers, first frame after {first:.2} s, {:.1} frames a second after it",
+                "{label}: {frames} frames in {elapsed:.2} s, {:.1} frames a second on {} workers, first frame after {first:.2} s, {:.1} frames a second after it, {:.1} up to {MOST_FRAMES_PERCENT} percent, decode capacity reads {:.1}",
                 frames as f64 / elapsed,
                 pool.worker_count,
-                (frames - 1) as f64 / (elapsed - first).max(1e-9)
+                (frames - 1) as f64 / (elapsed - first).max(1e-9),
+                (most_frames - 1) as f64 / (most - first).max(1e-9),
+                pool.decode_capacity_fps().unwrap_or(f64::NAN)
             );
         };
         crate::grok_encoder::use_cpu();

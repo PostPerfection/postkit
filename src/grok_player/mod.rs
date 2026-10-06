@@ -1,5 +1,6 @@
 mod audio;
 mod compositor;
+mod decode_capacity;
 mod decode_pool;
 mod presenter;
 mod scheduler;
@@ -188,6 +189,8 @@ struct Status {
     dropped_frames_scheduler_late: u64,
     delayed_frames: u64,
     decoder_fps: Option<f64>,
+    // what the decode pool could sustain at the current scale and stereo output, measured
+    decode_capacity_fps: Option<f64>,
     container_fps: Option<f64>,
     eof: bool,
     // the playing source has a left and a right eye
@@ -701,7 +704,7 @@ impl Drop for GrokPlayer {
 
 fn status_json(status: &Status) -> String {
     format!(
-        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}, "stereoscopic": {}, "warnings": [{}], "source": {}, "queued_source": {}}}"#,
+        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "decode_capacity_fps": {}, "container_fps": {}, "eof": {}, "stereoscopic": {}, "warnings": [{}], "source": {}, "queued_source": {}}}"#,
         json_number(status.position),
         json_number(status.duration),
         status.paused,
@@ -711,6 +714,7 @@ fn status_json(status: &Status) -> String {
         status.dropped_frames_scheduler_late,
         status.delayed_frames,
         json_number(status.decoder_fps),
+        json_number(status.decode_capacity_fps),
         json_number(status.container_fps),
         status.eof,
         status.stereoscopic,
@@ -754,6 +758,10 @@ mod tests {
         assert!(metadata.contains(r#""cache_seconds": null"#), "{metadata}");
         assert!(metadata.contains(r#""eof": false"#), "{metadata}");
         assert!(metadata.contains(r#""stereoscopic": false"#), "{metadata}");
+        assert!(
+            metadata.contains(r#""decode_capacity_fps": null"#),
+            "{metadata}"
+        );
         assert!(metadata.contains(r#""warnings": []"#), "{metadata}");
         assert!(metadata.contains(r#""source": null"#), "{metadata}");
         assert!(metadata.contains(r#""queued_source": null"#), "{metadata}");
@@ -770,7 +778,7 @@ mod tests {
                 .expect("metadata is JSON")
                 .as_object()
                 .map(|fields| fields.len()),
-            Some(16)
+            Some(17)
         );
     }
 
