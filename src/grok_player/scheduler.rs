@@ -416,15 +416,17 @@ impl Scheduler {
         let generation = self.generation;
         // reading a whole window at once stalls the clock
         let batch = self.pool.worker_count;
-        let Some(timeline) = self.timeline.as_mut() else {
-            return;
-        };
-        for index in wanted.into_iter().take(batch) {
-            let read = match self.queued.as_mut() {
-                Some(queued) if index >= frame_count => {
+        for (submitted, index) in wanted.into_iter().take(batch).enumerate() {
+            // a read takes milliseconds when the decode workers fill every core
+            if submitted > 0 && self.frame_due() {
+                break;
+            }
+            let read = match (self.queued.as_mut(), self.timeline.as_mut()) {
+                (Some(queued), _) if index >= frame_count => {
                     queued.timeline.codestream(index - frame_count)
                 }
-                _ => timeline.codestream(index),
+                (_, Some(timeline)) => timeline.codestream(index),
+                (_, None) => return,
             };
             match read {
                 Ok((codestream, render, mxf)) => {
@@ -441,6 +443,18 @@ impl Scheduler {
                 Err(reason) => self.pool.record_failure(generation, index, reduce, reason),
             }
         }
+    }
+
+    fn frame_due(&self) -> bool {
+        if !self.playing {
+            return false;
+        }
+        let Some(clock) = self.clock else {
+            return false;
+        };
+        clock
+            .elapsed_seconds(Instant::now(), self.sound_position())
+            .is_some_and(|elapsed| elapsed >= clock.frame_offset_seconds(self.current_frame + 1))
     }
 
     fn next_wait(&self) -> Duration {
