@@ -27,6 +27,22 @@ pub use presenter::{
 // the signature libmpv's mpv_opengl_init_params takes, declared here so this player needs no libmpv
 pub type GetProcAddressFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
 
+// in and out are composition frames, position 0 is the in frame
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameRange {
+    pub in_frame: u64,
+    // the frame playback stops before, None for the end of the composition
+    pub out_frame: Option<u64>,
+}
+
+#[derive(Default)]
+pub struct SourceOptions {
+    pub keys: Option<ContentKeys>,
+    // packages holding the assets a version file takes from its original version, searched after its own package
+    pub other_packages: Vec<PathBuf>,
+    pub range: Option<FrameRange>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeScale {
     Full,
@@ -177,18 +193,8 @@ struct Status {
 type UpdateCallback = Box<dyn Fn() + Send + 'static>;
 
 enum Command {
-    Load(
-        PathBuf,
-        Option<ContentKeys>,
-        Vec<PathBuf>,
-        Sender<Result<(), String>>,
-    ),
-    QueueNext(
-        PathBuf,
-        Option<ContentKeys>,
-        Vec<PathBuf>,
-        Sender<Result<(), String>>,
-    ),
+    Load(PathBuf, SourceOptions, Sender<Result<(), String>>),
+    QueueNext(PathBuf, SourceOptions, Sender<Result<(), String>>),
     ClearQueued,
     Stop,
     SetPaused(bool),
@@ -446,23 +452,34 @@ impl GrokPlayer {
     // ─── transport ─────────────────────────────────────────────────────────
 
     pub fn load(&self, source: &Path, keys: Option<ContentKeys>) -> Result<(), String> {
-        self.load_with_packages(source, keys, &[])
+        self.load_with_options(
+            source,
+            SourceOptions {
+                keys,
+                ..SourceOptions::default()
+            },
+        )
     }
 
-    // other_packages hold the assets a version file takes from its original version, searched after its own package
     pub fn load_with_packages(
         &self,
         source: &Path,
         keys: Option<ContentKeys>,
         other_packages: &[PathBuf],
     ) -> Result<(), String> {
+        self.load_with_options(
+            source,
+            SourceOptions {
+                keys,
+                other_packages: other_packages.to_vec(),
+                range: None,
+            },
+        )
+    }
+
+    pub fn load_with_options(&self, source: &Path, options: SourceOptions) -> Result<(), String> {
         let (reply, answer) = channel();
-        self.send(Command::Load(
-            source.to_path_buf(),
-            keys,
-            other_packages.to_vec(),
-            reply,
-        ))?;
+        self.send(Command::Load(source.to_path_buf(), options, reply))?;
         answer
             .recv()
             .map_err(|_| "the decode thread is gone".to_string())?
@@ -470,7 +487,13 @@ impl GrokPlayer {
 
     // plays straight after the loaded source, a later call replaces it, and load or stop clears it
     pub fn queue_next(&self, source: &Path, keys: Option<ContentKeys>) -> Result<(), String> {
-        self.queue_next_with_packages(source, keys, &[])
+        self.queue_next_with_options(
+            source,
+            SourceOptions {
+                keys,
+                ..SourceOptions::default()
+            },
+        )
     }
 
     pub fn queue_next_with_packages(
@@ -479,13 +502,23 @@ impl GrokPlayer {
         keys: Option<ContentKeys>,
         other_packages: &[PathBuf],
     ) -> Result<(), String> {
+        self.queue_next_with_options(
+            source,
+            SourceOptions {
+                keys,
+                other_packages: other_packages.to_vec(),
+                range: None,
+            },
+        )
+    }
+
+    pub fn queue_next_with_options(
+        &self,
+        source: &Path,
+        options: SourceOptions,
+    ) -> Result<(), String> {
         let (reply, answer) = channel();
-        self.send(Command::QueueNext(
-            source.to_path_buf(),
-            keys,
-            other_packages.to_vec(),
-            reply,
-        ))?;
+        self.send(Command::QueueNext(source.to_path_buf(), options, reply))?;
         answer
             .recv()
             .map_err(|_| "the decode thread is gone".to_string())?

@@ -6,8 +6,8 @@ use asdcplib::{LabelSet, Rational, WriterInfo};
 use postkit::colour::XyzToSrgb;
 use postkit::composition_timeline;
 use postkit::grok_player::{
-    DecodeScale, GrokPlayer, OverlayRectangle, PictureMasks, PictureScaling, PresentationSettings,
-    SubtitlePresentation, SubtitleSlot,
+    DecodeScale, FrameRange, GrokPlayer, OverlayRectangle, PictureMasks, PictureScaling,
+    PresentationSettings, SourceOptions, SubtitlePresentation, SubtitleSlot,
 };
 use postkit::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
 use std::path::{Path, PathBuf};
@@ -1035,6 +1035,226 @@ fn a_queued_source_plays_on_from_the_last_frame_with_no_gap() {
     );
     let last = (DISTINCT_FRAME_COLOURS - FIRST_FRAMES - 1) as f64 / f64::from(FRAMES_PER_SECOND);
     assert_eq!(player.position(), Some(last));
+}
+
+fn ranged(in_frame: u64, out_frame: Option<u64>) -> SourceOptions {
+    SourceOptions {
+        range: Some(FrameRange {
+            in_frame,
+            out_frame,
+        }),
+        ..SourceOptions::default()
+    }
+}
+
+// each colour once as it changes, from play until the end of the last source
+fn colours_played_to_the_end(player: &GrokPlayer, size: usize) -> Vec<[u8; 3]> {
+    let mut shown = vec![shown_colour(player, size, size)];
+    player.set_paused(false);
+    let deadline = Instant::now() + PATIENCE;
+    while !player.eof_reached() {
+        assert!(Instant::now() < deadline, "playback did not reach the end");
+        let colour = shown_colour(player, size, size);
+        if shown.last() != Some(&colour) {
+            shown.push(colour);
+        }
+        std::thread::sleep(POLL);
+    }
+    let last = shown_colour(player, size, size);
+    if shown.last() != Some(&last) {
+        shown.push(last);
+    }
+    shown
+}
+
+// a frame the scheduler woke too late to show may be missing from shown, never out of order
+fn assert_played_in_order(shown: &[[u8; 3]], frames: &[usize]) {
+    let expected: Vec<[u8; 3]> = frames.iter().map(|frame| frame_colour(*frame)).collect();
+    let mut remaining = expected.iter();
+    assert!(
+        shown
+            .iter()
+            .all(|colour| remaining.any(|frame| frame == colour)),
+        "frames {frames:?} did not play once each, in order: {shown:?}"
+    );
+    assert_eq!(shown.first(), expected.first(), "the first frame shown");
+    assert_eq!(shown.last(), expected.last(), "the last frame shown");
+}
+
+#[test]
+fn a_frame_range_plays_from_its_in_frame_to_the_frame_before_its_out_frame() {
+    const SIZE: u32 = 64;
+    const IN_FRAME: u64 = 3;
+    const OUT_FRAME: u64 = 7;
+    let directory = tempfile::tempdir().unwrap();
+    let mxf = flat_mxf(
+        directory.path(),
+        "picture.mxf",
+        SIZE,
+        SIZE,
+        DISTINCT_FRAME_COLOURS,
+    );
+    let (width, height) = (SIZE as usize, SIZE as usize);
+    let player = GrokPlayer::new();
+    player.init_software().unwrap();
+    player
+        .load_with_options(&mxf, ranged(IN_FRAME, Some(OUT_FRAME)))
+        .expect("load the range");
+    wait_until("the first frame was composed", || {
+        player.frame_size().is_some()
+    });
+
+    let fps = f64::from(FRAMES_PER_SECOND);
+    assert_eq!(player.duration(), Some((OUT_FRAME - IN_FRAME) as f64 / fps));
+    assert_eq!(player.position(), Some(0.0));
+    assert_eq!(shown_colour(&player, width, height), frame_colour(3));
+    forget_frames(&player);
+    player.frame_back_step();
+    player.frame_step();
+    wait_for_frame(&player);
+    assert_eq!(
+        shown_colour(&player, width, height),
+        frame_colour(4),
+        "a step back at the in frame left the range"
+    );
+    forget_frames(&player);
+    player.seek_absolute(0.0);
+    wait_for_frame(&player);
+
+    let shown = colours_played_to_the_end(&player, width);
+    assert_played_in_order(&shown, &[3, 4, 5, 6]);
+    assert_eq!(
+        player.position(),
+        Some((OUT_FRAME - IN_FRAME - 1) as f64 / fps)
+    );
+    assert_eq!(dropped_frames_not_decoded(&player), 0);
+
+    forget_frames(&player);
+    player.frame_step();
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        shown_colour(&player, width, height),
+        frame_colour(6),
+        "a step at the last frame of the range went past the out frame"
+    );
+}
+
+#[test]
+fn a_queued_range_takes_over_at_the_out_frame_of_the_range_playing() {
+    const SIZE: u32 = 64;
+    let directory = tempfile::tempdir().unwrap();
+    let mxf = flat_mxf(
+        directory.path(),
+        "picture.mxf",
+        SIZE,
+        SIZE,
+        DISTINCT_FRAME_COLOURS,
+    );
+    let player = GrokPlayer::new();
+    player.init_software().unwrap();
+    player
+        .load_with_options(&mxf, ranged(2, Some(5)))
+        .expect("load the first range");
+    player
+        .queue_next_with_options(&mxf, ranged(6, Some(9)))
+        .expect("queue the second range");
+    wait_until("the first frame was composed", || {
+        player.frame_size().is_some()
+    });
+
+    let shown = colours_played_to_the_end(&player, SIZE as usize);
+
+    assert_played_in_order(&shown, &[2, 3, 4, 6, 7, 8]);
+    assert_eq!(dropped_frames_not_decoded(&player), 0);
+    assert_eq!(
+        player.position(),
+        Some(2.0 / f64::from(FRAMES_PER_SECOND)),
+        "the position counts from the queued range's in frame"
+    );
+}
+
+#[test]
+fn a_subtitle_keeps_its_composition_time_inside_a_range() {
+    const WIDTH: u32 = 320;
+    const HEIGHT: u32 = 180;
+    // the cue runs over composition frames 12 to 17
+    const IN_FRAME: u64 = 12;
+    const FRAMES_PAST_THE_CUE: f64 = 7.0;
+    let directory = tempfile::tempdir().unwrap();
+    let mxf = directory.path().join("picture.mxf");
+    let frames = vec![flat_codestreams(WIDTH, HEIGHT, 1, CINEMA_2K_PROFILE).remove(0); 24];
+    write_mxf(&mxf, &frames, None, WIDTH, HEIGHT);
+    let srt = directory.path().join("cues.srt");
+    std::fs::write(&srt, "1\n00:00:00,500 --> 00:00:00,750\nHELLO THERE\n\n").unwrap();
+    let (width, height) = (WIDTH as usize, HEIGHT as usize);
+    let player = GrokPlayer::new();
+    player.init_software().unwrap();
+    player
+        .load_with_options(&mxf, ranged(IN_FRAME, None))
+        .expect("load the range");
+    wait_until("the first frame was composed", || {
+        player.frame_size().is_some()
+    });
+    let plain = software_frame(&player, width, height);
+
+    forget_frames(&player);
+    player
+        .set_subtitle_file(SubtitleSlot::Subtitle, Some(&srt))
+        .expect("srt loads");
+    wait_for_frame(&player);
+    assert!(
+        !changed_rows(
+            &plain,
+            &software_frame(&player, width, height),
+            width,
+            height
+        )
+        .is_empty(),
+        "the cue did not draw on the in frame, composition frame {IN_FRAME}"
+    );
+
+    forget_frames(&player);
+    player.seek_absolute(FRAMES_PAST_THE_CUE / f64::from(FRAMES_PER_SECOND));
+    wait_for_frame(&player);
+    assert!(
+        changed_rows(
+            &plain,
+            &software_frame(&player, width, height),
+            width,
+            height
+        )
+        .is_empty(),
+        "the cue drew past its end"
+    );
+}
+
+#[test]
+fn a_range_outside_the_composition_fails_naming_its_frames_and_the_length() {
+    const SIZE: u32 = 64;
+    const FRAMES: usize = 6;
+    let directory = tempfile::tempdir().unwrap();
+    let mxf = flat_mxf(directory.path(), "picture.mxf", SIZE, SIZE, FRAMES);
+    let player = GrokPlayer::new();
+    for (range, frames) in [
+        (ranged(2, Some(9)), "frames 2 to 9"),
+        (ranged(4, Some(4)), "frames 4 to 4"),
+        (ranged(6, None), "frames 6 to 6"),
+    ] {
+        let error = player
+            .load_with_options(&mxf, range)
+            .expect_err("the range is refused");
+        assert!(error.contains(frames), "{error}");
+        assert!(error.contains("which is 6 frames long"), "{error}");
+    }
+    player.load(&mxf, None).expect("load the whole composition");
+    let error = player
+        .queue_next_with_options(&mxf, ranged(1, Some(7)))
+        .expect_err("the queued range is refused");
+    assert!(error.contains("frames 1 to 7"), "{error}");
+    assert_eq!(
+        metadata_field(&player, "queued_source"),
+        serde_json::Value::Null
+    );
 }
 
 #[test]

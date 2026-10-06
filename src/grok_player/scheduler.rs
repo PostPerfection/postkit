@@ -9,11 +9,10 @@ use super::compositor::{Compositor, Layers};
 use super::decode_pool::{DecodeJob, DecodePool};
 use super::timeline::Timeline;
 use super::{
-    Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, Rgba8Frame, Shared, Status,
-    SubtitleSlot,
+    Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, Rgba8Frame, Shared,
+    SourceOptions, Status, SubtitleSlot,
 };
 use crate::colour::XyzToSrgb;
-use crate::content_keys::ContentKeys;
 use crate::preview::Display;
 use crate::subtitle_formats::{StyledCue, StyledRun, VAlign};
 
@@ -90,6 +89,14 @@ impl Clock {
             fps,
         }
     }
+}
+
+fn open_timeline(source: &Path, options: &SourceOptions) -> Result<Timeline, String> {
+    let mut timeline = Timeline::open(source, options.keys.as_ref(), &options.other_packages)?;
+    if let Some(range) = options.range {
+        timeline.play_range(range, source)?;
+    }
+    Ok(timeline)
 }
 
 fn frames_to_request(
@@ -352,9 +359,9 @@ impl Scheduler {
             return;
         }
         self.sound_offset_seconds = 0.0;
-        self.sound_loaded =
-            self.sound
-                .load(std::mem::take(&mut next.sound), next.fps, next.frame_count);
+        self.sound_loaded = self
+            .sound
+            .load(std::mem::take(&mut next.sound), next.played_frames());
         if self.sound_loaded && self.playing {
             self.sound.set_playing(true);
         }
@@ -385,7 +392,9 @@ impl Scheduler {
             return;
         };
         let overlay_scale = f64::from(picture.width) / f64::from(timeline.width.max(1));
-        let time_ms = (self.current_frame as f64 / timeline.fps * MILLISECONDS_PER_SECOND) as u64;
+        // subtitle cues are timed from the composition's first frame, not the in frame
+        let composition_frame = timeline.first_frame + self.current_frame;
+        let time_ms = (composition_frame as f64 / timeline.fps * MILLISECONDS_PER_SECOND) as u64;
         let mut cue_tracks: Vec<&[StyledCue]> = Vec::new();
         for track in [&self.subtitle, &self.caption] {
             if track.visible {
@@ -507,15 +516,15 @@ impl Scheduler {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Load(source, keys, other_packages, reply) => {
-                let outcome = self.load(&source, keys, &other_packages);
+            Command::Load(source, options, reply) => {
+                let outcome = self.load(&source, options);
                 // the caller reads duration and size the moment load returns
                 self.publish_status();
                 let _ = reply.send(outcome);
             }
             Command::Stop => self.stop(),
-            Command::QueueNext(source, keys, other_packages, reply) => {
-                let outcome = self.queue_next(source, keys, &other_packages);
+            Command::QueueNext(source, options, reply) => {
+                let outcome = self.queue_next(source, options);
                 self.publish_status();
                 let _ = reply.send(outcome);
             }
@@ -578,21 +587,13 @@ impl Scheduler {
         }
     }
 
-    fn load(
-        &mut self,
-        source: &Path,
-        keys: Option<ContentKeys>,
-        other_packages: &[PathBuf],
-    ) -> Result<(), String> {
+    fn load(&mut self, source: &Path, options: SourceOptions) -> Result<(), String> {
         self.stop();
-        let mut timeline = Timeline::open(source, keys.as_ref(), other_packages)?;
+        let mut timeline = open_timeline(source, &options)?;
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
-        self.sound_loaded = self.sound.load(
-            std::mem::take(&mut timeline.sound),
-            timeline.fps,
-            timeline.frame_count,
-        );
+        let played = timeline.played_frames();
+        self.sound_loaded = self.sound.load(std::mem::take(&mut timeline.sound), played);
         self.sound_offset_seconds = 0.0;
         self.source = Some(source.to_path_buf());
         self.timeline = Some(timeline);
@@ -602,23 +603,16 @@ impl Scheduler {
         Ok(())
     }
 
-    fn queue_next(
-        &mut self,
-        source: PathBuf,
-        keys: Option<ContentKeys>,
-        other_packages: &[PathBuf],
-    ) -> Result<(), String> {
+    fn queue_next(&mut self, source: PathBuf, options: SourceOptions) -> Result<(), String> {
         if self.timeline.is_none() {
             return Err("nothing is loaded for a source to follow".to_string());
         }
-        let mut timeline = Timeline::open(&source, keys.as_ref(), other_packages)?;
+        let mut timeline = open_timeline(&source, &options)?;
         self.clear_queued();
         if self.sound_loaded {
-            self.sound.queue(
-                std::mem::take(&mut timeline.sound),
-                timeline.fps,
-                timeline.frame_count,
-            );
+            let played = timeline.played_frames();
+            self.sound
+                .queue(std::mem::take(&mut timeline.sound), played);
         }
         self.queued = Some(QueuedSource { source, timeline });
         Ok(())

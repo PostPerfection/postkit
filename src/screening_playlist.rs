@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-pub const PLAYLIST_FORMAT_VERSION: u32 = 1;
+pub const PLAYLIST_FORMAT_VERSION: u32 = 2;
+// format 1 has no in and out frames and reads as format 2 without them
+const OLDEST_READ_FORMAT_VERSION: u32 = 1;
 const LOCAL_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 // what an html datetime-local input sends when the seconds are zero
 const LOCAL_TIME_WITHOUT_SECONDS_FORMAT: &str = "%Y-%m-%dT%H:%M";
@@ -42,6 +44,12 @@ pub enum RowItem {
         package_directory: PathBuf,
         cpl_id: Uuid,
         title: String,
+        // the first composition frame played, None for the first frame
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        in_frame: Option<u64>,
+        // the composition frame playback stops before, None for the end
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        out_frame: Option<u64>,
     },
     Intermission {
         seconds: u32,
@@ -75,6 +83,13 @@ pub enum PlaylistWarning {
         package_directory: PathBuf,
         cpl_id: Uuid,
     },
+    // the row plays the part of the range inside the composition
+    RangeOutsideComposition {
+        row: usize,
+        in_frame: u64,
+        out_frame: u64,
+        frame_count: u64,
+    },
     // the row starts late, at the end of the row before or at once for the first row
     StartsBeforeItCan {
         row: usize,
@@ -83,6 +98,12 @@ pub enum PlaylistWarning {
         #[serde(serialize_with = "serialize_local_time")]
         earliest_start: NaiveDateTime,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompositionLength {
+    pub frame_count: u64,
+    pub frames_per_second: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -104,15 +125,16 @@ impl ScreeningPlaylist {
     pub fn read(path: &Path) -> Result<ScreeningPlaylist, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let playlist: ScreeningPlaylist =
+        let mut playlist: ScreeningPlaylist =
             serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
-        if playlist.version != PLAYLIST_FORMAT_VERSION {
+        if !(OLDEST_READ_FORMAT_VERSION..=PLAYLIST_FORMAT_VERSION).contains(&playlist.version) {
             return Err(format!(
-                "{} is playlist format {}, this build reads format {PLAYLIST_FORMAT_VERSION}",
+                "{} is playlist format {}, this build reads formats {OLDEST_READ_FORMAT_VERSION} to {PLAYLIST_FORMAT_VERSION}",
                 path.display(),
                 playlist.version
             ));
         }
+        playlist.version = PLAYLIST_FORMAT_VERSION;
         Ok(playlist)
     }
 
@@ -145,7 +167,7 @@ pub fn plan(
     rows: &[PlaylistRow],
     first_row: usize,
     now: NaiveDateTime,
-    composition_seconds: impl Fn(&Path, Uuid) -> Option<f64>,
+    composition_length: impl Fn(&Path, Uuid) -> Option<CompositionLength>,
 ) -> PlaylistPlan {
     let mut planned = Vec::new();
     let mut warnings = Vec::new();
@@ -168,15 +190,23 @@ pub fn plan(
             RowItem::Composition {
                 package_directory,
                 cpl_id,
+                in_frame,
+                out_frame,
                 ..
-            } => composition_seconds(package_directory, *cpl_id).unwrap_or_else(|| {
-                warnings.push(PlaylistWarning::MissingComposition {
-                    row,
-                    package_directory: package_directory.clone(),
-                    cpl_id: *cpl_id,
-                });
-                0.0
-            }),
+            } => match composition_length(package_directory, *cpl_id) {
+                Some(length) => {
+                    let played = played_frames(row, *in_frame, *out_frame, length, &mut warnings);
+                    played as f64 / length.frames_per_second
+                }
+                None => {
+                    warnings.push(PlaylistWarning::MissingComposition {
+                        row,
+                        package_directory: package_directory.clone(),
+                        cpl_id: *cpl_id,
+                    });
+                    0.0
+                }
+            },
         };
         let expected_end = expected_start + seconds_delta(length_seconds);
         planned.push(RowPlan {
@@ -191,6 +221,28 @@ pub fn plan(
         rows: planned,
         warnings,
     }
+}
+
+// the frames of the range inside the composition
+fn played_frames(
+    row: usize,
+    in_frame: Option<u64>,
+    out_frame: Option<u64>,
+    length: CompositionLength,
+    warnings: &mut Vec<PlaylistWarning>,
+) -> u64 {
+    let in_frame = in_frame.unwrap_or(0);
+    let out_frame = out_frame.unwrap_or(length.frame_count);
+    if in_frame >= out_frame || out_frame > length.frame_count {
+        warnings.push(PlaylistWarning::RangeOutsideComposition {
+            row,
+            in_frame,
+            out_frame,
+            frame_count: length.frame_count,
+        });
+    }
+    let out_frame = out_frame.min(length.frame_count);
+    out_frame.saturating_sub(in_frame)
 }
 
 fn serialize_local_time<S: serde::Serializer>(
@@ -227,6 +279,7 @@ mod optional_local_time {
 mod tests {
     use super::*;
 
+    const FRAMES_PER_SECOND: f64 = 24.0;
     const FEATURE_SECONDS: f64 = 5400.0;
     const TRAILER_SECONDS: f64 = 150.5;
 
@@ -241,8 +294,24 @@ mod tests {
                 package_directory: PathBuf::from(package),
                 cpl_id: Uuid::nil(),
                 title: package.trim_start_matches('/').to_string(),
+                in_frame: None,
+                out_frame: None,
             },
         }
+    }
+
+    fn ranged(package: &str, in_frame: Option<u64>, out_frame: Option<u64>) -> PlaylistRow {
+        let mut row = composition(package, None);
+        if let RowItem::Composition {
+            in_frame: row_in,
+            out_frame: row_out,
+            ..
+        } = &mut row.item
+        {
+            *row_in = in_frame;
+            *row_out = out_frame;
+        }
+        row
     }
 
     fn intermission(seconds: u32, start_time: Option<&str>) -> PlaylistRow {
@@ -255,12 +324,16 @@ mod tests {
         }
     }
 
-    fn library_seconds(package: &Path, _cpl_id: Uuid) -> Option<f64> {
-        match package.to_str()? {
-            "/trailer" => Some(TRAILER_SECONDS),
-            "/feature" => Some(FEATURE_SECONDS),
-            _ => None,
-        }
+    fn library_length(package: &Path, _cpl_id: Uuid) -> Option<CompositionLength> {
+        let seconds = match package.to_str()? {
+            "/trailer" => TRAILER_SECONDS,
+            "/feature" => FEATURE_SECONDS,
+            _ => return None,
+        };
+        Some(CompositionLength {
+            frame_count: (seconds * FRAMES_PER_SECOND) as u64,
+            frames_per_second: FRAMES_PER_SECOND,
+        })
     }
 
     #[test]
@@ -278,6 +351,7 @@ mod tests {
                 },
             },
             composition("/feature", Some("2026-10-06T20:30:00")),
+            ranged("/trailer", Some(48), Some(240)),
         ];
 
         playlist.write(&path).unwrap();
@@ -285,13 +359,35 @@ mod tests {
         assert_eq!(ScreeningPlaylist::read(&path).unwrap(), playlist);
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(json["version"], 1);
+        assert_eq!(json["version"], 2);
         assert_eq!(json["rows"][0]["kind"], "composition");
         assert_eq!(json["rows"][0]["packageDirectory"], "/trailer");
         assert_eq!(json["rows"][0].get("startTime"), None);
         assert_eq!(json["rows"][1]["kind"], "intermission");
         assert_eq!(json["rows"][1]["stillImage"], "/stills/interval.png");
         assert_eq!(json["rows"][2]["startTime"], "2026-10-06T20:30:00");
+        assert_eq!(json["rows"][2].get("inFrame"), None);
+        assert_eq!(json["rows"][3]["inFrame"], 48);
+        assert_eq!(json["rows"][3]["outFrame"], 240);
+    }
+
+    #[test]
+    fn a_format_1_playlist_reads_as_format_2_without_ranges() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("before_ranges.json");
+        std::fs::write(
+            &path,
+            r#"{"version": 1, "name": "Old", "rows": [
+                {"kind": "composition", "packageDirectory": "/trailer",
+                 "cplId": "00000000-0000-0000-0000-000000000000", "title": "trailer"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let playlist = ScreeningPlaylist::read(&path).unwrap();
+
+        assert_eq!(playlist.version, PLAYLIST_FORMAT_VERSION);
+        assert_eq!(playlist.rows, [composition("/trailer", None)]);
     }
 
     #[test]
@@ -328,12 +424,12 @@ mod tests {
     fn a_newer_format_is_refused() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("later.json");
-        std::fs::write(&path, r#"{"version": 2, "name": "Later", "rows": []}"#).unwrap();
+        std::fs::write(&path, r#"{"version": 3, "name": "Later", "rows": []}"#).unwrap();
 
         let error = ScreeningPlaylist::read(&path).unwrap_err();
 
         assert!(
-            error.contains("is playlist format 2, this build reads format 1"),
+            error.contains("is playlist format 3, this build reads formats 1 to 2"),
             "{error}"
         );
     }
@@ -347,7 +443,7 @@ mod tests {
             composition("/feature", None),
         ];
 
-        let plan = plan(&rows, 0, now, library_seconds);
+        let plan = plan(&rows, 0, now, library_length);
 
         assert_eq!(plan.warnings, []);
         let starts: Vec<_> = plan.rows.iter().map(|row| row.expected_start).collect();
@@ -374,7 +470,7 @@ mod tests {
             composition("/feature", Some("2026-10-06T20:00:00")),
         ];
 
-        let plan = plan(&rows, 0, now, library_seconds);
+        let plan = plan(&rows, 0, now, library_length);
 
         assert_eq!(plan.warnings, []);
         assert_eq!(plan.rows[1].expected_start, time("2026-10-06T20:00:00"));
@@ -389,7 +485,7 @@ mod tests {
             composition("/trailer", Some("2026-10-06T20:00:00")),
         ];
 
-        let plan = plan(&rows, 0, now, library_seconds);
+        let plan = plan(&rows, 0, now, library_length);
 
         assert_eq!(
             plan.warnings,
@@ -408,7 +504,7 @@ mod tests {
         let now = time("2026-10-06T19:00:00");
         let rows = [composition("/gone", None), intermission(60, None)];
 
-        let plan = plan(&rows, 0, now, library_seconds);
+        let plan = plan(&rows, 0, now, library_length);
 
         assert_eq!(
             plan.warnings,
@@ -422,11 +518,72 @@ mod tests {
     }
 
     #[test]
+    fn a_ranged_row_lasts_as_long_as_its_range() {
+        let now = time("2026-10-06T19:00:00");
+        let rows = [
+            ranged("/feature", Some(240), Some(720)),
+            ranged("/trailer", Some(3600), None),
+            composition("/trailer", None),
+        ];
+
+        let plan = plan(&rows, 0, now, library_length);
+
+        assert_eq!(plan.warnings, []);
+        // 480 frames is 20 s, then the last 12 frames of the trailer, half a second
+        assert_eq!(plan.rows[1].expected_start, time("2026-10-06T19:00:20"));
+        assert_eq!(
+            plan.rows[2].expected_start,
+            time("2026-10-06T19:00:20") + TimeDelta::milliseconds(500)
+        );
+    }
+
+    #[test]
+    fn a_range_outside_the_composition_is_a_warning_and_plays_the_part_inside() {
+        let now = time("2026-10-06T19:00:00");
+        let trailer_frames = (TRAILER_SECONDS * FRAMES_PER_SECOND) as u64;
+        let rows = [
+            ranged(
+                "/trailer",
+                Some(trailer_frames - 24),
+                Some(trailer_frames + 240),
+            ),
+            ranged("/trailer", Some(100), Some(100)),
+            intermission(60, None),
+        ];
+
+        let plan = plan(&rows, 0, now, library_length);
+
+        assert_eq!(
+            plan.warnings,
+            [
+                PlaylistWarning::RangeOutsideComposition {
+                    row: 0,
+                    in_frame: trailer_frames - 24,
+                    out_frame: trailer_frames + 240,
+                    frame_count: trailer_frames,
+                },
+                PlaylistWarning::RangeOutsideComposition {
+                    row: 1,
+                    in_frame: 100,
+                    out_frame: 100,
+                    frame_count: trailer_frames,
+                },
+            ]
+        );
+        assert_eq!(plan.rows[1].expected_start, time("2026-10-06T19:00:01"));
+        assert_eq!(plan.rows[2].expected_start, time("2026-10-06T19:00:01"));
+        assert_eq!(
+            serde_json::to_value(&plan.warnings[0]).unwrap()["kind"],
+            "rangeOutsideComposition"
+        );
+    }
+
+    #[test]
     fn playing_from_a_later_row_plans_only_that_row_on() {
         let now = time("2026-10-06T19:00:00");
         let rows = [composition("/gone", None), composition("/trailer", None)];
 
-        let plan = plan(&rows, 1, now, library_seconds);
+        let plan = plan(&rows, 1, now, library_length);
 
         assert_eq!(plan.warnings, []);
         assert_eq!(plan.rows.len(), 1);
@@ -441,7 +598,7 @@ mod tests {
             &[composition("/trailer", Some("2026-10-06T18:00:00"))],
             0,
             now,
-            library_seconds,
+            library_length,
         );
 
         let json = serde_json::to_value(&plan).unwrap();

@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 
 use asdcplib::crypto::{AesDecContext, HmacContext};
 
-use super::audio::{self, KeyedSoundSegment};
+use super::FrameRange;
+use super::audio::{self, KeyedSoundSegment, PlayedFrames};
 use crate::composition_timeline::{self, SoundSegment};
 use crate::content_keys::ContentKeys;
 use crate::preview::{self, PictureReader, ResolvedPicture};
@@ -42,6 +43,8 @@ enum Frames {
 pub(super) struct Timeline {
     frames: Frames,
     segment_starts: Vec<u64>,
+    // the composition frame shown at position 0, past it frame_count frames play
+    pub first_frame: u64,
     pub frame_count: u64,
     pub fps: f64,
     pub width: u32,
@@ -139,6 +142,7 @@ impl Timeline {
         );
         Ok(Timeline {
             segment_starts,
+            first_frame: 0,
             frame_count,
             fps,
             width,
@@ -168,6 +172,7 @@ impl Timeline {
         let frame_count = files.len() as u64;
         Ok(Timeline {
             segment_starts: vec![0],
+            first_frame: 0,
             frame_count,
             fps: CODESTREAM_DIRECTORY_FPS,
             width: header.width,
@@ -178,7 +183,32 @@ impl Timeline {
         })
     }
 
+    pub fn play_range(&mut self, range: FrameRange, source: &Path) -> Result<(), String> {
+        let composition_frames = self.frame_count;
+        let out_frame = range.out_frame.unwrap_or(composition_frames);
+        if range.in_frame >= out_frame || out_frame > composition_frames {
+            return Err(format!(
+                "frames {} to {out_frame} are not a range inside {}, which is {composition_frames} frames long",
+                range.in_frame,
+                source.display()
+            ));
+        }
+        self.first_frame = range.in_frame;
+        self.frame_count = out_frame - range.in_frame;
+        Ok(())
+    }
+
+    pub fn played_frames(&self) -> PlayedFrames {
+        PlayedFrames {
+            fps: self.fps,
+            first_frame: self.first_frame,
+            frame_count: self.frame_count,
+        }
+    }
+
+    // frame counts from first_frame
     pub fn codestream(&mut self, frame: u64) -> Result<(Vec<u8>, DisplayRender, PathBuf), String> {
+        let frame = frame + self.first_frame;
         match &mut self.frames {
             Frames::Codestreams { files, render } => {
                 let path = files

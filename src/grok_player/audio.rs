@@ -160,7 +160,23 @@ struct SoundComposition {
     frame_count: u64,
 }
 
+// the composition frames the picture plays, frame 0 of the sound is first_frame of the composition
+#[derive(Clone, Copy)]
+pub(super) struct PlayedFrames {
+    pub fps: f64,
+    pub first_frame: u64,
+    pub frame_count: u64,
+}
+
 impl SoundComposition {
+    fn of(segments: Vec<KeyedSoundSegment>, frames: PlayedFrames) -> Self {
+        SoundComposition {
+            reels: reels_within(reels_of(segments, frames.fps), frames),
+            fps: frames.fps,
+            frame_count: frames.frame_count,
+        }
+    }
+
     fn empty() -> Self {
         SoundComposition {
             reels: Vec::new(),
@@ -288,35 +304,22 @@ impl Output {
     }
 
     // false when the composition has no sound to play
-    pub(super) fn load(
-        &self,
-        segments: Vec<KeyedSoundSegment>,
-        fps: f64,
-        frame_count: u64,
-    ) -> bool {
-        let reels = reels_of(segments, fps);
-        if reels.is_empty() {
+    pub(super) fn load(&self, segments: Vec<KeyedSoundSegment>, frames: PlayedFrames) -> bool {
+        let composition = SoundComposition::of(segments, frames);
+        if composition.reels.is_empty() {
             let _ = self.commands.send(Command::Stop);
             return false;
         }
         self.frames_per_second
-            .store(fps.to_bits(), Ordering::Release);
+            .store(frames.fps.to_bits(), Ordering::Release);
         self.mark_seek(0);
-        let _ = self.commands.send(Command::Load(SoundComposition {
-            reels,
-            fps,
-            frame_count,
-        }));
+        let _ = self.commands.send(Command::Load(composition));
         true
     }
 
     // the feeder plays it straight after the loaded composition, silent if it has no sound
-    pub(super) fn queue(&self, segments: Vec<KeyedSoundSegment>, fps: f64, frame_count: u64) {
-        let composition = SoundComposition {
-            reels: reels_of(segments, fps),
-            fps,
-            frame_count,
-        };
+    pub(super) fn queue(&self, segments: Vec<KeyedSoundSegment>, frames: PlayedFrames) {
+        let composition = SoundComposition::of(segments, frames);
         let _ = self.commands.send(Command::Queue(Some(composition)));
     }
 
@@ -435,6 +438,28 @@ fn reels_of(segments: Vec<KeyedSoundSegment>, fps: f64) -> Vec<SoundReel> {
         first_frame += frames;
     }
     reels
+}
+
+// sound edit units are picture frames, so the cut lands on a frame boundary to the sample
+fn reels_within(reels: Vec<SoundReel>, frames: PlayedFrames) -> Vec<SoundReel> {
+    let end = frames.first_frame + frames.frame_count;
+    reels
+        .into_iter()
+        .filter_map(|reel| {
+            let start = reel.first_frame.max(frames.first_frame);
+            let stop = (reel.first_frame + reel.frame_count).min(end);
+            if start >= stop {
+                return None;
+            }
+            let skipped = u32::try_from(start - reel.first_frame).ok()?;
+            Some(SoundReel {
+                first_frame: start - frames.first_frame,
+                frame_count: stop - start,
+                entry_edit_unit: reel.entry_edit_unit.checked_add(skipped)?,
+                ..reel
+            })
+        })
+        .collect()
 }
 
 fn trim_in_frames(trim: Option<&SegmentTrim>, fps: f64) -> (u32, u64) {
@@ -2168,6 +2193,53 @@ mod tests {
             played == expected,
             "the sound differs from the two compositions end to end"
         );
+    }
+
+    #[test]
+    fn a_frame_range_cuts_the_sound_at_its_frame_boundaries_to_the_sample() {
+        const REEL_EDIT_UNITS: usize = 4;
+        // from the middle of the first reel into the second
+        const FIRST_FRAME: u64 = 2;
+        const FRAME_COUNT: u64 = 4;
+        let directory = tempfile::tempdir().unwrap();
+        let first_samples = ramp(REEL_EDIT_UNITS, 1);
+        let second_samples = ramp(REEL_EDIT_UNITS, 5_000);
+        let segments = [
+            wrapped_samples(directory.path(), "first", 2, None, &first_samples),
+            wrapped_samples(directory.path(), "second", 2, None, &second_samples),
+        ]
+        .into_iter()
+        .map(|path| KeyedSoundSegment {
+            segment: SoundSegment { path, trim: None },
+            key: None,
+        })
+        .collect();
+
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = SoundComposition::of(
+            segments,
+            PlayedFrames {
+                fps: COMPOSITION_FPS,
+                first_frame: FIRST_FRAME,
+                frame_count: FRAME_COUNT,
+            },
+        );
+        feeder.seek(0);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+
+        let samples_per_frame = SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24 * STEREO_CHANNELS;
+        let mut both_reels = first_samples;
+        both_reels.extend(second_samples);
+        let start = FIRST_FRAME as usize * samples_per_frame;
+        let end = (FIRST_FRAME + FRAME_COUNT) as usize * samples_per_frame;
+        let expected = as_played(&both_reels[start..end]);
+        assert_eq!(played.len(), expected.len());
+        assert_eq!(
+            played[..samples_per_frame],
+            expected[..samples_per_frame],
+            "the first frame of sound is not the in frame's"
+        );
+        assert!(played == expected, "the sound inside the range differs");
     }
 
     #[test]
