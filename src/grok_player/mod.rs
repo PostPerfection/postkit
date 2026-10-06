@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::content_keys::ContentKeys;
 
+pub use audio::{MAXIMUM_SOUND_DELAY_MILLISECONDS, SoundOutputLayout, sound_output_device_names};
 pub use presenter::{
     MAXIMUM_BRIGHTNESS, MINIMUM_BRIGHTNESS, PictureMasks, PictureRectangle, PictureScaling,
     PresentationSettings,
@@ -180,6 +181,9 @@ enum Command {
     SetSubtitleFile(SubtitleSlot, Option<PathBuf>, Sender<Result<(), String>>),
     SetSubtitleVisibility(SubtitleSlot, bool),
     SetOverlay(Vec<OverlayRectangle>),
+    SetSoundOutputDevice(Option<String>),
+    SetSoundOutputLayout(SoundOutputLayout),
+    SetSoundDelay(i64),
     Redraw,
     DecodeFinished,
     Shutdown,
@@ -489,6 +493,26 @@ impl GrokPlayer {
             .presentation_changed
             .store(true, Ordering::Release);
         let _ = self.send(Command::Redraw);
+    }
+
+    // ─── sound ─────────────────────────────────────────────────────────────
+
+    // None plays on the default device, as does a name no device has
+    pub fn set_sound_output_device(&self, name: Option<String>) {
+        let _ = self.send(Command::SetSoundOutputDevice(name));
+    }
+
+    pub fn set_sound_output_layout(&self, layout: SoundOutputLayout) {
+        let _ = self.send(Command::SetSoundOutputLayout(layout));
+    }
+
+    // positive delays the sound behind the picture, clamped to MAXIMUM_SOUND_DELAY_MILLISECONDS either way
+    pub fn set_sound_delay_milliseconds(&self, milliseconds: i64) {
+        let clamped = milliseconds.clamp(
+            -MAXIMUM_SOUND_DELAY_MILLISECONDS,
+            MAXIMUM_SOUND_DELAY_MILLISECONDS,
+        );
+        let _ = self.send(Command::SetSoundDelay(clamped));
     }
 
     // ─── subtitles and overlays ────────────────────────────────────────────

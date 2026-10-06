@@ -1,37 +1,152 @@
 //! PCM from a composition's MainSound, and the clock the picture follows.
 //!
 //! Grok's player is picture-only. A DCP still names a sound MXF, so this reads
-//! it with asdcplib and feeds a stereo downmix to the default output device.
+//! it with asdcplib and feeds a stereo downmix or a 5.1 or 7.1 routing to the chosen output device.
 //! Missing sound, a missing device, or a failed stream leaves the picture
 //! running. Encrypted sound with no key for it is the one sound that fails load.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use asdcplib::crypto::AesDecContext;
+use asdcplib::pcm::McaLabelKind;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{SampleFormat, SampleRate, Stream};
+use cpal::{
+    Device, Host, SampleFormat, SampleRate, Stream, SupportedStreamConfig,
+    SupportedStreamConfigRange,
+};
 use zeroize::Zeroize;
 
+use super::MILLISECONDS_PER_SECOND;
 use crate::composition_timeline::{SegmentTrim, SoundSegment};
 use crate::content_keys::ContentKeys;
 
+pub const MAXIMUM_SOUND_DELAY_MILLISECONDS: i64 = 10_000;
+
 const STEREO_CHANNELS: usize = 2;
+const MCA_CHANNEL_TAG_PREFIX: &str = "ch";
 const CENTRE_AND_SURROUND: f32 = 0.707;
 const QUEUED_SOUND_SECONDS: f64 = 0.5;
 const FEED_WAIT: Duration = Duration::from_millis(5);
 const FULL_SCALE_I32: f32 = 2147483648.0;
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SoundOutputLayout {
+    #[default]
+    Stereo,
+    FivePointOne,
+    SevenPointOne,
+    // the widest of the three the device offers
+    Automatic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Speaker {
+    Left,
+    Right,
+    Centre,
+    LowFrequency,
+    LeftSurround,
+    RightSurround,
+    LeftRearSurround,
+    RightRearSurround,
+}
+
+// SMPTE 429-2 channel order as libdcp's Channel enum has it, None for HI, VI-N, sync and motion
+const DEFAULT_DCP_SPEAKERS: [Option<Speaker>; 12] = [
+    Some(Speaker::Left),
+    Some(Speaker::Right),
+    Some(Speaker::Centre),
+    Some(Speaker::LowFrequency),
+    Some(Speaker::LeftSurround),
+    Some(Speaker::RightSurround),
+    None,
+    None,
+    None,
+    None,
+    Some(Speaker::LeftRearSurround),
+    Some(Speaker::RightRearSurround),
+];
+
+// alsa-lib's surround51 and surround71 order, which PipeWire's ALSA plugin also assigns to 6 and 8 channels
+#[cfg(target_os = "linux")]
+const FIVE_POINT_ONE_DEVICE_ORDER: [Speaker; 6] = [
+    Speaker::Left,
+    Speaker::Right,
+    Speaker::LeftSurround,
+    Speaker::RightSurround,
+    Speaker::Centre,
+    Speaker::LowFrequency,
+];
+#[cfg(target_os = "linux")]
+const SEVEN_POINT_ONE_DEVICE_ORDER: [Speaker; 8] = [
+    Speaker::Left,
+    Speaker::Right,
+    Speaker::LeftRearSurround,
+    Speaker::RightRearSurround,
+    Speaker::Centre,
+    Speaker::LowFrequency,
+    Speaker::LeftSurround,
+    Speaker::RightSurround,
+];
+
+// WAVEFORMATEXTENSIBLE speaker mask order
+#[cfg(not(target_os = "linux"))]
+const FIVE_POINT_ONE_DEVICE_ORDER: [Speaker; 6] = [
+    Speaker::Left,
+    Speaker::Right,
+    Speaker::Centre,
+    Speaker::LowFrequency,
+    Speaker::LeftSurround,
+    Speaker::RightSurround,
+];
+#[cfg(not(target_os = "linux"))]
+const SEVEN_POINT_ONE_DEVICE_ORDER: [Speaker; 8] = [
+    Speaker::Left,
+    Speaker::Right,
+    Speaker::Centre,
+    Speaker::LowFrequency,
+    Speaker::LeftRearSurround,
+    Speaker::RightRearSurround,
+    Speaker::LeftSurround,
+    Speaker::RightSurround,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMix {
+    StereoDownmix,
+    Routed(&'static [Speaker]),
+}
+
+impl OutputMix {
+    fn apply(self, source: &[f32], speakers: &[Option<Speaker>], out: &mut Vec<f32>) {
+        match self {
+            OutputMix::StereoDownmix => downmix(source, speakers.len(), out),
+            OutputMix::Routed(device_order) => route(source, speakers, device_order, out),
+        }
+    }
+}
+
+pub fn sound_output_device_names() -> Result<Vec<String>, String> {
+    let devices = cpal::default_host()
+        .output_devices()
+        .map_err(|error| error.to_string())?;
+    Ok(devices.filter_map(|device| device.name().ok()).collect())
+}
+
 enum Command {
     Load(Vec<SoundReel>, f64),
     Seek(u64),
     SetPlaying(bool),
+    SetDevice(Option<String>, Sender<()>),
+    SetLayout(SoundOutputLayout, Sender<()>),
+    SetDelay(i64),
     Stop,
     Shutdown,
 }
@@ -93,6 +208,7 @@ struct Shared {
     stream_live: AtomicBool,
     reels_loaded: AtomicBool,
     device_sample_rate: AtomicU32,
+    output_channels: AtomicUsize,
     seek_frame: AtomicU64,
     emitted_sample_frames: AtomicU64,
     buffer: Mutex<VecDeque<f32>>,
@@ -105,14 +221,19 @@ impl Shared {
             stream_live: AtomicBool::new(false),
             reels_loaded: AtomicBool::new(false),
             device_sample_rate: AtomicU32::new(DEFAULT_SAMPLE_RATE),
+            output_channels: AtomicUsize::new(STEREO_CHANNELS),
             seek_frame: AtomicU64::new(0),
             emitted_sample_frames: AtomicU64::new(0),
             buffer: Mutex::new(VecDeque::new()),
         }
     }
 
+    fn output_channels(&self) -> usize {
+        self.output_channels.load(Ordering::Acquire)
+    }
+
     fn count_emitted(&self, samples: usize) {
-        let sample_frames = (samples / STEREO_CHANNELS) as u64;
+        let sample_frames = (samples / self.output_channels()) as u64;
         self.emitted_sample_frames
             .fetch_add(sample_frames, Ordering::AcqRel);
     }
@@ -192,6 +313,30 @@ impl Output {
     pub(super) fn stop(&self) {
         let _ = self.commands.send(Command::Stop);
     }
+
+    // blocks until the new stream is live for the scheduler's next clock
+    pub(super) fn set_device(&self, name: Option<String>) {
+        let (reply, reopened) = mpsc::channel();
+        if self.commands.send(Command::SetDevice(name, reply)).is_ok() {
+            let _ = reopened.recv();
+        }
+    }
+
+    pub(super) fn set_layout(&self, layout: SoundOutputLayout) {
+        let (reply, reopened) = mpsc::channel();
+        if self
+            .commands
+            .send(Command::SetLayout(layout, reply))
+            .is_ok()
+        {
+            let _ = reopened.recv();
+        }
+    }
+
+    // takes hold at the next seek
+    pub(super) fn set_delay_milliseconds(&self, milliseconds: i64) {
+        let _ = self.commands.send(Command::SetDelay(milliseconds));
+    }
 }
 
 impl Drop for Output {
@@ -243,35 +388,53 @@ fn trim_in_frames(trim: Option<&SegmentTrim>, fps: f64) -> (u32, u64) {
     (entry, frames)
 }
 
-fn start_stream(shared: Arc<Shared>, pcm_sample_rate: u32) -> Option<Stream> {
+struct OpenedStream {
+    stream: Stream,
+    mix: OutputMix,
+}
+
+fn start_stream(
+    shared: Arc<Shared>,
+    pcm_sample_rate: u32,
+    device_name: Option<&str>,
+    layout: SoundOutputLayout,
+) -> Option<OpenedStream> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        try_start_stream(shared, pcm_sample_rate)
+        try_start_stream(shared, pcm_sample_rate, device_name, layout)
     }))
     .ok()
     .flatten()
 }
 
-fn try_start_stream(shared: Arc<Shared>, pcm_sample_rate: u32) -> Option<Stream> {
+fn try_start_stream(
+    shared: Arc<Shared>,
+    pcm_sample_rate: u32,
+    device_name: Option<&str>,
+    layout: SoundOutputLayout,
+) -> Option<OpenedStream> {
     let host = cpal::default_host();
-    let device = host.default_output_device()?;
-    let default = device.default_output_config().ok()?;
-    let supported = device
+    let device = output_device(&host, device_name)?;
+    let ranges: Vec<SupportedStreamConfigRange> = device
         .supported_output_configs()
-        .ok()
-        .and_then(|ranges| {
-            ranges
-                .filter(|range| {
-                    range.channels() >= STEREO_CHANNELS as u16
-                        && matches!(range.sample_format(), SampleFormat::F32 | SampleFormat::I16)
-                })
-                .find_map(|range| range.try_with_sample_rate(SampleRate(pcm_sample_rate)))
-        })
-        .unwrap_or(default);
+        .map(|ranges| ranges.collect())
+        .unwrap_or_default();
+    let (supported, mix) = match surround_config(&ranges, layout, pcm_sample_rate) {
+        Some(surround) => surround,
+        None => (
+            stereo_config(&device, &ranges, pcm_sample_rate)?,
+            OutputMix::StereoDownmix,
+        ),
+    };
     let mut config = supported.config();
-    config.channels = STEREO_CHANNELS as u16;
+    if mix == OutputMix::StereoDownmix {
+        config.channels = STEREO_CHANNELS as u16;
+    }
     shared
         .device_sample_rate
         .store(config.sample_rate.0, Ordering::Release);
+    shared
+        .output_channels
+        .store(usize::from(config.channels), Ordering::Release);
     let playing = Arc::clone(&shared);
     let err_fn = |error| tracing::error!("preview sound: {error}");
     let stream = match supported.sample_format() {
@@ -301,13 +464,105 @@ fn try_start_stream(shared: Arc<Shared>, pcm_sample_rate: u32) -> Option<Stream>
                 tracing::warn!("preview sound: {error}");
                 return None;
             }
-            Some(stream)
+            Some(OpenedStream { stream, mix })
         }
         Err(error) => {
             tracing::warn!("preview sound: {error}");
             None
         }
     }
+}
+
+fn output_device(host: &Host, name: Option<&str>) -> Option<Device> {
+    let Some(name) = name else {
+        return host.default_output_device();
+    };
+    let named = host.output_devices().ok().and_then(|mut devices| {
+        devices.find(|device| device.name().is_ok_and(|device_name| device_name == name))
+    });
+    if named.is_none() {
+        tracing::warn!(
+            "preview sound: output device {name} is missing, playing on the default device"
+        );
+    }
+    named.or_else(|| host.default_output_device())
+}
+
+fn is_writable_format(format: SampleFormat) -> bool {
+    matches!(format, SampleFormat::F32 | SampleFormat::I16)
+}
+
+fn stereo_config(
+    device: &Device,
+    ranges: &[SupportedStreamConfigRange],
+    pcm_sample_rate: u32,
+) -> Option<SupportedStreamConfig> {
+    let default = device.default_output_config().ok()?;
+    let matching = ranges
+        .iter()
+        .filter(|range| {
+            range.channels() >= STEREO_CHANNELS as u16 && is_writable_format(range.sample_format())
+        })
+        .find_map(|range| range.try_with_sample_rate(SampleRate(pcm_sample_rate)));
+    Some(matching.unwrap_or(default))
+}
+
+// None plays the stereo downmix
+fn surround_config(
+    ranges: &[SupportedStreamConfigRange],
+    layout: SoundOutputLayout,
+    pcm_sample_rate: u32,
+) -> Option<(SupportedStreamConfig, OutputMix)> {
+    let order: &'static [Speaker] = match layout {
+        SoundOutputLayout::Stereo => return None,
+        SoundOutputLayout::FivePointOne => &FIVE_POINT_ONE_DEVICE_ORDER,
+        SoundOutputLayout::SevenPointOne => &SEVEN_POINT_ONE_DEVICE_ORDER,
+        SoundOutputLayout::Automatic => match automatic_layout(ranges) {
+            SoundOutputLayout::SevenPointOne => &SEVEN_POINT_ONE_DEVICE_ORDER,
+            SoundOutputLayout::FivePointOne => &FIVE_POINT_ONE_DEVICE_ORDER,
+            _ => return None,
+        },
+    };
+    let offered: Vec<SupportedStreamConfigRange> = ranges
+        .iter()
+        .filter(|range| {
+            usize::from(range.channels()) == order.len()
+                && is_writable_format(range.sample_format())
+        })
+        .copied()
+        .collect();
+    let at_pcm_rate = offered
+        .iter()
+        .find_map(|range| range.try_with_sample_rate(SampleRate(pcm_sample_rate)));
+    let config = at_pcm_rate.or_else(|| {
+        offered
+            .into_iter()
+            .next()
+            .map(SupportedStreamConfigRange::with_max_sample_rate)
+    });
+    let Some(config) = config else {
+        tracing::warn!(
+            "preview sound: the device offers no {} channel output, playing a stereo downmix",
+            order.len()
+        );
+        return None;
+    };
+    Some((config, OutputMix::Routed(order)))
+}
+
+fn automatic_layout(ranges: &[SupportedStreamConfigRange]) -> SoundOutputLayout {
+    let offers = |channels: usize| {
+        ranges.iter().any(|range| {
+            usize::from(range.channels()) == channels && is_writable_format(range.sample_format())
+        })
+    };
+    if offers(SEVEN_POINT_ONE_DEVICE_ORDER.len()) {
+        return SoundOutputLayout::SevenPointOne;
+    }
+    if offers(FIVE_POINT_ONE_DEVICE_ORDER.len()) {
+        return SoundOutputLayout::FivePointOne;
+    }
+    SoundOutputLayout::Stereo
 }
 
 fn write_f32(shared: &Shared, dest: &mut [f32]) {
@@ -349,6 +604,11 @@ struct Feeder {
     pcm_sample_rate: u32,
     resampler: Option<Resampler>,
     stream: Option<Stream>,
+    device_name: Option<String>,
+    layout: SoundOutputLayout,
+    mix: OutputMix,
+    delay_seconds: f64,
+    skipped_source_sample_frames: usize,
 }
 
 struct SoundReader {
@@ -363,6 +623,7 @@ struct AudioLayout {
     bytes_per_edit_unit: usize,
     edit_units: u32,
     sample_rate: u32,
+    speakers: Vec<Option<Speaker>>,
 }
 
 fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
@@ -376,6 +637,11 @@ fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
         pcm_sample_rate: DEFAULT_SAMPLE_RATE,
         resampler: None,
         stream: None,
+        device_name: None,
+        layout: SoundOutputLayout::default(),
+        mix: OutputMix::StereoDownmix,
+        delay_seconds: 0.0,
+        skipped_source_sample_frames: 0,
     };
     loop {
         feeder.fill();
@@ -385,6 +651,19 @@ fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
             Ok(Command::Seek(frame)) => feeder.seek(frame),
             Ok(Command::SetPlaying(playing)) => {
                 feeder.shared.playing.store(playing, Ordering::Release);
+            }
+            Ok(Command::SetDevice(name, reply)) => {
+                feeder.device_name = name;
+                feeder.reopen();
+                let _ = reply.send(());
+            }
+            Ok(Command::SetLayout(layout, reply)) => {
+                feeder.layout = layout;
+                feeder.reopen();
+                let _ = reply.send(());
+            }
+            Ok(Command::SetDelay(milliseconds)) => {
+                feeder.delay_seconds = milliseconds as f64 / MILLISECONDS_PER_SECOND;
             }
             Ok(Command::Stop) => feeder.stop(),
             Err(RecvTimeoutError::Timeout) => {}
@@ -415,24 +694,59 @@ impl Feeder {
         self.pcm_sample_rate = opened.layout.sample_rate;
         self.reader = Some((first.path.clone(), opened));
         self.fps = fps;
-        self.next_frame = 0;
-        self.seek_frame = Some(0);
         self.reels = reels;
         self.shared.reels_loaded.store(true, Ordering::Release);
         if self.stream.is_none() {
-            self.stream = start_stream(Arc::clone(&self.shared), self.pcm_sample_rate);
-            self.shared
-                .stream_live
-                .store(self.stream.is_some(), Ordering::Release);
+            self.open_stream();
+        }
+        self.seek(0);
+    }
+
+    // a device or layout change before the first load waits for that load
+    fn reopen(&mut self) {
+        if self.stream.is_none() && self.reels.is_empty() {
+            return;
+        }
+        self.open_stream();
+    }
+
+    fn open_stream(&mut self) {
+        // an exclusive ALSA device refuses a second stream
+        self.stream = None;
+        self.shared.buffer.lock().unwrap().clear();
+        let opened = start_stream(
+            Arc::clone(&self.shared),
+            self.pcm_sample_rate,
+            self.device_name.as_deref(),
+            self.layout,
+        );
+        self.shared
+            .stream_live
+            .store(opened.is_some(), Ordering::Release);
+        if let Some(opened) = opened {
+            self.stream = Some(opened.stream);
+            self.mix = opened.mix;
         }
         self.reset_resampler();
     }
 
     fn seek(&mut self, frame: u64) {
-        self.next_frame = frame;
         self.seek_frame = Some(frame);
-        self.shared.buffer.lock().unwrap().clear();
         self.reset_resampler();
+        let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
+        let start = sound_start(
+            frame,
+            self.fps,
+            self.delay_seconds,
+            self.pcm_sample_rate,
+            device_rate,
+        );
+        self.next_frame = start.edit_unit;
+        self.skipped_source_sample_frames = start.skipped_source_sample_frames;
+        let silence = start.leading_silence_sample_frames * self.shared.output_channels();
+        let mut buffer = self.shared.buffer.lock().unwrap();
+        buffer.clear();
+        buffer.extend(std::iter::repeat_n(0.0, silence));
     }
 
     fn stop(&mut self) {
@@ -447,9 +761,10 @@ impl Feeder {
 
     fn reset_resampler(&mut self) {
         let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
+        let channels = self.shared.output_channels();
         self.resampler =
             (device_rate > 0 && self.pcm_sample_rate > 0 && device_rate != self.pcm_sample_rate)
-                .then(|| Resampler::new(self.pcm_sample_rate, device_rate));
+                .then(|| Resampler::new(self.pcm_sample_rate, device_rate, channels));
     }
 
     fn fill(&mut self) {
@@ -460,7 +775,8 @@ impl Feeder {
             return;
         }
         let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
-        let high_water = (f64::from(device_rate) * QUEUED_SOUND_SECONDS) as usize * STEREO_CHANNELS;
+        let high_water = (f64::from(device_rate) * QUEUED_SOUND_SECONDS) as usize
+            * self.shared.output_channels();
         loop {
             let queued = self.shared.buffer.lock().unwrap().len();
             if queued >= high_water {
@@ -478,8 +794,14 @@ impl Feeder {
             return;
         }
         let played = self.shared.emitted_sample_frames.load(Ordering::Acquire);
-        let sample_frames = played + (queued / STEREO_CHANNELS) as u64;
-        let reached = frame_at_queue_end(seek_frame, sample_frames, self.fps, device_rate);
+        let sample_frames = played + (queued / self.shared.output_channels()) as u64;
+        let reached = frame_at_queue_end(
+            seek_frame,
+            sample_frames,
+            self.fps,
+            device_rate,
+            self.delay_seconds,
+        );
         if self.next_frame >= reached {
             return;
         }
@@ -488,6 +810,7 @@ impl Feeder {
             self.next_frame
         );
         self.next_frame = reached;
+        self.skipped_source_sample_frames = 0;
     }
 
     fn push_edit_unit(&mut self) -> bool {
@@ -519,15 +842,19 @@ impl Feeder {
             layout.bits,
             &mut interleaved,
         );
-        let mut stereo = Vec::new();
-        downmix(&interleaved, layout.channels as usize, &mut stereo);
+        let skipped =
+            (self.skipped_source_sample_frames * layout.channels as usize).min(interleaved.len());
+        interleaved.drain(..skipped);
+        self.skipped_source_sample_frames = 0;
+        let mut mixed = Vec::new();
+        self.mix.apply(&interleaved, &layout.speakers, &mut mixed);
         let device_samples = match self.resampler.as_mut() {
             Some(resampler) => {
                 let mut resampled = Vec::new();
-                resampler.push(&stereo, &mut resampled);
+                resampler.push(&mixed, &mut resampled);
                 resampled
             }
-            None => stereo,
+            None => mixed,
         };
         self.shared.buffer.lock().unwrap().extend(device_samples);
         self.next_frame += 1;
@@ -572,42 +899,96 @@ impl Feeder {
     }
 }
 
-fn frame_at_queue_end(seek_frame: u64, sample_frames: u64, fps: f64, sample_rate: u32) -> u64 {
+// the sound edit unit the device reaches once it has played sample_frames past the seek
+fn frame_at_queue_end(
+    seek_frame: u64,
+    sample_frames: u64,
+    fps: f64,
+    sample_rate: u32,
+    delay_seconds: f64,
+) -> u64 {
     if fps <= 0.0 || sample_rate == 0 {
         return seek_frame;
     }
     let played = sample_frames as f64 * fps / f64::from(sample_rate);
-    seek_frame + played.floor().max(0.0) as u64
+    (seek_frame as f64 + played - delay_seconds * fps)
+        .floor()
+        .max(0.0) as u64
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SoundStart {
+    leading_silence_sample_frames: usize,
+    edit_unit: u64,
+    skipped_source_sample_frames: usize,
+}
+
+// the sound under a picture frame is delay_seconds earlier in the composition
+fn sound_start(
+    seek_frame: u64,
+    fps: f64,
+    delay_seconds: f64,
+    source_rate: u32,
+    device_rate: u32,
+) -> SoundStart {
+    if fps <= 0.0 {
+        return SoundStart {
+            leading_silence_sample_frames: 0,
+            edit_unit: seek_frame,
+            skipped_source_sample_frames: 0,
+        };
+    }
+    let start_frames = seek_frame as f64 - delay_seconds * fps;
+    if start_frames < 0.0 {
+        let silence_seconds = -start_frames / fps;
+        return SoundStart {
+            leading_silence_sample_frames: (silence_seconds * f64::from(device_rate)).round()
+                as usize,
+            edit_unit: 0,
+            skipped_source_sample_frames: 0,
+        };
+    }
+    let edit_unit = start_frames.floor();
+    let into_edit_unit_seconds = (start_frames - edit_unit) / fps;
+    SoundStart {
+        leading_silence_sample_frames: 0,
+        edit_unit: edit_unit as u64,
+        skipped_source_sample_frames: (into_edit_unit_seconds * f64::from(source_rate)).round()
+            as usize,
+    }
 }
 
 struct Resampler {
     step: f64,
     position: f64,
-    carry: [f32; STEREO_CHANNELS],
+    channels: usize,
+    carry: Vec<f32>,
 }
 
 impl Resampler {
-    fn new(source_rate: u32, device_rate: u32) -> Self {
+    fn new(source_rate: u32, device_rate: u32, channels: usize) -> Self {
         Resampler {
             step: f64::from(source_rate) / f64::from(device_rate),
             position: 0.0,
-            carry: [0.0; STEREO_CHANNELS],
+            channels,
+            carry: vec![0.0; channels],
         }
     }
 
-    fn push(&mut self, stereo: &[f32], out: &mut Vec<f32>) {
-        let sample_frames = stereo.len() / STEREO_CHANNELS;
+    fn push(&mut self, samples: &[f32], out: &mut Vec<f32>) {
+        let channels = self.channels;
+        let sample_frames = samples.len() / channels;
         if sample_frames == 0 {
             return;
         }
-        let carry = self.carry;
+        let carry = std::mem::take(&mut self.carry);
         // the frame before this block, so a partial step carries across blocks
-        let frame = |index: f64| -> [f32; STEREO_CHANNELS] {
+        let frame = |index: f64| -> &[f32] {
             if index < 0.0 {
-                return carry;
+                return &carry;
             }
-            let start = index as usize * STEREO_CHANNELS;
-            [stereo[start], stereo[start + 1]]
+            let start = index as usize * channels;
+            &samples[start..start + channels]
         };
         let last = sample_frames as f64 - 1.0;
         while self.position < last {
@@ -615,11 +996,12 @@ impl Resampler {
             let fraction = (self.position - base) as f32;
             let before = frame(base);
             let after = frame(base + 1.0);
-            out.push(before[0] + (after[0] - before[0]) * fraction);
-            out.push(before[1] + (after[1] - before[1]) * fraction);
+            for (before, after) in before.iter().zip(after) {
+                out.push(before + (after - before) * fraction);
+            }
             self.position += self.step;
         }
-        self.carry = frame(last);
+        self.carry = frame(last).to_vec();
         self.position -= sample_frames as f64;
     }
 }
@@ -639,6 +1021,7 @@ fn open_reader(path: &Path, key: Option<&SoundContentKey>) -> Result<SoundReader
     if descriptor.channel_count == 0 || descriptor.block_align == 0 {
         return Err(format!("{} names no pcm", path.display()));
     }
+    let speakers = source_speakers(&mut reader, descriptor.channel_count as usize);
     let decrypt = match key {
         Some(SoundContentKey(key)) => {
             let mut decrypt = AesDecContext::new();
@@ -658,9 +1041,61 @@ fn open_reader(path: &Path, key: Option<&SoundContentKey>) -> Result<SoundReader
                 * frames_per_edit_unit(&descriptor) as usize,
             edit_units: descriptor.container_duration,
             sample_rate: sample_rate_of(&descriptor),
+            speakers,
         },
         decrypt,
     })
+}
+
+// a file with no MCA channel labels is taken to be in the default DCP order
+fn source_speakers(reader: &mut asdcplib::pcm::MxfReader, channels: usize) -> Vec<Option<Speaker>> {
+    let labels = reader.mca_label_subdescriptors().unwrap_or_else(|error| {
+        tracing::warn!("preview sound: MCA labels unreadable, assuming the default order: {error}");
+        Vec::new()
+    });
+    let labelled: Vec<(usize, Option<Speaker>)> = labels
+        .into_iter()
+        .filter(|label| label.kind == McaLabelKind::AudioChannel)
+        .filter_map(|label| {
+            let index = label.channel_id?.checked_sub(1)? as usize;
+            Some((index, speaker_of_mca_tag(&label.tag_symbol)))
+        })
+        .collect();
+    if labelled.is_empty() {
+        return default_dcp_speakers(channels);
+    }
+    let mut speakers = vec![None; channels];
+    for (index, speaker) in labelled {
+        if let Some(slot) = speakers.get_mut(index) {
+            *slot = speaker;
+        }
+    }
+    speakers
+}
+
+fn default_dcp_speakers(channels: usize) -> Vec<Option<Speaker>> {
+    (0..channels)
+        .map(|channel| DEFAULT_DCP_SPEAKERS.get(channel).copied().flatten())
+        .collect()
+}
+
+// the symbols libdcp's mca_id_to_channel reads
+fn speaker_of_mca_tag(tag_symbol: &str) -> Option<Speaker> {
+    let symbol = tag_symbol
+        .strip_prefix(MCA_CHANNEL_TAG_PREFIX)
+        .unwrap_or(tag_symbol)
+        .to_ascii_lowercase();
+    match symbol.as_str() {
+        "l" => Some(Speaker::Left),
+        "r" => Some(Speaker::Right),
+        "c" => Some(Speaker::Centre),
+        "lfe" => Some(Speaker::LowFrequency),
+        "ls" | "lss" => Some(Speaker::LeftSurround),
+        "rs" | "rss" => Some(Speaker::RightSurround),
+        "lrs" | "lsr" => Some(Speaker::LeftRearSurround),
+        "rrs" | "rsr" => Some(Speaker::RightRearSurround),
+        _ => None,
+    }
 }
 
 fn sample_rate_of(descriptor: &asdcplib::pcm::AudioDescriptor) -> u32 {
@@ -730,6 +1165,44 @@ fn downmix(src: &[f32], channels: usize, stereo: &mut Vec<f32>) {
     }
 }
 
+fn route(
+    source: &[f32],
+    speakers: &[Option<Speaker>],
+    device_order: &[Speaker],
+    out: &mut Vec<f32>,
+) {
+    if speakers.is_empty() {
+        return;
+    }
+    let outputs: Vec<Option<usize>> = speakers
+        .iter()
+        .map(|speaker| speaker.and_then(|speaker| device_position(speaker, device_order)))
+        .collect();
+    for frame in source.chunks_exact(speakers.len()) {
+        let start = out.len();
+        out.resize(start + device_order.len(), 0.0);
+        let device_frame = &mut out[start..];
+        for (sample, output) in frame.iter().zip(&outputs) {
+            if let Some(output) = output {
+                device_frame[*output] += sample;
+            }
+        }
+        for sample in device_frame {
+            *sample = sample.clamp(-1.0, 1.0);
+        }
+    }
+}
+
+// a 5.1 device has no rear surrounds
+fn device_position(speaker: Speaker, device_order: &[Speaker]) -> Option<usize> {
+    let position = |wanted: Speaker| device_order.iter().position(|placed| *placed == wanted);
+    position(speaker).or_else(|| match speaker {
+        Speaker::LeftRearSurround => position(Speaker::LeftSurround),
+        Speaker::RightRearSurround => position(Speaker::RightSurround),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::timeline::Timeline;
@@ -750,6 +1223,7 @@ mod tests {
     const PICTURE_ID: &str = "11111111-1111-4111-8111-111111111111";
     const SOUND_ID: &str = "55555555-5555-4555-8555-555555555555";
     const PICTURE_SIZE: u32 = 64;
+    const NO_DELAY: f64 = 0.0;
 
     fn sample(index: usize) -> i16 {
         const SAMPLE_STEP: usize = 37;
@@ -934,13 +1408,13 @@ mod tests {
 
     #[test]
     fn the_queue_end_is_where_the_device_will_be() {
-        assert_eq!(frame_at_queue_end(100, 0, 24.0, 48_000), 100);
+        assert_eq!(frame_at_queue_end(100, 0, 24.0, 48_000, NO_DELAY), 100);
         // one edit unit of 24 fps sound is 2000 sample frames
-        assert_eq!(frame_at_queue_end(100, 2_000, 24.0, 48_000), 101);
-        assert_eq!(frame_at_queue_end(100, 1_999, 24.0, 48_000), 100);
-        assert_eq!(frame_at_queue_end(100, 96_000, 24.0, 48_000), 148);
-        assert_eq!(frame_at_queue_end(100, 96_000, 0.0, 48_000), 100);
-        assert_eq!(frame_at_queue_end(100, 96_000, 24.0, 0), 100);
+        assert_eq!(frame_at_queue_end(100, 2_000, 24.0, 48_000, NO_DELAY), 101);
+        assert_eq!(frame_at_queue_end(100, 1_999, 24.0, 48_000, NO_DELAY), 100);
+        assert_eq!(frame_at_queue_end(100, 96_000, 24.0, 48_000, NO_DELAY), 148);
+        assert_eq!(frame_at_queue_end(100, 96_000, 0.0, 48_000, NO_DELAY), 100);
+        assert_eq!(frame_at_queue_end(100, 96_000, 24.0, 0, NO_DELAY), 100);
     }
 
     #[test]
@@ -963,7 +1437,7 @@ mod tests {
 
     #[test]
     fn halving_the_rate_takes_every_other_sample_frame() {
-        let mut resampler = Resampler::new(48_000, 24_000);
+        let mut resampler = Resampler::new(48_000, 24_000, STEREO_CHANNELS);
         let source = [0.0, 10.0, 1.0, 11.0, 2.0, 12.0, 3.0, 13.0];
         let mut out = Vec::new();
         resampler.push(&source, &mut out);
@@ -972,7 +1446,7 @@ mod tests {
 
     #[test]
     fn doubling_the_rate_interpolates_between_sample_frames() {
-        let mut resampler = Resampler::new(24_000, 48_000);
+        let mut resampler = Resampler::new(24_000, 48_000, STEREO_CHANNELS);
         let source = [0.0, 0.0, 1.0, -1.0];
         let mut out = Vec::new();
         resampler.push(&source, &mut out);
@@ -981,7 +1455,7 @@ mod tests {
 
     #[test]
     fn the_resampler_carries_a_partial_step_into_the_next_block() {
-        let mut resampler = Resampler::new(48_000, 32_000);
+        let mut resampler = Resampler::new(48_000, 32_000, STEREO_CHANNELS);
         let first = [0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
         let mut out = Vec::new();
         resampler.push(&first, &mut out);
@@ -994,7 +1468,7 @@ mod tests {
 
     #[test]
     fn the_resampler_emits_about_the_device_rate() {
-        let mut resampler = Resampler::new(48_000, 44_100);
+        let mut resampler = Resampler::new(48_000, 44_100, STEREO_CHANNELS);
         let block: Vec<f32> = (0..4_000).map(|index| index as f32).collect();
         let mut out = Vec::new();
         for _ in 0..24 {
@@ -1005,5 +1479,392 @@ mod tests {
             (emitted - 44_100).abs() <= 2,
             "a second of 48 kHz sound became {emitted} sample frames"
         );
+    }
+
+    // channel n holds n / 64, exact in f32
+    fn numbered_frame(channels: usize) -> Vec<f32> {
+        const STEP: f32 = 64.0;
+        (1..=channels)
+            .map(|channel| channel as f32 / STEP)
+            .collect()
+    }
+
+    fn numbered(channel: usize) -> f32 {
+        numbered_frame(channel)[channel - 1]
+    }
+
+    const ALSA_FIVE_POINT_ONE: [Speaker; 6] = [
+        Speaker::Left,
+        Speaker::Right,
+        Speaker::LeftSurround,
+        Speaker::RightSurround,
+        Speaker::Centre,
+        Speaker::LowFrequency,
+    ];
+    const ALSA_SEVEN_POINT_ONE: [Speaker; 8] = [
+        Speaker::Left,
+        Speaker::Right,
+        Speaker::LeftRearSurround,
+        Speaker::RightRearSurround,
+        Speaker::Centre,
+        Speaker::LowFrequency,
+        Speaker::LeftSurround,
+        Speaker::RightSurround,
+    ];
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_devices_take_the_alsa_channel_order() {
+        assert_eq!(FIVE_POINT_ONE_DEVICE_ORDER, ALSA_FIVE_POINT_ONE);
+        assert_eq!(SEVEN_POINT_ONE_DEVICE_ORDER, ALSA_SEVEN_POINT_ONE);
+    }
+
+    #[test]
+    fn sixteen_channels_route_to_seven_point_one_by_label() {
+        let mut out = Vec::new();
+        route(
+            &numbered_frame(16),
+            &default_dcp_speakers(16),
+            &ALSA_SEVEN_POINT_ONE,
+            &mut out,
+        );
+        // HI, VI-N, sync, motion and sign language play nowhere
+        let expected = [1, 2, 11, 12, 3, 4, 5, 6].map(numbered);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn sixteen_channels_on_five_point_one_fold_the_rears_into_the_surrounds() {
+        let mut out = Vec::new();
+        route(
+            &numbered_frame(16),
+            &default_dcp_speakers(16),
+            &ALSA_FIVE_POINT_ONE,
+            &mut out,
+        );
+        let expected = [
+            numbered(1),
+            numbered(2),
+            numbered(5) + numbered(11),
+            numbered(6) + numbered(12),
+            numbered(3),
+            numbered(4),
+        ];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn six_channels_route_to_five_point_one() {
+        let mut out = Vec::new();
+        route(
+            &numbered_frame(6),
+            &default_dcp_speakers(6),
+            &ALSA_FIVE_POINT_ONE,
+            &mut out,
+        );
+        assert_eq!(out, [1, 2, 5, 6, 3, 4].map(numbered));
+    }
+
+    #[test]
+    fn six_channels_on_seven_point_one_leave_the_rears_silent() {
+        let mut out = Vec::new();
+        route(
+            &numbered_frame(6),
+            &default_dcp_speakers(6),
+            &ALSA_SEVEN_POINT_ONE,
+            &mut out,
+        );
+        let expected = [
+            numbered(1),
+            numbered(2),
+            0.0,
+            0.0,
+            numbered(3),
+            numbered(4),
+            numbered(5),
+            numbered(6),
+        ];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn routing_keeps_sample_frames_apart() {
+        let speakers = default_dcp_speakers(2);
+        let mut out = Vec::new();
+        route(
+            &[0.25, -0.25, 0.5, -0.5],
+            &speakers,
+            &ALSA_FIVE_POINT_ONE,
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            [
+                0.25, -0.25, 0.0, 0.0, 0.0, 0.0, 0.5, -0.5, 0.0, 0.0, 0.0, 0.0
+            ]
+        );
+    }
+
+    #[test]
+    fn the_stereo_mix_is_the_downmix_whatever_the_labels_say() {
+        let source = numbered_frame(16);
+        let mut stereo = Vec::new();
+        OutputMix::StereoDownmix.apply(&source, &default_dcp_speakers(16), &mut stereo);
+        let centre = CENTRE_AND_SURROUND * numbered(3);
+        let left = numbered(1) + centre + CENTRE_AND_SURROUND * numbered(5);
+        let right = numbered(2) + centre + CENTRE_AND_SURROUND * numbered(6);
+        assert_eq!(stereo, [left, right]);
+    }
+
+    #[test]
+    fn mca_tags_name_their_speakers() {
+        assert_eq!(speaker_of_mca_tag("chL"), Some(Speaker::Left));
+        assert_eq!(speaker_of_mca_tag("chLFE"), Some(Speaker::LowFrequency));
+        assert_eq!(speaker_of_mca_tag("chLss"), Some(Speaker::LeftSurround));
+        assert_eq!(
+            speaker_of_mca_tag("chRrs"),
+            Some(Speaker::RightRearSurround)
+        );
+        assert_eq!(speaker_of_mca_tag("chHI"), None);
+        assert_eq!(speaker_of_mca_tag("chVIN"), None);
+    }
+
+    fn wrapped_sound(directory: &Path, channels: u16, labels: Option<&str>) -> PathBuf {
+        let wav = directory.join("sound.wav");
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            bits_per_sample: SOUND_BITS,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+        for _ in 0..DEFAULT_SAMPLE_RATE as usize * usize::from(channels) {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+        let output = directory.join("sound.mxf");
+        let track = mxf_wrap(&MxfWrapOptions {
+            input_files: vec![wav],
+            output: output.clone(),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::AsDcp,
+            fps_num: EDIT_UNITS_PER_SECOND,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: labels.map(|labels| crate::mxf_wrap::McaConfig {
+                labels: labels.to_string(),
+                spoken_language: None,
+                soundfield_group: None,
+            }),
+            resource_ids: Vec::new(),
+            hdr: None,
+            asset_uuid: None,
+            timed_text_duration_frames: None,
+        });
+        assert!(track.success, "sound wrap failed: {}", track.error);
+        output
+    }
+
+    #[test]
+    fn the_feeder_reads_speakers_from_the_mca_labels() {
+        let directory = tempfile::tempdir().unwrap();
+        let labels = crate::mca::soundfield_to_mca_config(&crate::mca::soundfield_71()).unwrap();
+        let sound = wrapped_sound(directory.path(), 8, Some(&labels));
+        let opened = open_reader(&sound, None).unwrap();
+        // the default order would make channels 7 and 8 HI and VI-N
+        assert_eq!(
+            opened.layout.speakers,
+            [
+                Speaker::Left,
+                Speaker::Right,
+                Speaker::Centre,
+                Speaker::LowFrequency,
+                Speaker::LeftSurround,
+                Speaker::RightSurround,
+                Speaker::LeftRearSurround,
+                Speaker::RightRearSurround,
+            ]
+            .map(Some)
+        );
+    }
+
+    #[test]
+    fn unlabelled_sound_takes_the_default_dcp_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let sound = wrapped_sound(directory.path(), 8, None);
+        let opened = open_reader(&sound, None).unwrap();
+        assert_eq!(opened.layout.speakers, default_dcp_speakers(8));
+        assert_eq!(opened.layout.speakers[6], None, "channel 7 is HI");
+    }
+
+    fn offered(channels: u16, format: SampleFormat) -> SupportedStreamConfigRange {
+        SupportedStreamConfigRange::new(
+            channels,
+            SampleRate(44_100),
+            SampleRate(DEFAULT_SAMPLE_RATE),
+            cpal::SupportedBufferSize::Unknown,
+            format,
+        )
+    }
+
+    #[test]
+    fn automatic_takes_the_widest_layout_the_device_offers() {
+        let stereo = offered(2, SampleFormat::F32);
+        let six = offered(6, SampleFormat::I16);
+        let eight = offered(8, SampleFormat::F32);
+        assert_eq!(
+            automatic_layout(&[stereo, six, eight]),
+            SoundOutputLayout::SevenPointOne
+        );
+        assert_eq!(
+            automatic_layout(&[stereo, six]),
+            SoundOutputLayout::FivePointOne
+        );
+        assert_eq!(automatic_layout(&[stereo]), SoundOutputLayout::Stereo);
+        assert_eq!(automatic_layout(&[]), SoundOutputLayout::Stereo);
+        // the feeder writes only f32 and i16
+        assert_eq!(
+            automatic_layout(&[stereo, offered(8, SampleFormat::U8)]),
+            SoundOutputLayout::Stereo
+        );
+    }
+
+    #[test]
+    fn a_surround_layout_opens_with_its_channel_count() {
+        let ranges = [offered(2, SampleFormat::F32), offered(6, SampleFormat::F32)];
+        let (config, mix) = surround_config(
+            &ranges,
+            SoundOutputLayout::FivePointOne,
+            DEFAULT_SAMPLE_RATE,
+        )
+        .unwrap();
+        assert_eq!(config.channels(), 6);
+        assert_eq!(config.sample_rate(), SampleRate(DEFAULT_SAMPLE_RATE));
+        assert_eq!(mix, OutputMix::Routed(&FIVE_POINT_ONE_DEVICE_ORDER));
+        // a rate the device lacks opens at its highest
+        let (config, _) =
+            surround_config(&ranges, SoundOutputLayout::FivePointOne, 96_000).unwrap();
+        assert_eq!(config.sample_rate(), SampleRate(DEFAULT_SAMPLE_RATE));
+    }
+
+    #[test]
+    fn a_layout_the_device_lacks_plays_the_stereo_downmix() {
+        let ranges = [offered(2, SampleFormat::F32), offered(6, SampleFormat::F32)];
+        assert!(
+            surround_config(
+                &ranges,
+                SoundOutputLayout::SevenPointOne,
+                DEFAULT_SAMPLE_RATE
+            )
+            .is_none()
+        );
+        assert!(surround_config(&ranges, SoundOutputLayout::Stereo, DEFAULT_SAMPLE_RATE).is_none());
+        let (config, _) =
+            surround_config(&ranges, SoundOutputLayout::Automatic, DEFAULT_SAMPLE_RATE).unwrap();
+        assert_eq!(config.channels(), 6);
+    }
+
+    #[test]
+    fn a_delayed_sound_starts_earlier_in_the_composition() {
+        // 250 ms at 24 fps is 6 edit units
+        assert_eq!(
+            sound_start(48, 24.0, 0.25, 48_000, 48_000),
+            SoundStart {
+                leading_silence_sample_frames: 0,
+                edit_unit: 42,
+                skipped_source_sample_frames: 0,
+            }
+        );
+        // an advanced sound starts later
+        assert_eq!(sound_start(48, 24.0, -0.5, 48_000, 48_000).edit_unit, 60);
+        assert_eq!(
+            sound_start(48, 24.0, NO_DELAY, 48_000, 48_000),
+            SoundStart {
+                leading_silence_sample_frames: 0,
+                edit_unit: 48,
+                skipped_source_sample_frames: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn a_delay_inside_an_edit_unit_skips_source_samples() {
+        // 10 ms back from frame 48 is 0.76 of edit unit 47, 1520 sample frames into it at 48 kHz
+        assert_eq!(
+            sound_start(48, 24.0, 0.01, 48_000, 44_100),
+            SoundStart {
+                leading_silence_sample_frames: 0,
+                edit_unit: 47,
+                skipped_source_sample_frames: 1_520,
+            }
+        );
+    }
+
+    #[test]
+    fn a_delay_before_the_first_frame_plays_silence_at_the_device_rate() {
+        assert_eq!(
+            sound_start(0, 24.0, 0.1, 48_000, 44_100),
+            SoundStart {
+                leading_silence_sample_frames: 4_410,
+                edit_unit: 0,
+                skipped_source_sample_frames: 0,
+            }
+        );
+        // frame 1 is 41.7 ms in, so 58.3 ms of silence is left
+        assert_eq!(
+            sound_start(1, 24.0, 0.1, 48_000, 48_000).leading_silence_sample_frames,
+            2_800
+        );
+    }
+
+    #[test]
+    fn the_picture_runs_the_delay_ahead_of_the_sound_it_plays_over() {
+        let (seek_frame, fps, sample_rate, delay) = (48, 24.0, 48_000, 0.25);
+        let played_sample_frames = 24_000;
+        let picture_seconds =
+            seek_frame as f64 / fps + played_sample_frames as f64 / f64::from(sample_rate);
+        let sound_edit_unit =
+            frame_at_queue_end(seek_frame, played_sample_frames, fps, sample_rate, delay);
+        assert_eq!(picture_seconds, 2.5);
+        assert_eq!(sound_edit_unit as f64 / fps, picture_seconds - delay);
+        // at the seek itself the device is on the edit unit the feeder starts from
+        let start = sound_start(seek_frame, fps, delay, sample_rate, sample_rate);
+        assert_eq!(
+            frame_at_queue_end(seek_frame, 0, fps, sample_rate, delay),
+            start.edit_unit
+        );
+    }
+
+    #[test]
+    fn leading_silence_holds_the_queue_end_at_the_first_edit_unit() {
+        let start = sound_start(0, 24.0, 2.0, 48_000, 48_000);
+        assert_eq!(start.leading_silence_sample_frames, 96_000);
+        let silence = start.leading_silence_sample_frames as u64;
+        assert_eq!(frame_at_queue_end(0, silence / 2, 24.0, 48_000, 2.0), 0);
+        assert_eq!(frame_at_queue_end(0, silence, 24.0, 48_000, 2.0), 0);
+        assert_eq!(frame_at_queue_end(0, silence + 2_000, 24.0, 48_000, 2.0), 1);
+    }
+
+    #[test]
+    fn the_resampler_keeps_six_channels_apart() {
+        let mut resampler = Resampler::new(48_000, 24_000, 6);
+        let source: Vec<f32> = (0..24).map(|index| index as f32).collect();
+        let mut out = Vec::new();
+        resampler.push(&source, &mut out);
+        assert_eq!(
+            out,
+            [
+                0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "needs a sound device"]
+    fn lists_the_output_devices() {
+        let names = sound_output_device_names().unwrap();
+        eprintln!("output devices: {names:#?}");
+        assert!(!names.is_empty());
     }
 }

@@ -404,6 +404,18 @@ impl Scheduler {
                 self.overlays = rectangles;
                 self.recompose();
             }
+            Command::SetSoundOutputDevice(name) => {
+                self.sound.set_device(name);
+                self.restart_sound();
+            }
+            Command::SetSoundOutputLayout(layout) => {
+                self.sound.set_layout(layout);
+                self.restart_sound();
+            }
+            Command::SetSoundDelay(milliseconds) => {
+                self.sound.set_delay_milliseconds(milliseconds);
+                self.restart_sound();
+            }
             Command::Redraw => self.shared.fire_update(),
             Command::DecodeFinished => {}
             Command::Shutdown => {}
@@ -461,6 +473,17 @@ impl Scheduler {
         }
         if self.playing {
             // otherwise the refill stall counts as dropped frames
+            self.clock = Some(self.new_clock());
+        }
+    }
+
+    // the sound starts again under the frame on screen, and the picture clock with it
+    fn restart_sound(&mut self) {
+        if self.timeline.is_none() {
+            return;
+        }
+        self.sound.seek(self.current_frame);
+        if self.playing {
             self.clock = Some(self.new_clock());
         }
     }
