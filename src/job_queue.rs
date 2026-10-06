@@ -264,6 +264,8 @@ impl<C: QueueJob> JobQueue<C> {
 
     /// Record the job as queued and put it at the back of the queue.
     pub fn submit(&self, job: C) {
+        // held across the write so a move cannot record its order ahead of this job
+        let _listed = self.history.lock().unwrap();
         self.record(JobState::Queued, "", &job);
         self.queue.lock().unwrap().push_back(job);
     }
