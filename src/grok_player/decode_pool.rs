@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 
 use super::timeline::DisplayRender;
 use super::{Command, OPAQUE_ALPHA, RGBA_BYTES_PER_PIXEL, Rgba8Frame};
-use crate::colour::XyzToSrgb;
 use crate::grok_decoder::DecodedFrame;
 use crate::preview::{self, Display, FrameRender, Rgb8Frame};
 
@@ -25,6 +24,8 @@ pub(super) struct DecodeJob {
     pub reduce: u8,
     pub render: DisplayRender,
     pub mxf: PathBuf,
+    // the X'Y'Z' transform current when the scheduler asked for the frame
+    pub display: Arc<Display>,
 }
 
 pub(super) enum CachedFrame {
@@ -43,6 +44,8 @@ struct CachedResult {
 pub(super) struct FrameCache {
     // a seek moves this on, a decode scale change does not
     dropped_before: u64,
+    // results from earlier generations were coloured by the display transform before the current one
+    recoloured_from: u64,
     frames: BTreeMap<u64, CachedResult>,
 }
 
@@ -50,6 +53,7 @@ impl FrameCache {
     fn new() -> Self {
         FrameCache {
             dropped_before: 0,
+            recoloured_from: 0,
             frames: BTreeMap::new(),
         }
     }
@@ -109,7 +113,12 @@ impl FrameCache {
     pub fn holds_at(&self, frame_index: u64, reduce: u8) -> bool {
         self.frames
             .get(&frame_index)
-            .is_some_and(|held| held.reduce == reduce)
+            .is_some_and(|held| held.reduce == reduce && held.generation >= self.recoloured_from)
+    }
+
+    // frames already decoded keep showing until their recoloured results arrive
+    pub fn recolour_from(&mut self, generation: u64) {
+        self.recoloured_from = generation;
     }
 
     pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgba8Frame>> {
@@ -127,8 +136,9 @@ impl FrameCache {
             Some(CachedResult {
                 frame: CachedFrame::Decoded(frame),
                 reduce: held,
+                generation,
                 ..
-            }) if *held == reduce => Some(frame.clone()),
+            }) if *held == reduce && *generation >= self.recoloured_from => Some(frame.clone()),
             _ => None,
         }
     }
@@ -420,6 +430,10 @@ impl DecodePool {
         }
     }
 
+    pub fn recolour_from(&self, generation: u64) {
+        self.cache.lock().unwrap().recolour_from(generation);
+    }
+
     pub fn record_failure(&self, generation: u64, frame_index: u64, reduce: u8, reason: String) {
         self.cache.lock().unwrap().store(
             generation,
@@ -493,14 +507,12 @@ impl Drop for DecodePool {
 }
 
 fn run_worker(queue: &JobQueue<DecodeJob>, cache: &Mutex<FrameCache>, finished: &Sender<Command>) {
-    // the table build costs a few hundred microseconds
-    let display = Display::Srgb(XyzToSrgb::new());
     while let Some(job) = queue.pop() {
         if !cache.lock().unwrap().accepts(job.generation) {
             continue;
         }
         let reduce = job.reduce;
-        let decoded = match decode_job(job.codestream, reduce, job.render, &job.mxf, &display) {
+        let decoded = match decode_job(job.codestream, reduce, job.render, &job.mxf, &job.display) {
             Ok(frame) => CachedFrame::Decoded(Arc::new(Rgba8Frame::from_rgb8(&frame))),
             Err(reason) => CachedFrame::Failed(reason),
         };
@@ -601,10 +613,10 @@ mod device {
                 cpu_queue: cpu_queue.clone(),
                 cache: cache.clone(),
                 finished: finished.clone(),
-                display: Display::Srgb(XyzToSrgb::new()),
                 pull_open: AtomicBool::new(false),
                 rgb8_on_device: AtomicBool::new(false),
                 batch_render: Mutex::new(None),
+                batch_asked_device_colour: AtomicBool::new(false),
                 in_flight: AtomicUsize::new(0),
                 returned: AtomicUsize::new(0),
             }),
@@ -624,13 +636,14 @@ mod device {
         cpu_queue: Arc<JobQueue<DecodeJob>>,
         cache: Arc<Mutex<FrameCache>>,
         finished: Sender<Command>,
-        display: Display,
         // false makes every pull return false, which ends the plugin's workers
         pull_open: AtomicBool,
         // the device hands back packed 8 bit RGB frames instead of the codestream's planes
         rgb8_on_device: AtomicBool,
         // the render the running batch began with
         batch_render: Mutex<Option<DisplayRender>>,
+        // the running batch asked the device for sRGB instead of planes
+        batch_asked_device_colour: AtomicBool,
         in_flight: AtomicUsize,
         returned: AtomicUsize,
     }
@@ -643,6 +656,7 @@ mod device {
         render: DisplayRender,
         mxf: PathBuf,
         codestream: Vec<u8>,
+        display: Arc<Display>,
     }
 
     struct RunningBatch {
@@ -708,6 +722,11 @@ mod device {
         // give the device to a waiting encode, or drain a stalled tail
         fn poll(&mut self) {
             if DEVICE_LEASE.encode_wants_the_device() {
+                self.end_batch();
+                return;
+            }
+            // a pull closed it for a frame the running batch cannot colour
+            if !self.state.pull_open.load(Ordering::Acquire) {
                 self.end_batch();
                 return;
             }
@@ -783,8 +802,12 @@ mod device {
                             .as_ref()
                             .map_or(std::ptr::null(), |matrix| matrix.as_ptr()),
                     });
+            let device_colour = asks_device_colour(shape);
             // the plugin's workers pull inside begin, so the render is on record first
             *self.state.batch_render.lock().unwrap() = Some(shape.render);
+            self.state
+                .batch_asked_device_colour
+                .store(device_colour, Ordering::Release);
             let mut rgb8_on_device = false;
             let info = grokj2k_sys::grk_plugin_batch_decompress_memory_info {
                 codestream: shape.codestream.as_ptr(),
@@ -792,8 +815,7 @@ mod device {
                 pull: Some(pull_frame),
                 callback: Some(frame_callback),
                 user: self.state.as_ref() as *const CallbackState as *mut c_void,
-                // only a DCP frame is X'Y'Z', which the device transforms out of its own tables
-                srgb8_output: matches!(shape.render, DisplayRender::DcpXyz),
+                srgb8_output: device_colour,
                 display_transform: display_transform
                     .as_ref()
                     .map_or(std::ptr::null(), |transform| transform as *const _),
@@ -870,8 +892,14 @@ mod device {
                 reduce: self.reduce,
                 render: self.render,
                 mxf: self.mxf,
+                display: self.display,
             }
         }
+    }
+
+    // only a DCP frame is X'Y'Z', and the device's own tables transform it to sRGB only
+    fn asks_device_colour(job: &DecodeJob) -> bool {
+        matches!(job.render, DisplayRender::DcpXyz) && matches!(*job.display, Display::Srgb(_))
     }
 
     // runs on the plugin's worker threads, several at once, blocking while the queue is empty
@@ -892,6 +920,12 @@ mod device {
                 state.cpu_queue.push(job);
                 continue;
             }
+            if asks_device_colour(&job) != state.batch_asked_device_colour.load(Ordering::Acquire) {
+                // the backend ends this batch and begins one for the new display transform
+                state.pull_open.store(false, Ordering::Release);
+                state.queue.push_front(job);
+                return false;
+            }
             break job;
         };
         let context = Box::new(FrameContext {
@@ -901,6 +935,7 @@ mod device {
             render: job.render,
             mxf: job.mxf,
             codestream: job.codestream,
+            display: job.display,
         });
         state.in_flight.fetch_add(1, Ordering::AcqRel);
         unsafe {
@@ -931,7 +966,7 @@ mod device {
             } else {
                 read_device_image(image)
                     .and_then(|decoded| {
-                        render_decoded(&decoded, context.render, &context.mxf, &state.display)
+                        render_decoded(&decoded, context.render, &context.mxf, &context.display)
                     })
                     .map(|frame| Rgba8Frame::from_rgb8(&frame))
             };
@@ -1302,6 +1337,7 @@ mod tests {
                 reduce: 0,
                 render,
                 mxf: PathBuf::from("run.j2c"),
+                display: Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new())),
             });
         }
         for _ in 0..codestreams.len() {
@@ -1454,7 +1490,7 @@ mod tests {
             timeline.frame_count,
             codestream.len()
         );
-        let display = Display::Srgb(XyzToSrgb::new());
+        let display = Display::Srgb(crate::colour::XyzToSrgb::new());
         let milliseconds = |label: &str, step: &mut dyn FnMut()| {
             let start = std::time::Instant::now();
             for _ in 0..RUNS {
@@ -1533,7 +1569,7 @@ mod tests {
     fn one_frame_of_2k_cinema_decodes_and_composes_in() {
         const RUNS: u32 = 20;
         let codestream = cinema_2k_codestream();
-        let display = Display::Srgb(XyzToSrgb::new());
+        let display = Display::Srgb(crate::colour::XyzToSrgb::new());
         let path = std::path::Path::new("bench.j2c");
         println!("codestream is {} bytes", codestream.len());
         for reduce in 0..=2u8 {
@@ -1602,6 +1638,7 @@ mod tests {
                 reduce: 0,
                 render: DisplayRender::DcpXyz,
                 mxf: PathBuf::from("run.j2c"),
+                display: Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new())),
             });
         }
         done.recv_timeout(Duration::from_secs(60))
@@ -1636,7 +1673,19 @@ mod tests {
             }
             Err(_) => (cinema_2k_codestream(), DisplayRender::DcpXyz),
         };
-        let sustain = |label: &str| {
+        let built_in = Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new()));
+        #[cfg(feature = "icc")]
+        let profile_directory = tempfile::tempdir().unwrap();
+        #[cfg(feature = "icc")]
+        let display_p3 = {
+            let path = crate::colour::icc::tests::written(
+                &crate::colour::icc::tests::display_p3_profile(),
+                profile_directory.path(),
+                "p3.icc",
+            );
+            Arc::new(Display::from_profile(Some(&path), Default::default()).unwrap())
+        };
+        let sustain = |label: &str, display: &Arc<Display>| {
             let (finished, _drain) = std::sync::mpsc::channel();
             let pool = DecodePool::start(finished);
             let start = std::time::Instant::now();
@@ -1648,6 +1697,7 @@ mod tests {
                     reduce: 0,
                     render,
                     mxf: std::path::PathBuf::from("bench.j2c"),
+                    display: display.clone(),
                 });
             }
             let mut first_frame_after = None;
@@ -1667,17 +1717,28 @@ mod tests {
             );
         };
         crate::grok_encoder::use_cpu();
-        sustain("cpu pool");
+        sustain("cpu pool", &built_in);
+        #[cfg(feature = "icc")]
+        sustain("cpu pool, Display P3 profile", &display_p3);
 
         #[cfg(feature = "grok-gpu")]
         match crate::grok_encoder::use_gpu_from_environment() {
             Ok(()) => {
                 let before = crate::grok_encoder::accelerated_frames();
-                sustain("device batch");
+                sustain("device batch", &built_in);
                 println!(
                     "the device took {} of {frames} decodes",
                     crate::grok_encoder::accelerated_frames() - before
                 );
+                #[cfg(feature = "icc")]
+                {
+                    let before = crate::grok_encoder::accelerated_frames();
+                    sustain("device batch, Display P3 profile", &display_p3);
+                    println!(
+                        "the device took {} of {frames} decodes",
+                        crate::grok_encoder::accelerated_frames() - before
+                    );
+                }
                 crate::grok_encoder::use_cpu();
             }
             Err(reason) => println!("no device numbers: {reason}"),

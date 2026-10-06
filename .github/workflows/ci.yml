@@ -14,11 +14,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            grok-features: async grok-ffi libmpv
+            grok-features: async grok-ffi libmpv icc
           - os: macos-latest
-            grok-features: async grok-ffi libmpv
+            grok-features: async grok-ffi libmpv icc
           - os: windows-latest
-            grok-features: async grok-ffi libmpv
+            grok-features: async grok-ffi libmpv icc
     steps:
       - uses: actions/checkout@v4
 

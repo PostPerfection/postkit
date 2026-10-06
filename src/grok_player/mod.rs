@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::colour::RenderingIntent;
 use crate::content_keys::ContentKeys;
 
 pub use audio::{MAXIMUM_SOUND_DELAY_MILLISECONDS, SoundOutputLayout, sound_output_device_names};
@@ -196,6 +197,7 @@ enum Command {
     SeekAbsolute(f64),
     Step(i64),
     SetDecodeScale(DecodeScale),
+    SetDisplay(Arc<crate::preview::Display>),
     SetSubtitleFile(SubtitleSlot, Option<PathBuf>, Sender<Result<(), String>>),
     SetSubtitleVisibility(SubtitleSlot, bool),
     SetSubtitlePresentation(SubtitlePresentation),
@@ -551,6 +553,12 @@ impl GrokPlayer {
         let _ = self.send(Command::SetDecodeScale(scale));
     }
 
+    // a monitor ICC profile for DCP X'Y'Z' pictures, None for the built-in sRGB
+    pub fn set_display_profile(&self, profile: Option<&Path>) -> Result<(), String> {
+        let display = crate::preview::Display::from_profile(profile, RenderingIntent::default())?;
+        self.send(Command::SetDisplay(Arc::new(display)))
+    }
+
     // brightness and masks out of range are clamped
     pub fn set_presentation(&self, settings: PresentationSettings) {
         *self.shared.presentation.lock().unwrap() = settings.clamped();
@@ -717,6 +725,18 @@ mod tests {
                 .map(|fields| fields.len()),
             Some(15)
         );
+    }
+
+    #[cfg(not(feature = "icc"))]
+    #[test]
+    fn a_display_profile_needs_the_icc_feature() {
+        let profile = Path::new("monitor.icc");
+        let error = GrokPlayer::new()
+            .set_display_profile(Some(profile))
+            .expect_err("no profile without the icc feature");
+        assert!(error.contains("monitor.icc"), "{error}");
+        assert!(error.contains("`icc` feature"), "{error}");
+        assert_eq!(GrokPlayer::new().set_display_profile(None), Ok(()));
     }
 
     #[test]

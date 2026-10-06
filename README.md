@@ -74,7 +74,9 @@ cargo test
 ```
 
 Cargo features: `grok-ffi` (J2K encoder), `libmpv` (embedded player), `async`
-(tokio), `icc` (monitor-ICC display path in `preview`/`colour`, needs liblcms2).
+(tokio), `icc` (monitor-ICC display path in `preview`/`colour` and
+`GrokPlayer::set_display_profile`, matrix-shaper RGB display profiles only, links
+the system liblcms2 or builds the copy lcms2-sys bundles).
 All off by default.
 
 Every build links the FFmpeg 8.1.3 LGPL libraries through ffmpeg-next 9, and

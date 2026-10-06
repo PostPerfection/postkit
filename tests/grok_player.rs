@@ -37,6 +37,18 @@ fn frame_colour(index: usize) -> [u8; 3] {
 }
 
 fn flat_codestreams(width: u32, height: u32, count: usize, profile: u16) -> Vec<Vec<u8>> {
+    let codes: Vec<[i32; 3]> = (0..count).map(|index| [frame_code(index); 3]).collect();
+    xyz_codestreams(width, height, &codes, profile)
+}
+
+// one flat frame per X'Y'Z' code triple
+fn xyz_codestreams(
+    width: u32,
+    height: u32,
+    frame_codes: &[[i32; 3]],
+    profile: u16,
+) -> Vec<Vec<u8>> {
+    let count = frame_codes.len();
     let params = postkit::grok_encoder::CompressParams {
         irreversible: false,
         compression_ratio: 1.0,
@@ -60,13 +72,9 @@ fn flat_codestreams(width: u32, height: u32, count: usize, profile: u16) -> Vec<
             if next >= count {
                 return None;
             }
-            let code = frame_code(next);
+            let [x, y, z] = frame_codes[next];
             let frame = postkit::grok_encoder::RawFrame::Planar {
-                components: [
-                    vec![code; samples],
-                    vec![code; samples],
-                    vec![code; samples],
-                ],
+                components: [vec![x; samples], vec![y; samples], vec![z; samples]],
                 width,
                 height,
                 precision: 12,
@@ -1311,4 +1319,181 @@ fn read_ppm(path: &Path, width: u32, height: u32) -> Vec<u8> {
     let pixels = bytes[index + 1..].to_vec();
     assert_eq!(pixels.len(), (width * height * 3) as usize);
     pixels
+}
+
+#[cfg(feature = "icc")]
+mod display_profile {
+    use super::*;
+    use lcms2::{CIExyY, CIExyYTRIPLE, Profile, ToneCurve};
+
+    const SIZE: u32 = 64;
+    const DCI_PEAK_LUMINANCE: f64 = 52.37;
+    const DCI_REFERENCE_WHITE: f64 = 48.0;
+    const DCDM_GAMMA: f64 = 2.6;
+    const MAXIMUM_CODE: f64 = 4095.0;
+    // CIE XYZ of full sRGB red, the first column of the sRGB to XYZ matrix
+    const SRGB_RED_XYZ: [f64; 3] = [0.4124564, 0.2126729, 0.0193339];
+    // full sRGB red as a Display P3 monitor encodes it
+    const SRGB_RED_ON_DISPLAY_P3: [u8; 3] = [234, 51, 35];
+    const GREY_CODE: i32 = 2000;
+    const SRGB_PARAMETRIC_TYPE: i16 = 4;
+    const SRGB_CURVE: [f64; 5] = [2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045];
+    const ONE_CODE_VALUE: u8 = 1;
+    // the 12-bit X'Y'Z' codes round the colour on the way in
+    const DISPLAY_P3_TOLERANCE: u8 = 2;
+
+    // SMPTE 428-1: X'Y'Z' codes of a CIE XYZ colour relative to the reference white
+    fn dcdm_codes(xyz: [f64; 3]) -> [i32; 3] {
+        xyz.map(|value| {
+            let peak_relative = value * DCI_REFERENCE_WHITE / DCI_PEAK_LUMINANCE;
+            (peak_relative.powf(1.0 / DCDM_GAMMA) * MAXIMUM_CODE).round() as i32
+        })
+    }
+
+    fn display_p3_profile() -> Profile {
+        let chromaticity = |x: f64, y: f64| CIExyY { x, y, Y: 1.0 };
+        let curve = ToneCurve::new_parametric(SRGB_PARAMETRIC_TYPE, &SRGB_CURVE).unwrap();
+        Profile::new_rgb(
+            &chromaticity(0.3127, 0.3290),
+            &CIExyYTRIPLE {
+                Red: chromaticity(0.680, 0.320),
+                Green: chromaticity(0.265, 0.690),
+                Blue: chromaticity(0.150, 0.060),
+            },
+            &[&curve, &curve, &curve],
+        )
+        .unwrap()
+    }
+
+    fn written(profile: &Profile, directory: &Path, name: &str) -> PathBuf {
+        let path = directory.join(name);
+        std::fs::write(&path, profile.icc().unwrap()).unwrap();
+        path
+    }
+
+    fn clip(directory: &Path, frame_codes: &[[i32; 3]]) -> PathBuf {
+        let frames = xyz_codestreams(SIZE, SIZE, frame_codes, CINEMA_2K_PROFILE);
+        let path = directory.join("picture.mxf");
+        write_mxf(&path, &frames, None, SIZE, SIZE);
+        path
+    }
+
+    fn shown(player: &GrokPlayer) -> [u8; 3] {
+        shown_colour(player, SIZE as usize, SIZE as usize)
+    }
+
+    fn assert_near(shown: [u8; 3], expected: [u8; 3], tolerance: u8, what: &str) {
+        let off = (0..3)
+            .map(|channel| shown[channel].abs_diff(expected[channel]))
+            .max()
+            .unwrap();
+        assert!(
+            off <= tolerance,
+            "{what}: shown {shown:?}, expected {expected:?}"
+        );
+    }
+
+    fn change_profile(player: &GrokPlayer, profile: Option<&Path>) {
+        forget_frames(player);
+        player
+            .set_display_profile(profile)
+            .expect("set the profile");
+        wait_for_frame(player);
+    }
+
+    #[test]
+    fn a_display_profile_recolours_the_paused_frame_without_a_reload() {
+        let directory = tempfile::tempdir().unwrap();
+        let red = dcdm_codes(SRGB_RED_XYZ);
+        let grey = [GREY_CODE; 3];
+        let source = clip(directory.path(), &[grey, red]);
+        let srgb = written(&Profile::new_srgb(), directory.path(), "srgb.icc");
+        let display_p3 = written(&display_p3_profile(), directory.path(), "p3.icc");
+        let built_in = XyzToSrgb::new();
+        let built_in_of = |[x, y, z]: [i32; 3]| built_in.pixel(x as u16, y as u16, z as u16);
+
+        let player = loaded_player(&source);
+        assert_eq!(shown(&player), built_in_of(grey));
+
+        change_profile(&player, Some(&srgb));
+        assert_near(
+            shown(&player),
+            built_in_of(grey),
+            ONE_CODE_VALUE,
+            "grey through sRGB",
+        );
+        forget_frames(&player);
+        player.frame_step();
+        wait_for_frame(&player);
+        assert_near(
+            shown(&player),
+            built_in_of(red),
+            ONE_CODE_VALUE,
+            "red through sRGB",
+        );
+
+        change_profile(&player, Some(&display_p3));
+        assert_near(
+            shown(&player),
+            SRGB_RED_ON_DISPLAY_P3,
+            DISPLAY_P3_TOLERANCE,
+            "red through Display P3",
+        );
+
+        let garbage = directory.path().join("garbage.icc");
+        std::fs::write(&garbage, b"not an icc profile").unwrap();
+        let error = player
+            .set_display_profile(Some(&garbage))
+            .expect_err("an unreadable profile is refused");
+        assert!(error.contains(&garbage.display().to_string()), "{error}");
+        forget_frames(&player);
+        player.frame_back_step();
+        wait_for_frame(&player);
+        forget_frames(&player);
+        player.frame_step();
+        wait_for_frame(&player);
+        assert_near(
+            shown(&player),
+            SRGB_RED_ON_DISPLAY_P3,
+            DISPLAY_P3_TOLERANCE,
+            "the refused profile left Display P3 in place",
+        );
+
+        change_profile(&player, None);
+        assert_eq!(shown(&player), built_in_of(red));
+    }
+
+    #[test]
+    fn a_display_profile_change_during_playback_drops_no_frames() {
+        const FRAMES: usize = 72;
+        let directory = tempfile::tempdir().unwrap();
+        let red = dcdm_codes(SRGB_RED_XYZ);
+        let source = clip(directory.path(), &[red; FRAMES]);
+        let display_p3 = written(&display_p3_profile(), directory.path(), "p3.icc");
+
+        let player = loaded_player(&source);
+        let window = (player.lookahead_frames() + 1).min(FRAMES);
+        wait_until("the decode window filled", || {
+            player.cached_frame_count() >= window
+        });
+        player.set_paused(false);
+        wait_until("playback moved off the first frame", || {
+            player.position().is_some_and(|position| position > 0.0)
+        });
+        player
+            .set_display_profile(Some(&display_p3))
+            .expect("set the profile");
+        wait_until("a Display P3 frame reached the screen", || {
+            let colour = shown(&player);
+            (0..3).all(|channel| {
+                colour[channel].abs_diff(SRGB_RED_ON_DISPLAY_P3[channel]) <= DISPLAY_P3_TOLERANCE
+            })
+        });
+        assert!(!player.eof_reached(), "the fixture ended before the change");
+        assert_eq!(
+            dropped_frames_not_decoded(&player),
+            0,
+            "the profile change dropped frames that had not decoded in time"
+        );
+    }
 }

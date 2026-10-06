@@ -12,7 +12,9 @@ use super::{
     Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, Rgba8Frame, Shared, Status,
     SubtitleSlot,
 };
+use crate::colour::XyzToSrgb;
 use crate::content_keys::ContentKeys;
+use crate::preview::Display;
 use crate::subtitle_formats::{StyledCue, StyledRun, VAlign};
 
 // a worker finishing a frame wakes the scheduler sooner than this
@@ -142,6 +144,7 @@ struct Scheduler {
     playing: bool,
     eof: bool,
     reduce: u8,
+    display: Arc<Display>,
     clock: Option<Clock>,
     last_plain: Option<Arc<Rgba8Frame>>,
     overlays: Vec<OverlayRectangle>,
@@ -178,6 +181,7 @@ impl Scheduler {
             playing: false,
             eof: false,
             reduce: DecodeScale::Full.reduce(),
+            display: Arc::new(Display::Srgb(XyzToSrgb::new())),
             clock: None,
             last_plain: None,
             overlays: Vec::new(),
@@ -461,6 +465,7 @@ impl Scheduler {
                         reduce,
                         render,
                         mxf,
+                        display: self.display.clone(),
                     });
                 }
                 Err(reason) => self.pool.record_failure(generation, index, reduce, reason),
@@ -532,7 +537,12 @@ impl Scheduler {
                     return;
                 }
                 self.reduce = scale.reduce();
-                self.change_decode_scale();
+                self.change_frame_rendering();
+            }
+            Command::SetDisplay(display) => {
+                self.display = display;
+                self.change_frame_rendering();
+                self.pool.recolour_from(self.generation);
             }
             Command::SetSubtitleFile(slot, file, reply) => {
                 let _ = reply.send(self.set_subtitle_file(slot, file.as_deref()));
@@ -651,7 +661,7 @@ impl Scheduler {
     }
 
     // the frames already decoded are still worth showing, so only the queued jobs go
-    fn change_decode_scale(&mut self) {
+    fn change_frame_rendering(&mut self) {
         self.generation += 1;
         self.in_flight.clear();
         self.pool.discard_queued_jobs();

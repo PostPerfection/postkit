@@ -787,17 +787,26 @@ pub(crate) enum Display {
 
 impl Display {
     fn build(opts: &DcpPreviewOptions) -> Result<Self, PreviewError> {
-        match &opts.display_profile {
-            None => Ok(Display::Srgb(XyzToSrgb::new())),
-            #[cfg(feature = "icc")]
-            Some(p) => crate::colour::XyzToIcc::new(p, opts.intent)
-                .map(Display::Icc)
-                .map_err(PreviewError::Decode),
-            #[cfg(not(feature = "icc"))]
-            Some(_) => Err(PreviewError::Decode(
-                "a display ICC profile was requested but postkit was built without the `icc` feature"
-                    .into(),
-            )),
+        Self::from_profile(opts.display_profile.as_deref(), opts.intent)
+            .map_err(PreviewError::Decode)
+    }
+
+    pub(crate) fn from_profile(
+        profile: Option<&Path>,
+        intent: RenderingIntent,
+    ) -> Result<Self, String> {
+        let Some(profile) = profile else {
+            return Ok(Display::Srgb(XyzToSrgb::new()));
+        };
+        #[cfg(feature = "icc")]
+        return crate::colour::XyzToIcc::new(profile, intent).map(Display::Icc);
+        #[cfg(not(feature = "icc"))]
+        {
+            let _ = intent;
+            Err(format!(
+                "{}: a display ICC profile needs postkit built with the `icc` feature",
+                profile.display()
+            ))
         }
     }
 

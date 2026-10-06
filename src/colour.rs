@@ -1040,6 +1040,13 @@ fn srgb_oetf(u: f32) -> f32 {
     }
 }
 
+// each 12-bit X'Y'Z' code as peak-relative linear light
+fn dcdm_expansion_table() -> Vec<f32> {
+    (0..=4095u32)
+        .map(|c| (c as f32 / MAX_CODE_12BIT).powf(DCDM_GAMMA))
+        .collect()
+}
+
 /// Precomputed DCI X'Y'Z' → sRGB display transform.
 ///
 /// Built once, then applied per pixel via LUTs (no per-pixel `powf`).
@@ -1067,9 +1074,7 @@ impl XyzToSrgb {
                 *c *= scale;
             }
         }
-        let expand = (0..=4095u32)
-            .map(|c| (c as f32 / MAX_CODE_12BIT).powf(DCDM_GAMMA))
-            .collect();
+        let expand = dcdm_expansion_table();
         let oetf = (0..=4095u32)
             .map(|i| (srgb_oetf(i as f32 / 4095.0) * 255.0 + 0.5) as u8)
             .collect();
@@ -1108,22 +1113,43 @@ impl XyzToSrgb {
 }
 
 #[cfg(feature = "icc")]
-mod icc {
-    use super::{D65_WHITE_XYZ, DCI_PEAK_LUMINANCE, DCI_REFERENCE_WHITE, MAX_CODE_12BIT};
-    use super::{DCDM_GAMMA, RenderingIntent, bradford, mat_vec};
-    use lcms2::{Intent, PixelFormat, Profile, Transform};
+pub(crate) mod icc {
+    use super::{D65_WHITE_XYZ, DCI_PEAK_LUMINANCE, DCI_REFERENCE_WHITE};
+    use super::{RenderingIntent, bradford, dcdm_expansion_table, mat_mul, mat_vec};
+    use lcms2::{
+        ColorSpaceSignature, Intent, PixelFormat, Profile, ProfileClassSignature, TagSignature,
+        Transform,
+    };
+    use std::path::Path;
 
     // D50 PCS white (lcms2's XYZ profile connection space).
     const D50_WHITE_XYZ: [f32; 3] = [0.964_212, 1.0, 0.825_188];
+    const MAXIMUM_CODE: u16 = 4095;
+    const EIGHT_BIT_FULL_SCALE: f32 = 255.0;
+    const XYZ12LE_BYTES_PER_PIXEL: usize = 6;
+    const RGB_CHANNELS: usize = 3;
+    // output table steps follow the f32 exponent, finer towards black where display curves are steepest
+    const OUTPUT_TABLE_MANTISSA_BITS: u32 = 7;
+    const F32_MANTISSA_BITS: u32 = 23;
+    // linear light below this shows as black on any display curve
+    const OUTPUT_TABLE_DARKEST: f32 = 1.0 / (1u32 << 24) as f32;
+    // a profile carrying any of these converts out of the PCS through a lookup table
+    const OUTPUT_LOOKUP_TABLE_TAGS: [TagSignature; 6] = [
+        TagSignature::BToA0Tag,
+        TagSignature::BToA1Tag,
+        TagSignature::BToA2Tag,
+        TagSignature::BToD0Tag,
+        TagSignature::BToD1Tag,
+        TagSignature::BToD2Tag,
+    ];
 
-    /// DCI X'Y'Z' → device RGB through a monitor ICC profile.
-    ///
-    /// Decodes to peak-relative linear XYZ, adapts D65 → the D50 PCS,
-    /// then runs the ICC engine (littleCMS) into the profile's 8-bit RGB.
+    // DCI X'Y'Z' to a matrix-shaper monitor profile: one matrix into its linear RGB, then its curves
     pub struct XyzToIcc {
         expand: Vec<f32>,
-        to_pcs: [[f32; 3]; 3],
-        transform: Transform<[f32; 3], [u8; 3]>,
+        // linear XYZ to the profile's linear RGB, with the luminance scale and the D65 to D50 adaptation
+        matrix: [[f32; 3]; 3],
+        // each channel's 8-bit code, indexed by output_table_index of its linear value
+        output_tables: [Vec<u8>; RGB_CHANNELS],
     }
 
     fn map_intent(i: RenderingIntent) -> Intent {
@@ -1135,56 +1161,353 @@ mod icc {
         }
     }
 
+    fn output_table_bits(linear: f32) -> u32 {
+        linear.to_bits() >> (F32_MANTISSA_BITS - OUTPUT_TABLE_MANTISSA_BITS)
+    }
+
+    fn output_table_index(linear: f32) -> usize {
+        if linear.is_nan() || linear <= OUTPUT_TABLE_DARKEST {
+            return 0;
+        }
+        (output_table_bits(linear.min(1.0)) - output_table_bits(OUTPUT_TABLE_DARKEST)) as usize
+    }
+
+    // the middle of the linear range each table entry covers
+    fn output_table_linear(index: usize) -> f32 {
+        let first = output_table_bits(OUTPUT_TABLE_DARKEST) + index as u32;
+        let shift = F32_MANTISSA_BITS - OUTPUT_TABLE_MANTISSA_BITS;
+        let low = f32::from_bits(first << shift);
+        let high = f32::from_bits((first + 1) << shift);
+        ((low + high) / 2.0).min(1.0)
+    }
+
+    fn inverse(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
+        let cofactor = |row: usize, column: usize| {
+            let (r0, r1) = ((row + 1) % 3, (row + 2) % 3);
+            let (c0, c1) = ((column + 1) % 3, (column + 2) % 3);
+            m[r0][c0] * m[r1][c1] - m[r0][c1] * m[r1][c0]
+        };
+        let determinant: f32 = (0..3)
+            .map(|column| m[0][column] * cofactor(0, column))
+            .sum();
+        if determinant.abs() < f32::EPSILON {
+            return None;
+        }
+        let mut result = [[0.0f32; 3]; 3];
+        for (row, result_row) in result.iter_mut().enumerate() {
+            for (column, value) in result_row.iter_mut().enumerate() {
+                *value = cofactor(column, row) / determinant;
+            }
+        }
+        Some(result)
+    }
+
+    fn open_display_profile(icc_path: &Path) -> Result<Profile, String> {
+        let profile = Profile::new_file(icc_path).map_err(|error| {
+            format!(
+                "{}: cannot read the ICC profile: {error}",
+                icc_path.display()
+            )
+        })?;
+        if profile.device_class() != ProfileClassSignature::DisplayClass
+            || profile.color_space() != ColorSpaceSignature::RgbData
+        {
+            return Err(format!(
+                "{}: not an RGB display profile",
+                icc_path.display()
+            ));
+        }
+        let lookup_table = OUTPUT_LOOKUP_TABLE_TAGS
+            .iter()
+            .any(|tag| profile.has_tag(*tag));
+        if lookup_table || !profile.is_matrix_shaper() {
+            return Err(format!(
+                "{}: a lookup table profile, only matrix-shaper display profiles are supported",
+                icc_path.display()
+            ));
+        }
+        Ok(profile)
+    }
+
     impl XyzToIcc {
-        pub fn new(icc_path: &std::path::Path, intent: RenderingIntent) -> Result<Self, String> {
-            let device = Profile::new_file(icc_path)
-                .map_err(|e| format!("failed to load ICC profile: {e}"))?;
+        pub fn new(icc_path: &Path, intent: RenderingIntent) -> Result<Self, String> {
+            let device = open_display_profile(icc_path)?;
             let pcs = Profile::new_xyz();
-            let transform = Transform::new(
+            let transform_error = |error: lcms2::Error| {
+                format!(
+                    "{}: cannot build the ICC transform: {error}",
+                    icc_path.display()
+                )
+            };
+            let into_pcs: Transform<[f32; 3], [f32; 3]> = Transform::new(
+                &device,
+                PixelFormat::RGB_FLT,
+                &pcs,
+                PixelFormat::XYZ_FLT,
+                map_intent(intent),
+            )
+            .map_err(transform_error)?;
+            let out_of_pcs: Transform<[f32; 3], [f32; 3]> = Transform::new(
                 &pcs,
                 PixelFormat::XYZ_FLT,
                 &device,
-                PixelFormat::RGB_8,
+                PixelFormat::RGB_FLT,
                 map_intent(intent),
             )
-            .map_err(|e| format!("failed to build ICC transform: {e}"))?;
+            .map_err(transform_error)?;
 
+            // the curves map 0 and 1 to themselves, so each primary at full is its PCS column
+            let mut primaries = [[0.0f32; 3]; RGB_CHANNELS];
+            into_pcs.transform_pixels(
+                &[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                &mut primaries,
+            );
+            let mut device_to_pcs = [[0.0f32; 3]; 3];
+            for (column, primary) in primaries.iter().enumerate() {
+                for (row, value) in primary.iter().enumerate() {
+                    device_to_pcs[row][column] = *value;
+                }
+            }
+            let pcs_to_device = inverse(&device_to_pcs).ok_or_else(|| {
+                format!(
+                    "{}: the profile's primaries do not span a colour space",
+                    icc_path.display()
+                )
+            })?;
+            let mut matrix = mat_mul(&pcs_to_device, &bradford(D65_WHITE_XYZ, D50_WHITE_XYZ));
             let scale = DCI_PEAK_LUMINANCE / DCI_REFERENCE_WHITE;
-            let mut to_pcs = bradford(D65_WHITE_XYZ, D50_WHITE_XYZ);
-            for row in to_pcs.iter_mut() {
+            for row in matrix.iter_mut() {
                 for c in row.iter_mut() {
                     *c *= scale;
                 }
             }
-            let expand = (0..=4095u32)
-                .map(|c| (c as f32 / MAX_CODE_12BIT).powf(DCDM_GAMMA))
+
+            // a grey of linear value v reads every channel's curve at v
+            let entries = output_table_index(1.0) + 1;
+            let greys: Vec<[f32; 3]> = (0..entries)
+                .map(|index| {
+                    let linear = output_table_linear(index);
+                    mat_vec(&device_to_pcs, [linear; 3])
+                })
                 .collect();
+            let mut encoded = vec![[0.0f32; 3]; entries];
+            out_of_pcs.transform_pixels(&greys, &mut encoded);
+            let output_tables = std::array::from_fn(|channel| {
+                encoded
+                    .iter()
+                    .map(|rgb| (rgb[channel].clamp(0.0, 1.0) * EIGHT_BIT_FULL_SCALE + 0.5) as u8)
+                    .collect()
+            });
             Ok(Self {
-                expand,
-                to_pcs,
-                transform,
+                expand: dcdm_expansion_table(),
+                matrix,
+                output_tables,
+            })
+        }
+
+        pub fn pixel(&self, x: u16, y: u16, z: u16) -> [u8; 3] {
+            let xyz = [x, y, z].map(|code| self.expand[usize::from(code.min(MAXIMUM_CODE))]);
+            let rgb = mat_vec(&self.matrix, xyz);
+            std::array::from_fn(|channel| {
+                self.output_tables[channel][output_table_index(rgb[channel])]
             })
         }
 
         /// Transform an `xyz12le` rawvideo frame into packed 8-bit device RGB.
         pub fn frame_xyz12le_to_rgb8(&self, raw: &[u8], out: &mut Vec<u8>) {
-            let n = raw.len() / 6;
-            let mut pcs: Vec<[f32; 3]> = Vec::with_capacity(n);
-            for px in raw.as_chunks::<6>().0 {
-                let x = (u16::from_le_bytes([px[0], px[1]]) >> 4).min(4095) as usize;
-                let y = (u16::from_le_bytes([px[2], px[3]]) >> 4).min(4095) as usize;
-                let z = (u16::from_le_bytes([px[4], px[5]]) >> 4).min(4095) as usize;
-                pcs.push(mat_vec(
-                    &self.to_pcs,
-                    [self.expand[x], self.expand[y], self.expand[z]],
-                ));
-            }
-            let mut rgb = vec![[0u8; 3]; n];
-            self.transform.transform_pixels(&pcs, &mut rgb);
             out.clear();
-            out.reserve(n * 3);
-            for p in rgb {
-                out.extend_from_slice(&p);
+            out.reserve(raw.len() / XYZ12LE_BYTES_PER_PIXEL * RGB_CHANNELS);
+            for px in raw.as_chunks::<XYZ12LE_BYTES_PER_PIXEL>().0 {
+                let x = u16::from_le_bytes([px[0], px[1]]) >> 4;
+                let y = u16::from_le_bytes([px[2], px[3]]) >> 4;
+                let z = u16::from_le_bytes([px[4], px[5]]) >> 4;
+                out.extend_from_slice(&self.pixel(x, y, z));
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) mod tests {
+        use super::*;
+        use crate::colour::{DCDM_GAMMA, MAX_CODE_12BIT};
+        use lcms2::{CIExyY, CIExyYTRIPLE, Flags, ToneCurve};
+        use std::path::PathBuf;
+
+        // codes 0 to 4095 in steps that land between the table entries
+        const TEST_GRID_STEP: usize = 45;
+        const SRGB_PARAMETRIC_TYPE: i16 = 4;
+        const SRGB_CURVE: [f64; 5] = [2.4, 1.0 / 1.055, 0.055 / 1.055, 1.0 / 12.92, 0.04045];
+        const PURE_GAMMA: f64 = 2.2;
+
+        fn chromaticity(x: f64, y: f64) -> CIExyY {
+            CIExyY { x, y, Y: 1.0 }
+        }
+
+        fn d65_rgb_profile(primaries: [(f64, f64); 3], curve: &ToneCurve) -> Profile {
+            let [red, green, blue] = primaries.map(|(x, y)| chromaticity(x, y));
+            Profile::new_rgb(
+                &chromaticity(0.3127, 0.3290),
+                &CIExyYTRIPLE {
+                    Red: red,
+                    Green: green,
+                    Blue: blue,
+                },
+                &[curve, curve, curve],
+            )
+            .unwrap()
+        }
+
+        pub(crate) fn display_p3_profile() -> Profile {
+            d65_rgb_profile(
+                [(0.680, 0.320), (0.265, 0.690), (0.150, 0.060)],
+                &ToneCurve::new_parametric(SRGB_PARAMETRIC_TYPE, &SRGB_CURVE).unwrap(),
+            )
+        }
+
+        // sRGB primaries with a plain power curve, which has no linear toe near black
+        fn pure_gamma_profile() -> Profile {
+            d65_rgb_profile(
+                [(0.640, 0.330), (0.300, 0.600), (0.150, 0.060)],
+                &ToneCurve::new(PURE_GAMMA),
+            )
+        }
+
+        pub(crate) fn written(profile: &Profile, directory: &Path, name: &str) -> PathBuf {
+            let path = directory.join(name);
+            std::fs::write(&path, profile.icc().unwrap()).unwrap();
+            path
+        }
+
+        fn grid() -> Vec<[u16; 3]> {
+            let steps: Vec<u16> = (0..=MAXIMUM_CODE).step_by(TEST_GRID_STEP).collect();
+            let mut codes = Vec::new();
+            for &x in &steps {
+                for &y in &steps {
+                    for &z in &steps {
+                        codes.push([x, y, z]);
+                    }
+                }
+            }
+            codes
+        }
+
+        // littleCMS run on every pixel, in 8-bit code values before rounding
+        fn direct_littlecms(path: &Path, codes: &[[u16; 3]]) -> Vec<[f32; 3]> {
+            let device = Profile::new_file(path).unwrap();
+            let transform: Transform<[f32; 3], [f32; 3]> = Transform::new(
+                &Profile::new_xyz(),
+                PixelFormat::XYZ_FLT,
+                &device,
+                PixelFormat::RGB_FLT,
+                Intent::RelativeColorimetric,
+            )
+            .unwrap();
+            let mut to_pcs = bradford(D65_WHITE_XYZ, D50_WHITE_XYZ);
+            for row in to_pcs.iter_mut() {
+                for c in row.iter_mut() {
+                    *c *= DCI_PEAK_LUMINANCE / DCI_REFERENCE_WHITE;
+                }
+            }
+            let pcs: Vec<[f32; 3]> = codes
+                .iter()
+                .map(|code| {
+                    let linear =
+                        code.map(|code| (f32::from(code) / MAX_CODE_12BIT).powf(DCDM_GAMMA));
+                    mat_vec(&to_pcs, linear)
+                })
+                .collect();
+            let mut rgb = vec![[0.0f32; 3]; codes.len()];
+            transform.transform_pixels(&pcs, &mut rgb);
+            rgb.iter()
+                .map(|pixel| pixel.map(|value| value.clamp(0.0, 1.0) * EIGHT_BIT_FULL_SCALE))
+                .collect()
+        }
+
+        fn largest_error_against_littlecms(profile: &Profile) -> f32 {
+            let directory = tempfile::tempdir().unwrap();
+            let path = written(profile, directory.path(), "display.icc");
+            let transform = XyzToIcc::new(&path, RenderingIntent::RelativeColorimetric).unwrap();
+            let codes = grid();
+            codes
+                .iter()
+                .zip(direct_littlecms(&path, &codes))
+                .flat_map(|([x, y, z], expected)| {
+                    let shown = transform.pixel(*x, *y, *z);
+                    (0..RGB_CHANNELS)
+                        .map(move |channel| (f32::from(shown[channel]) - expected[channel]).abs())
+                })
+                .fold(0.0, f32::max)
+        }
+
+        #[test]
+        fn every_code_lands_within_one_code_value_of_littlecms() {
+            for (name, profile) in [
+                ("sRGB", Profile::new_srgb()),
+                ("Display P3", display_p3_profile()),
+                ("gamma 2.2", pure_gamma_profile()),
+            ] {
+                let error = largest_error_against_littlecms(&profile);
+                eprintln!("{name}: largest error {error} code values");
+                assert!(error < 1.0, "{name} is {error} code values off littleCMS");
+            }
+        }
+
+        fn refusal(path: &Path) -> String {
+            match XyzToIcc::new(path, RenderingIntent::RelativeColorimetric) {
+                Ok(_) => panic!("{} was accepted", path.display()),
+                Err(error) => error,
+            }
+        }
+
+        #[test]
+        fn a_profile_this_transform_cannot_run_is_refused_by_name() {
+            let directory = tempfile::tempdir().unwrap();
+            let missing = directory.path().join("missing.icc");
+            let garbage = directory.path().join("garbage.icc");
+            std::fs::write(&garbage, b"not an icc profile").unwrap();
+            let lab = written(
+                &Profile::new_lab4_context(
+                    lcms2::GlobalContext::new(),
+                    &chromaticity(0.3457, 0.3585),
+                )
+                .unwrap(),
+                directory.path(),
+                "lab.icc",
+            );
+            let grey = written(
+                &Profile::new_gray(&chromaticity(0.3127, 0.3290), &ToneCurve::new(PURE_GAMMA))
+                    .unwrap(),
+                directory.path(),
+                "grey.icc",
+            );
+            // an sRGB profile that also converts out of the PCS through a table
+            let srgb = Profile::new_srgb();
+            let link_transform: Transform<[u8; 3], [u8; 3]> = Transform::new(
+                &srgb,
+                PixelFormat::RGB_8,
+                &srgb,
+                PixelFormat::RGB_8,
+                Intent::RelativeColorimetric,
+            )
+            .unwrap();
+            let link = Profile::new_device_link(&link_transform, 4.3, Flags::default()).unwrap();
+            let lcms2::Tag::Pipeline(table) = link.read_tag(TagSignature::AToB0Tag) else {
+                panic!("a device link holds its pipeline in AToB0");
+            };
+            let mut lookup_table = Profile::new_srgb();
+            assert!(lookup_table.write_tag(TagSignature::BToA0Tag, lcms2::Tag::Pipeline(table)));
+            let lookup_table = written(&lookup_table, directory.path(), "lookup_table.icc");
+
+            for (path, reason) in [
+                (&missing, "cannot read"),
+                (&garbage, "cannot read"),
+                (&lab, "not an RGB display profile"),
+                (&grey, "not an RGB display profile"),
+                (&lookup_table, "lookup table"),
+            ] {
+                let error = refusal(path);
+                assert!(error.contains(&path.display().to_string()), "{error}");
+                assert!(error.contains(reason), "{error}");
             }
         }
     }
