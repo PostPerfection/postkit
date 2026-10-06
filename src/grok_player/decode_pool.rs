@@ -813,15 +813,16 @@ mod device {
                 .as_ref()
                 .and_then(|transform| transform.matrix)
                 .map(row_major);
-            let display_transform =
-                app2e
+            let display_transform = app2e.as_ref().map(|transform| {
+                // zeroed so fields newer grok headers add, output_thresholds among them, stay null
+                let mut device_transform: grokj2k_sys::grk_plugin_display_transform =
+                    unsafe { std::mem::zeroed() };
+                device_transform.transfer = transform.transfer.as_ptr();
+                device_transform.matrix = gamut_matrix
                     .as_ref()
-                    .map(|transform| grokj2k_sys::grk_plugin_display_transform {
-                        transfer: transform.transfer.as_ptr(),
-                        matrix: gamut_matrix
-                            .as_ref()
-                            .map_or(std::ptr::null(), |matrix| matrix.as_ptr()),
-                    });
+                    .map_or(std::ptr::null(), |matrix| matrix.as_ptr());
+                device_transform
+            });
             let device_colour = asks_device_colour(shape);
             // the plugin's workers pull inside begin, so the render is on record first
             *self.state.batch_render.lock().unwrap() = Some(shape.render);
