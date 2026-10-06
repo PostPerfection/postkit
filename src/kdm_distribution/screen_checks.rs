@@ -144,19 +144,27 @@ fn check_window_inside_leaf(
     }
 }
 
-pub fn check_screen(
+// the recipient and device chains at one time, before any window is known
+pub fn check_screen_certificates(
     screen_label: &str,
     screen: &Screen,
-    window: &KdmWindowTimes,
-    issue_date: DateTime<Utc>,
+    at: DateTime<Utc>,
 ) -> CheckReport {
+    check_chains(screen_label, screen, at).0
+}
+
+fn check_chains(
+    screen_label: &str,
+    screen: &Screen,
+    at: DateTime<Utc>,
+) -> (CheckReport, Option<ChainCertificate>) {
     let mut report = CheckReport::default();
-    let desired_times = [issue_date];
+    let desired_times = [at];
     let recipient_pem = match screen.cert.pem() {
         Ok(pem) => pem,
         Err(e) => {
             report.unreadable(screen_label, RECIPIENT_CHAIN_NAME, e);
-            return report;
+            return (report, None);
         }
     };
     let recipient_context = ChainContext {
@@ -164,15 +172,14 @@ pub fn check_screen(
         desired_times: &desired_times,
         best_effort_rules: &[],
     };
-    if let Some(chain) = check_pem_chain(
+    let leaf = check_pem_chain(
         &mut report,
         screen_label,
         RECIPIENT_CHAIN_NAME,
         &recipient_pem,
         &recipient_context,
-    ) {
-        check_window_inside_leaf(&mut report, screen_label, &chain[0], window);
-    }
+    )
+    .and_then(|chain| chain.into_iter().next());
 
     let device_context = ChainContext {
         leaf_roles: LeafRoles::AnyOf(AUTHORIZED_DEVICE_ROLES),
@@ -191,6 +198,19 @@ pub fn check_screen(
             &device.certificate,
             &device_context,
         );
+    }
+    (report, leaf)
+}
+
+pub fn check_screen(
+    screen_label: &str,
+    screen: &Screen,
+    window: &KdmWindowTimes,
+    issue_date: DateTime<Utc>,
+) -> CheckReport {
+    let (mut report, leaf) = check_chains(screen_label, screen, issue_date);
+    if let Some(leaf) = leaf {
+        check_window_inside_leaf(&mut report, screen_label, &leaf, window);
     }
     report
 }
@@ -324,6 +344,22 @@ mod tests {
             vec![CertificateCheck::Rule(ChainRule::Role)]
         );
         assert_eq!(report.failures[0].chain, "authorized device LD");
+    }
+
+    #[test]
+    fn the_certificate_status_needs_no_window() {
+        let f = fixtures();
+        let good = screen_with(
+            &f.security_managers[0].certificate,
+            &[("LD", &f.link_decryptor.certificate)],
+        );
+        assert!(check_screen_certificates(SCREEN, &good, Utc::now()).passed());
+        let wrong_role = screen_with(&f.projector.certificate, &[]);
+        let report = check_screen_certificates(SCREEN, &wrong_role, Utc::now());
+        assert_eq!(
+            checks(&report),
+            vec![CertificateCheck::Rule(ChainRule::Role)]
+        );
     }
 
     #[test]

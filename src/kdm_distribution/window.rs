@@ -66,6 +66,21 @@ fn utc(zoned: &jiff::Zoned) -> Result<DateTime<Utc>, String> {
         .ok_or_else(|| format!("{zoned} is out of range"))
 }
 
+pub fn check_time_zone(zone_name: &str) -> Result<(), String> {
+    TimeZone::get(zone_name)
+        .map(|_| ())
+        .map_err(|e| format!("'{zone_name}' is not an IANA time zone: {e}"))
+}
+
+pub fn time_zone_names() -> Vec<String> {
+    let mut names: Vec<String> = jiff::tz::db()
+        .available()
+        .map(|name| name.to_string())
+        .collect();
+    names.sort();
+    names
+}
+
 pub fn kdm_window_in_time_zone(
     window: &LocalWindow,
     zone_name: &str,
@@ -76,8 +91,8 @@ pub fn kdm_window_in_time_zone(
             window.end, window.start
         ));
     }
-    let time_zone = TimeZone::get(zone_name)
-        .map_err(|e| format!("'{zone_name}' is not an IANA time zone: {e}"))?;
+    check_time_zone(zone_name)?;
+    let time_zone = TimeZone::get(zone_name).map_err(|e| e.to_string())?;
     let start = zoned(window.start, &time_zone, zone_name, WindowEdge::Start)?;
     let end = zoned(window.end, &time_zone, zone_name, WindowEdge::End)?;
     Ok(KdmWindowTimes {
@@ -132,6 +147,16 @@ mod tests {
         .unwrap();
         assert_eq!(times.not_valid_before, "2027-04-01T09:00:00+11:00");
         assert_eq!(times.not_valid_after, "2027-04-06T09:00:00+10:00");
+    }
+
+    #[test]
+    fn the_zone_list_holds_the_iana_names_a_cinema_can_take() {
+        let names = time_zone_names();
+        for zone in ["Europe/London", "America/New_York", "Australia/Melbourne"] {
+            assert!(names.iter().any(|name| name == zone), "{zone}");
+            assert!(check_time_zone(zone).is_ok());
+        }
+        assert!(check_time_zone("Europe/Atlantis").is_err());
     }
 
     #[test]

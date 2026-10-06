@@ -1,9 +1,11 @@
 use super::cinema::{AuthorizedDevice, CertSource, Cinema, Screen};
+use super::email::{Security, SmtpConfig};
 use super::window::LocalWindow;
 use crate::certificate::{
     CertOptions, CertType, KdmConfig, KdmContentKey, build_kdm, generate_certificate,
     generate_chain,
 };
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -309,4 +311,76 @@ pub fn local_window() -> LocalWindow {
             .and_hms_opt(23, 0, 0)
             .unwrap(),
     }
+}
+
+#[derive(Default)]
+pub struct SmtpTranscript {
+    pub commands: String,
+    pub body: String,
+}
+
+// advertises no extensions after EHLO so lettre attempts neither STARTTLS nor AUTH
+fn serve_one_message(
+    listener: std::net::TcpListener,
+    transcript: std::sync::Arc<std::sync::Mutex<SmtpTranscript>>,
+) {
+    use std::io::{BufRead, BufReader};
+
+    const GREETING: &[u8] = b"220 test ESMTP\r\n";
+    const EHLO_REPLY: &[u8] = b"250-test\r\n250 OK\r\n";
+    const OK: &[u8] = b"250 OK\r\n";
+    const START_DATA: &[u8] = b"354 end with a dot\r\n";
+    const BYE: &[u8] = b"221 bye\r\n";
+    const END_OF_DATA: &str = ".";
+
+    let (stream, _) = listener.accept().unwrap();
+    let mut writer = stream.try_clone().unwrap();
+    let mut reader = BufReader::new(stream);
+    writer.write_all(GREETING).unwrap();
+
+    let mut line = String::new();
+    while reader.read_line(&mut line).unwrap() > 0 {
+        transcript.lock().unwrap().commands.push_str(&line);
+        let command = line.trim_end().to_string();
+        line.clear();
+
+        if command.starts_with("EHLO") || command.starts_with("HELO") {
+            writer.write_all(EHLO_REPLY).unwrap();
+        } else if command.starts_with("DATA") {
+            writer.write_all(START_DATA).unwrap();
+            while reader.read_line(&mut line).unwrap() > 0 {
+                if line.trim_end() == END_OF_DATA {
+                    line.clear();
+                    break;
+                }
+                transcript.lock().unwrap().body.push_str(&line);
+                line.clear();
+            }
+            writer.write_all(OK).unwrap();
+        } else if command.starts_with("QUIT") {
+            writer.write_all(BYE).unwrap();
+            break;
+        } else {
+            writer.write_all(OK).unwrap();
+        }
+    }
+}
+
+pub fn fake_server() -> (SmtpConfig, std::sync::Arc<std::sync::Mutex<SmtpTranscript>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let transcript = std::sync::Arc::new(std::sync::Mutex::new(SmtpTranscript::default()));
+    let server_transcript = std::sync::Arc::clone(&transcript);
+    std::thread::spawn(move || serve_one_message(listener, server_transcript));
+    let config = SmtpConfig {
+        host: "127.0.0.1".to_string(),
+        port,
+        security: Security::None,
+        username: None,
+        password: None,
+        from: "kdm@dist.test".to_string(),
+        subject_template: Some("Keys for {title} at {cinema}".to_string()),
+        body_template: None,
+    };
+    (config, transcript)
 }

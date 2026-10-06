@@ -224,6 +224,15 @@ pub fn zip_files(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
     Ok(buf.into_inner())
 }
 
+pub fn write_files(directory: &Path, files: &[(String, Vec<u8>)]) -> Result<(), String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|e| format!("cannot create {}: {e}", directory.display()))?;
+    for (name, bytes) in files {
+        crate::fs::write_atomic(&directory.join(name), bytes)?;
+    }
+    Ok(())
+}
+
 pub fn write_zip(
     output_dir: &Path,
     zip_name: &str,

@@ -1,4 +1,6 @@
-use super::bundle::{CinemaBundle, KdmNaming, name_fields_from_content_title, write_zip};
+use super::bundle::{
+    CinemaBundle, KdmNaming, name_fields_from_content_title, write_files, write_zip,
+};
 use super::cinema::{Cinema, Recipient, Screen};
 use super::formulation::{
     ContentStandard, FormulationFlagNames, choose_formulation, resolve_formulation,
@@ -394,22 +396,45 @@ fn outside_dkdm_window(window: &KdmWindowTimes, dkdm_from: &str, dkdm_to: &str) 
     })
 }
 
-struct DkdmContext<'a> {
-    issue: &'a DkdmIssue<'a>,
-    dkdm_file: PathBuf,
-    temporary: &'a Path,
+// what the DKDM says about every screen it is issued to
+struct DkdmFacts {
+    cpl_id: String,
+    content_title: String,
     standard: Option<ContentStandard>,
-    dkdm_not_valid_before: String,
-    dkdm_not_valid_after: String,
+    not_valid_before: String,
+    not_valid_after: String,
     naming_fields: super::bundle::KdmNameFields,
 }
 
-fn issue_screen(
-    context: &DkdmContext<'_>,
+impl DkdmFacts {
+    fn read(issue: &DkdmIssue<'_>) -> Result<Self, String> {
+        let metadata = parse_kdm(issue.dkdm_xml)?;
+        let naming_fields = name_fields_from_content_title(&metadata.content_title);
+        Ok(Self {
+            cpl_id: metadata.cpl_id.to_string(),
+            content_title: metadata.content_title,
+            standard: issue.standard.or(naming_fields.standard),
+            not_valid_before: metadata.not_valid_before,
+            not_valid_after: metadata.not_valid_after,
+            naming_fields,
+        })
+    }
+}
+
+struct CheckedTarget {
+    label: String,
+    window: KdmWindowTimes,
+    formulation: KdmFormulation,
+    warnings: Vec<String>,
+}
+
+// every check a screen passes before its KDM is written, and the reasons it fails
+fn check_target(
+    issue: &DkdmIssue<'_>,
+    facts: &DkdmFacts,
     target: &ScreenTarget<'_>,
     not_checked: &mut Vec<String>,
-) -> Result<WrittenKdm, Vec<String>> {
-    let issue = context.issue;
+) -> Result<CheckedTarget, Vec<String>> {
     let label = screen_label(target.cinema, target.screen);
     let zone = target.cinema.time_zone.as_deref().ok_or_else(|| {
         vec![format!(
@@ -433,43 +458,123 @@ fn issue_screen(
     }
     let mut reasons = findings_text(&signer_report);
     reasons.extend(findings_text(&screen_report));
+    let choice = choose_formulation(
+        issue.formulation,
+        target.screen.authorized_devices.len(),
+        facts.standard,
+    );
+    if let Err(e) = &choice {
+        reasons.push(format!("{label}: {e}"));
+    }
+    let Ok(choice) = choice else {
+        return Err(reasons);
+    };
     if !reasons.is_empty() {
         return Err(reasons);
     }
+
     let mut warnings: Vec<String> = screen_report
         .warnings
         .iter()
         .map(ToString::to_string)
         .collect();
-
-    let choice = choose_formulation(
-        issue.formulation,
-        target.screen.authorized_devices.len(),
-        context.standard,
-    )
-    .map_err(|e| vec![format!("{label}: {e}")])?;
     warnings.extend(
         choice
             .warnings
             .iter()
             .map(|warning| format!("{label}: {warning}")),
     );
-    if let Some(warning) = outside_dkdm_window(
-        &window,
-        &context.dkdm_not_valid_before,
-        &context.dkdm_not_valid_after,
-    ) {
+    if let Some(warning) =
+        outside_dkdm_window(&window, &facts.not_valid_before, &facts.not_valid_after)
+    {
         warnings.push(format!("{label}: {warning}"));
     }
+    Ok(CheckedTarget {
+        label,
+        window,
+        formulation: choice.formulation,
+        warnings,
+    })
+}
 
-    let write = |contents: &str| write_temporary(context.temporary, contents);
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScreenPlan {
+    pub cinema: String,
+    pub screen: String,
+    // None when the screen is refused before a window or formulation is settled
+    pub not_valid_before: Option<String>,
+    pub not_valid_after: Option<String>,
+    pub formulation: Option<KdmFormulation>,
+    pub refusals: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuePlan {
+    pub cpl_id: String,
+    pub content_title: String,
+    pub screens: Vec<ScreenPlan>,
+    pub not_checked: Vec<String>,
+}
+
+// what issue_from_dkdm would do for each screen, without writing anything
+pub fn plan_issue(
+    issue: &DkdmIssue<'_>,
+    targets: &[ScreenTarget<'_>],
+) -> Result<IssuePlan, String> {
+    let facts = DkdmFacts::read(issue)?;
+    let mut plan = IssuePlan {
+        cpl_id: facts.cpl_id.clone(),
+        content_title: facts.content_title.clone(),
+        ..Default::default()
+    };
+    for target in targets {
+        let checked = check_target(issue, &facts, target, &mut plan.not_checked);
+        let mut screen = ScreenPlan {
+            cinema: target.cinema.name.clone(),
+            screen: target.screen.name.clone(),
+            not_valid_before: None,
+            not_valid_after: None,
+            formulation: None,
+            refusals: Vec::new(),
+            warnings: Vec::new(),
+        };
+        match checked {
+            Ok(checked) => {
+                screen.not_valid_before = Some(checked.window.not_valid_before);
+                screen.not_valid_after = Some(checked.window.not_valid_after);
+                screen.formulation = Some(checked.formulation);
+                screen.warnings = checked.warnings;
+            }
+            Err(reasons) => screen.refusals = reasons,
+        }
+        plan.screens.push(screen);
+    }
+    Ok(plan)
+}
+
+fn write_screen(
+    issue: &DkdmIssue<'_>,
+    facts: &DkdmFacts,
+    dkdm_file: &Path,
+    temporary: &Path,
+    target: &ScreenTarget<'_>,
+    checked: CheckedTarget,
+) -> Result<WrittenKdm, Vec<String>> {
+    let CheckedTarget {
+        label,
+        window,
+        formulation,
+        warnings,
+    } = checked;
+    let write = |contents: &str| write_temporary(temporary, contents);
     let recipient_pem = target
         .screen
         .cert
         .pem()
         .map_err(|e| vec![format!("{label}: {e}")])?;
     let recipient_file = write(&recipient_pem).map_err(|e| vec![e])?;
-    let device_cert_files = if choice.formulation.lists_supplied_devices() {
+    let device_cert_files = if formulation.lists_supplied_devices() {
         target
             .screen
             .authorized_devices
@@ -481,7 +586,7 @@ fn issue_screen(
         Vec::new()
     };
     let config = RewrapConfig {
-        dkdm_file: context.dkdm_file.clone(),
+        dkdm_file: dkdm_file.to_path_buf(),
         dkdm_recipient_key_file: issue.dkdm_recipient_key.to_path_buf(),
         recipient_cert_file: recipient_file,
         signer_cert_file: issue.signer.certificate.clone(),
@@ -491,7 +596,7 @@ fn issue_screen(
         valid_from: window.not_valid_before.clone(),
         valid_to: window.not_valid_after.clone(),
         device_cert_files,
-        formulation: choice.formulation,
+        formulation,
         picture_forensic_marking: issue.picture_forensic_marking,
         audio_forensic_marking: issue.audio_forensic_marking,
         issue_date: Some(issue.issue_date),
@@ -501,7 +606,7 @@ fn issue_screen(
         cert_info_from_pem(&recipient_pem).map_err(|e| vec![format!("{label}: {e}")])?;
 
     let naming = KdmNaming {
-        fields: &context.naming_fields,
+        fields: &facts.naming_fields,
         creation_facility: issue.creation_facility,
         active: window.start_date,
         inactive: window.end_date,
@@ -516,7 +621,7 @@ fn issue_screen(
             cinema: target.cinema.name.clone(),
             screen: target.screen.name.clone(),
             file_name: naming.kdm_file_name(serial),
-            formulation: choice.formulation,
+            formulation,
             not_valid_before: window.not_valid_before,
             not_valid_after: window.not_valid_after,
             issue_date: issue.issue_date,
@@ -531,36 +636,31 @@ fn issue_screen(
     })
 }
 
-// re-wraps the DKDM once per screen and writes one ZIP per cinema into output_dir
+// re-wraps the DKDM once per screen and writes one ZIP per cinema into output_dir, with its
+// KDMs beside it in a folder of the same name
 pub fn issue_from_dkdm(
     issue: &DkdmIssue<'_>,
     targets: &[ScreenTarget<'_>],
     output_dir: &Path,
 ) -> Result<DkdmIssueOutcome, String> {
-    let metadata = parse_kdm(issue.dkdm_xml)?;
-    let naming_fields = name_fields_from_content_title(&metadata.content_title);
+    let facts = DkdmFacts::read(issue)?;
     let temporary = tempfile::tempdir().map_err(|e| format!("cannot create temp dir: {e}"))?;
     let dkdm_file = temporary.path().join("dkdm.xml");
     std::fs::write(&dkdm_file, issue.dkdm_xml)
         .map_err(|e| format!("cannot write {}: {e}", dkdm_file.display()))?;
-    let context = DkdmContext {
-        issue,
-        dkdm_file,
-        temporary: temporary.path(),
-        standard: issue.standard.or(naming_fields.standard),
-        dkdm_not_valid_before: metadata.not_valid_before.clone(),
-        dkdm_not_valid_after: metadata.not_valid_after.clone(),
-        naming_fields,
-    };
 
     let mut outcome = DkdmIssueOutcome {
-        cpl_id: metadata.cpl_id.to_string(),
-        content_title: metadata.content_title.clone(),
+        cpl_id: facts.cpl_id.clone(),
+        content_title: facts.content_title.clone(),
         ..Default::default()
     };
     let mut written: Vec<(&Cinema, WrittenKdm)> = Vec::new();
     for target in targets {
-        match issue_screen(&context, target, &mut outcome.not_checked) {
+        let result =
+            check_target(issue, &facts, target, &mut outcome.not_checked).and_then(|checked| {
+                write_screen(issue, &facts, &dkdm_file, temporary.path(), target, checked)
+            });
+        match result {
             Ok(kdm) => written.push((target.cinema, kdm)),
             Err(reasons) => outcome.refused.push(ScreenRefusal {
                 cinema: target.cinema.name.clone(),
@@ -588,7 +688,7 @@ pub fn issue_from_dkdm(
             continue;
         };
         let zip_name = KdmNaming {
-            fields: &context.naming_fields,
+            fields: &facts.naming_fields,
             creation_facility: issue.creation_facility,
             active,
             inactive,
@@ -598,6 +698,7 @@ pub fn issue_from_dkdm(
             .iter()
             .map(|kdm| (kdm.issued.file_name.clone(), kdm.xml.clone().into_bytes()))
             .collect();
+        write_files(&output_dir.join(&zip_name), &entries)?;
         let zip_path = write_zip(output_dir, &zip_name, &entries)?;
         outcome.bundles.push(CinemaBundle {
             cinema: cinema.name.clone(),
@@ -948,6 +1049,15 @@ mod tests {
             format!("k_LongerThanFo3D_FTR_EN-XX_51-HI-VI_Rex_{dates}_DIS_OV_US-13")
         );
         let entries = zip_entries(&rex_bundle.zip_path);
+        for (name, xml) in &entries {
+            let beside = dir.path().join(&rex_bundle.zip_name).join(name);
+            assert_eq!(
+                &read(&beside),
+                xml,
+                "{} is written beside the ZIP",
+                beside.display()
+            );
+        }
         let names: Vec<&str> = entries.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(
             names,

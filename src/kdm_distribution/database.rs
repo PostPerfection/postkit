@@ -1,10 +1,12 @@
 // the distributor's cinemas, titles, bookings and issued KDMs in one sqlite file
 use super::bundle::name_fields_from_content_title;
 use super::cinema::{AuthorizedDevice, CertSource, Cinema, CinemaDb, Screen};
+use super::email::{SmtpConfig, send_bundle};
 use super::formulation::ContentStandard;
 use super::history;
 use super::issue::{
-    DkdmIssue, DkdmIssueOutcome, IssuedKdm, KdmSigner, ScreenTarget, issue_from_dkdm,
+    DkdmIssue, DkdmIssueOutcome, IssuePlan, IssuedKdm, KdmSigner, ScreenTarget, issue_from_dkdm,
+    plan_issue,
 };
 use super::window::LocalWindow;
 use crate::certificate::{
@@ -26,7 +28,8 @@ const SMPTE_STANDARD: &str = "smpte";
 const INTEROP_STANDARD: &str = "interop";
 
 // index i upgrades a database at schema version i to version i + 1
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE certificates (
     id INTEGER PRIMARY KEY,
     thumbprint TEXT NOT NULL UNIQUE,
@@ -100,7 +103,20 @@ CREATE TABLE issues (
     valid_to TEXT NOT NULL,
     file_name TEXT NOT NULL
 );
-"#];
+"#,
+    r#"
+CREATE TABLE deliveries (
+    id INTEGER PRIMARY KEY,
+    delivered_at TEXT NOT NULL,
+    booking_id INTEGER REFERENCES bookings(id) ON DELETE SET NULL,
+    cinema TEXT NOT NULL,
+    zip_name TEXT NOT NULL,
+    zip_path TEXT NOT NULL,
+    recipients TEXT NOT NULL,
+    result TEXT NOT NULL
+);
+"#,
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredCinema {
@@ -148,6 +164,26 @@ pub struct IssueRecord {
     pub file_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "kind", content = "detail")]
+pub enum DeliveryResult {
+    // written to the output folder and not emailed
+    Written,
+    Sent,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryRecord {
+    pub delivered_at: String,
+    pub booking_id: Option<BookingId>,
+    pub cinema: String,
+    pub zip_name: String,
+    pub zip_path: String,
+    pub recipients: Vec<String>,
+    pub result: DeliveryResult,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ImportReport {
     pub cinemas: usize,
@@ -167,6 +203,49 @@ pub struct IssueSettings {
 
 pub struct DistributionDatabase {
     connection: Connection,
+}
+
+// a booking with everything its screens need, loaded once
+struct BookingParts {
+    booking: Booking,
+    title: Title,
+    cinemas: Vec<StoredCinema>,
+    // (index into cinemas, index into that cinema's screens) per booked screen
+    target_indexes: Vec<(usize, usize)>,
+}
+
+impl BookingParts {
+    fn targets(&self) -> Vec<ScreenTarget<'_>> {
+        self.target_indexes
+            .iter()
+            .map(|(cinema_index, screen_index)| {
+                let cinema = &self.cinemas[*cinema_index].cinema;
+                ScreenTarget {
+                    cinema,
+                    screen: &cinema.screens[*screen_index],
+                    window: self.booking.window,
+                }
+            })
+            .collect()
+    }
+
+    fn issue<'a>(
+        &'a self,
+        settings: &'a IssueSettings,
+        issue_date: DateTime<Utc>,
+    ) -> DkdmIssue<'a> {
+        DkdmIssue {
+            dkdm_xml: &self.title.dkdm_xml,
+            dkdm_recipient_key: &settings.dkdm_recipient_key,
+            signer: &settings.signer,
+            standard: self.title.standard,
+            formulation: self.booking.formulation,
+            picture_forensic_marking: settings.picture_forensic_marking,
+            audio_forensic_marking: settings.audio_forensic_marking,
+            creation_facility: &settings.creation_facility,
+            issue_date,
+        }
+    }
 }
 
 fn database_error(error: rusqlite::Error) -> String {
@@ -785,6 +864,100 @@ impl DistributionDatabase {
             .collect()
     }
 
+    pub fn record_delivery(&mut self, record: &DeliveryRecord) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO deliveries (delivered_at, booking_id, cinema, zip_name, zip_path,
+                     recipients, result)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    record.delivered_at,
+                    record.booking_id,
+                    record.cinema,
+                    record.zip_name,
+                    record.zip_path,
+                    to_json(&record.recipients)?,
+                    to_json(&record.result)?
+                ],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    pub fn deliveries(&self) -> Result<Vec<DeliveryRecord>, String> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT delivered_at, booking_id, cinema, zip_name, zip_path, recipients, result
+                 FROM deliveries ORDER BY id",
+            )
+            .map_err(database_error)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    DeliveryRecord {
+                        delivered_at: row.get(0)?,
+                        booking_id: row.get(1)?,
+                        cinema: row.get(2)?,
+                        zip_name: row.get(3)?,
+                        zip_path: row.get(4)?,
+                        recipients: Vec::new(),
+                        result: DeliveryResult::Written,
+                    },
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                ))
+            })
+            .map_err(database_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(database_error)?;
+        rows.into_iter()
+            .map(|(mut record, recipients, result)| {
+                record.recipients = from_json(&recipients)?;
+                record.result = from_json(&result)?;
+                Ok(record)
+            })
+            .collect()
+    }
+
+    // one email per cinema ZIP when smtp is given, each attempt recorded with its result
+    pub fn deliver_bundles(
+        &mut self,
+        outcome: &DkdmIssueOutcome,
+        booking_id: Option<BookingId>,
+        smtp: Option<&SmtpConfig>,
+        delivered_at: DateTime<Utc>,
+    ) -> Result<Vec<DeliveryRecord>, String> {
+        let mut records = Vec::new();
+        for bundle in &outcome.bundles {
+            let result = match smtp {
+                None => DeliveryResult::Written,
+                Some(config) => {
+                    match send_bundle(config, bundle, &outcome.content_title, &bundle.emails) {
+                        Ok(()) => DeliveryResult::Sent,
+                        Err(e) => DeliveryResult::Failed(e),
+                    }
+                }
+            };
+            let record = DeliveryRecord {
+                delivered_at: delivered_at.to_rfc3339(),
+                booking_id,
+                cinema: bundle.cinema.clone(),
+                zip_name: bundle.zip_name.clone(),
+                zip_path: bundle.zip_path.display().to_string(),
+                recipients: if smtp.is_some() {
+                    bundle.emails.clone()
+                } else {
+                    Vec::new()
+                },
+                result,
+            };
+            self.record_delivery(&record)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
     // a screen whose certificate cannot be read is skipped and named in the report
     pub fn import_cinema_database(&mut self, database: &CinemaDb) -> Result<ImportReport, String> {
         let mut report = ImportReport::default();
@@ -834,17 +1007,11 @@ impl DistributionDatabase {
         Ok(records.len())
     }
 
-    // every screen in the booking from the title's DKDM, each KDM recorded in the history
-    pub fn issue_booking(
-        &mut self,
-        booking_id: BookingId,
-        settings: &IssueSettings,
-        issue_date: DateTime<Utc>,
-    ) -> Result<DkdmIssueOutcome, String> {
+    fn booking_parts(&self, booking_id: BookingId) -> Result<BookingParts, String> {
         let booking = self.booking(booking_id)?;
         let title = self.title(booking.title_id)?;
         let mut cinemas: Vec<StoredCinema> = Vec::new();
-        let mut targets_by_index = Vec::new();
+        let mut target_indexes = Vec::new();
         for screen_id in &booking.screen_ids {
             let cinema_id = self.screen_cinema(*screen_id)?;
             let cinema_index = match cinemas.iter().position(|stored| stored.id == cinema_id) {
@@ -859,31 +1026,41 @@ impl DistributionDatabase {
                 .iter()
                 .position(|id| id == screen_id)
                 .ok_or_else(|| format!("screen {screen_id} not found"))?;
-            targets_by_index.push((cinema_index, screen_index));
+            target_indexes.push((cinema_index, screen_index));
         }
-        let targets: Vec<ScreenTarget<'_>> = targets_by_index
-            .iter()
-            .map(|(cinema_index, screen_index)| {
-                let cinema = &cinemas[*cinema_index].cinema;
-                ScreenTarget {
-                    cinema,
-                    screen: &cinema.screens[*screen_index],
-                    window: booking.window,
-                }
-            })
-            .collect();
-        let issue = DkdmIssue {
-            dkdm_xml: &title.dkdm_xml,
-            dkdm_recipient_key: &settings.dkdm_recipient_key,
-            signer: &settings.signer,
-            standard: title.standard,
-            formulation: booking.formulation,
-            picture_forensic_marking: settings.picture_forensic_marking,
-            audio_forensic_marking: settings.audio_forensic_marking,
-            creation_facility: &settings.creation_facility,
-            issue_date,
-        };
-        let outcome = issue_from_dkdm(&issue, &targets, &settings.output_dir)?;
+        Ok(BookingParts {
+            booking,
+            title,
+            cinemas,
+            target_indexes,
+        })
+    }
+
+    // the formulation, window and check report each booked screen would get, nothing written
+    pub fn plan_booking(
+        &self,
+        booking_id: BookingId,
+        settings: &IssueSettings,
+        issue_date: DateTime<Utc>,
+    ) -> Result<IssuePlan, String> {
+        let parts = self.booking_parts(booking_id)?;
+        plan_issue(&parts.issue(settings, issue_date), &parts.targets())
+    }
+
+    // every screen in the booking from the title's DKDM, each KDM recorded in the history
+    pub fn issue_booking(
+        &mut self,
+        booking_id: BookingId,
+        settings: &IssueSettings,
+        issue_date: DateTime<Utc>,
+    ) -> Result<DkdmIssueOutcome, String> {
+        let parts = self.booking_parts(booking_id)?;
+        let title = parts.title.clone();
+        let outcome = issue_from_dkdm(
+            &parts.issue(settings, issue_date),
+            &parts.targets(),
+            &settings.output_dir,
+        )?;
         let issued: Vec<&IssuedKdm> = outcome
             .bundles
             .iter()
@@ -957,6 +1134,7 @@ mod tests {
                 "bookings",
                 "certificates",
                 "cinemas",
+                "deliveries",
                 "issues",
                 "schema_version",
                 "screens",
@@ -975,6 +1153,29 @@ mod tests {
         drop(newer);
         let error = DistributionDatabase::open(&path).err().unwrap();
         assert!(error.contains("schema version 99"), "{error}");
+    }
+
+    #[test]
+    fn a_first_version_database_is_upgraded_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kdm.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (1);
+                 {}
+                 INSERT INTO cinemas (name, emails, notes, contacts)
+                 VALUES ('Rex', '[]', '', '[]');",
+                MIGRATIONS[0]
+            ))
+            .unwrap();
+        drop(connection);
+        let database = DistributionDatabase::open(&path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), 2);
+        assert!(table_names(&database).contains(&"deliveries".to_string()));
+        assert_eq!(database.cinemas().unwrap()[0].cinema.name, "Rex");
+        assert!(database.deliveries().unwrap().is_empty());
     }
 
     #[test]
@@ -1161,5 +1362,101 @@ mod tests {
             Some(KdmFormulation::MultipleModifiedTransitional1)
         );
         assert_eq!(issues[2].cinema.as_deref(), Some("Odeon"));
+    }
+
+    fn booked(database: &mut DistributionDatabase) -> BookingId {
+        let (rex, odeon) = cinemas();
+        let mut screens = Vec::new();
+        for cinema in [&rex, &odeon] {
+            let id = database.save_cinema(cinema).unwrap();
+            screens.extend(database.cinema(id).unwrap().screen_ids);
+        }
+        let title = database.add_title_from_dkdm(&dkdm(DCNC_TITLE, 30)).unwrap();
+        database
+            .add_booking(title, &screens, local_window(), None, Utc::now())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_plan_names_each_screen_formulation_and_refusal_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let booking = booked(&mut database);
+        let mut odeon = database.cinemas().unwrap()[0].cinema.clone();
+        assert_eq!(odeon.name, "Odeon");
+        odeon.time_zone = None;
+        database.save_cinema(&odeon).unwrap();
+
+        let plan = database
+            .plan_booking(booking, &settings(dir.path()), Utc::now())
+            .unwrap();
+        let formulations: Vec<Option<KdmFormulation>> = plan
+            .screens
+            .iter()
+            .map(|screen| screen.formulation)
+            .collect();
+        assert_eq!(
+            formulations,
+            vec![
+                Some(KdmFormulation::MultipleModifiedTransitional1),
+                Some(KdmFormulation::ModifiedTransitional1),
+                None
+            ]
+        );
+        assert!(plan.screens[0].refusals.is_empty());
+        assert!(plan.screens[0].not_valid_before.is_some());
+        assert!(plan.screens[2].refusals[0].contains("has no time zone"));
+        assert!(plan.not_checked.iter().any(|note| note.contains("rule 12")));
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(database.issues().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delivering_records_a_written_zip_and_the_smtp_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let booking = booked(&mut database);
+        let outcome = database
+            .issue_booking(booking, &settings(dir.path()), Utc::now())
+            .unwrap();
+        let written = database
+            .deliver_bundles(&outcome, Some(booking), None, Utc::now())
+            .unwrap();
+        assert!(
+            written
+                .iter()
+                .all(|record| record.result == DeliveryResult::Written)
+        );
+
+        let single = DkdmIssueOutcome {
+            bundles: vec![outcome.bundles[0].clone()],
+            ..outcome.clone()
+        };
+        let (smtp, transcript) = crate::kdm_distribution::test_support::fake_server();
+        let sent = database
+            .deliver_bundles(&single, Some(booking), Some(&smtp), Utc::now())
+            .unwrap();
+        assert_eq!(sent[0].result, DeliveryResult::Sent);
+        assert_eq!(sent[0].recipients, vec!["kdm@rex.test"]);
+        assert!(
+            transcript
+                .lock()
+                .unwrap()
+                .body
+                .contains(&format!("Subject: {}", outcome.bundles[0].zip_name))
+        );
+
+        let mut refused = smtp.clone();
+        refused.port = 1;
+        let failed = database
+            .deliver_bundles(&single, Some(booking), Some(&refused), Utc::now())
+            .unwrap();
+        assert!(
+            matches!(&failed[0].result, DeliveryResult::Failed(reason) if reason.contains("smtp send"))
+        );
+
+        let recorded = database.deliveries().unwrap();
+        assert_eq!(recorded.len(), outcome.bundles.len() + 2);
+        assert_eq!(recorded.last().unwrap(), &failed[0]);
     }
 }
