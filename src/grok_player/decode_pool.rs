@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::timeline::DisplayRender;
 use super::{Command, OPAQUE_ALPHA, RGBA_BYTES_PER_PIXEL, Rgba8Frame};
@@ -36,6 +36,8 @@ struct CachedResult {
     frame: CachedFrame,
     reduce: u8,
     generation: u64,
+    // a later result at another scale keeps the time the first one arrived
+    decoded_since: Option<Instant>,
 }
 
 pub(super) struct FrameCache {
@@ -80,15 +82,28 @@ impl FrameCache {
         {
             return false;
         }
+        let decoded_since = match (&frame, self.frames.get(&frame_index)) {
+            (CachedFrame::Failed(_), _) => None,
+            (CachedFrame::Decoded(_), Some(held)) => held.decoded_since.or(Some(Instant::now())),
+            (CachedFrame::Decoded(_), None) => Some(Instant::now()),
+        };
         self.frames.insert(
             frame_index,
             CachedResult {
                 frame,
                 reduce,
                 generation,
+                decoded_since,
             },
         );
         true
+    }
+
+    pub fn decoded_by(&self, frame_index: u64, deadline: Instant) -> bool {
+        self.frames
+            .get(&frame_index)
+            .and_then(|held| held.decoded_since)
+            .is_some_and(|since| since <= deadline)
     }
 
     pub fn holds_at(&self, frame_index: u64, reduce: u8) -> bool {
@@ -436,6 +451,10 @@ impl DecodePool {
 
     pub fn newest_decoded_in(&self, first: u64, last: u64) -> Option<u64> {
         self.cache.lock().unwrap().newest_decoded_in(first, last)
+    }
+
+    pub fn decoded_by(&self, frame_index: u64, deadline: Instant) -> bool {
+        self.cache.lock().unwrap().decoded_by(frame_index, deadline)
     }
 
     pub fn forget_before(&self, first: u64) {
@@ -1084,6 +1103,24 @@ mod tests {
             "a failure counts as held, or it is asked for again"
         );
         assert!(!cache.holds_at(6, FULL));
+    }
+
+    #[test]
+    fn a_frame_counts_as_decoded_from_its_first_result_at_any_scale() {
+        let mut cache = FrameCache::new();
+        let before_any_result = Instant::now() - Duration::from_millis(1);
+        cache.store(0, 4, FULL, frame(8));
+        cache.store(0, 5, FULL, CachedFrame::Failed("no".into()));
+        let after_the_first_results = Instant::now();
+        cache.store(1, 4, QUARTER, frame(2));
+
+        assert!(cache.decoded_by(4, after_the_first_results));
+        assert!(!cache.decoded_by(4, before_any_result));
+        assert!(
+            !cache.decoded_by(5, Instant::now()),
+            "a failure never decoded"
+        );
+        assert!(!cache.decoded_by(6, Instant::now()));
     }
 
     #[test]

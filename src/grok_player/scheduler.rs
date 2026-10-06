@@ -150,6 +150,10 @@ struct Scheduler {
     compositor: Compositor,
     presentations: VecDeque<Instant>,
     dropped_frames: u64,
+    // dropped frames that had not decoded when their slot ended
+    dropped_frames_not_decoded: u64,
+    // dropped frames decoded before their slot ended that the scheduler woke too late to show
+    dropped_frames_scheduler_late: u64,
     delayed_frames: u64,
     sound: audio::Output,
     sound_loaded: bool,
@@ -182,6 +186,8 @@ impl Scheduler {
             compositor: Compositor::new(),
             presentations: VecDeque::new(),
             dropped_frames: 0,
+            dropped_frames_not_decoded: 0,
+            dropped_frames_scheduler_late: 0,
             delayed_frames: 0,
             sound: audio::Output::new(),
             sound_loaded: false,
@@ -254,7 +260,7 @@ impl Scheduler {
             self.skip_over_a_failed_frame(target);
             return;
         };
-        self.dropped_frames += index - next;
+        self.count_dropped(next..index, clock, elapsed);
         if elapsed > clock.frame_offset_seconds(index) + clock.frame_period_seconds() {
             self.delayed_frames += 1;
         }
@@ -264,12 +270,29 @@ impl Scheduler {
         self.present(index, plain);
     }
 
+    fn count_dropped(&mut self, skipped: std::ops::Range<u64>, clock: Clock, elapsed: f64) {
+        let now = Instant::now();
+        for frame in skipped {
+            let since_slot_ended = elapsed - clock.frame_offset_seconds(frame + 1);
+            let slot_ended = now
+                .checked_sub(Duration::from_secs_f64(since_slot_ended.max(0.0)))
+                .unwrap_or(now);
+            if self.pool.decoded_by(frame, slot_ended) {
+                self.dropped_frames_scheduler_late += 1;
+            } else {
+                self.dropped_frames_not_decoded += 1;
+            }
+            self.dropped_frames += 1;
+        }
+    }
+
     fn skip_over_a_failed_frame(&mut self, target: u64) {
         let Some(reason) = self.pool.failure(target) else {
             return;
         };
         tracing::error!("frame {target} did not decode: {reason}");
         self.dropped_frames += target - self.current_frame;
+        self.dropped_frames_not_decoded += target - self.current_frame;
         self.current_frame = target;
     }
 
@@ -617,6 +640,8 @@ impl Scheduler {
         self.current_frame = 0;
         self.needs_publish = false;
         self.dropped_frames = 0;
+        self.dropped_frames_not_decoded = 0;
+        self.dropped_frames_scheduler_late = 0;
         self.delayed_frames = 0;
         self.presentations.clear();
         self.restart_decoding();
@@ -760,6 +785,8 @@ impl Scheduler {
             paused: !self.playing,
             filename: timeline.map(|timeline| timeline.title.clone()),
             dropped_frames: self.dropped_frames,
+            dropped_frames_not_decoded: self.dropped_frames_not_decoded,
+            dropped_frames_scheduler_late: self.dropped_frames_scheduler_late,
             delayed_frames: self.delayed_frames,
             decoder_fps: self.playback_rate(),
             container_fps: timeline.map(|timeline| timeline.fps),

@@ -162,6 +162,8 @@ struct Status {
     paused: bool,
     filename: Option<String>,
     dropped_frames: u64,
+    dropped_frames_not_decoded: u64,
+    dropped_frames_scheduler_late: u64,
     delayed_frames: u64,
     decoder_fps: Option<f64>,
     container_fps: Option<f64>,
@@ -646,12 +648,14 @@ impl Drop for GrokPlayer {
 
 fn status_json(status: &Status) -> String {
     format!(
-        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}, "warnings": [{}], "source": {}, "queued_source": {}}}"#,
+        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}, "warnings": [{}], "source": {}, "queued_source": {}}}"#,
         json_number(status.position),
         json_number(status.duration),
         status.paused,
         json_string(status.filename.as_deref()),
         status.dropped_frames,
+        status.dropped_frames_not_decoded,
+        status.dropped_frames_scheduler_late,
         status.delayed_frames,
         json_number(status.decoder_fps),
         json_number(status.container_fps),
@@ -698,12 +702,20 @@ mod tests {
         assert!(metadata.contains(r#""warnings": []"#), "{metadata}");
         assert!(metadata.contains(r#""source": null"#), "{metadata}");
         assert!(metadata.contains(r#""queued_source": null"#), "{metadata}");
+        assert!(
+            metadata.contains(r#""dropped_frames_not_decoded": 0"#),
+            "{metadata}"
+        );
+        assert!(
+            metadata.contains(r#""dropped_frames_scheduler_late": 0"#),
+            "{metadata}"
+        );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&metadata)
                 .expect("metadata is JSON")
                 .as_object()
                 .map(|fields| fields.len()),
-            Some(13)
+            Some(15)
         );
     }
 
