@@ -7,7 +7,7 @@
 //! picture track files and mpv gets them as one EDL timeline.
 
 use crate::cpl_xml::read_prefixed_tag;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// The one mpv source that plays a composition, and the title to show for it.
@@ -39,6 +39,13 @@ pub struct SoundSegment {
 pub struct SegmentTrim {
     pub start_seconds: f64,
     pub length_seconds: Option<f64>,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Composition {
+    pub pictures: Vec<PictureSegment>,
+    pub sound: Vec<SoundSegment>,
+    pub title: Option<String>,
 }
 
 /// A picture the CPL names, as the id to look up and the span to play.
@@ -78,46 +85,135 @@ pub fn read_composition(package_dir: &Path) -> (Vec<PictureSegment>, Option<Stri
     )
 }
 
-pub fn read_composition_from_cpl(cpl_path: &Path) -> (Vec<PictureSegment>, Option<String>) {
-    let package_dir = cpl_path.parent().unwrap_or(Path::new("."));
-    let Some(assets) = package_assets(package_dir) else {
-        return (Vec::new(), None);
-    };
-    let Ok(cpl) = std::fs::read_to_string(cpl_path) else {
-        return (Vec::new(), None);
-    };
-    (
-        segments_of(package_dir, &assets, &cpl),
-        composition_title(&cpl),
-    )
-}
-
-/// Every MainSound track file the composition names, in reel order. Empty when
-/// the package has no sound, which is a valid composition.
-pub fn read_sound(package_dir: &Path) -> Vec<SoundSegment> {
-    let Some(assets) = package_assets(package_dir) else {
-        return Vec::new();
-    };
-    let Some(cpl) = first_cpl(package_dir, &assets) else {
-        return Vec::new();
-    };
-    sound_segments_of(package_dir, &assets, &cpl)
-}
-
-pub fn read_sound_from_cpl(cpl_path: &Path) -> Vec<SoundSegment> {
-    let package_dir = cpl_path.parent().unwrap_or(Path::new("."));
-    let Some(assets) = package_assets(package_dir) else {
-        return Vec::new();
-    };
-    let Ok(cpl) = std::fs::read_to_string(cpl_path) else {
-        return Vec::new();
-    };
-    sound_segments_of(package_dir, &assets, &cpl)
-}
-
 fn package_assets(package_dir: &Path) -> Option<Vec<(String, String)>> {
     let assetmap = crate::assetmap::find(package_dir)?;
     Some(crate::assetmap::parse_ordered(&assetmap))
+}
+
+// the CPL's own package is searched first, then other_packages in order
+pub fn resolve_composition(
+    source: &Path,
+    other_packages: &[PathBuf],
+) -> Result<Composition, String> {
+    let (package_dir, cpl) = composition_document(source)?;
+    let searched: Vec<PathBuf> = std::iter::once(package_dir)
+        .chain(other_packages.iter().cloned())
+        .collect();
+    let paths_by_id = asset_paths(&searched)?;
+    let missing_asset_error = |asset_id: String| {
+        let directories: Vec<String> = searched
+            .iter()
+            .map(|directory| directory.display().to_string())
+            .collect();
+        format!(
+            "asset {asset_id} is in none of the packages searched: {}",
+            directories.join(", ")
+        )
+    };
+    let pictures = located(picture_references(&cpl), &paths_by_id)
+        .into_iter()
+        .map(|found| found.map(|(path, trim)| PictureSegment { path, trim }))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(missing_asset_error)?;
+    if pictures.is_empty() {
+        return Err(format!("{} names no picture", source.display()));
+    }
+    let sound = located(reel_asset_references(&cpl, "MainSound"), &paths_by_id)
+        .into_iter()
+        .map(|found| found.map(|(path, trim)| SoundSegment { path, trim }))
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(missing_asset_error)?;
+    Ok(Composition {
+        pictures,
+        sound,
+        title: composition_title(&cpl),
+    })
+}
+
+// the library packages holding the pictures and sound the CPL's own package lacks
+pub fn find_original_version_packages(
+    source: &Path,
+    library: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
+    let (package_dir, cpl) = composition_document(source)?;
+    let own_assets = asset_paths(std::slice::from_ref(&package_dir))?;
+    let mut missing: Vec<String> = picture_references(&cpl)
+        .into_iter()
+        .chain(reel_asset_references(&cpl, "MainSound"))
+        .map(|reference| reference.asset_id)
+        .filter(|asset_id| !own_assets.contains_key(asset_id))
+        .collect();
+    let mut seen = HashSet::new();
+    missing.retain(|asset_id| seen.insert(asset_id.clone()));
+    let own_package = std::fs::canonicalize(&package_dir).ok();
+    let mut found = Vec::new();
+    for candidate in library {
+        if missing.is_empty() {
+            break;
+        }
+        if std::fs::canonicalize(candidate).ok() == own_package {
+            continue;
+        }
+        let Some(assets) = package_assets(candidate) else {
+            continue;
+        };
+        let held = |asset_id: &String| assets.iter().any(|(id, _)| id == asset_id);
+        if !missing.iter().any(held) {
+            continue;
+        }
+        missing.retain(|asset_id| !held(asset_id));
+        found.push(candidate.clone());
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "no package in the library holds {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(found)
+}
+
+// the package directory and the text of its first CPL, or of the CPL file named
+fn composition_document(source: &Path) -> Result<(PathBuf, String), String> {
+    if source.is_dir() {
+        let assets = package_assets(source)
+            .ok_or_else(|| format!("{} holds no ASSETMAP", source.display()))?;
+        let cpl = first_cpl(source, &assets)
+            .ok_or_else(|| format!("{} holds no CPL", source.display()))?;
+        return Ok((source.to_path_buf(), cpl));
+    }
+    let cpl = std::fs::read_to_string(source).map_err(|e| format!("{}: {e}", source.display()))?;
+    let package_dir = source.parent().unwrap_or(Path::new(".")).to_path_buf();
+    Ok((package_dir, cpl))
+}
+
+// the first package that lists an id wins
+fn asset_paths(packages: &[PathBuf]) -> Result<HashMap<String, PathBuf>, String> {
+    let mut paths_by_id = HashMap::new();
+    for package in packages {
+        let assets = package_assets(package)
+            .ok_or_else(|| format!("{} holds no ASSETMAP", package.display()))?;
+        for (asset_id, relative) in assets {
+            paths_by_id
+                .entry(asset_id)
+                .or_insert_with(|| package.join(relative));
+        }
+    }
+    Ok(paths_by_id)
+}
+
+// each reference's file, or the id no package holds
+fn located(
+    references: Vec<PictureReference>,
+    paths_by_id: &HashMap<String, PathBuf>,
+) -> Vec<Result<(PathBuf, Option<SegmentTrim>), String>> {
+    references
+        .into_iter()
+        .map(|reference| match paths_by_id.get(&reference.asset_id) {
+            Some(path) => Ok((path.clone(), reference.trim)),
+            None => Err(reference.asset_id),
+        })
+        .collect()
 }
 
 fn segments_of(package_dir: &Path, assets: &[(String, String)], cpl: &str) -> Vec<PictureSegment> {
@@ -127,32 +223,18 @@ fn segments_of(package_dir: &Path, assets: &[(String, String)], cpl: &str) -> Ve
         .collect()
 }
 
-fn sound_segments_of(
-    package_dir: &Path,
-    assets: &[(String, String)],
-    cpl: &str,
-) -> Vec<SoundSegment> {
-    resolve_segments(package_dir, assets, reel_asset_references(cpl, "MainSound"))
-        .into_iter()
-        .map(|(path, trim)| SoundSegment { path, trim })
-        .collect()
-}
-
 fn resolve_segments(
     package_dir: &Path,
     assets: &[(String, String)],
     references: Vec<PictureReference>,
 ) -> Vec<(PathBuf, Option<SegmentTrim>)> {
-    let path_by_id: HashMap<&str, &str> = assets
+    let paths_by_id: HashMap<String, PathBuf> = assets
         .iter()
-        .map(|(id, relative)| (id.as_str(), relative.as_str()))
+        .map(|(id, relative)| (id.clone(), package_dir.join(relative)))
         .collect();
-    references
+    located(references, &paths_by_id)
         .into_iter()
-        .filter_map(|asset| {
-            let relative = path_by_id.get(asset.asset_id.as_str())?;
-            Some((package_dir.join(relative), asset.trim))
-        })
+        .filter_map(Result::ok)
         .collect()
 }
 
@@ -514,7 +596,9 @@ mod tests {
             vec![dir.path().join("picture.mxf")]
         );
         assert_eq!(
-            read_sound(dir.path())
+            resolve_composition(dir.path(), &[])
+                .unwrap()
+                .sound
                 .into_iter()
                 .map(|segment| segment.path)
                 .collect::<Vec<_>>(),
@@ -527,7 +611,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_assetmap(dir.path(), "CPL_a.xml", &[(REEL_UUIDS[0], "only.mxf")]);
         std::fs::write(dir.path().join("CPL_a.xml"), dcp_cpl(&REEL_UUIDS[..1])).unwrap();
-        assert!(read_sound(dir.path()).is_empty());
+        assert!(
+            resolve_composition(dir.path(), &[])
+                .unwrap()
+                .sound
+                .is_empty()
+        );
     }
 
     #[test]
@@ -799,5 +888,119 @@ mod tests {
             mpv_source(dir.path()).unwrap().title,
             Some("Feature".to_string())
         );
+    }
+
+    const SOUND_UUID: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+    // a version file whose second reel picture and whose sound are in other packages
+    fn version_file(dir: &Path) {
+        write_assetmap(dir, "CPL_a.xml", &[(REEL_UUIDS[0], "vf_reel1.mxf")]);
+        std::fs::write(
+            dir.join("CPL_a.xml"),
+            dcp_cpl_with_sound(&[(REEL_UUIDS[0], SOUND_UUID), (REEL_UUIDS[1], SOUND_UUID)]),
+        )
+        .unwrap();
+    }
+
+    fn package_directory(library: &Path, name: &str, assets: &[(&str, &str)]) -> PathBuf {
+        let dir = library.join(name);
+        std::fs::create_dir(&dir).unwrap();
+        write_assetmap(&dir, "CPL_ov.xml", assets);
+        dir
+    }
+
+    #[test]
+    fn assets_resolve_through_the_other_packages_after_the_own_package() {
+        let library = tempfile::tempdir().unwrap();
+        let version_file_dir = package_directory(library.path(), "vf", &[]);
+        version_file(&version_file_dir);
+        let original_version = package_directory(
+            library.path(),
+            "ov",
+            &[
+                (REEL_UUIDS[0], "ov_reel1.mxf"),
+                (REEL_UUIDS[1], "ov_reel2.mxf"),
+                (SOUND_UUID, "ov_sound.mxf"),
+            ],
+        );
+
+        let composition =
+            resolve_composition(&version_file_dir, std::slice::from_ref(&original_version))
+                .unwrap();
+        let pictures: Vec<PathBuf> = composition
+            .pictures
+            .into_iter()
+            .map(|segment| segment.path)
+            .collect();
+        assert_eq!(
+            pictures,
+            vec![
+                version_file_dir.join("vf_reel1.mxf"),
+                original_version.join("ov_reel2.mxf")
+            ]
+        );
+        assert_eq!(
+            composition.sound[0].path,
+            original_version.join("ov_sound.mxf")
+        );
+    }
+
+    #[test]
+    fn an_asset_no_package_holds_fails_naming_it_and_the_packages_searched() {
+        let library = tempfile::tempdir().unwrap();
+        let version_file_dir = package_directory(library.path(), "vf", &[]);
+        version_file(&version_file_dir);
+        let original_version =
+            package_directory(library.path(), "ov", &[(SOUND_UUID, "ov_sound.mxf")]);
+
+        let error = resolve_composition(&version_file_dir, std::slice::from_ref(&original_version))
+            .unwrap_err();
+        assert!(error.contains(REEL_UUIDS[1]), "{error}");
+        assert!(
+            error.contains(&version_file_dir.display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains(&original_version.display().to_string()),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_original_version_finder_keeps_only_packages_holding_missing_assets() {
+        let library = tempfile::tempdir().unwrap();
+        let version_file_dir = package_directory(library.path(), "vf", &[]);
+        version_file(&version_file_dir);
+        let unrelated = package_directory(library.path(), "unrelated", &[(REEL_UUIDS[2], "x.mxf")]);
+        let pictures = package_directory(library.path(), "pictures", &[(REEL_UUIDS[1], "p.mxf")]);
+        let sound = package_directory(library.path(), "sound", &[(SOUND_UUID, "s.mxf")]);
+        let duplicate = package_directory(library.path(), "duplicate", &[(SOUND_UUID, "s.mxf")]);
+        let not_a_package = library.path().join("not_a_package");
+        std::fs::create_dir(&not_a_package).unwrap();
+
+        let searched = [
+            not_a_package,
+            version_file_dir.clone(),
+            unrelated,
+            pictures.clone(),
+            sound.clone(),
+            duplicate,
+        ];
+        assert_eq!(
+            find_original_version_packages(&version_file_dir, &searched),
+            Ok(vec![pictures, sound])
+        );
+    }
+
+    #[test]
+    fn the_original_version_finder_names_the_assets_no_package_holds() {
+        let library = tempfile::tempdir().unwrap();
+        let version_file_dir = package_directory(library.path(), "vf", &[]);
+        version_file(&version_file_dir);
+        let pictures = package_directory(library.path(), "pictures", &[(REEL_UUIDS[1], "p.mxf")]);
+
+        let error = find_original_version_packages(&version_file_dir, &[pictures]).unwrap_err();
+        assert!(error.contains(SOUND_UUID), "{error}");
+        assert!(!error.contains(REEL_UUIDS[1]), "{error}");
     }
 }

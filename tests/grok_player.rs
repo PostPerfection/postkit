@@ -563,6 +563,144 @@ fn a_multi_reel_package_plays_every_reel_with_the_trims_the_cpl_states() {
     );
 }
 
+fn write_package(directory: &Path, cpl_id: &str, assets: &[(&str, &str)], reels: Vec<DcpCplReel>) {
+    let cpl_name = format!("CPL_{cpl_id}.xml");
+    let assets = std::iter::once((cpl_id, cpl_name.as_str()))
+        .chain(assets.iter().copied())
+        .map(|(id, path)| AssetMapAsset {
+            id: id.into(),
+            path: path.into(),
+            ..Default::default()
+        })
+        .collect();
+    std::fs::write(
+        directory.join("ASSETMAP.xml"),
+        AssetMap {
+            uuid: "bbbbbbbb-0000-0000-0000-000000000000".into(),
+            namespace: ns::AM_SMPTE.into(),
+            assets,
+            ..Default::default()
+        }
+        .to_xml(),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join(&cpl_name),
+        DcpCpl {
+            uuid: cpl_id.into(),
+            namespace: ns::CPL_SMPTE.into(),
+            title: cpl_name.clone(),
+            reels,
+            ..Default::default()
+        }
+        .to_xml(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_version_file_plays_its_original_version_reel_in_order() {
+    const SIZE: u32 = 64;
+    const FRAMES_PER_REEL: usize = 3;
+    const ORIGINAL_VERSION_CPL: &str = "0e000000-0000-0000-0000-000000000000";
+    const VERSION_FILE_CPL: &str = "0f000000-0000-0000-0000-000000000000";
+    // reel 2 is only in the original version
+    const REELS: [(&str, &str); 3] = [
+        ("11111111-1111-1111-1111-111111111111", "reel1.mxf"),
+        ("22222222-2222-2222-2222-222222222222", "reel2.mxf"),
+        ("33333333-3333-3333-3333-333333333333", "reel3.mxf"),
+    ];
+    let library = tempfile::tempdir().unwrap();
+    let original_version = library.path().join("ov");
+    let version_file = library.path().join("vf");
+    std::fs::create_dir_all(&original_version).unwrap();
+    std::fs::create_dir_all(&version_file).unwrap();
+
+    let codestreams =
+        flat_codestreams(SIZE, SIZE, FRAMES_PER_REEL * REELS.len(), CINEMA_2K_PROFILE);
+    let reels: Vec<DcpCplReel> = REELS
+        .iter()
+        .enumerate()
+        .map(|(index, (picture_id, name))| {
+            let package = if index == 1 {
+                &original_version
+            } else {
+                &version_file
+            };
+            let frames = &codestreams[index * FRAMES_PER_REEL..(index + 1) * FRAMES_PER_REEL];
+            write_mxf(&package.join(name), frames, None, SIZE, SIZE);
+            DcpCplReel {
+                reel_id: format!("aaaaaaaa-0000-0000-0000-00000000000{index}"),
+                picture_id: (*picture_id).into(),
+                picture_edit_rate_num: FRAMES_PER_SECOND,
+                picture_edit_rate_den: 1,
+                picture_duration: FRAMES_PER_REEL as u64,
+                picture_width: SIZE,
+                picture_height: SIZE,
+                ..Default::default()
+            }
+        })
+        .collect();
+    write_package(
+        &original_version,
+        ORIGINAL_VERSION_CPL,
+        &[REELS[1]],
+        vec![reels[1].clone()],
+    );
+    write_package(
+        &version_file,
+        VERSION_FILE_CPL,
+        &[REELS[0], REELS[2]],
+        reels,
+    );
+
+    let searched = vec![version_file.clone(), original_version.clone()];
+    assert_eq!(
+        composition_timeline::find_original_version_packages(&version_file, &searched),
+        Ok(vec![original_version.clone()])
+    );
+    assert!(!GrokPlayer::accepts(&version_file));
+    assert!(GrokPlayer::accepts_with_packages(
+        &version_file,
+        std::slice::from_ref(&original_version)
+    ));
+
+    let player = GrokPlayer::new();
+    player.init_software().unwrap();
+    let error = player
+        .load(&version_file, None)
+        .expect_err("reel 2 is in no package searched");
+    assert!(error.contains(REELS[1].0), "{error}");
+    assert!(
+        error.contains(&version_file.display().to_string()),
+        "{error}"
+    );
+
+    player
+        .load_with_packages(&version_file, None, &[original_version])
+        .expect("load");
+    wait_until("the first frame was composed", || {
+        player.frame_size().is_some()
+    });
+    let total_frames = FRAMES_PER_REEL * REELS.len();
+    assert_eq!(
+        player.duration(),
+        Some(total_frames as f64 / f64::from(FRAMES_PER_SECOND))
+    );
+    let (width, height) = (SIZE as usize, SIZE as usize);
+    assert_eq!(shown_colour(&player, width, height), frame_colour(0));
+    for frame in 1..total_frames {
+        forget_frames(&player);
+        player.frame_step();
+        wait_for_frame(&player);
+        assert_eq!(
+            shown_colour(&player, width, height),
+            frame_colour(frame),
+            "frame {frame}"
+        );
+    }
+}
+
 #[test]
 fn a_square_picture_is_letterboxed_into_a_wide_surface() {
     const SIZE: u32 = 64;

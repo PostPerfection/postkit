@@ -51,12 +51,14 @@ pub(super) struct Timeline {
 }
 
 impl Timeline {
-    pub fn open(source: &Path, keys: Option<&ContentKeys>) -> Result<Self, String> {
+    pub fn open(
+        source: &Path,
+        keys: Option<&ContentKeys>,
+        other_packages: &[PathBuf],
+    ) -> Result<Self, String> {
         if source.is_dir() {
             if crate::assetmap::find(source).is_some() {
-                let (segments, title) = composition_timeline::read_composition(source);
-                let sound = composition_timeline::read_sound(source);
-                return Self::from_composition(source, segments, title, sound, keys);
+                return Self::from_resolved(source, other_packages, keys);
             }
             return Self::from_codestream_directory(source);
         }
@@ -67,22 +69,27 @@ impl Timeline {
             Some(MXF_EXTENSION) => {
                 Self::from_composition(source, Vec::new(), None, Vec::new(), keys)
             }
-            Some(CPL_EXTENSION) => {
-                let (segments, title) = composition_timeline::read_composition_from_cpl(source);
-                if segments.is_empty() {
-                    return Err(format!(
-                        "{} names no picture this player can resolve",
-                        source.display()
-                    ));
-                }
-                let sound = composition_timeline::read_sound_from_cpl(source);
-                Self::from_composition(source, segments, title, sound, keys)
-            }
+            Some(CPL_EXTENSION) => Self::from_resolved(source, other_packages, keys),
             _ => Err(format!(
                 "{} is neither a JPEG 2000 MXF, a CPL, nor a directory of codestreams",
                 source.display()
             )),
         }
+    }
+
+    fn from_resolved(
+        source: &Path,
+        other_packages: &[PathBuf],
+        keys: Option<&ContentKeys>,
+    ) -> Result<Self, String> {
+        let composition = composition_timeline::resolve_composition(source, other_packages)?;
+        Self::from_composition(
+            source,
+            composition.pictures,
+            composition.title,
+            composition.sound,
+            keys,
+        )
     }
 
     fn from_composition(
@@ -329,10 +336,10 @@ pub(super) fn codestream_files(directory: &Path) -> Vec<PathBuf> {
     files
 }
 
-pub(super) fn accepts(source: &Path) -> bool {
+pub(super) fn accepts(source: &Path, other_packages: &[PathBuf]) -> bool {
     if source.is_dir() {
         if crate::assetmap::find(source).is_some() {
-            return first_picture_is_readable(composition_timeline::read_composition(source).0);
+            return composition_is_readable(source, other_packages);
         }
         return !codestream_files(source).is_empty();
     }
@@ -341,17 +348,18 @@ pub(super) fn accepts(source: &Path) -> bool {
     }
     match extension(source).as_deref() {
         Some(MXF_EXTENSION) => preview::is_jpeg2000_mxf(source),
-        Some(CPL_EXTENSION) => {
-            first_picture_is_readable(composition_timeline::read_composition_from_cpl(source).0)
-        }
+        Some(CPL_EXTENSION) => composition_is_readable(source, other_packages),
         _ => false,
     }
 }
 
-fn first_picture_is_readable(segments: Vec<composition_timeline::PictureSegment>) -> bool {
-    segments
-        .first()
-        .is_some_and(|segment| preview::is_jpeg2000_mxf(&segment.path))
+fn composition_is_readable(source: &Path, other_packages: &[PathBuf]) -> bool {
+    composition_timeline::resolve_composition(source, other_packages).is_ok_and(|composition| {
+        composition
+            .pictures
+            .first()
+            .is_some_and(|segment| preview::is_jpeg2000_mxf(&segment.path))
+    })
 }
 
 fn extension(path: &Path) -> Option<String> {
@@ -408,7 +416,7 @@ pub(super) mod tests {
     }
 
     fn open_error(source: &Path, keys: Option<&ContentKeys>) -> String {
-        Timeline::open(source, keys)
+        Timeline::open(source, keys, &[])
             .err()
             .expect("the timeline must not open")
     }
@@ -419,7 +427,7 @@ pub(super) mod tests {
         let (mxf, frames) = encrypted_picture(directory.path());
         let keys = content_keys(directory.path(), &[(PICTURE_KEY_ID, PICTURE_KEY)]);
 
-        let mut timeline = Timeline::open(&mxf, Some(&keys)).unwrap();
+        let mut timeline = Timeline::open(&mxf, Some(&keys), &[]).unwrap();
         for (index, frame) in frames.iter().enumerate() {
             let (codestream, render, _) = timeline.codestream(index as u64).unwrap();
             assert!(

@@ -174,8 +174,18 @@ struct Status {
 type UpdateCallback = Box<dyn Fn() + Send + 'static>;
 
 enum Command {
-    Load(PathBuf, Option<ContentKeys>, Sender<Result<(), String>>),
-    QueueNext(PathBuf, Option<ContentKeys>, Sender<Result<(), String>>),
+    Load(
+        PathBuf,
+        Option<ContentKeys>,
+        Vec<PathBuf>,
+        Sender<Result<(), String>>,
+    ),
+    QueueNext(
+        PathBuf,
+        Option<ContentKeys>,
+        Vec<PathBuf>,
+        Sender<Result<(), String>>,
+    ),
     ClearQueued,
     Stop,
     SetPaused(bool),
@@ -309,7 +319,11 @@ impl GrokPlayer {
 
     // stereoscopic essence is refused, the mono asdcplib reader cannot read it
     pub fn accepts(source: &Path) -> bool {
-        timeline::accepts(source)
+        timeline::accepts(source, &[])
+    }
+
+    pub fn accepts_with_packages(source: &Path, other_packages: &[PathBuf]) -> bool {
+        timeline::accepts(source, other_packages)
     }
 
     // ─── render backends ───────────────────────────────────────────────────
@@ -428,8 +442,23 @@ impl GrokPlayer {
     // ─── transport ─────────────────────────────────────────────────────────
 
     pub fn load(&self, source: &Path, keys: Option<ContentKeys>) -> Result<(), String> {
+        self.load_with_packages(source, keys, &[])
+    }
+
+    // other_packages hold the assets a version file takes from its original version, searched after its own package
+    pub fn load_with_packages(
+        &self,
+        source: &Path,
+        keys: Option<ContentKeys>,
+        other_packages: &[PathBuf],
+    ) -> Result<(), String> {
         let (reply, answer) = channel();
-        self.send(Command::Load(source.to_path_buf(), keys, reply))?;
+        self.send(Command::Load(
+            source.to_path_buf(),
+            keys,
+            other_packages.to_vec(),
+            reply,
+        ))?;
         answer
             .recv()
             .map_err(|_| "the decode thread is gone".to_string())?
@@ -437,8 +466,22 @@ impl GrokPlayer {
 
     // plays straight after the loaded source, a later call replaces it, and load or stop clears it
     pub fn queue_next(&self, source: &Path, keys: Option<ContentKeys>) -> Result<(), String> {
+        self.queue_next_with_packages(source, keys, &[])
+    }
+
+    pub fn queue_next_with_packages(
+        &self,
+        source: &Path,
+        keys: Option<ContentKeys>,
+        other_packages: &[PathBuf],
+    ) -> Result<(), String> {
         let (reply, answer) = channel();
-        self.send(Command::QueueNext(source.to_path_buf(), keys, reply))?;
+        self.send(Command::QueueNext(
+            source.to_path_buf(),
+            keys,
+            other_packages.to_vec(),
+            reply,
+        ))?;
         answer
             .recv()
             .map_err(|_| "the decode thread is gone".to_string())?

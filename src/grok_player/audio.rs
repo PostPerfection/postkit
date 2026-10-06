@@ -1513,7 +1513,7 @@ mod tests {
         let (package, first_edit_unit) = package_with_encrypted_sound(directory.path());
         let keys = content_keys(directory.path(), &[(SOUND_KEY_ID, SOUND_KEY)]);
 
-        let timeline = Timeline::open(&package, Some(&keys)).unwrap();
+        let timeline = Timeline::open(&package, Some(&keys), &[]).unwrap();
         let [sound] = timeline.sound.as_slice() else {
             panic!("the package names one sound reel");
         };
@@ -1537,7 +1537,7 @@ mod tests {
     fn encrypted_sound_with_no_keys_fails_the_load() {
         let directory = tempfile::tempdir().unwrap();
         let (package, _) = package_with_encrypted_sound(directory.path());
-        let error = Timeline::open(&package, None)
+        let error = Timeline::open(&package, None, &[])
             .err()
             .expect("the sound has no key");
         assert_eq!(
@@ -1554,7 +1554,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (package, _) = package_with_encrypted_sound(directory.path());
         let keys = content_keys(directory.path(), &[([0x66; 16], SOUND_KEY)]);
-        let error = Timeline::open(&package, Some(&keys))
+        let error = Timeline::open(&package, Some(&keys), &[])
             .err()
             .expect("the keys do not cover the sound");
         assert_eq!(

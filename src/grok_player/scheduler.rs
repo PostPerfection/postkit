@@ -479,15 +479,15 @@ impl Scheduler {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Load(source, keys, reply) => {
-                let outcome = self.load(&source, keys);
+            Command::Load(source, keys, other_packages, reply) => {
+                let outcome = self.load(&source, keys, &other_packages);
                 // the caller reads duration and size the moment load returns
                 self.publish_status();
                 let _ = reply.send(outcome);
             }
             Command::Stop => self.stop(),
-            Command::QueueNext(source, keys, reply) => {
-                let outcome = self.queue_next(source, keys);
+            Command::QueueNext(source, keys, other_packages, reply) => {
+                let outcome = self.queue_next(source, keys, &other_packages);
                 self.publish_status();
                 let _ = reply.send(outcome);
             }
@@ -545,9 +545,14 @@ impl Scheduler {
         }
     }
 
-    fn load(&mut self, source: &Path, keys: Option<ContentKeys>) -> Result<(), String> {
+    fn load(
+        &mut self,
+        source: &Path,
+        keys: Option<ContentKeys>,
+        other_packages: &[PathBuf],
+    ) -> Result<(), String> {
         self.stop();
-        let mut timeline = Timeline::open(source, keys.as_ref())?;
+        let mut timeline = Timeline::open(source, keys.as_ref(), other_packages)?;
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
         self.sound_loaded = self.sound.load(
@@ -564,11 +569,16 @@ impl Scheduler {
         Ok(())
     }
 
-    fn queue_next(&mut self, source: PathBuf, keys: Option<ContentKeys>) -> Result<(), String> {
+    fn queue_next(
+        &mut self,
+        source: PathBuf,
+        keys: Option<ContentKeys>,
+        other_packages: &[PathBuf],
+    ) -> Result<(), String> {
         if self.timeline.is_none() {
             return Err("nothing is loaded for a source to follow".to_string());
         }
-        let mut timeline = Timeline::open(&source, keys.as_ref())?;
+        let mut timeline = Timeline::open(&source, keys.as_ref(), other_packages)?;
         self.clear_queued();
         if self.sound_loaded {
             self.sound.queue(

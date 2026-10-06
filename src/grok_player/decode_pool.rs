@@ -1406,7 +1406,7 @@ mod tests {
         const RUNS: u32 = 10;
         let source = std::env::var("POSTKIT_BENCH_SOURCE").expect("POSTKIT_BENCH_SOURCE");
         let mut timeline =
-            super::super::timeline::Timeline::open(std::path::Path::new(&source), None)
+            super::super::timeline::Timeline::open(std::path::Path::new(&source), None, &[])
                 .expect("open");
         let (codestream, render, mxf) = timeline.codestream(0).expect("frame 0");
         crate::grok_encoder::initialize(0);
@@ -1588,9 +1588,12 @@ mod tests {
             .unwrap_or(96);
         let (codestream, render) = match std::env::var("POSTKIT_BENCH_SOURCE") {
             Ok(source) => {
-                let mut timeline =
-                    super::super::timeline::Timeline::open(std::path::Path::new(&source), None)
-                        .expect("open");
+                let mut timeline = super::super::timeline::Timeline::open(
+                    std::path::Path::new(&source),
+                    None,
+                    &[],
+                )
+                .expect("open");
                 let (codestream, render, _mxf) = timeline.codestream(0).expect("frame 0");
                 (codestream, render)
             }
