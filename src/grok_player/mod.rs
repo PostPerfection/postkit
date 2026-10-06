@@ -16,7 +16,10 @@ use std::time::{Duration, Instant};
 
 use crate::content_keys::ContentKeys;
 
-pub use presenter::PictureRectangle;
+pub use presenter::{
+    MAXIMUM_BRIGHTNESS, MINIMUM_BRIGHTNESS, PictureMasks, PictureRectangle, PictureScaling,
+    PresentationSettings,
+};
 
 // the signature libmpv's mpv_opengl_init_params takes, declared here so this player needs no libmpv
 pub type GetProcAddressFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
@@ -177,6 +180,7 @@ enum Command {
     SetSubtitleFile(SubtitleSlot, Option<PathBuf>, Sender<Result<(), String>>),
     SetSubtitleVisibility(SubtitleSlot, bool),
     SetOverlay(Vec<OverlayRectangle>),
+    Redraw,
     DecodeFinished,
     Shutdown,
 }
@@ -190,6 +194,8 @@ struct Shared {
     callback: Mutex<Option<UpdateCallback>>,
     cached_frames: AtomicUsize,
     lookahead_frames: AtomicUsize,
+    presentation: Mutex<PresentationSettings>,
+    presentation_changed: AtomicBool,
 }
 
 impl Shared {
@@ -206,6 +212,8 @@ impl Shared {
             callback: Mutex::new(None),
             cached_frames: AtomicUsize::new(0),
             lookahead_frames: AtomicUsize::new(0),
+            presentation: Mutex::new(PresentationSettings::default()),
+            presentation_changed: AtomicBool::new(false),
         }
     }
 
@@ -248,6 +256,10 @@ impl Shared {
 
     fn set_lookahead(&self, count: usize) {
         self.lookahead_frames.store(count, Ordering::Release);
+    }
+
+    fn presentation(&self) -> PresentationSettings {
+        *self.presentation.lock().unwrap()
     }
 }
 
@@ -329,7 +341,14 @@ impl GrokPlayer {
         let frame = self.shared.current_frame();
         let serial = self.shared.serial.load(Ordering::Acquire);
         let started = Instant::now();
-        let upload = presenter.draw(framebuffer, width, height, flip_y, frame, serial)?;
+        let settings = self.shared.presentation();
+        let surface = presenter::GlSurface {
+            framebuffer,
+            width,
+            height,
+            flip_y,
+        };
+        let upload = presenter.draw(surface, frame, serial, &settings)?;
         if let Some(upload) = upload {
             record_render_timing(upload, started.elapsed());
         }
@@ -356,7 +375,7 @@ impl GrokPlayer {
             target[..needed].fill(0);
             return Ok(());
         };
-        presenter::draw_software(&frame, width, height, target)
+        presenter::draw_software(&frame, width, height, &self.shared.presentation(), target)
     }
 
     pub fn picture_rectangle(
@@ -365,16 +384,29 @@ impl GrokPlayer {
         surface_height: u32,
     ) -> Option<PictureRectangle> {
         let frame = self.shared.current_frame()?;
-        presenter::picture_rectangle(surface_width, surface_height, frame.width, frame.height)
+        let placement = presenter::picture_placement(
+            surface_width,
+            surface_height,
+            frame.width,
+            frame.height,
+            self.shared.presentation().scaling,
+        )?;
+        Some(placement.rectangle)
     }
 
-    // true once for each newly composed frame
+    // true once for each newly composed frame and once after each presentation change
     pub fn wants_redraw(&self) -> bool {
+        let presentation_changed = self
+            .shared
+            .presentation_changed
+            .swap(false, Ordering::AcqRel);
         let serial = self.shared.serial.load(Ordering::Acquire);
-        self.shared
+        let frame_changed = self
+            .shared
             .acknowledged_serial
             .swap(serial, Ordering::AcqRel)
-            != serial
+            != serial;
+        frame_changed || presentation_changed
     }
 
     // fires on the scheduler thread, so it must not touch ui state directly
@@ -448,6 +480,15 @@ impl GrokPlayer {
 
     pub fn set_decode_scale(&self, scale: DecodeScale) {
         let _ = self.send(Command::SetDecodeScale(scale));
+    }
+
+    // brightness and masks out of range are clamped
+    pub fn set_presentation(&self, settings: PresentationSettings) {
+        *self.shared.presentation.lock().unwrap() = settings.clamped();
+        self.shared
+            .presentation_changed
+            .store(true, Ordering::Release);
+        let _ = self.send(Command::Redraw);
     }
 
     // ─── subtitles and overlays ────────────────────────────────────────────

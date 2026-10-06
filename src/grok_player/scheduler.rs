@@ -404,6 +404,7 @@ impl Scheduler {
                 self.overlays = rectangles;
                 self.recompose();
             }
+            Command::Redraw => self.shared.fire_update(),
             Command::DecodeFinished => {}
             Command::Shutdown => {}
         }

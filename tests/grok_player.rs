@@ -5,7 +5,10 @@ use asdcplib::jp2k::{CodestreamHeader, MxfWriter, PictureDescriptor};
 use asdcplib::{LabelSet, Rational, WriterInfo};
 use postkit::colour::XyzToSrgb;
 use postkit::composition_timeline;
-use postkit::grok_player::{DecodeScale, GrokPlayer, OverlayRectangle, SubtitleSlot};
+use postkit::grok_player::{
+    DecodeScale, GrokPlayer, OverlayRectangle, PictureMasks, PictureScaling, PresentationSettings,
+    SubtitleSlot,
+};
 use postkit::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -596,6 +599,52 @@ fn a_square_picture_is_letterboxed_into_a_wide_surface() {
         pixel(&buffer, SURFACE_WIDTH, 319, 179),
         [0, 0, 0],
         "right bar"
+    );
+}
+
+#[test]
+fn a_presentation_change_while_paused_redraws_the_still_frame() {
+    const SIZE: u32 = 64;
+    const SURFACE_WIDTH: usize = 320;
+    const SURFACE_HEIGHT: usize = 180;
+    const BRIGHTNESS: f32 = 0.5;
+    let directory = tempfile::tempdir().unwrap();
+    let mxf = flat_mxf(directory.path(), "picture.mxf", SIZE, SIZE, 2);
+
+    let player = loaded_player(&mxf);
+    assert!(
+        !player.wants_redraw(),
+        "a paused player has nothing to redraw"
+    );
+    player.set_presentation(PresentationSettings {
+        brightness: BRIGHTNESS,
+        masks: PictureMasks {
+            left: 0.5,
+            ..PictureMasks::default()
+        },
+        scaling: PictureScaling::Fill,
+    });
+    wait_until("the presentation change asked for a redraw", || {
+        player.wants_redraw()
+    });
+
+    let rectangle = player
+        .picture_rectangle(SURFACE_WIDTH as u32, SURFACE_HEIGHT as u32)
+        .expect("a composed frame lands somewhere");
+    assert_eq!(
+        (rectangle.x, rectangle.y, rectangle.width, rectangle.height),
+        (0, 0, 320, 180),
+        "fill covers the surface"
+    );
+    let buffer = software_frame(&player, SURFACE_WIDTH, SURFACE_HEIGHT);
+    let dimmed = frame_colour(0).map(|sample| (f32::from(sample) * BRIGHTNESS).round() as u8);
+    assert_eq!(pixel(&buffer, SURFACE_WIDTH, 0, 90), [0, 0, 0], "masked");
+    assert_eq!(pixel(&buffer, SURFACE_WIDTH, 159, 90), [0, 0, 0], "masked");
+    assert_eq!(pixel(&buffer, SURFACE_WIDTH, 160, 90), dimmed, "dimmed");
+    assert_eq!(
+        pixel(&buffer, SURFACE_WIDTH, 319, 0),
+        dimmed,
+        "dimmed corner"
     );
 }
 

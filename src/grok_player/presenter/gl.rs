@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::{ComposedFrame, GetProcAddressFn, RGBA_BYTES_PER_PIXEL};
-use super::picture_rectangle;
+use super::{PresentationSettings, picture_placement};
 
 const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_RGBA: u32 = 0x1908;
@@ -56,18 +56,25 @@ const VERTEX_SHADER: &str = "#version 330 core\n\
 layout(location = 0) in vec2 position;\n\
 layout(location = 1) in vec2 corner;\n\
 uniform int flip_y;\n\
+uniform vec4 crop;\n\
 out vec2 texture_coordinate;\n\
 void main() {\n\
-    texture_coordinate = vec2(corner.x, flip_y != 0 ? corner.y : 1.0 - corner.y);\n\
+    vec2 oriented = vec2(corner.x, flip_y != 0 ? corner.y : 1.0 - corner.y);\n\
+    texture_coordinate = crop.xy + oriented * crop.zw;\n\
     gl_Position = vec4(position, 0.0, 1.0);\n\
 }\n";
 
 const FRAGMENT_SHADER: &str = "#version 330 core\n\
 in vec2 texture_coordinate;\n\
 uniform sampler2D picture;\n\
+uniform float brightness;\n\
+uniform vec4 unmasked;\n\
 out vec4 fragment;\n\
 void main() {\n\
-    fragment = vec4(texture(picture, texture_coordinate).rgb, 1.0);\n\
+    bool masked = any(lessThan(texture_coordinate, unmasked.xy))\n\
+        || any(greaterThan(texture_coordinate, unmasked.zw));\n\
+    vec3 colour = clamp(texture(picture, texture_coordinate).rgb * brightness, 0.0, 1.0);\n\
+    fragment = vec4(masked ? vec3(0.0) : colour, 1.0);\n\
 }\n";
 
 type GlGenTextures = unsafe extern "C" fn(i32, *mut u32);
@@ -90,6 +97,8 @@ type GlGetProgramInfoLog = unsafe extern "C" fn(u32, i32, *mut i32, *mut c_char)
 type GlUseProgram = unsafe extern "C" fn(u32);
 type GlGetUniformLocation = unsafe extern "C" fn(u32, *const c_char) -> i32;
 type GlUniform1i = unsafe extern "C" fn(i32, i32);
+type GlUniform1f = unsafe extern "C" fn(i32, f32);
+type GlUniform4f = unsafe extern "C" fn(i32, f32, f32, f32, f32);
 type GlGenVertexArrays = unsafe extern "C" fn(i32, *mut u32);
 type GlBindVertexArray = unsafe extern "C" fn(u32);
 type GlGenBuffers = unsafe extern "C" fn(i32, *mut u32);
@@ -127,6 +136,8 @@ struct Entries {
     use_program: GlUseProgram,
     get_uniform_location: GlGetUniformLocation,
     uniform1i: GlUniform1i,
+    uniform1f: GlUniform1f,
+    uniform4f: GlUniform4f,
     gen_vertex_arrays: GlGenVertexArrays,
     bind_vertex_array: GlBindVertexArray,
     gen_buffers: GlGenBuffers,
@@ -144,6 +155,21 @@ struct Entries {
     get_stringi: GlGetStringi,
 }
 
+struct Uniforms {
+    picture: i32,
+    flip_y: i32,
+    crop: i32,
+    brightness: i32,
+    unmasked: i32,
+}
+
+pub(crate) struct GlSurface {
+    pub framebuffer: i32,
+    pub width: i32,
+    pub height: i32,
+    pub flip_y: bool,
+}
+
 // every method must run on the thread whose gl context built it
 pub(crate) struct GlPresenter {
     entries: Entries,
@@ -153,8 +179,7 @@ pub(crate) struct GlPresenter {
     // a decode scale change reallocates the texture
     texture_size: (u32, u32),
     uploaded_serial: u64,
-    picture_uniform: i32,
-    flip_y_uniform: i32,
+    uniforms: Uniforms,
     // GL_APPLE_client_storage only: same GPU as the GL context. A 3060 decode
     // with an iGPU window still copies through the host (no Apple extension).
     client_storage: bool,
@@ -200,6 +225,8 @@ impl GlPresenter {
                 use_program: entry(loader, context, "glUseProgram")?,
                 get_uniform_location: entry(loader, context, "glGetUniformLocation")?,
                 uniform1i: entry(loader, context, "glUniform1i")?,
+                uniform1f: entry(loader, context, "glUniform1f")?,
+                uniform4f: entry(loader, context, "glUniform4f")?,
                 gen_vertex_arrays: entry(loader, context, "glGenVertexArrays")?,
                 bind_vertex_array: entry(loader, context, "glBindVertexArray")?,
                 gen_buffers: entry(loader, context, "glGenBuffers")?,
@@ -219,13 +246,16 @@ impl GlPresenter {
         };
 
         let program = link_program(&entries)?;
-        let (picture_uniform, flip_y_uniform) = unsafe {
-            let picture = CString::new("picture").unwrap();
-            let flip_y = CString::new("flip_y").unwrap();
-            (
-                (entries.get_uniform_location)(program, picture.as_ptr()),
-                (entries.get_uniform_location)(program, flip_y.as_ptr()),
-            )
+        let location = |name: &str| {
+            let name = CString::new(name).unwrap();
+            unsafe { (entries.get_uniform_location)(program, name.as_ptr()) }
+        };
+        let uniforms = Uniforms {
+            picture: location("picture"),
+            flip_y: location("flip_y"),
+            crop: location("crop"),
+            brightness: location("brightness"),
+            unmasked: location("unmasked"),
         };
 
         let mut vertex_array = 0u32;
@@ -294,8 +324,7 @@ impl GlPresenter {
             texture,
             texture_size: (0, 0),
             uploaded_serial: 0,
-            picture_uniform,
-            flip_y_uniform,
+            uniforms,
             client_storage,
             backing: None,
         })
@@ -304,13 +333,17 @@ impl GlPresenter {
     // the duration is the texture upload, None when this serial was already uploaded
     pub fn draw(
         &mut self,
-        framebuffer: i32,
-        width: i32,
-        height: i32,
-        flip_y: bool,
+        surface: GlSurface,
         frame: Option<Arc<ComposedFrame>>,
         serial: u64,
+        settings: &PresentationSettings,
     ) -> Result<Option<Duration>, String> {
+        let GlSurface {
+            framebuffer,
+            width,
+            height,
+            flip_y,
+        } = surface;
         unsafe {
             let entries = &self.entries;
             (entries.bind_framebuffer)(GL_FRAMEBUFFER, framebuffer as u32);
@@ -324,11 +357,18 @@ impl GlPresenter {
         if width <= 0 || height <= 0 {
             return Ok(None);
         }
-        let Some(rectangle) =
-            picture_rectangle(width as u32, height as u32, frame.width, frame.height)
-        else {
+        let Some(placement) = picture_placement(
+            width as u32,
+            height as u32,
+            frame.width,
+            frame.height,
+            settings.scaling,
+        ) else {
             return Ok(None);
         };
+        let rectangle = placement.rectangle;
+        let [unmasked_left, unmasked_top, unmasked_right, unmasked_bottom] =
+            settings.unmasked_area();
 
         let uploaded = self.upload(frame, serial);
         let entries = &self.entries;
@@ -343,8 +383,24 @@ impl GlPresenter {
             (entries.use_program)(self.program);
             (entries.active_texture)(GL_TEXTURE0);
             (entries.bind_texture)(GL_TEXTURE_2D, self.texture);
-            (entries.uniform1i)(self.picture_uniform, PICTURE_TEXTURE_UNIT);
-            (entries.uniform1i)(self.flip_y_uniform, i32::from(flip_y));
+            let uniforms = &self.uniforms;
+            (entries.uniform1i)(uniforms.picture, PICTURE_TEXTURE_UNIT);
+            (entries.uniform1i)(uniforms.flip_y, i32::from(flip_y));
+            (entries.uniform4f)(
+                uniforms.crop,
+                placement.horizontal.start as f32,
+                placement.vertical.start as f32,
+                placement.horizontal.size as f32,
+                placement.vertical.size as f32,
+            );
+            (entries.uniform1f)(uniforms.brightness, settings.brightness);
+            (entries.uniform4f)(
+                uniforms.unmasked,
+                unmasked_left as f32,
+                unmasked_top as f32,
+                unmasked_right as f32,
+                unmasked_bottom as f32,
+            );
             (entries.bind_vertex_array)(self.vertex_array);
             (entries.draw_arrays)(GL_TRIANGLE_STRIP, 0, QUAD_VERTICES);
             (entries.bind_vertex_array)(0);
