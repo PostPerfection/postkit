@@ -3,6 +3,9 @@ use crate::xmldsig::{DSIG_NS, XmlSigner};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+mod chain_rules;
+pub use chain_rules::*;
+
 /// Certificate type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CertType {
@@ -471,6 +474,15 @@ pub fn generate_certificate(opts: &CertOptions) -> i32 {
             }
         };
 
+        // ST 430-2 rule 18: a child must not outlive the issuer that vouches for it
+        match issuer_not_after(&issuer_cert_pem) {
+            Ok(issuer_end) => params.not_after = params.not_after.min(issuer_end),
+            Err(e) => {
+                tracing::error!("{e}");
+                return -1;
+            }
+        }
+
         let issuer_params = match CertificateParams::from_ca_cert_pem(&issuer_cert_pem) {
             Ok(p) => p,
             Err(e) => {
@@ -508,6 +520,16 @@ pub fn generate_certificate(opts: &CertOptions) -> i32 {
 
     tracing::info!("generated certificate: {}", opts.output_cert.display());
     0
+}
+
+fn issuer_not_after(issuer_cert_pem: &str) -> Result<time::OffsetDateTime, String> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(issuer_cert_pem.as_bytes())
+        .map_err(|e| format!("failed to parse issuer cert PEM: {e}"))?;
+    let issuer = pem
+        .parse_x509()
+        .map_err(|e| format!("failed to parse issuer cert: {e}"))?;
+    time::OffsetDateTime::from_unix_timestamp(issuer.validity().not_after.timestamp())
+        .map_err(|e| format!("issuer cert expiry is out of range: {e}"))
 }
 
 /// Generate a self-signed certificate chain (root → intermediate → signer).
@@ -752,6 +774,7 @@ fn check_kdm_window(
     signer_cert_file: &Path,
     signer_chain_files: &[PathBuf],
     window: &KdmWindow,
+    issue_date: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), String> {
     match classify_window(recipient, window) {
         KdmWindowOverlap::WithinCertificate => {}
@@ -777,7 +800,7 @@ fn check_kdm_window(
     // and signatures are checked at the same time.
     let mut chain = vec![signer_cert_file.to_path_buf()];
     chain.extend(signer_chain_files.iter().cloned());
-    validate_chain_inner(&chain, Some(window))
+    validate_chain_inner(&chain, issue_date, Some(window))
         .map_err(|e| format!("the signer chain cannot issue this KDM: {e}"))?;
     Ok(())
 }
@@ -788,7 +811,7 @@ fn check_kdm_window(
 /// signature algorithm that x509-parser/ring cannot check is reported as a
 /// failure, never as a pass.
 pub fn validate_chain(chain: &[PathBuf]) -> i32 {
-    match validate_chain_inner(chain, None) {
+    match validate_chain_inner(chain, chrono::Utc::now(), None) {
         Ok(n) => {
             tracing::info!("certificate chain valid ({n} certificates)");
             0
@@ -800,11 +823,9 @@ pub fn validate_chain(chain: &[PathBuf]) -> i32 {
     }
 }
 
-/// The chain walk behind `validate_chain`. With `kdm_window` set it also
-/// applies the check libdcp makes before it encrypts a KDM: every certificate
-/// from leaf to root must cover the whole window.
 fn validate_chain_inner(
     chain: &[PathBuf],
+    desired_time: chrono::DateTime<chrono::Utc>,
     kdm_window: Option<&KdmWindow>,
 ) -> Result<usize, String> {
     use x509_parser::prelude::*;
@@ -812,33 +833,21 @@ fn validate_chain_inner(
     if chain.is_empty() {
         return Err("empty certificate chain".into());
     }
-
-    // Pem owns its contents, so parsed certs below can borrow from this vec.
-    let mut pems = Vec::new();
-    for path in chain {
-        let data = std::fs::read(path)
-            .map_err(|e| format!("failed to read certificate {}: {e}", path.display()))?;
-        let (_, pem) = parse_x509_pem(&data)
-            .map_err(|e| format!("failed to parse PEM {}: {e}", path.display()))?;
-        pems.push(pem);
+    let certificates = chain_from_files(chain)?;
+    let report = check_chain(
+        &certificates,
+        &ChainContext {
+            leaf_roles: LeafRoles::ZeroOrMore,
+            desired_times: &[desired_time],
+            best_effort_rules: &[],
+        },
+    );
+    if !report.passed() {
+        let failures: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
+        return Err(failures.join("; "));
     }
-
-    let mut certs = Vec::new();
-    for (pem, path) in pems.iter().zip(chain) {
-        let cert = pem
-            .parse_x509()
-            .map_err(|e| format!("failed to parse X.509 {}: {e}", path.display()))?;
-        certs.push(cert);
-    }
-
-    let now = ASN1Time::now();
-    for (cert, path) in certs.iter().zip(chain) {
-        if cert.validity().not_after < now {
-            return Err(format!("certificate expired: {}", path.display()));
-        }
-        if cert.validity().not_before > now {
-            return Err(format!("certificate not yet valid: {}", path.display()));
-        }
+    for skipped in &report.not_checked {
+        tracing::info!("{} not checked: {}", skipped.rule, skipped.reason);
     }
 
     // libdcp (decrypted_kdm.cc, comparators in util.cc) compares at day
@@ -847,7 +856,9 @@ fn validate_chain_inner(
     if let Some(window) = kdm_window {
         let window_start = window.not_before.date_naive();
         let window_end = window.not_after.date_naive();
-        for (cert, path) in certs.iter().zip(chain) {
+        for (certificate, path) in certificates.iter().zip(chain) {
+            let (_, cert) = X509Certificate::from_der(&certificate.der)
+                .map_err(|e| format!("failed to parse X.509 {}: {e}", path.display()))?;
             let cert_start = certificate_validity_date(cert.validity().not_before)?;
             let cert_end = certificate_validity_date(cert.validity().not_after)?;
             if cert_start >= window_start {
@@ -867,41 +878,7 @@ fn validate_chain_inner(
         }
     }
 
-    // Each cert must be signed by the next one up; the last must be self-signed.
-    for i in 0..certs.len() {
-        let issuer = certs.get(i + 1).unwrap_or(&certs[i]);
-        let is_root = i + 1 == certs.len();
-
-        if certs[i].issuer() != issuer.subject() {
-            return Err(if is_root {
-                format!(
-                    "root cert is not self-issued: {} (subject '{}', issuer '{}')",
-                    chain[i].display(),
-                    distinguished_name(certs[i].subject()),
-                    distinguished_name(certs[i].issuer())
-                )
-            } else {
-                format!(
-                    "chain broken: issuer of {} ('{}') does not match subject of {} ('{}')",
-                    chain[i].display(),
-                    distinguished_name(certs[i].issuer()),
-                    chain[i + 1].display(),
-                    distinguished_name(issuer.subject())
-                )
-            });
-        }
-
-        certs[i]
-            .verify_signature(Some(issuer.public_key()))
-            .map_err(|e| {
-                format!(
-                    "signature verification failed for {}: {e}",
-                    chain[i].display()
-                )
-            })?;
-    }
-
-    Ok(certs.len())
+    Ok(certificates.len())
 }
 
 /// Add a trusted device.
@@ -1280,6 +1257,9 @@ pub struct KdmConfig {
     /// Forensic marking of the audio essence, likewise defaulting to Enabled.
     #[serde(default)]
     pub audio_forensic_marking: AudioForensicMarking,
+    // None stamps the KDM with the time it is built
+    #[serde(default)]
+    pub issue_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// A caller-supplied content key placed in a KDM, binding it to an already
@@ -1518,6 +1498,7 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
         &config.signer_cert_file,
         &config.signer_chain_files,
         &window,
+        config.issue_date.unwrap_or_else(chrono::Utc::now),
     )?;
 
     // Prefer the caller's keys (from the DCP's keys file) so the KDM unlocks the
@@ -1552,6 +1533,7 @@ pub fn build_kdm(config: &KdmConfig) -> Result<GeneratedKdm, String> {
         &recipient,
         &signer,
         &keys,
+        None,
     )?;
 
     Ok(GeneratedKdm {
@@ -1639,6 +1621,7 @@ fn build_kdm_xml(
     recipient: &Recipient,
     signer: &Signer,
     keys: &[KdmKey],
+    source_content_authenticator: Option<&str>,
 ) -> Result<String, String> {
     use base64::Engine;
 
@@ -1647,7 +1630,7 @@ fn build_kdm_xml(
     }
     check_formulation_devices(config.formulation, &config.device_cert_files)?;
 
-    let now = chrono::Utc::now();
+    let now = config.issue_date.unwrap_or_else(chrono::Utc::now);
     let message_id = uuid::Uuid::new_v4();
 
     // One TypedKeyId in KeyIdList and one EncryptedKey in AuthenticatedPrivate
@@ -1711,10 +1694,14 @@ fn build_kdm_xml(
     // libdcp calls this approximate and it is: strictly the ContentAuthenticator
     // is a thumbprint of one of the CPL signer certificates, which is this
     // certificate only when the entity signing the KDM also signed the CPL.
+    // a DKDM's own ContentAuthenticator names the CPL signer, which the re-issuer is not
     let content_authenticator = if config.formulation.carries_content_authenticator() {
+        let thumbprint = source_content_authenticator
+            .map(str::to_string)
+            .unwrap_or_else(|| thumbprint_base64(&signer.thumbprint));
         format!(
             "        <{CONTENT_AUTHENTICATOR_ELEMENT}>{}</{CONTENT_AUTHENTICATOR_ELEMENT}>\n",
-            thumbprint_base64(&signer.thumbprint)
+            xml_escape(&thumbprint)
         )
     } else {
         String::new()
@@ -1845,6 +1832,9 @@ pub struct RewrapConfig {
     /// Forensic marking of the audio essence, on the same terms.
     #[serde(default)]
     pub audio_forensic_marking: AudioForensicMarking,
+    // never copied from the DKDM: a security manager picks the latest IssueDate
+    #[serde(default)]
+    pub issue_date: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Re-wrap a DKDM: decrypt its content keys with the DKDM recipient's private
@@ -1932,6 +1922,7 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         &config.signer_cert_file,
         &config.signer_chain_files,
         &window,
+        config.issue_date.unwrap_or_else(chrono::Utc::now),
     )?;
 
     let content_title = parsed.content_title.as_deref().unwrap_or("");
@@ -1946,6 +1937,7 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         formulation: config.formulation,
         picture_forensic_marking: config.picture_forensic_marking,
         audio_forensic_marking: config.audio_forensic_marking,
+        issue_date: config.issue_date,
         ..Default::default()
     };
 
@@ -1958,6 +1950,7 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
         &recipient,
         &signer,
         &keys,
+        parsed.content_authenticator.as_deref(),
     )?;
 
     let first = &keys[0];
@@ -2011,6 +2004,8 @@ pub struct KdmMetadata {
     /// ST 430-1 Recipient X509SubjectName, the DN of the certificate the KDM
     /// was made for. None when the KDM does not name one.
     pub recipient_subject_name: Option<String>,
+    #[serde(default)]
+    pub content_authenticator: Option<String>,
 }
 
 /// Everything read from a KDM's XML without the recipient key: the public
@@ -2025,6 +2020,7 @@ struct ParsedKdmXml {
     not_valid_after: Option<String>,
     key_ids: Vec<KdmKeyId>,
     recipient_subject_name: Option<String>,
+    content_authenticator: Option<String>,
 }
 
 /// Accept a `urn:uuid:` or bare UUID string, rejecting anything else.
@@ -2064,6 +2060,7 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
     let mut not_valid_after = None;
     let mut key_ids = Vec::new();
     let mut recipient_subject_name = None;
+    let mut content_authenticator = None;
 
     loop {
         match reader
@@ -2087,6 +2084,10 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
                 }
                 b"ContentTitleText" => {
                     collecting = Some("title");
+                    buffer.clear();
+                }
+                b"ContentAuthenticator" => {
+                    collecting = Some("content_authenticator");
                     buffer.clear();
                 }
                 b"AnnotationText" => {
@@ -2141,6 +2142,10 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
                     content_title = Some(buffer.trim().to_string());
                     collecting = None;
                 }
+                b"ContentAuthenticator" if collecting == Some("content_authenticator") => {
+                    content_authenticator = Some(buffer.trim().to_string());
+                    collecting = None;
+                }
                 b"AnnotationText" if collecting == Some("annotation") => {
                     annotation_text = Some(buffer.trim().to_string());
                     collecting = None;
@@ -2191,6 +2196,7 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
         not_valid_after,
         key_ids,
         recipient_subject_name,
+        content_authenticator,
     })
 }
 
@@ -2274,6 +2280,7 @@ pub fn parse_kdm(kdm_xml: &str) -> Result<KdmMetadata, String> {
             .ok_or("KDM has no ContentKeysNotValidAfter")?,
         key_ids: parsed.key_ids,
         recipient_subject_name: parsed.recipient_subject_name,
+        content_authenticator: parsed.content_authenticator,
     })
 }
 
@@ -2452,22 +2459,27 @@ fn parse_validity_end(value: &str, start: &str) -> Result<String, String> {
     // Parse as relative duration from start
     let start_dt = chrono::DateTime::parse_from_rfc3339(start)
         .or_else(|_| chrono::DateTime::parse_from_str(start, "%Y-%m-%dT%H:%M:%S%:z"))
-        .map_err(|e| format!("Cannot parse start date '{start}': {e}"))?;
+        .map_err(|e| format!("cannot parse valid-from '{start}': {e}"))?;
 
     let duration = parse_duration(value)?;
     let end = start_dt + duration;
-    Ok(end.format("%Y-%m-%dT%H:%M:%S+00:00").to_string())
+    // the end keeps the start's offset
+    Ok(end.format("%Y-%m-%dT%H:%M:%S%:z").to_string())
 }
 
-/// Parse a human-friendly duration string.
-fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
+pub fn resolve_kdm_window(valid_from: &str, valid_to: &str) -> Result<(String, String), String> {
+    let not_valid_before = resolve_valid_from(valid_from);
+    let not_valid_after = parse_validity_end(valid_to, &not_valid_before)?;
+    Ok((not_valid_before, not_valid_after))
+}
+
+pub fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
     let s = s.trim().to_lowercase();
     let parts: Vec<&str> = s.split_whitespace().collect();
-
     if parts.len() == 2 {
         let n: i64 = parts[0]
             .parse()
-            .map_err(|_| format!("Invalid number in duration: '{}'", parts[0]))?;
+            .map_err(|_| format!("invalid number in duration: '{}'", parts[0]))?;
         let unit = parts[1].trim_end_matches('s');
         return match unit {
             "second" | "sec" => Ok(chrono::Duration::seconds(n)),
@@ -2475,31 +2487,18 @@ fn parse_duration(s: &str) -> Result<chrono::Duration, String> {
             "hour" | "hr" => Ok(chrono::Duration::hours(n)),
             "day" => Ok(chrono::Duration::days(n)),
             "week" | "wk" => Ok(chrono::Duration::weeks(n)),
-            _ => Err(format!("Unknown duration unit: '{unit}'")),
+            _ => Err(format!("unknown duration unit: '{unit}'")),
         };
     }
-
-    // Try suffix format: 7d, 24h, 2w
-    if let Some(stripped) = s.strip_suffix('h') {
-        let n: i64 = stripped
-            .parse()
-            .map_err(|_| format!("Invalid duration: '{s}'"))?;
-        return Ok(chrono::Duration::hours(n));
+    for (suffix, hours) in [('h', 1i64), ('d', 24), ('w', 24 * 7)] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            let n: i64 = stripped
+                .parse()
+                .map_err(|_| format!("invalid duration: '{s}'"))?;
+            return Ok(chrono::Duration::hours(n * hours));
+        }
     }
-    if let Some(stripped) = s.strip_suffix('d') {
-        let n: i64 = stripped
-            .parse()
-            .map_err(|_| format!("Invalid duration: '{s}'"))?;
-        return Ok(chrono::Duration::days(n));
-    }
-    if let Some(stripped) = s.strip_suffix('w') {
-        let n: i64 = stripped
-            .parse()
-            .map_err(|_| format!("Invalid duration: '{s}'"))?;
-        return Ok(chrono::Duration::weeks(n));
-    }
-
-    Err(format!("Cannot parse duration: '{s}'"))
+    Err(format!("cannot parse duration: '{s}'"))
 }
 
 /// Length of an ST 430-2 thumbprint: SHA-1 is a 160-bit digest.
@@ -2887,6 +2886,7 @@ mod tests {
             device_cert_files: vec![],
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         }
     }
 
@@ -2924,6 +2924,7 @@ mod tests {
             device_cert_files: vec![],
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         }
     }
 
@@ -3672,7 +3673,7 @@ mod tests {
             f.intermediate.clone(),
             f.impostor_root.clone(),
         ];
-        let err = validate_chain_inner(&chain, None)
+        let err = validate_chain_inner(&chain, chrono::Utc::now(), None)
             .expect_err("a root that did not sign the intermediate must be rejected");
         assert!(
             err.contains("signature verification failed"),
@@ -3717,6 +3718,7 @@ mod tests {
             &recipient,
             &signer,
             keys,
+            None,
         )
         .expect("build stand-in dkdm")
     }
@@ -3771,6 +3773,7 @@ mod tests {
             formulation: KdmFormulation::default(),
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
 
@@ -3830,6 +3833,7 @@ mod tests {
             formulation: KdmFormulation::default(),
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
         let new_ct = parse_kdm_xml(&std::fs::read_to_string(&out).unwrap())
@@ -3868,6 +3872,7 @@ mod tests {
             formulation: KdmFormulation::default(),
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         };
         let err = rewrap_dkdm(&config).expect_err("wrong recipient key must fail");
         assert!(
@@ -3913,6 +3918,7 @@ mod tests {
             formulation: KdmFormulation::default(),
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         };
         rewrap_dkdm_to_file(&config).expect("rewrap");
         let result = xmlsec1_verify(&out, &f.root, &[&f.intermediate]);
@@ -4395,6 +4401,7 @@ mod tests {
             formulation: KdmFormulation::MultipleModifiedTransitional1,
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         };
         let rewrapped = rewrap_dkdm(&config).expect("rewrap");
         assert_eq!(
@@ -4685,6 +4692,7 @@ mod tests {
             formulation: KdmFormulation::ModifiedTransitional1,
             picture_forensic_marking: PictureForensicMarking::default(),
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         };
         let err = rewrap_dkdm(&config).expect_err("re-wrap must not drop the device list either");
         assert!(
@@ -5068,6 +5076,7 @@ mod tests {
             formulation: KdmFormulation::default(),
             picture_forensic_marking: PictureForensicMarking::Disabled,
             audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
         };
         let kdm = rewrap_dkdm(&config).expect("rewrap");
         assert_eq!(

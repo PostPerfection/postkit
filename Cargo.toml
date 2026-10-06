@@ -10,7 +10,7 @@ allsorts = "0.17"
 ar-reshaper = "1.5"
 asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "c8c24cc2d3ed4d22460b744e55b0b840ed98cbfa" }
 base64 = "0.22"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 cpal = { version = "0.15", optional = true }
 cosmic-text = { version = "0.17", default-features = false, features = ["std", "swash"] }
 dirs = "6"
