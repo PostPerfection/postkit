@@ -65,6 +65,7 @@ pub mod regxml;
 pub mod report;
 pub mod rest_api;
 pub mod restore;
+pub mod screening_playlist;
 pub mod shell_completion;
 pub mod still;
 pub mod subtitle_formats;

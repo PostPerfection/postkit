@@ -51,6 +51,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `prores` | ProRes detection and transcoding |
 | `report` | HTML/JSON QC report generation |
 | `rest_api` | Shared REST API server utilities |
+| `screening_playlist` | A screening playlist of compositions and intermissions with optional start times, its JSON file, and when each row plays |
 | `shell_completion` | Bash/Zsh/Fish/PowerShell completion generation |
 | `subtitle_formats` | Subtitle input parsers to a styled-cue model (ASS/SSA, FCPXML, Matroska, PAC, Interop PNG), RTL shaping, line-wrap |
 | `subtitle_retime` | Subtitle timing conversion between framerates; standalone SRT parser |
