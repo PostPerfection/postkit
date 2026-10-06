@@ -11,15 +11,12 @@ use quick_xml::events::Event;
 use quick_xml::reader::Reader;
 
 use super::{HAlign, StyledCue, SubtitleError, VAlign};
-use crate::timecode::timecode_to_seconds;
 
 const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// Parse an Interop DCSubtitle XML file, resolving and validating PNG images.
-///
-/// `fps` interprets the last timecode field (frames) into seconds, matching the
-/// rest of postkit's interop handling.
-pub fn parse_interop_png(xml_path: &Path, fps: f64) -> Result<Vec<StyledCue>, SubtitleError> {
+/// Times count editable units of 4 ms after the seconds, as Interop writes them.
+pub fn parse_interop_png(xml_path: &Path) -> Result<Vec<StyledCue>, SubtitleError> {
     let content = std::fs::read_to_string(xml_path)?;
     let base = xml_path.parent().unwrap_or_else(|| Path::new("."));
     let mut reader = Reader::from_str(&content);
@@ -36,8 +33,8 @@ pub fn parse_interop_png(xml_path: &Path, fps: f64) -> Result<Vec<StyledCue>, Su
         {
             Event::Start(e) | Event::Empty(e) => match local_name(e.name().as_ref()).as_str() {
                 "subtitle" => {
-                    let tin = attr(&e, "timein").map(|v| tc_ms(&v, fps));
-                    let tout = attr(&e, "timeout").map(|v| tc_ms(&v, fps));
+                    let tin = attr(&e, "timein").map(|v| tc_ms(&v));
+                    let tout = attr(&e, "timeout").map(|v| tc_ms(&v));
                     cur_time = Some((tin.unwrap_or(0), tout.unwrap_or(0)));
                 }
                 "image" => {
@@ -101,8 +98,8 @@ pub(crate) fn resolve_png(base: &Path, name: &str) -> Result<PathBuf, SubtitleEr
     Ok(path)
 }
 
-fn tc_ms(tc: &str, fps: f64) -> u64 {
-    (timecode_to_seconds(tc, fps) * 1000.0).round() as u64
+fn tc_ms(tc: &str) -> u64 {
+    super::dcp::interop_time_ms(tc).unwrap_or(0)
 }
 
 pub(super) fn parse_valign(s: &str) -> Option<VAlign> {
@@ -156,7 +153,7 @@ mod tests {
 
     const XML: &str = r#"<?xml version="1.0"?>
 <DCSubtitle Version="1.0">
-  <Subtitle SpotNumber="1" TimeIn="00:00:01:00" TimeOut="00:00:05:12">
+  <Subtitle SpotNumber="1" TimeIn="00:00:01:000" TimeOut="00:00:05:125">
     <Image VAlign="bottom" HAlign="center" VPosition="8">sub0001.png</Image>
   </Subtitle>
 </DCSubtitle>"#;
@@ -168,7 +165,7 @@ mod tests {
         let xml = dir.path().join("subs.xml");
         fs::write(&xml, XML).unwrap();
 
-        let cues = parse_interop_png(&xml, 24.0).unwrap();
+        let cues = parse_interop_png(&xml).unwrap();
         assert_eq!(cues.len(), 1);
         let c = &cues[0];
         assert_eq!(c.start_ms, 1000);
@@ -185,7 +182,7 @@ mod tests {
         let xml = dir.path().join("subs.xml");
         fs::write(&xml, XML).unwrap();
         assert!(matches!(
-            parse_interop_png(&xml, 24.0),
+            parse_interop_png(&xml),
             Err(SubtitleError::MissingImage(_))
         ));
     }
@@ -197,7 +194,7 @@ mod tests {
         let xml = dir.path().join("subs.xml");
         fs::write(&xml, XML).unwrap();
         assert!(matches!(
-            parse_interop_png(&xml, 24.0),
+            parse_interop_png(&xml),
             Err(SubtitleError::BadPng(_))
         ));
     }

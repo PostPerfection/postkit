@@ -281,6 +281,10 @@ fn cue_span(
     ))
 }
 
+pub(super) fn interop_time_ms(text: &str) -> Option<u64> {
+    time_ms(text, false, None)
+}
+
 // HH:MM:SS:FF at the TimeCodeRate for SMPTE, HH:MM:SS:TTT in 4 ms units for Interop, or HH:MM:SS.sss
 fn time_ms(text: &str, smpte: bool, time_code_rate: Option<f64>) -> Option<u64> {
     let fields: Vec<&str> = text.split(':').collect();
