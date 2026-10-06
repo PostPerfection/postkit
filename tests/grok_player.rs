@@ -1847,6 +1847,76 @@ mod stereoscopic {
         player.frame_size().expect("a frame is on screen")
     }
 
+    // the reel form a 3D DCP's CPL takes, with the msp-cpl prefix
+    fn stereoscopic_cpl(cpl_id: &str, picture_id: &str, frames: usize) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <CompositionPlaylist xmlns=\"http://www.smpte-ra.org/schemas/429-7/2006/CPL\">\
+             <Id>urn:uuid:{cpl_id}</Id><ContentTitleText>Stereo Test</ContentTitleText>\
+             <ReelList><Reel><Id>urn:uuid:aaaaaaaa-0000-0000-0000-000000000001</Id><AssetList>\
+             <msp-cpl:MainStereoscopicPicture xmlns:msp-cpl=\"http://www.smpte-ra.org/schemas/429-10/2008/Main-Stereo-Picture-CPL\">\
+             <Id>urn:uuid:{picture_id}</Id><EditRate>24 1</EditRate>\
+             <IntrinsicDuration>{frames}</IntrinsicDuration><EntryPoint>0</EntryPoint>\
+             <Duration>{frames}</Duration><FrameRate>48 1</FrameRate>\
+             </msp-cpl:MainStereoscopicPicture></AssetList></Reel></ReelList>\
+             </CompositionPlaylist>"
+        )
+    }
+
+    #[test]
+    fn a_3d_package_resolves_its_stereoscopic_picture_and_plays_both_eyes() {
+        const CPL_ID: &str = "cc10cc10-0000-0000-0000-000000000003";
+        const PICTURE_ID: &str = "eee336f9-c2ce-48b0-81e5-a40d78956b9b";
+        const FRAMES: usize = 2;
+        let directory = tempfile::tempdir().unwrap();
+        let picture = format!("picture_{PICTURE_ID}.mxf");
+        stereo_mxf(directory.path(), &picture, SIZE, SIZE, FRAMES);
+        let cpl = format!("CPL_{CPL_ID}.xml");
+        std::fs::write(
+            directory.path().join(&cpl),
+            stereoscopic_cpl(CPL_ID, PICTURE_ID, FRAMES),
+        )
+        .unwrap();
+        let assets = [(CPL_ID, cpl.as_str()), (PICTURE_ID, picture.as_str())]
+            .into_iter()
+            .map(|(id, path)| AssetMapAsset {
+                id: id.into(),
+                path: path.into(),
+                ..Default::default()
+            })
+            .collect();
+        std::fs::write(
+            directory.path().join("ASSETMAP.xml"),
+            AssetMap {
+                uuid: "bbbbbbbb-0000-0000-0000-000000000003".into(),
+                namespace: ns::AM_SMPTE.into(),
+                assets,
+                ..Default::default()
+            }
+            .to_xml(),
+        )
+        .unwrap();
+
+        assert!(GrokPlayer::accepts(directory.path()), "a 3D package");
+        assert!(
+            GrokPlayer::accepts(&directory.path().join(&cpl)),
+            "a 3D CPL"
+        );
+        let player = loaded_player(directory.path());
+        assert_eq!(metadata_field(&player, "stereoscopic"), true);
+        assert_eq!(
+            player.duration(),
+            Some(FRAMES as f64 / f64::from(FRAMES_PER_SECOND))
+        );
+        change_output(&player, StereoOutput::SideBySide);
+        assert_eq!(at(&player, QUARTER, QUARTER), frame_colour(0), "left half");
+        assert_eq!(
+            at(&player, THREE_QUARTERS, QUARTER),
+            right_eye_colour(0),
+            "right half"
+        );
+    }
+
     #[test]
     fn a_stereo_output_change_during_playback_drops_no_frames() {
         const FRAMES: usize = 72;

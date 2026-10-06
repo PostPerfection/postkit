@@ -268,7 +268,7 @@ fn picture_references(cpl: &str) -> Vec<PictureReference> {
 
 /// One MainPicture per reel, so a single forward scan gives reel order.
 fn main_picture_references(cpl: &str) -> Vec<PictureReference> {
-    reel_asset_references(cpl, "MainPicture")
+    reel_asset_references(cpl, crate::cpl_xml::MAIN_PICTURE_ELEMENT_PATTERN)
 }
 
 /// One named reel asset per reel (MainPicture, MainSound), in reel order.
@@ -347,10 +347,11 @@ fn composition_title(cpl: &str) -> Option<String> {
 /// past the next one that opens, so a reel missing a close tag still resolves
 /// instead of swallowing the reels after it.
 fn element_blocks<'text>(xml: &'text str, name: &str) -> Vec<&'text str> {
-    let Ok(open) = regex::Regex::new(&format!(r"<(?:\w+:)?{name}\b")) else {
+    let prefix = crate::cpl_xml::ELEMENT_PREFIX_PATTERN;
+    let Ok(open) = regex::Regex::new(&format!(r"<{prefix}{name}\b")) else {
         return Vec::new();
     };
-    let Ok(close) = regex::Regex::new(&format!(r"</(?:\w+:)?{name}>")) else {
+    let Ok(close) = regex::Regex::new(&format!(r"</{prefix}{name}>")) else {
         return Vec::new();
     };
     let starts: Vec<usize> = open.find_iter(xml).map(|found| found.start()).collect();
@@ -632,6 +633,28 @@ mod tests {
         let uri = edl_uri(&whole_files(&["/dcp/café.mxf"]));
         assert_eq!(uri, "edl://%14%/dcp/café.mxf");
         assert_eq!(uri.strip_prefix("edl://%14%").unwrap().len(), 14);
+    }
+
+    #[test]
+    fn a_3d_reel_resolves_its_stereoscopic_picture() {
+        let dir = tempfile::tempdir().unwrap();
+        write_assetmap(dir.path(), "CPL_a.xml", &[(REEL_UUIDS[0], "stereo.mxf")]);
+        std::fs::write(
+            dir.path().join("CPL_a.xml"),
+            format!(
+                "<CompositionPlaylist xmlns=\"x\"><ReelList><Reel><AssetList>\
+                 <msp-cpl:MainStereoscopicPicture xmlns:msp-cpl=\"y\">\
+                 <Id>urn:uuid:{}</Id><Duration>48</Duration>\
+                 </msp-cpl:MainStereoscopicPicture></AssetList></Reel></ReelList>\
+                 </CompositionPlaylist>",
+                REEL_UUIDS[0]
+            ),
+        )
+        .unwrap();
+
+        let composition = resolve_composition(dir.path(), &[]).unwrap();
+        assert_eq!(composition.pictures.len(), 1);
+        assert_eq!(composition.pictures[0].path, dir.path().join("stereo.mxf"));
     }
 
     #[test]

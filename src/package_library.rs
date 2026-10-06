@@ -14,9 +14,14 @@ const DURATION_ELEMENT: &str = "Duration";
 const INTRINSIC_DURATION_ELEMENT: &str = "IntrinsicDuration";
 const ENTRY_POINT_ELEMENT: &str = "EntryPoint";
 const EDIT_RATE_ELEMENT: &str = "EditRate";
-// a 3D reel holds its picture in MainStereoscopicPicture
-const PICTURE_ASSET_PATTERN: &str = r"(?s)<(?:[\w-]+:)?Main(?:Stereoscopic)?Picture[\s>].*?</(?:[\w-]+:)?Main(?:Stereoscopic)?Picture>";
 const KEY_ID_PATTERN: &str = r"<(?:[\w-]+:)?KeyId[\s>/]";
+
+fn picture_asset_pattern() -> String {
+    use crate::cpl_xml::{
+        ELEMENT_PREFIX_PATTERN as PREFIX, MAIN_PICTURE_ELEMENT_PATTERN as PICTURE,
+    };
+    format!(r"(?s)<{PREFIX}{PICTURE}[\s>].*?</{PREFIX}{PICTURE}>")
+}
 
 /// The DCP standard a CPL is written to, told apart by its root element's namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -163,7 +168,8 @@ fn read_composition(cpl: &str) -> Result<(Standard, CompositionEntry), String> {
     let title = quick_xml::escape::unescape(&stated_title)
         .map_err(|error| format!("ContentTitleText: {error}"))?
         .into_owned();
-    let pictures = regex::Regex::new(PICTURE_ASSET_PATTERN).map_err(|error| error.to_string())?;
+    let pictures =
+        regex::Regex::new(&picture_asset_pattern()).map_err(|error| error.to_string())?;
     let picture_assets: Vec<&str> = pictures
         .find_iter(cpl)
         .map(|found| found.as_str())

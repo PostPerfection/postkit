@@ -24,6 +24,11 @@ pub fn read_tag(xml: &str, tag: &str) -> Option<String> {
     }
 }
 
+// a namespace prefix such as msp-cpl: carries a hyphen
+pub const ELEMENT_PREFIX_PATTERN: &str = r"(?:[\w-]+:)?";
+// a 3D reel holds its picture in MainStereoscopicPicture
+pub const MAIN_PICTURE_ELEMENT_PATTERN: &str = r"Main(?:Stereoscopic)?Picture";
+
 // an OPL's <CompositionPlaylistId> must not match
 pub fn is_composition_playlist(xml: &str) -> bool {
     regex::Regex::new(r"<(?:\w+:)?CompositionPlaylist[\s>]").is_ok_and(|root| root.is_match(xml))
