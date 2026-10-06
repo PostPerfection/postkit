@@ -84,10 +84,49 @@ pub fn name_fields_from_content_title(content_title: &str) -> KdmNameFields {
     }
 }
 
+// letters canonical decomposition leaves whole
+const LETTERS_WITHOUT_DECOMPOSITION: &[(char, &str)] = &[
+    ('Æ', "AE"),
+    ('æ', "ae"),
+    ('Œ', "OE"),
+    ('œ', "oe"),
+    ('ß', "ss"),
+    ('Ø', "O"),
+    ('ø', "o"),
+    ('Đ', "D"),
+    ('đ', "d"),
+    ('Ð', "D"),
+    ('ð', "d"),
+    ('Ł', "L"),
+    ('ł', "l"),
+    ('Þ', "TH"),
+    ('þ', "th"),
+    ('ı', "i"),
+    ('ﬁ', "fi"),
+    ('ﬂ', "fl"),
+];
+
+// decomposition splits an accented letter into its base and a combining mark, which is dropped
+pub fn ascii_transliteration(value: &str) -> String {
+    let decomposed = icu_normalizer::DecomposingNormalizerBorrowed::new_nfd().normalize(value);
+    let mut ascii = String::with_capacity(decomposed.len());
+    for character in decomposed.chars() {
+        if character.is_ascii() {
+            ascii.push(character);
+        } else if let Some((_, replacement)) = LETTERS_WITHOUT_DECOMPOSITION
+            .iter()
+            .find(|(letter, _)| *letter == character)
+        {
+            ascii.push_str(replacement);
+        }
+    }
+    ascii
+}
+
 // fields hold letters, digits and hyphens only, the underscore separates fields
 pub fn name_field(value: &str, maximum_length: usize) -> String {
     let mut field = String::new();
-    for character in value.chars() {
+    for character in ascii_transliteration(value).chars() {
         if character.is_ascii_alphanumeric() {
             field.push(character);
         } else if (character.is_whitespace() || character == '_' || character == WORD_SEPARATOR)
@@ -241,7 +280,19 @@ mod tests {
         };
         assert_eq!(
             naming.kdm_file_name("1001"),
-            "k_Le-Caf-des-toi_1001_20261224_20270102_XYZ.xml"
+            "k_Le-Cafe-des-Et_1001_20261224_20270102_XYZ.xml"
+        );
+    }
+
+    #[test]
+    fn accents_and_ligatures_become_ascii_letters() {
+        assert_eq!(
+            ascii_transliteration("Café Ærøskøbing Œuvre Straße Łódź Ñandú"),
+            "Cafe AEroskobing OEuvre Strasse Lodz Nandu"
+        );
+        assert_eq!(
+            name_field("Kinoteatr Wrocław Città", 20),
+            "Kinoteatr-Wroclaw-Ci"
         );
     }
 

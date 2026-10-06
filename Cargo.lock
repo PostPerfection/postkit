@@ -2025,6 +2025,7 @@ dependencies = [
  "hevc_parser",
  "hex",
  "hound",
+ "icu_normalizer",
  "jiff",
  "lcms2",
  "lettre",
