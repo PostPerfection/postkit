@@ -32,6 +32,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `hash` | SHA-1 / SHA-256 file hashing |
 | `j2k` | JPEG 2000 codestream parsing, DCI validation, MXF frame extraction and bitrate analysis |
 | `job_queue` | The job queue every wizard process runs, with its jobs file |
+| `kdm_store` | A directory of KDMs, and which one a composition plays with on a given player and time |
 | `loudness` | Audio loudness measurement (EBU R128, Leq(m)) and gain adjustment |
 | `mca` | SMPTE ST 377-4 Multi-Channel Audio label generation |
 | `metadata_edit` | CPL/OPL metadata editor |
@@ -39,6 +40,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `mpv` | mpv IPC player integration for preview |
 | `mxf_wrap` | MXF track file wrapping (picture, stereoscopic 3D, audio, Atmos); optional AES-128 essence encryption, MCA labels, HDR/WCG metadata |
 | `otioz_import` | OpenTimelineIO zip bundle import |
+| `package_library` | The DCPs under watched folders, read from their CPLs, with a stored verification verdict per package |
 | `packaging` | Shared DCP/IMF CPL, PKL and ASSETMAP XML writers |
 | `pipeline` | Full video-to-DCP streaming pipeline |
 | `plugin` | Python plugin system with pre/post hooks |

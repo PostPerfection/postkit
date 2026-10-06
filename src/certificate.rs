@@ -656,15 +656,15 @@ pub fn read_certificate(cert_path: &Path) -> CertInfo {
 
 /// A KDM's content-key validity window, as the two ST 430-1 timestamps carry it.
 #[derive(Debug, Clone, Copy)]
-struct KdmWindow {
-    not_before: chrono::DateTime<chrono::Utc>,
-    not_after: chrono::DateTime<chrono::Utc>,
+pub(crate) struct KdmWindow {
+    pub(crate) not_before: chrono::DateTime<chrono::Utc>,
+    pub(crate) not_after: chrono::DateTime<chrono::Utc>,
 }
 
 impl KdmWindow {
     /// Both bounds have to be the exact ST 430-1 spelling, so the key block's
     /// own check runs here and a bad value fails before any crypto is done.
-    fn parse(not_before: &str, not_after: &str) -> Result<Self, String> {
+    pub(crate) fn parse(not_before: &str, not_after: &str) -> Result<Self, String> {
         check_kdm_timestamp("ContentKeysNotValidBefore", not_before)?;
         check_kdm_timestamp("ContentKeysNotValidAfter", not_after)?;
         let parse_one = |label: &str, value: &str| {
@@ -2008,6 +2008,9 @@ pub struct KdmMetadata {
     /// ST 430-1 ContentKeysNotValidAfter, the RFC 3339 end of the window.
     pub not_valid_after: String,
     pub key_ids: Vec<KdmKeyId>,
+    /// ST 430-1 Recipient X509SubjectName, the DN of the certificate the KDM
+    /// was made for. None when the KDM does not name one.
+    pub recipient_subject_name: Option<String>,
 }
 
 /// Everything read from a KDM's XML without the recipient key: the public
@@ -2021,6 +2024,7 @@ struct ParsedKdmXml {
     not_valid_before: Option<String>,
     not_valid_after: Option<String>,
     key_ids: Vec<KdmKeyId>,
+    recipient_subject_name: Option<String>,
 }
 
 /// Accept a `urn:uuid:` or bare UUID string, rejecting anything else.
@@ -2045,6 +2049,7 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
     let mut reader = Reader::from_str(xml);
     let mut in_auth_private = false;
     let mut in_key_id_list = false;
+    let mut in_recipient = false;
     // Type of the current TypedKeyId, None until a KeyType is seen.
     let mut pending_key_type: Option<[u8; 4]> = None;
     // Set while text is being gathered for the named field.
@@ -2058,6 +2063,7 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
     let mut not_valid_before = None;
     let mut not_valid_after = None;
     let mut key_ids = Vec::new();
+    let mut recipient_subject_name = None;
 
     loop {
         match reader
@@ -2066,6 +2072,11 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
         {
             Event::Start(e) => match e.local_name().as_ref() {
                 b"AuthenticatedPrivate" => in_auth_private = true,
+                b"Recipient" => in_recipient = true,
+                b"X509SubjectName" if in_recipient => {
+                    collecting = Some("recipient_subject_name");
+                    buffer.clear();
+                }
                 b"KeyIdList" => {
                     in_key_id_list = true;
                     pending_key_type = None;
@@ -2112,7 +2123,12 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
             }
             Event::End(e) => match e.local_name().as_ref() {
                 b"AuthenticatedPrivate" => in_auth_private = false,
+                b"Recipient" => in_recipient = false,
                 b"KeyIdList" => in_key_id_list = false,
+                b"X509SubjectName" if collecting == Some("recipient_subject_name") => {
+                    recipient_subject_name = Some(buffer.trim().to_string());
+                    collecting = None;
+                }
                 b"CipherValue" if collecting == Some("cipher") => {
                     let stripped: String = buffer.split_whitespace().collect();
                     let bytes = base64::engine::general_purpose::STANDARD
@@ -2174,6 +2190,7 @@ fn parse_kdm_xml(xml: &str) -> Result<ParsedKdmXml, String> {
         not_valid_before,
         not_valid_after,
         key_ids,
+        recipient_subject_name,
     })
 }
 
@@ -2256,6 +2273,7 @@ pub fn parse_kdm(kdm_xml: &str) -> Result<KdmMetadata, String> {
             .not_valid_after
             .ok_or("KDM has no ContentKeysNotValidAfter")?,
         key_ids: parsed.key_ids,
+        recipient_subject_name: parsed.recipient_subject_name,
     })
 }
 
@@ -4059,6 +4077,18 @@ mod tests {
         assert_eq!(meta.key_ids[0].key_id, key_id);
         assert_eq!(meta.key_ids[0].key_type, Some(*b"MDIK"));
         assert!(meta.not_valid_before < meta.not_valid_after);
+        let recipient = parse_recipient(&config.recipient_cert_file).expect("recipient");
+        assert_eq!(
+            meta.recipient_subject_name.as_deref(),
+            Some(recipient.subject_dn.as_str())
+        );
+        assert!(
+            meta.recipient_subject_name
+                .as_deref()
+                .is_some_and(|name| name.contains("CN=CS.Acme.smpte-430-2.LEAF")),
+            "got: {:?}",
+            meta.recipient_subject_name
+        );
     }
 
     #[test]
