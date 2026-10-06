@@ -635,7 +635,7 @@ mod device {
                 pull_open: AtomicBool::new(false),
                 rgb8_on_device: AtomicBool::new(false),
                 batch_render: Mutex::new(None),
-                batch_asked_device_colour: AtomicBool::new(false),
+                batch_device_colour: Mutex::new(DeviceColour::Cpu),
                 in_flight: AtomicUsize::new(0),
                 returned: AtomicUsize::new(0),
             }),
@@ -661,8 +661,8 @@ mod device {
         rgb8_on_device: AtomicBool,
         // the render the running batch began with
         batch_render: Mutex<Option<DisplayRender>>,
-        // the running batch asked the device for sRGB instead of planes
-        batch_asked_device_colour: AtomicBool,
+        // what the running batch asked the device to colour DCP frames with
+        batch_device_colour: Mutex<DeviceColour>,
         in_flight: AtomicUsize,
         returned: AtomicUsize,
     }
@@ -813,22 +813,28 @@ mod device {
                 .as_ref()
                 .and_then(|transform| transform.matrix)
                 .map(row_major);
-            let display_transform = app2e.as_ref().map(|transform| {
-                // zeroed so fields newer grok headers add, output_thresholds among them, stay null
-                let mut device_transform: grokj2k_sys::grk_plugin_display_transform =
-                    unsafe { std::mem::zeroed() };
-                device_transform.transfer = transform.transfer.as_ptr();
-                device_transform.matrix = gamut_matrix
-                    .as_ref()
-                    .map_or(std::ptr::null(), |matrix| matrix.as_ptr());
-                device_transform
+            let device_colour = device_colour(shape);
+            let app2e_transform = app2e.as_ref().map(|transform| {
+                device_display_transform(&transform.transfer, gamut_matrix.as_ref(), None)
             });
-            let device_colour = asks_device_colour(shape);
+            // the tables only have to outlive the begin call
+            #[cfg(all(feature = "icc", grok_display_output_thresholds))]
+            let profile_tables = device_colour.profile_tables();
+            #[cfg(all(feature = "icc", grok_display_output_thresholds))]
+            let profile_transform = profile_tables.as_ref().map(|tables| {
+                device_display_transform(
+                    &tables.transfer,
+                    Some(&tables.matrix),
+                    Some(&tables.output_thresholds),
+                )
+            });
+            #[cfg(not(all(feature = "icc", grok_display_output_thresholds)))]
+            let profile_transform = None;
+            let display_transform = app2e_transform.or(profile_transform);
+            let built_in_srgb = matches!(device_colour, DeviceColour::BuiltInSrgb);
             // the plugin's workers pull inside begin, so the render is on record first
             *self.state.batch_render.lock().unwrap() = Some(shape.render);
-            self.state
-                .batch_asked_device_colour
-                .store(device_colour, Ordering::Release);
+            *self.state.batch_device_colour.lock().unwrap() = device_colour;
             let mut rgb8_on_device = false;
             let info = grokj2k_sys::grk_plugin_batch_decompress_memory_info {
                 codestream: shape.codestream.as_ptr(),
@@ -836,7 +842,7 @@ mod device {
                 pull: Some(pull_frame),
                 callback: Some(frame_callback),
                 user: self.state.as_ref() as *const CallbackState as *mut c_void,
-                srgb8_output: device_colour,
+                srgb8_output: built_in_srgb,
                 display_transform: display_transform
                     .as_ref()
                     .map_or(std::ptr::null(), |transform| transform as *const _),
@@ -919,9 +925,71 @@ mod device {
         }
     }
 
-    // only a DCP frame is X'Y'Z', and the device's own tables transform it to sRGB only
-    fn asks_device_colour(job: &DecodeJob) -> bool {
-        matches!(job.render, DisplayRender::DcpXyz) && matches!(*job.display, Display::Srgb(_))
+    // what colours a DCP frame on the device, every other frame keeps its own path
+    pub(super) enum DeviceColour {
+        Cpu,
+        BuiltInSrgb,
+        // a monitor profile's matrix and output curves, which grok without output thresholds cannot take
+        #[cfg(all(feature = "icc", grok_display_output_thresholds))]
+        Profile(Arc<Display>),
+    }
+
+    impl DeviceColour {
+        fn same_as(&self, other: &DeviceColour) -> bool {
+            match (self, other) {
+                (DeviceColour::Cpu, DeviceColour::Cpu) => true,
+                (DeviceColour::BuiltInSrgb, DeviceColour::BuiltInSrgb) => true,
+                #[cfg(all(feature = "icc", grok_display_output_thresholds))]
+                (DeviceColour::Profile(this), DeviceColour::Profile(that)) => {
+                    Arc::ptr_eq(this, that)
+                }
+                _ => false,
+            }
+        }
+
+        #[cfg(all(feature = "icc", grok_display_output_thresholds))]
+        fn profile_tables(&self) -> Option<crate::colour::DeviceDisplayTables> {
+            let DeviceColour::Profile(display) = self else {
+                return None;
+            };
+            match &**display {
+                Display::Icc(transform) => Some(transform.device_tables()),
+                Display::Srgb(_) => None,
+            }
+        }
+    }
+
+    pub(super) fn device_colour(job: &DecodeJob) -> DeviceColour {
+        if !matches!(job.render, DisplayRender::DcpXyz) {
+            return DeviceColour::Cpu;
+        }
+        match &*job.display {
+            Display::Srgb(_) => DeviceColour::BuiltInSrgb,
+            #[cfg(all(feature = "icc", grok_display_output_thresholds))]
+            Display::Icc(_) => DeviceColour::Profile(job.display.clone()),
+            #[cfg(all(feature = "icc", not(grok_display_output_thresholds)))]
+            Display::Icc(_) => DeviceColour::Cpu,
+        }
+    }
+
+    // zeroed so fields newer grok headers add stay null
+    fn device_display_transform(
+        transfer: &[f32],
+        matrix: Option<&[f32; 9]>,
+        output_thresholds: Option<&[f32]>,
+    ) -> grokj2k_sys::grk_plugin_display_transform {
+        let mut device_transform: grokj2k_sys::grk_plugin_display_transform =
+            unsafe { std::mem::zeroed() };
+        device_transform.transfer = transfer.as_ptr();
+        device_transform.matrix = matrix.map_or(std::ptr::null(), |matrix| matrix.as_ptr());
+        #[cfg(grok_display_output_thresholds)]
+        {
+            device_transform.output_thresholds =
+                output_thresholds.map_or(std::ptr::null(), |thresholds| thresholds.as_ptr());
+        }
+        #[cfg(not(grok_display_output_thresholds))]
+        let _ = output_thresholds;
+        device_transform
     }
 
     // runs on the plugin's worker threads, several at once, blocking while the queue is empty
@@ -942,7 +1010,9 @@ mod device {
                 state.cpu_queue.push(job);
                 continue;
             }
-            if asks_device_colour(&job) != state.batch_asked_device_colour.load(Ordering::Acquire) {
+            let same_colour =
+                device_colour(&job).same_as(&state.batch_device_colour.lock().unwrap());
+            if !same_colour {
                 // the backend ends this batch and begins one for the new display transform
                 state.pull_open.store(false, Ordering::Release);
                 state.queue.push_front(job);
@@ -1332,6 +1402,167 @@ mod tests {
         std::fs::read(directory.path().join("frame_00000000.j2c")).expect("fixture codestream")
     }
 
+    #[cfg(feature = "icc")]
+    fn display_p3(directory: &std::path::Path) -> Arc<Display> {
+        let path = crate::colour::icc::tests::written(
+            &crate::colour::icc::tests::display_p3_profile(),
+            directory,
+            "p3.icc",
+        );
+        Arc::new(Display::from_profile(Some(&path), Default::default()).unwrap())
+    }
+
+    #[cfg(feature = "icc")]
+    #[test]
+    fn a_profile_colours_dcp_frames_on_the_device_only_where_grok_takes_output_thresholds() {
+        use device::{DeviceColour, device_colour};
+        let directory = tempfile::tempdir().unwrap();
+        let job = |render: DisplayRender, display: Arc<Display>| DecodeJob {
+            generation: 0,
+            frame_index: 0,
+            codestream: Vec::new(),
+            reduce: 0,
+            render,
+            mxf: PathBuf::from("run.j2c"),
+            display,
+            stereo: None,
+        };
+        let built_in = Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new()));
+        let profile = display_p3(directory.path());
+
+        assert!(matches!(
+            device_colour(&job(DisplayRender::DcpXyz, built_in)),
+            DeviceColour::BuiltInSrgb
+        ));
+        assert!(matches!(
+            device_colour(&job(DisplayRender::PlainRgb, profile.clone())),
+            DeviceColour::Cpu
+        ));
+        let profiled = device_colour(&job(DisplayRender::DcpXyz, profile));
+        #[cfg(grok_display_output_thresholds)]
+        assert!(matches!(profiled, DeviceColour::Profile(_)));
+        #[cfg(not(grok_display_output_thresholds))]
+        assert!(
+            matches!(profiled, DeviceColour::Cpu),
+            "grok without output thresholds hands the frame back for the cpu to colour"
+        );
+    }
+
+    // flat patches, so the device's and the cpu's inverse wavelets agree inside each one
+    #[cfg(all(feature = "grok-gpu", feature = "icc"))]
+    fn patches_codestream() -> (Vec<u8>, Vec<(u32, u32)>) {
+        const WIDTH: u32 = 2048;
+        const HEIGHT: u32 = 1080;
+        const PATCH: u32 = 120;
+        const MARGIN: u32 = 16;
+        const CINEMA_2K_PROFILE: u16 = 0x0003;
+        const DCI_RESOLUTIONS: u8 = 6;
+        const DCI_COMPRESSION_RATIO: f64 = 12.0;
+        const COLUMNS: u32 = WIDTH / PATCH;
+        const ROWS: u32 = HEIGHT / PATCH;
+        let code = |x: u32, y: u32, channel: u32| -> i32 {
+            let (column, row) = ((x / PATCH).min(COLUMNS - 1), (y / PATCH).min(ROWS - 1));
+            let step = 4095 / (COLUMNS + ROWS);
+            [
+                column * step + row * 40,
+                row * step * 2,
+                (COLUMNS - column) * step,
+            ][channel as usize]
+                .min(4095) as i32
+        };
+        let plane = |channel: u32| -> Vec<i32> {
+            (0..WIDTH * HEIGHT)
+                .map(|index| code(index % WIDTH, index / WIDTH, channel))
+                .collect()
+        };
+        let params = crate::grok_encoder::CompressParams {
+            irreversible: true,
+            compression_ratio: DCI_COMPRESSION_RATIO,
+            mct: false,
+            apply_xyz_transform: false,
+            profile: CINEMA_2K_PROFILE,
+            num_resolutions: DCI_RESOLUTIONS,
+            ..crate::grok_encoder::CompressParams::default()
+        };
+        crate::grok_encoder::initialize(0);
+        let directory = tempfile::tempdir().unwrap();
+        let mut frame = Some(crate::grok_encoder::RawFrame::Planar {
+            components: [plane(0), plane(1), plane(2)],
+            width: WIDTH,
+            height: HEIGHT,
+            precision: 12,
+            index: 0,
+        });
+        let result = crate::grok_encoder::encode_pipeline(
+            directory.path(),
+            &params,
+            1,
+            &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            &Arc::new(crate::grok_encoder::PhaseClocks::default()),
+            |_| frame.take(),
+            |_| {},
+        );
+        assert!(result.success, "fixture encode failed: {}", result.error);
+        let codestream =
+            std::fs::read(directory.path().join("frame_00000000.j2c")).expect("fixture codestream");
+        let interiors = (0..ROWS)
+            .flat_map(|row| (0..COLUMNS).map(move |column| (column, row)))
+            .flat_map(|(column, row)| {
+                (MARGIN..PATCH - MARGIN).flat_map(move |dy| {
+                    (MARGIN..PATCH - MARGIN).map(move |dx| (column * PATCH + dx, row * PATCH + dy))
+                })
+            })
+            .collect();
+        (codestream, interiors)
+    }
+
+    #[cfg(all(feature = "grok-gpu", feature = "icc"))]
+    #[test]
+    fn a_profile_colours_a_dcp_batch_on_the_device_as_the_cpu_does() {
+        const FRAMES: usize = 4;
+        let _device = DEVICE_TESTS.lock().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let profile = display_p3(directory.path());
+        let (codestream, interiors) = patches_codestream();
+        let codestreams = vec![codestream; FRAMES];
+
+        crate::grok_encoder::use_cpu();
+        let on_cpu = decode_run_through_a_pool(&codestreams, DisplayRender::DcpXyz, &profile);
+        if let Err(reason) = crate::grok_encoder::use_gpu_from_environment() {
+            panic!("{reason}");
+        }
+        let before = crate::grok_encoder::accelerated_frames();
+        let on_device = decode_run_through_a_pool(&codestreams, DisplayRender::DcpXyz, &profile);
+        let device_frames = crate::grok_encoder::accelerated_frames() - before;
+        crate::grok_encoder::use_cpu();
+        assert_eq!(
+            device_frames, FRAMES as u64,
+            "the device decoded {device_frames} frames"
+        );
+
+        let mut histogram = [0usize; 256];
+        for (device, cpu) in on_device.iter().zip(&on_cpu) {
+            for &(x, y) in &interiors {
+                let at = ((y * device.width + x) as usize) * RGBA_BYTES_PER_PIXEL;
+                for channel in 0..RGB_COMPONENT_COUNT {
+                    let difference = device.data[at + channel].abs_diff(cpu.data[at + channel]);
+                    histogram[usize::from(difference)] += 1;
+                }
+            }
+        }
+        let worst = histogram.iter().rposition(|count| *count > 0).unwrap_or(0);
+        println!(
+            "patch interiors: differences 0:{} 1:{} 2+:{}",
+            histogram[0],
+            histogram[1],
+            histogram[2..].iter().sum::<usize>()
+        );
+        assert!(
+            worst <= 1,
+            "the device differs from the cpu by {worst} codes"
+        );
+    }
+
     #[test]
     fn only_a_full_resolution_frame_goes_to_a_switched_on_device() {
         assert_eq!(route(0, true), Route::Device);
@@ -1348,6 +1579,7 @@ mod tests {
     fn decode_run_through_a_pool(
         codestreams: &[Vec<u8>],
         render: DisplayRender,
+        display: &Arc<Display>,
     ) -> Vec<Arc<Rgba8Frame>> {
         let (finished, done) = std::sync::mpsc::channel();
         let pool = DecodePool::start(finished);
@@ -1360,7 +1592,7 @@ mod tests {
                 reduce: 0,
                 render,
                 mxf: PathBuf::from("run.j2c"),
-                display: Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new())),
+                display: display.clone(),
                 stereo: None,
             });
         }
@@ -1390,13 +1622,14 @@ mod tests {
         const SAMPLES_OVER_ONE_CODE_PER_MILLION: usize = 1000;
         let frames = codestreams.len();
         crate::grok_encoder::use_cpu();
-        let on_cpu = decode_run_through_a_pool(codestreams, render);
+        let built_in = Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new()));
+        let on_cpu = decode_run_through_a_pool(codestreams, render, &built_in);
 
         if let Err(reason) = crate::grok_encoder::use_gpu_from_environment() {
             panic!("{reason}");
         }
         let before = crate::grok_encoder::accelerated_frames();
-        let on_device = decode_run_through_a_pool(codestreams, render);
+        let on_device = decode_run_through_a_pool(codestreams, render, &built_in);
         let device_frames = crate::grok_encoder::accelerated_frames() - before;
         crate::grok_encoder::use_cpu();
         assert_eq!(

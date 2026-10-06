@@ -1143,6 +1143,18 @@ pub(crate) mod icc {
         TagSignature::BToD2Tag,
     ];
 
+    pub const DEVICE_OUTPUT_CODES: usize = 256;
+
+    // the transform as the accelerator plugin's display tables state it
+    pub struct DeviceDisplayTables {
+        // each 12-bit code as peak-relative linear light
+        pub transfer: Vec<f32>,
+        // row major
+        pub matrix: [f32; 9],
+        // per channel, red first, the light at which each 8-bit code starts
+        pub output_thresholds: Vec<f32>,
+    }
+
     // DCI X'Y'Z' to a matrix-shaper monitor profile: one matrix into its linear RGB, then its curves
     pub struct XyzToIcc {
         expand: Vec<f32>,
@@ -1172,12 +1184,16 @@ pub(crate) mod icc {
         (output_table_bits(linear.min(1.0)) - output_table_bits(OUTPUT_TABLE_DARKEST)) as usize
     }
 
+    // the linear light where a table entry's range starts
+    fn output_table_start(index: usize) -> f32 {
+        let first = output_table_bits(OUTPUT_TABLE_DARKEST) + index as u32;
+        f32::from_bits(first << (F32_MANTISSA_BITS - OUTPUT_TABLE_MANTISSA_BITS))
+    }
+
     // the middle of the linear range each table entry covers
     fn output_table_linear(index: usize) -> f32 {
-        let first = output_table_bits(OUTPUT_TABLE_DARKEST) + index as u32;
-        let shift = F32_MANTISSA_BITS - OUTPUT_TABLE_MANTISSA_BITS;
-        let low = f32::from_bits(first << shift);
-        let high = f32::from_bits((first + 1) << shift);
+        let low = output_table_start(index);
+        let high = output_table_start(index + 1);
         ((low + high) / 2.0).min(1.0)
     }
 
@@ -1303,6 +1319,29 @@ pub(crate) mod icc {
                 matrix,
                 output_tables,
             })
+        }
+
+        // the device shows the largest code whose threshold the light reaches, as these tables do
+        pub fn device_tables(&self) -> DeviceDisplayTables {
+            let output_thresholds = self
+                .output_tables
+                .iter()
+                .flat_map(|table| {
+                    (0..DEVICE_OUTPUT_CODES).map(move |code| {
+                        match table.iter().position(|&shown| usize::from(shown) >= code) {
+                            // every light shows at least the darkest entry's code
+                            Some(0) => f32::MIN,
+                            Some(index) => output_table_start(index),
+                            None => f32::MAX,
+                        }
+                    })
+                })
+                .collect();
+            DeviceDisplayTables {
+                transfer: self.expand.clone(),
+                matrix: std::array::from_fn(|at| self.matrix[at / 3][at % 3]),
+                output_thresholds,
+            }
         }
 
         pub fn pixel(&self, x: u16, y: u16, z: u16) -> [u8; 3] {
@@ -1452,6 +1491,59 @@ pub(crate) mod icc {
             }
         }
 
+        // the largest code whose threshold the light reaches, 0 when none does, as grok.h states
+        fn device_code(thresholds: &[f32], light: f32) -> usize {
+            thresholds
+                .iter()
+                .rposition(|threshold| *threshold <= light)
+                .unwrap_or(0)
+        }
+
+        #[test]
+        fn the_device_thresholds_pick_the_code_the_cpu_tables_pick() {
+            let directory = tempfile::tempdir().unwrap();
+            for (name, profile) in [
+                ("sRGB", Profile::new_srgb()),
+                ("Display P3", display_p3_profile()),
+                ("gamma 2.2", pure_gamma_profile()),
+            ] {
+                let path = written(&profile, directory.path(), "display.icc");
+                let transform =
+                    XyzToIcc::new(&path, RenderingIntent::RelativeColorimetric).unwrap();
+                let tables = transform.device_tables();
+                assert_eq!(
+                    tables.output_thresholds.len(),
+                    RGB_CHANNELS * DEVICE_OUTPUT_CODES
+                );
+                let entries = transform.output_tables[0].len();
+                // every entry's start, the light just below it, and lights outside 0 to 1
+                let mut lights = vec![-1.0, 0.0, OUTPUT_TABLE_DARKEST, 1.0, 1.5, f32::MAX];
+                for index in 0..entries {
+                    let start = output_table_start(index);
+                    lights.extend([
+                        start,
+                        f32::from_bits(start.to_bits() - 1),
+                        output_table_linear(index),
+                    ]);
+                }
+                for (channel, table) in transform.output_tables.iter().enumerate() {
+                    let thresholds = &tables.output_thresholds
+                        [channel * DEVICE_OUTPUT_CODES..(channel + 1) * DEVICE_OUTPUT_CODES];
+                    assert!(
+                        thresholds.windows(2).all(|pair| pair[0] <= pair[1]),
+                        "{name}"
+                    );
+                    for &light in &lights {
+                        assert_eq!(
+                            device_code(thresholds, light),
+                            usize::from(table[output_table_index(light)]),
+                            "{name} channel {channel} at light {light:e}"
+                        );
+                    }
+                }
+            }
+        }
+
         fn refusal(path: &Path) -> String {
             match XyzToIcc::new(path, RenderingIntent::RelativeColorimetric) {
                 Ok(_) => panic!("{} was accepted", path.display()),
@@ -1514,7 +1606,7 @@ pub(crate) mod icc {
 }
 
 #[cfg(feature = "icc")]
-pub use icc::XyzToIcc;
+pub use icc::{DeviceDisplayTables, XyzToIcc};
 
 #[cfg(test)]
 mod tests_display {

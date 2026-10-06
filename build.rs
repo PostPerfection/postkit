@@ -5,15 +5,20 @@ const GROK_PLUGIN_BUILD_INFO_FUNCTION: &str = "grk_plugin_build_info";
 const GROK_PLUGIN_INIT_INFO_START: &str = "typedef struct _grk_plugin_init_info";
 const GROK_PLUGIN_INIT_INFO_END: &str = "} grk_plugin_init_info;";
 const GROK_PLUGIN_NUM_THREADS_FIELD: &str = "num_threads";
+const GROK_DISPLAY_TRANSFORM_START: &str = "typedef struct grk_plugin_display_transform";
+const GROK_DISPLAY_TRANSFORM_END: &str = "} grk_plugin_display_transform;";
+const GROK_DISPLAY_OUTPUT_THRESHOLDS_FIELD: &str = "output_thresholds";
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rustc-check-cfg=cfg(grok_plugin_build_info)");
     println!("cargo::rustc-check-cfg=cfg(grok_plugin_num_threads)");
+    println!("cargo::rustc-check-cfg=cfg(grok_display_output_thresholds)");
     if std::env::var_os("CARGO_FEATURE_GROK_FFI").is_some() {
         let header_text = read_grok_header();
         detect_grok_plugin_build_info(&header_text);
         detect_grok_plugin_num_threads(&header_text);
+        detect_grok_display_output_thresholds(&header_text);
     }
     postkit_ffmpeg_link_search::emit_ffmpeg_link_search();
     if std::env::var_os("CARGO_FEATURE_LIBMPV").is_none() {
@@ -58,6 +63,18 @@ fn detect_grok_plugin_num_threads(header_text: &str) {
         .expect("grok.h declares grk_plugin_init_info");
     if init_info.contains(GROK_PLUGIN_NUM_THREADS_FIELD) {
         println!("cargo::rustc-cfg=grok_plugin_num_threads");
+    }
+}
+
+// a monitor profile's output curves reach the device only through this field
+fn detect_grok_display_output_thresholds(header_text: &str) {
+    let display_transform = header_text
+        .split_once(GROK_DISPLAY_TRANSFORM_START)
+        .and_then(|(_, rest)| rest.split_once(GROK_DISPLAY_TRANSFORM_END))
+        .map(|(display_transform, _)| display_transform);
+    if display_transform.is_some_and(|fields| fields.contains(GROK_DISPLAY_OUTPUT_THRESHOLDS_FIELD))
+    {
+        println!("cargo::rustc-cfg=grok_display_output_thresholds");
     }
 }
 
