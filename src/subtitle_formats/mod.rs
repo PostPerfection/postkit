@@ -13,6 +13,7 @@ use crate::subtitle_retime::SrtCue;
 
 pub mod ass;
 pub mod bidi;
+pub mod dcp;
 pub mod fcpxml;
 pub mod interop;
 pub mod mks;

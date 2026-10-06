@@ -5,6 +5,7 @@ mod decode_pool;
 mod presenter;
 mod scheduler;
 mod stereo;
+mod subtitle_tracks;
 mod timeline;
 
 use std::cell::RefCell;
@@ -198,6 +199,17 @@ struct Status {
     warnings: Vec<String>,
     source: Option<String>,
     queued_source: Option<String>,
+    subtitle_track: Option<TrackStatus>,
+    caption_track: Option<TrackStatus>,
+}
+
+// a slot holding cues, in the language its track names
+#[derive(Clone)]
+struct TrackStatus {
+    language: Option<String>,
+    // every language the composition has a track in for the slot
+    languages: Vec<String>,
+    visible: bool,
 }
 
 type UpdateCallback = Box<dyn Fn() + Send + 'static>;
@@ -217,6 +229,7 @@ enum Command {
     SetStereoOutput(StereoOutput),
     SetSubtitleFile(SubtitleSlot, Option<PathBuf>, Sender<Result<(), String>>),
     SetSubtitleVisibility(SubtitleSlot, bool),
+    SetSubtitleLanguage(SubtitleSlot, String, Sender<Result<(), String>>),
     SetSubtitlePresentation(SubtitlePresentation),
     SetOverlay(Vec<OverlayRectangle>),
     SetSoundOutputDevice(Option<String>),
@@ -638,6 +651,19 @@ impl GrokPlayer {
 
     // ─── subtitles and overlays ────────────────────────────────────────────
 
+    // the slot shows the composition's track in `language`, and the compositions after it too when theirs has one
+    pub fn set_subtitle_language(&self, slot: SubtitleSlot, language: &str) -> Result<(), String> {
+        let (reply, answer) = channel();
+        self.send(Command::SetSubtitleLanguage(
+            slot,
+            language.to_string(),
+            reply,
+        ))?;
+        answer
+            .recv()
+            .map_err(|_| "the decode thread is gone".to_string())?
+    }
+
     pub fn set_subtitle_file(&self, slot: SubtitleSlot, file: Option<&Path>) -> Result<(), String> {
         let (reply, answer) = channel();
         self.send(Command::SetSubtitleFile(
@@ -704,7 +730,7 @@ impl Drop for GrokPlayer {
 
 fn status_json(status: &Status) -> String {
     format!(
-        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "decode_capacity_fps": {}, "container_fps": {}, "eof": {}, "stereoscopic": {}, "warnings": [{}], "source": {}, "queued_source": {}}}"#,
+        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "decode_capacity_fps": {}, "container_fps": {}, "eof": {}, "stereoscopic": {}, "warnings": [{}], "source": {}, "queued_source": {}, "subtitle_track": {}, "caption_track": {}}}"#,
         json_number(status.position),
         json_number(status.duration),
         status.paused,
@@ -726,6 +752,25 @@ fn status_json(status: &Status) -> String {
             .join(", "),
         json_string(status.source.as_deref()),
         json_string(status.queued_source.as_deref()),
+        track_json(status.subtitle_track.as_ref()),
+        track_json(status.caption_track.as_ref()),
+    )
+}
+
+fn track_json(track: Option<&TrackStatus>) -> String {
+    let Some(track) = track else {
+        return "null".to_string();
+    };
+    format!(
+        r#"{{"language": {}, "languages": [{}], "visible": {}}}"#,
+        json_string(track.language.as_deref()),
+        track
+            .languages
+            .iter()
+            .map(|language| json_string(Some(language)))
+            .collect::<Vec<_>>()
+            .join(", "),
+        track.visible
     )
 }
 
@@ -773,12 +818,14 @@ mod tests {
             metadata.contains(r#""dropped_frames_scheduler_late": 0"#),
             "{metadata}"
         );
+        assert!(metadata.contains(r#""subtitle_track": null"#), "{metadata}");
+        assert!(metadata.contains(r#""caption_track": null"#), "{metadata}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&metadata)
                 .expect("metadata is JSON")
                 .as_object()
                 .map(|fields| fields.len()),
-            Some(17)
+            Some(19)
         );
     }
 

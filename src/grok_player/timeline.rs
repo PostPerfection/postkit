@@ -5,7 +5,8 @@ pub(super) use asdcplib::jp2k::StereoscopicPhase;
 
 use super::FrameRange;
 use super::audio::{self, KeyedSoundSegment, PlayedFrames};
-use crate::composition_timeline::{self, SoundSegment};
+use super::subtitle_tracks::{self, CompositionSubtitles, Reels};
+use crate::composition_timeline::{self, SoundSegment, SubtitleSegment};
 use crate::content_keys::ContentKeys;
 use crate::preview::{self, PictureReader, ResolvedPicture};
 use crate::preview_colour::PictureColour;
@@ -54,6 +55,8 @@ pub(super) struct Timeline {
     pub height: u32,
     pub title: String,
     pub sound: Vec<KeyedSoundSegment>,
+    // None for a source that is not a composition, which leaves the subtitle slots as they are
+    pub subtitles: Option<CompositionSubtitles>,
 }
 
 impl Timeline {
@@ -73,7 +76,7 @@ impl Timeline {
         }
         match extension(source).as_deref() {
             Some(MXF_EXTENSION) => {
-                Self::from_composition(source, Vec::new(), None, Vec::new(), keys)
+                Self::from_composition(source, Vec::new(), None, Vec::new(), None, keys)
             }
             Some(CPL_EXTENSION) => Self::from_resolved(source, other_packages, keys),
             _ => Err(format!(
@@ -94,6 +97,11 @@ impl Timeline {
             composition.pictures,
             composition.title,
             composition.sound,
+            Some((
+                composition.subtitles,
+                composition.captions,
+                composition.unread_subtitles,
+            )),
             keys,
         )
     }
@@ -103,6 +111,7 @@ impl Timeline {
         segments: Vec<composition_timeline::PictureSegment>,
         title: Option<String>,
         sound: Vec<SoundSegment>,
+        subtitles_and_captions: Option<(Vec<SubtitleSegment>, Vec<SubtitleSegment>, bool)>,
         keys: Option<&ContentKeys>,
     ) -> Result<Self, String> {
         let listed: Vec<(PathBuf, Option<composition_timeline::SegmentTrim>)> =
@@ -118,8 +127,11 @@ impl Timeline {
         let mut opened = Vec::new();
         let mut segment_starts = Vec::new();
         let mut frame_count = 0u64;
+        // every listed reel, the empty ones too, so a subtitle finds its reel by index
+        let mut reel_frames = Vec::new();
         for (path, trim) in listed {
             let segment = open_segment(&path, trim.as_ref(), keys)?;
+            reel_frames.push((frame_count, segment.frame_count));
             if segment.frame_count == 0 {
                 continue;
             }
@@ -143,6 +155,21 @@ impl Timeline {
             first.resolved.width,
             first.resolved.height,
         );
+        let reels = Reels {
+            starts_seconds: reel_frames
+                .iter()
+                .map(|(start, _)| *start as f64 / fps)
+                .collect(),
+            lengths_seconds: reel_frames
+                .iter()
+                .map(|(_, frames)| f64::from(*frames) / fps)
+                .collect(),
+        };
+        let subtitles = subtitles_and_captions
+            .map(|(subtitles, captions, unread)| {
+                subtitle_tracks::load(&subtitles, &captions, unread, &reels, keys)
+            })
+            .transpose()?;
         Ok(Timeline {
             segment_starts,
             first_frame: 0,
@@ -154,6 +181,7 @@ impl Timeline {
             title: title.unwrap_or_else(|| file_name(source)),
             frames: Frames::Essence(opened),
             sound,
+            subtitles,
         })
     }
 
@@ -185,6 +213,7 @@ impl Timeline {
             title: file_name(directory),
             frames: Frames::Codestreams { files, render },
             sound: Vec::new(),
+            subtitles: None,
         })
     }
 

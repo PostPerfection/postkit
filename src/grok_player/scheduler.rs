@@ -8,10 +8,11 @@ use super::audio;
 use super::compositor::{Compositor, Layers};
 use super::decode_pool::{DecodeJob, DecodePool};
 use super::stereo::{StereoHalf, StereoOutput, StereoPair};
+use super::subtitle_tracks::CompositionTrack;
 use super::timeline::{StereoscopicPhase, Timeline};
 use super::{
     Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, Rgba8Frame, Shared,
-    SourceOptions, Status, SubtitleSlot,
+    SourceOptions, Status, SubtitleSlot, TrackStatus,
 };
 use crate::colour::XyzToSrgb;
 use crate::preview::Display;
@@ -124,10 +125,41 @@ struct QueuedSource {
     timeline: Timeline,
 }
 
-#[derive(Default)]
 struct SubtitleTrack {
     cues: Vec<StyledCue>,
+    language: Option<String>,
+    // the composition's track in every language, the shown one among them
+    alternatives: Vec<CompositionTrack>,
+    // picked by hand and kept for the compositions that follow
+    preferred_language: Option<String>,
     visible: bool,
+}
+
+// a track a composition loads shows unless the slot was turned off
+impl Default for SubtitleTrack {
+    fn default() -> Self {
+        SubtitleTrack {
+            cues: Vec::new(),
+            language: None,
+            alternatives: Vec::new(),
+            preferred_language: None,
+            visible: true,
+        }
+    }
+}
+
+impl SubtitleTrack {
+    fn status(&self) -> Option<TrackStatus> {
+        (!self.cues.is_empty()).then(|| TrackStatus {
+            language: self.language.clone(),
+            languages: self
+                .alternatives
+                .iter()
+                .filter_map(|track| track.language.clone())
+                .collect(),
+            visible: self.visible,
+        })
+    }
 }
 
 pub(super) fn run(shared: Arc<Shared>, commands: Receiver<Command>, finished: Sender<Command>) {
@@ -346,6 +378,9 @@ impl Scheduler {
         self.pool.rebase(finished.frame_count, self.generation);
         self.pool.measure_capacity_from(self.generation);
         self.hand_off_sound(&finished, &mut timeline);
+        if let Err(error) = self.take_composition_subtitles(&mut timeline) {
+            tracing::error!("subtitles of {}: {error}", source.display());
+        }
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
         self.source = Some(source);
@@ -599,6 +634,10 @@ impl Scheduler {
                 let _ = reply.send(self.set_subtitle_file(slot, file.as_deref()));
                 self.recompose();
             }
+            Command::SetSubtitleLanguage(slot, language, reply) => {
+                let _ = reply.send(self.set_subtitle_language(slot, &language));
+                self.recompose();
+            }
             Command::SetSubtitleVisibility(slot, visible) => {
                 self.track_mut(slot).visible = visible;
                 self.recompose();
@@ -632,6 +671,7 @@ impl Scheduler {
     fn load(&mut self, source: &Path, options: SourceOptions) -> Result<(), String> {
         self.stop();
         let mut timeline = open_timeline(source, &options)?;
+        self.take_composition_subtitles(&mut timeline)?;
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
         let played = timeline.played_frames();
@@ -781,16 +821,71 @@ impl Scheduler {
             return Ok(());
         };
         let cues = parse_subtitles(file)?;
-        self.compositor.prepare_subtitles()?;
-        let top_of_frame = slot == SubtitleSlot::Caption;
+        self.fill_slot(slot, cues, None)?;
         let track = self.track_mut(slot);
-        track.cues = cues;
+        track.alternatives.clear();
         track.visible = true;
-        if top_of_frame {
-            for cue in &mut track.cues {
+        Ok(())
+    }
+
+    fn set_subtitle_language(&mut self, slot: SubtitleSlot, language: &str) -> Result<(), String> {
+        let chosen = self
+            .track_mut(slot)
+            .alternatives
+            .iter()
+            .find(|track| track.language.as_deref() == Some(language))
+            .cloned()
+            .ok_or_else(|| format!("the composition has no {language} track for that slot"))?;
+        self.track_mut(slot).preferred_language = Some(language.to_string());
+        self.fill_slot(slot, chosen.cues, chosen.language)
+    }
+
+    // a composition brings its own tracks, a bare track file keeps what was set by hand
+    fn take_composition_subtitles(&mut self, timeline: &mut Timeline) -> Result<(), String> {
+        let Some(loaded) = timeline.subtitles.as_mut() else {
+            return Ok(());
+        };
+        let subtitles = std::mem::take(&mut loaded.subtitles);
+        let captions = std::mem::take(&mut loaded.captions);
+        self.fill_slot_from(SubtitleSlot::Subtitle, subtitles)?;
+        self.fill_slot_from(SubtitleSlot::Caption, captions)
+    }
+
+    // the track in the language picked earlier, else the first the CPL names
+    fn fill_slot_from(
+        &mut self,
+        slot: SubtitleSlot,
+        tracks: Vec<CompositionTrack>,
+    ) -> Result<(), String> {
+        let preferred = self.track_mut(slot).preferred_language.clone();
+        let chosen = tracks
+            .iter()
+            .find(|track| preferred.is_some() && track.language == preferred)
+            .or(tracks.first())
+            .cloned()
+            .unwrap_or_default();
+        self.fill_slot(slot, chosen.cues, chosen.language)?;
+        self.track_mut(slot).alternatives = tracks;
+        Ok(())
+    }
+
+    fn fill_slot(
+        &mut self,
+        slot: SubtitleSlot,
+        mut cues: Vec<StyledCue>,
+        language: Option<String>,
+    ) -> Result<(), String> {
+        if !cues.is_empty() {
+            self.compositor.prepare_subtitles()?;
+        }
+        if slot == SubtitleSlot::Caption {
+            for cue in &mut cues {
                 cue.valign = Some(VAlign::Top);
             }
         }
+        let track = self.track_mut(slot);
+        track.cues = cues;
+        track.language = language;
         Ok(())
     }
 
@@ -849,7 +944,18 @@ impl Scheduler {
                 .queued
                 .as_ref()
                 .map(|queued| queued.source.display().to_string()),
-            warnings: self.sound.warnings(),
+            warnings: self
+                .sound
+                .warnings()
+                .into_iter()
+                .chain(
+                    timeline
+                        .and_then(|timeline| timeline.subtitles.as_ref())
+                        .and_then(|subtitles| subtitles.warning.clone()),
+                )
+                .collect(),
+            subtitle_track: self.subtitle.status(),
+            caption_track: self.caption.status(),
         });
         self.shared
             .set_cached_frames(self.pool.cached_frame_count());

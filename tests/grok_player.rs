@@ -887,6 +887,263 @@ fn a_subtitle_draws_in_its_own_band_only_while_its_cue_runs() {
     });
 }
 
+// one cue in the second reel, from its sixth frame to its twelfth
+const SECOND_REEL_SUBTITLE: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<SubtitleReel xmlns=\"http://www.smpte-ra.org/schemas/428-7/2010/DCST\">
+  <Id>urn:uuid:5b000000-0000-4000-8000-000000000001</Id>
+  <ContentTitleText>reel 2</ContentTitleText>
+  <Language>de</Language>
+  <EditRate>24 1</EditRate>
+  <TimeCodeRate>24</TimeCodeRate>
+  <SubtitleList>
+    <Font Color=\"FFFFFFFF\">
+      <Subtitle SpotNumber=\"1\" TimeIn=\"00:00:00:06\" TimeOut=\"00:00:00:12\">
+        <Text Valign=\"bottom\" Vposition=\"10\" Halign=\"center\">REEL TWO</Text>
+      </Subtitle>
+    </Font>
+  </SubtitleList>
+</SubtitleReel>";
+
+// the CPL with a MainSubtitle in the reel at `reel`
+fn with_reel_subtitle(cpl: &str, reel: usize, subtitle_id: &str, frames: u64) -> String {
+    let element = format!(
+        "<MainSubtitle><Id>urn:uuid:{subtitle_id}</Id><EditRate>24 1</EditRate>\
+         <IntrinsicDuration>{frames}</IntrinsicDuration><EntryPoint>0</EntryPoint>\
+         <Duration>{frames}</Duration><Language>de</Language></MainSubtitle>"
+    );
+    let at = cpl
+        .match_indices("</AssetList>")
+        .nth(reel)
+        .expect("the reel exists")
+        .0;
+    format!("{}{element}{}", &cpl[..at], &cpl[at..])
+}
+
+#[test]
+fn a_cpl_subtitle_track_shows_its_cue_at_the_right_frame_of_the_second_reel() {
+    const WIDTH: u32 = 320;
+    const HEIGHT: u32 = 180;
+    const REEL_FRAMES: u64 = 12;
+    const CPL_ID: &str = "5c000000-0000-4000-8000-000000000001";
+    const PICTURE_IDS: [&str; 2] = [
+        "5c000000-0000-4000-8000-000000000002",
+        "5c000000-0000-4000-8000-000000000003",
+    ];
+    const SUBTITLE_ID: &str = "5c000000-0000-4000-8000-000000000004";
+    let directory = tempfile::tempdir().unwrap();
+    let frames =
+        vec![flat_codestreams(WIDTH, HEIGHT, 1, CINEMA_2K_PROFILE).remove(0); REEL_FRAMES as usize];
+    write_mxf(
+        &directory.path().join("reel1.mxf"),
+        &frames,
+        None,
+        WIDTH,
+        HEIGHT,
+    );
+    write_mxf(
+        &directory.path().join("reel2.mxf"),
+        &frames,
+        None,
+        WIDTH,
+        HEIGHT,
+    );
+    timed_text_track(
+        directory.path(),
+        "subtitle",
+        SECOND_REEL_SUBTITLE,
+        REEL_FRAMES,
+    );
+    let reels = PICTURE_IDS
+        .iter()
+        .enumerate()
+        .map(|(index, picture_id)| DcpCplReel {
+            reel_id: format!("5c000000-0000-4000-8000-00000000001{index}"),
+            picture_id: (*picture_id).into(),
+            picture_edit_rate_num: FRAMES_PER_SECOND,
+            picture_edit_rate_den: 1,
+            picture_duration: REEL_FRAMES,
+            picture_width: WIDTH,
+            picture_height: HEIGHT,
+            ..Default::default()
+        })
+        .collect();
+    write_package(
+        directory.path(),
+        CPL_ID,
+        &[
+            (PICTURE_IDS[0], "reel1.mxf"),
+            (PICTURE_IDS[1], "reel2.mxf"),
+            (SUBTITLE_ID, "subtitle.mxf"),
+        ],
+        reels,
+    );
+    let cpl_path = directory.path().join(format!("CPL_{CPL_ID}.xml"));
+    let cpl = std::fs::read_to_string(&cpl_path).unwrap();
+    std::fs::write(
+        &cpl_path,
+        with_reel_subtitle(&cpl, 1, SUBTITLE_ID, REEL_FRAMES),
+    )
+    .unwrap();
+
+    let player = loaded_player(directory.path());
+    let (width, height) = (WIDTH as usize, HEIGHT as usize);
+    let plain = software_frame(&player, width, height);
+    let frame_rows = |frame: u64| {
+        forget_frames(&player);
+        player.seek_absolute(frame as f64 / f64::from(FRAMES_PER_SECOND));
+        wait_for_frame(&player);
+        changed_rows(
+            &plain,
+            &software_frame(&player, width, height),
+            width,
+            height,
+        )
+    };
+
+    assert!(
+        frame_rows(REEL_FRAMES + 5).is_empty(),
+        "the cue drew before its first frame"
+    );
+    let cue_rows = frame_rows(REEL_FRAMES + 6);
+    assert!(
+        !cue_rows.is_empty(),
+        "the cue drew nothing on its first frame"
+    );
+    assert!(
+        cue_rows.iter().all(|row| *row > height / 2),
+        "the cue left the bottom band: {cue_rows:?}"
+    );
+    let metadata: serde_json::Value = serde_json::from_str(&player.metadata_json()).unwrap();
+    assert_eq!(metadata["subtitle_track"]["language"], "de");
+    assert_eq!(metadata["caption_track"], serde_json::Value::Null);
+}
+
+fn timed_text_track(directory: &Path, name: &str, xml: &str, frames: u64) -> PathBuf {
+    let source = directory.join(format!("{name}.xml"));
+    std::fs::write(&source, xml).unwrap();
+    let output = directory.join(format!("{name}.mxf"));
+    let track = postkit::mxf_wrap::mxf_wrap(&postkit::mxf_wrap::MxfWrapOptions {
+        input_files: vec![source],
+        output: output.clone(),
+        essence_type: postkit::mxf_wrap::EssenceType::TimedText,
+        standard: postkit::mxf_wrap::MxfStandard::AsDcp,
+        fps_num: FRAMES_PER_SECOND,
+        fps_den: 1,
+        partition_size: 0,
+        encryption: None,
+        mca_config: None,
+        resource_ids: Vec::new(),
+        hdr: None,
+        asset_uuid: None,
+        timed_text_duration_frames: Some(frames as u32),
+    });
+    assert!(track.success, "timed text wrap failed: {}", track.error);
+    output
+}
+
+#[test]
+fn closed_captions_in_two_languages_switch_on_request_and_keep_the_choice() {
+    const SIZE: u32 = 64;
+    const FRAMES: u64 = 12;
+    const CPL_ID: &str = "5f000000-0000-4000-8000-000000000001";
+    const PICTURE_ID: &str = "5f000000-0000-4000-8000-000000000002";
+    const CAPTION_IDS: [&str; 2] = [
+        "5f000000-0000-4000-8000-000000000003",
+        "5f000000-0000-4000-8000-000000000004",
+    ];
+    let directory = tempfile::tempdir().unwrap();
+    let frames =
+        vec![flat_codestreams(SIZE, SIZE, 1, CINEMA_2K_PROFILE).remove(0); FRAMES as usize];
+    write_mxf(
+        &directory.path().join("picture.mxf"),
+        &frames,
+        None,
+        SIZE,
+        SIZE,
+    );
+    for (index, language) in ["fr", "en"].iter().enumerate() {
+        let xml = SECOND_REEL_SUBTITLE
+            .replace(
+                "<Language>de</Language>",
+                &format!("<Language>{language}</Language>"),
+            )
+            .replace("5b000000-0000-4000-8000-000000000001", CAPTION_IDS[index]);
+        timed_text_track(
+            directory.path(),
+            &format!("caption_{language}"),
+            &xml,
+            FRAMES,
+        );
+    }
+    write_package(
+        directory.path(),
+        CPL_ID,
+        &[
+            (PICTURE_ID, "picture.mxf"),
+            (CAPTION_IDS[0], "caption_fr.mxf"),
+            (CAPTION_IDS[1], "caption_en.mxf"),
+        ],
+        vec![DcpCplReel {
+            reel_id: "5f000000-0000-4000-8000-000000000010".into(),
+            picture_id: PICTURE_ID.into(),
+            picture_edit_rate_num: FRAMES_PER_SECOND,
+            picture_edit_rate_den: 1,
+            picture_duration: FRAMES,
+            picture_width: SIZE,
+            picture_height: SIZE,
+            ..Default::default()
+        }],
+    );
+    let captions: String = CAPTION_IDS
+        .iter()
+        .zip(["fr", "en"])
+        .map(|(id, language)| {
+            format!(
+                "<tt:ClosedCaption xmlns:tt=\"http://www.smpte-ra.org/schemas/429-12/2008/TT\">\
+                 <Id>urn:uuid:{id}</Id><EditRate>24 1</EditRate><IntrinsicDuration>{FRAMES}</IntrinsicDuration>\
+                 <EntryPoint>0</EntryPoint><Duration>{FRAMES}</Duration><Language>{language}</Language>\
+                 </tt:ClosedCaption>"
+            )
+        })
+        .collect();
+    let cpl_path = directory.path().join(format!("CPL_{CPL_ID}.xml"));
+    let cpl = std::fs::read_to_string(&cpl_path).unwrap();
+    std::fs::write(
+        &cpl_path,
+        cpl.replacen("</AssetList>", &format!("{captions}</AssetList>"), 1),
+    )
+    .unwrap();
+    let caption_track = |player: &GrokPlayer| {
+        let metadata: serde_json::Value = serde_json::from_str(&player.metadata_json()).unwrap();
+        metadata["caption_track"].clone()
+    };
+
+    let player = loaded_player(directory.path());
+    wait_until("the caption track is reported", || {
+        caption_track(&player)["language"] == "fr"
+    });
+    assert_eq!(
+        caption_track(&player)["languages"],
+        serde_json::json!(["fr", "en"])
+    );
+    player
+        .set_subtitle_language(SubtitleSlot::Caption, "en")
+        .expect("an en track exists");
+    wait_until("the en track shows", || {
+        caption_track(&player)["language"] == "en"
+    });
+    assert!(
+        player
+            .set_subtitle_language(SubtitleSlot::Caption, "de")
+            .is_err()
+    );
+
+    player.load(directory.path(), None).expect("reload");
+    wait_until("the next load keeps en", || {
+        caption_track(&player)["language"] == "en"
+    });
+}
+
 #[test]
 fn a_subtitle_offset_while_paused_moves_the_drawn_cue() {
     const WIDTH: u32 = 320;

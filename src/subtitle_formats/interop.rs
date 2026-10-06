@@ -89,7 +89,7 @@ struct ImgAttrs {
     vposition: Option<f32>,
 }
 
-fn resolve_png(base: &Path, name: &str) -> Result<PathBuf, SubtitleError> {
+pub(crate) fn resolve_png(base: &Path, name: &str) -> Result<PathBuf, SubtitleError> {
     let path = base.join(name);
     let mut f =
         std::fs::File::open(&path).map_err(|_| SubtitleError::MissingImage(path.clone()))?;
@@ -105,7 +105,7 @@ fn tc_ms(tc: &str, fps: f64) -> u64 {
     (timecode_to_seconds(tc, fps) * 1000.0).round() as u64
 }
 
-fn parse_valign(s: &str) -> Option<VAlign> {
+pub(super) fn parse_valign(s: &str) -> Option<VAlign> {
     match s.to_lowercase().as_str() {
         "top" => Some(VAlign::Top),
         "center" | "centre" => Some(VAlign::Middle),
@@ -114,7 +114,7 @@ fn parse_valign(s: &str) -> Option<VAlign> {
     }
 }
 
-fn parse_halign(s: &str) -> Option<HAlign> {
+pub(super) fn parse_halign(s: &str) -> Option<HAlign> {
     match s.to_lowercase().as_str() {
         "left" => Some(HAlign::Left),
         "center" | "centre" => Some(HAlign::Center),
@@ -123,7 +123,7 @@ fn parse_halign(s: &str) -> Option<HAlign> {
     }
 }
 
-fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
+pub(super) fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     e.attributes().flatten().find_map(|a| {
         if local_name(a.key.as_ref()).to_lowercase() == name {
             Some(String::from_utf8_lossy(&a.value).into_owned())
@@ -133,7 +133,7 @@ fn attr(e: &quick_xml::events::BytesStart, name: &str) -> Option<String> {
     })
 }
 
-fn local_name(name: &[u8]) -> String {
+pub(super) fn local_name(name: &[u8]) -> String {
     let s = String::from_utf8_lossy(name);
     let local = match s.rsplit_once(':') {
         Some((_, local)) => local,

@@ -43,10 +43,24 @@ pub struct SegmentTrim {
     pub length_seconds: Option<f64>,
 }
 
+// an ST 429-5 timed text MXF or an Interop subtitle XML
+#[derive(Debug, PartialEq)]
+pub struct SubtitleSegment {
+    pub path: PathBuf,
+    // the reel it plays in, which is the picture segment of the same index
+    pub reel: usize,
+    pub trim: Option<SegmentTrim>,
+    pub language: Option<String>,
+}
+
 #[derive(Debug, PartialEq)]
 pub struct Composition {
     pub pictures: Vec<PictureSegment>,
     pub sound: Vec<SoundSegment>,
+    pub subtitles: Vec<SubtitleSegment>,
+    pub captions: Vec<SubtitleSegment>,
+    // an IMF composition's IMSC subtitles, which the player has no reader for
+    pub unread_subtitles: bool,
     pub title: Option<String>,
 }
 
@@ -137,11 +151,58 @@ pub fn resolve_composition(
         })
         .collect::<Result<Vec<_>, String>>()
         .map_err(missing_asset_error)?;
+    let subtitle_segments = |element: &str| {
+        reel_subtitle_references(&cpl, element)
+            .into_iter()
+            .map(|(reel, reference, language)| {
+                let path = paths_by_id
+                    .get(&reference.asset_id)
+                    .ok_or_else(|| missing_asset_error(reference.asset_id.clone()))?;
+                Ok(SubtitleSegment {
+                    path: path.clone(),
+                    reel,
+                    trim: reference.trim,
+                    language,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()
+    };
     Ok(Composition {
         pictures,
         sound,
+        subtitles: subtitle_segments(MAIN_SUBTITLE_ELEMENT)?,
+        captions: subtitle_segments(CLOSED_CAPTION_ELEMENT_PATTERN)?,
+        unread_subtitles: !element_blocks(&cpl, IMF_SUBTITLES_SEQUENCE_ELEMENT).is_empty(),
         title: composition_title(&cpl),
     })
+}
+
+const MAIN_SUBTITLE_ELEMENT: &str = "MainSubtitle";
+const IMF_SUBTITLES_SEQUENCE_ELEMENT: &str = "SubtitlesSequence";
+// ST 429-12 names it ClosedCaption, the Interop CPL MainClosedCaption
+const CLOSED_CAPTION_ELEMENT_PATTERN: &str = "(?:Main)?ClosedCaption";
+
+// every track of the kind in each reel, a reel can carry one a language, with the reel's index
+fn reel_subtitle_references(
+    cpl: &str,
+    element: &str,
+) -> Vec<(usize, TrackFileReference, Option<String>)> {
+    element_blocks(cpl, "Reel")
+        .into_iter()
+        .enumerate()
+        .flat_map(|(reel, block)| {
+            element_blocks(block, element)
+                .into_iter()
+                .filter_map(move |track| {
+                    let reference = TrackFileReference {
+                        asset_id: uuid_in(track, "Id")?,
+                        trim: segment_trim(track, "Duration", None),
+                        edit_rate: None,
+                    };
+                    Some((reel, reference, read_prefixed_tag(track, "Language")))
+                })
+        })
+        .collect()
 }
 
 // the library packages holding the pictures and sound the CPL's own package lacks
@@ -154,6 +215,16 @@ pub fn find_original_version_packages(
     let mut missing: Vec<String> = picture_references(&cpl)
         .into_iter()
         .chain(sound_references(&cpl))
+        .chain(
+            reel_subtitle_references(&cpl, MAIN_SUBTITLE_ELEMENT)
+                .into_iter()
+                .map(|(_, reference, _)| reference),
+        )
+        .chain(
+            reel_subtitle_references(&cpl, CLOSED_CAPTION_ELEMENT_PATTERN)
+                .into_iter()
+                .map(|(_, reference, _)| reference),
+        )
         .map(|reference| reference.asset_id)
         .filter(|asset_id| !own_assets.contains_key(asset_id))
         .collect();
@@ -802,6 +873,22 @@ mod tests {
     }
 
     #[test]
+    fn an_imf_subtitles_sequence_is_marked_unread() {
+        let dir = tempfile::tempdir().unwrap();
+        write_assetmap(dir.path(), "CPL_a.xml", &[(REEL_UUIDS[0], "VIDEO_one.mxf")]);
+        let with_subtitles = imf_cpl(&REEL_UUIDS[..1]).replace(
+            "</SequenceList>",
+            "<cc:SubtitlesSequence xmlns:cc=\"z\"><ResourceList/></cc:SubtitlesSequence></SequenceList>",
+        );
+        std::fs::write(dir.path().join("CPL_a.xml"), with_subtitles).unwrap();
+
+        let composition = resolve_composition(dir.path(), &[]).unwrap();
+
+        assert!(composition.unread_subtitles);
+        assert!(composition.subtitles.is_empty());
+    }
+
+    #[test]
     fn a_supplemental_imp_finds_the_audio_its_original_holds() {
         let library = tempfile::tempdir().unwrap();
         let english = [
@@ -1178,6 +1265,51 @@ mod tests {
             find_original_version_packages(&version_file_dir, &searched),
             Ok(vec![pictures, sound])
         );
+    }
+
+    const SUBTITLE_UUID: &str = "5e000000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn a_version_file_takes_its_subtitle_from_the_original_version() {
+        let library = tempfile::tempdir().unwrap();
+        let version_file_dir = package_directory(
+            library.path(),
+            "vf",
+            &[
+                (REEL_UUIDS[0], "vf_reel1.mxf"),
+                (SOUND_UUID, "vf_sound.mxf"),
+            ],
+        );
+        let subtitled = dcp_cpl_with_sound(&[(REEL_UUIDS[0], SOUND_UUID)]).replace(
+            "</MainSound>",
+            &format!(
+                "</MainSound><MainSubtitle><Id>urn:uuid:{SUBTITLE_UUID}</Id><EntryPoint>0</EntryPoint>\
+                 <Duration>48</Duration><Language>fr</Language></MainSubtitle>"
+            ),
+        );
+        std::fs::write(version_file_dir.join("CPL_ov.xml"), subtitled).unwrap();
+        let original_version =
+            package_directory(library.path(), "ov", &[(SUBTITLE_UUID, "ov_subtitle.mxf")]);
+
+        let found = find_original_version_packages(
+            &version_file_dir,
+            std::slice::from_ref(&original_version),
+        );
+        let composition =
+            resolve_composition(&version_file_dir, std::slice::from_ref(&original_version))
+                .unwrap();
+
+        assert_eq!(found, Ok(vec![original_version.clone()]));
+        assert_eq!(
+            composition.subtitles,
+            vec![SubtitleSegment {
+                path: original_version.join("ov_subtitle.mxf"),
+                reel: 0,
+                trim: None,
+                language: Some("fr".to_string()),
+            }]
+        );
+        assert!(composition.captions.is_empty());
     }
 
     #[test]
