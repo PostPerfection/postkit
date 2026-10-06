@@ -32,6 +32,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `hash` | SHA-1 / SHA-256 file hashing |
 | `j2k` | JPEG 2000 codestream parsing, DCI validation, MXF frame extraction and bitrate analysis |
 | `job_queue` | The job queue every wizard process runs, with its jobs file |
+| `kdm_distribution` | A distributor's cinemas, screens, titles, bookings and issued KDMs: FLM import (ST 430-16 and 430-7), ISDCF Doc 5 certificate checks, formulation per screen, windows in the cinema's time zone, KDM and ZIP naming, SMTP delivery, sqlite store |
 | `kdm_store` | A directory of KDMs, and which one a composition plays with on a given player and time |
 | `loudness` | Audio loudness measurement (EBU R128, Leq(m)) and gain adjustment |
 | `mca` | SMPTE ST 377-4 Multi-Channel Audio label generation |
