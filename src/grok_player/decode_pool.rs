@@ -554,7 +554,7 @@ fn run_worker(
     }
 }
 
-fn jobs_per_frame(stereo: Option<&StereoHalf>) -> usize {
+pub(super) fn jobs_per_frame(stereo: Option<&StereoHalf>) -> usize {
     if stereo.is_some() { 2 } else { 1 }
 }
 

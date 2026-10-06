@@ -2273,29 +2273,6 @@ mod stereoscopic {
     }
 
     #[test]
-    fn decoding_both_eyes_halves_the_decode_capacity() {
-        const EYE_SIZE: u32 = 512;
-        const FRAMES: usize = 40;
-        let directory = tempfile::tempdir().unwrap();
-        let mxf = stereo_mxf(directory.path(), "stereo.mxf", EYE_SIZE, EYE_SIZE, FRAMES);
-        let player = GrokPlayer::new();
-        player.init_software().unwrap();
-        player.load(&mxf, None).expect("load");
-        wait_until("the first frame was composed", || {
-            player.frame_size().is_some()
-        });
-        let (ratio, readings) = median_capacity_ratio(
-            &player,
-            |player| player.set_stereo_output(StereoOutput::LeftEye),
-            |player| player.set_stereo_output(StereoOutput::SideBySide),
-        );
-        assert!(
-            (0.3..0.75).contains(&ratio),
-            "left eye against side by side, fps: {readings:?}"
-        );
-    }
-
-    #[test]
     fn a_stereo_output_change_during_playback_drops_no_frames() {
         const FRAMES: usize = 72;
         let directory = tempfile::tempdir().unwrap();

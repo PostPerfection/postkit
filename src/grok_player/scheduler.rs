@@ -94,7 +94,22 @@ impl Clock {
 }
 
 // a mono reel has one codestream a frame, read through the left eye
-const MONO_EYE: [StereoscopicPhase; 1] = [StereoscopicPhase::Left];
+const MONO_EYE: StereoscopicPhase = StereoscopicPhase::Left;
+
+// the eyes one frame decodes, each with the pair it packs into when there are two
+fn eyes_to_decode(
+    stereo_output: StereoOutput,
+    stereoscopic: bool,
+) -> Vec<(StereoscopicPhase, Option<StereoHalf>)> {
+    if !stereoscopic {
+        return vec![(MONO_EYE, None)];
+    }
+    let eyes = stereo_output.eyes();
+    let pair = (eyes.len() > 1).then(|| StereoPair::new(stereo_output.arrangement()));
+    eyes.iter()
+        .map(|&eye| (eye, pair.clone().map(|pair| StereoHalf { pair, eye })))
+        .collect()
+}
 
 fn open_timeline(source: &Path, options: &SourceOptions) -> Result<Timeline, String> {
     let mut timeline = Timeline::open(source, options.keys.as_ref(), &options.other_packages)?;
@@ -506,18 +521,11 @@ impl Scheduler {
                 (_, Some(timeline)) => (timeline, index),
                 (_, None) => return,
             };
-            let (eyes, pair) = if timeline.stereoscopic {
-                let eyes = self.stereo_output.eyes();
-                let pair =
-                    (eyes.len() > 1).then(|| StereoPair::new(self.stereo_output.arrangement()));
-                (eyes, pair)
-            } else {
-                (MONO_EYE.as_slice(), None)
-            };
-            let reads: Result<Vec<_>, String> = eyes
-                .iter()
-                .map(|eye| Ok((*eye, timeline.codestream(frame, *eye)?)))
-                .collect();
+            let reads: Result<Vec<_>, String> =
+                eyes_to_decode(self.stereo_output, timeline.stereoscopic)
+                    .into_iter()
+                    .map(|(eye, stereo)| Ok((stereo, timeline.codestream(frame, eye)?)))
+                    .collect();
             let reads = match reads {
                 Ok(reads) => reads,
                 Err(reason) => {
@@ -526,7 +534,7 @@ impl Scheduler {
                 }
             };
             self.in_flight.insert(index);
-            for (eye, (codestream, render, mxf)) in reads {
+            for (stereo, (codestream, render, mxf)) in reads {
                 self.pool.submit(DecodeJob {
                     generation,
                     frame_index: index,
@@ -535,7 +543,7 @@ impl Scheduler {
                     render,
                     mxf,
                     display: self.display.clone(),
-                    stereo: pair.clone().map(|pair| StereoHalf { pair, eye }),
+                    stereo,
                 });
             }
         }
@@ -1067,6 +1075,34 @@ mod tests {
         assert!((due - 0.125).abs() < 1e-9, "frame 13 came due at {due}");
         assert!(clock.frame_offset_seconds(9) == 0.0);
         assert!((clock.frame_period_seconds() - 1.0 / 24.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn one_eye_output_decodes_one_job_a_frame_and_both_eyes_count_double() {
+        use super::super::decode_pool::jobs_per_frame;
+        use StereoscopicPhase::{Left, Right};
+        let cases = [
+            (StereoOutput::LeftEye, vec![Left]),
+            (StereoOutput::RightEye, vec![Right]),
+            (StereoOutput::SideBySide, vec![Left, Right]),
+            (StereoOutput::TopAndBottom, vec![Left, Right]),
+        ];
+        for (output, expected_eyes) in cases {
+            let jobs = eyes_to_decode(output, true);
+            let eyes: Vec<_> = jobs.iter().map(|(eye, _)| *eye).collect();
+            assert_eq!(eyes, expected_eyes, "{output:?}");
+            for (_, stereo) in &jobs {
+                assert_eq!(
+                    jobs_per_frame(stereo.as_ref()),
+                    expected_eyes.len(),
+                    "{output:?}"
+                );
+            }
+        }
+        // a mono source ignores the stereo output
+        let mono = eyes_to_decode(StereoOutput::SideBySide, false);
+        assert_eq!(mono.len(), 1);
+        assert_eq!(jobs_per_frame(mono[0].1.as_ref()), 1);
     }
 
     #[test]
