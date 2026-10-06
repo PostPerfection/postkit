@@ -614,7 +614,7 @@ fn json_number(value: Option<f64>) -> String {
 
 fn json_string(value: Option<&str>) -> String {
     match value {
-        Some(text) => format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\"")),
+        Some(text) => serde_json::Value::from(text).to_string(),
         None => "null".to_string(),
     }
 }
