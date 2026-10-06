@@ -116,6 +116,9 @@ CREATE TABLE deliveries (
     result TEXT NOT NULL
 );
 "#,
+    r#"
+ALTER TABLE bookings ADD COLUMN needs_reissue INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,6 +150,8 @@ pub struct Booking {
     // in each cinema's own time zone
     pub window: LocalWindow,
     pub formulation: Option<KdmFormulation>,
+    // edited after KDMs were issued, so the issued ones no longer match
+    pub needs_reissue: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -701,14 +706,7 @@ impl DistributionDatabase {
         ids.into_iter().map(|id| self.title(id)).collect()
     }
 
-    pub fn add_booking(
-        &mut self,
-        title_id: TitleId,
-        screen_ids: &[ScreenId],
-        window: LocalWindow,
-        formulation: Option<KdmFormulation>,
-        created_at: DateTime<Utc>,
-    ) -> Result<BookingId, String> {
+    fn check_booking(&self, screen_ids: &[ScreenId], window: &LocalWindow) -> Result<(), String> {
         if screen_ids.is_empty() {
             return Err("a booking needs at least one screen".to_string());
         }
@@ -718,10 +716,44 @@ impl DistributionDatabase {
                 window.end, window.start
             ));
         }
-        self.title(title_id)?;
         for screen_id in screen_ids {
             self.screen_cinema(*screen_id)?;
         }
+        Ok(())
+    }
+
+    fn write_booking_screens(
+        transaction: &Transaction<'_>,
+        booking_id: BookingId,
+        screen_ids: &[ScreenId],
+    ) -> Result<(), String> {
+        transaction
+            .execute(
+                "DELETE FROM booking_screens WHERE booking_id = ?1",
+                params![booking_id],
+            )
+            .map_err(database_error)?;
+        for screen_id in screen_ids {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO booking_screens (booking_id, screen_id) VALUES (?1, ?2)",
+                    params![booking_id, screen_id],
+                )
+                .map_err(database_error)?;
+        }
+        Ok(())
+    }
+
+    pub fn add_booking(
+        &mut self,
+        title_id: TitleId,
+        screen_ids: &[ScreenId],
+        window: LocalWindow,
+        formulation: Option<KdmFormulation>,
+        created_at: DateTime<Utc>,
+    ) -> Result<BookingId, String> {
+        self.title(title_id)?;
+        self.check_booking(screen_ids, &window)?;
         let transaction = self.connection.transaction().map_err(database_error)?;
         transaction
             .execute(
@@ -737,25 +769,89 @@ impl DistributionDatabase {
             )
             .map_err(database_error)?;
         let booking_id = transaction.last_insert_rowid();
-        for screen_id in screen_ids {
-            transaction
-                .execute(
-                    "INSERT INTO booking_screens (booking_id, screen_id) VALUES (?1, ?2)",
-                    params![booking_id, screen_id],
-                )
-                .map_err(database_error)?;
-        }
+        Self::write_booking_screens(&transaction, booking_id, screen_ids)?;
         transaction.commit().map_err(database_error)?;
         Ok(booking_id)
     }
 
-    pub fn booking(&self, id: BookingId) -> Result<Booking, String> {
-        let (title_id, start, end, formulation): (TitleId, String, String, Option<String>) = self
+    // a booking that already has KDMs is marked as needing a reissue when it changes
+    pub fn update_booking(
+        &mut self,
+        id: BookingId,
+        screen_ids: &[ScreenId],
+        window: LocalWindow,
+        formulation: Option<KdmFormulation>,
+    ) -> Result<(), String> {
+        let before = self.booking(id)?;
+        self.check_booking(screen_ids, &window)?;
+        let mut sorted_screens = screen_ids.to_vec();
+        sorted_screens.sort_unstable();
+        sorted_screens.dedup();
+        let changed = before.screen_ids != sorted_screens
+            || before.window != window
+            || before.formulation != formulation;
+        let issued: bool = self
             .connection
             .query_row(
-                "SELECT title_id, local_start, local_end, formulation FROM bookings WHERE id = ?1",
+                "SELECT EXISTS (SELECT 1 FROM issues WHERE booking_id = ?1)",
                 params![id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| row.get(0),
+            )
+            .map_err(database_error)?;
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        transaction
+            .execute(
+                "UPDATE bookings SET local_start = ?1, local_end = ?2, formulation = ?3,
+                     needs_reissue = needs_reissue OR ?4
+                 WHERE id = ?5",
+                params![
+                    window.start.format(LOCAL_TIME_FORMAT).to_string(),
+                    window.end.format(LOCAL_TIME_FORMAT).to_string(),
+                    formulation.map(KdmFormulation::as_str),
+                    changed && issued,
+                    id
+                ],
+            )
+            .map_err(database_error)?;
+        Self::write_booking_screens(&transaction, id, screen_ids)?;
+        transaction.commit().map_err(database_error)?;
+        Ok(())
+    }
+
+    // the issue history and deliveries stay, with no booking to point at
+    pub fn remove_booking(&mut self, id: BookingId) -> Result<(), String> {
+        let removed = self
+            .connection
+            .execute("DELETE FROM bookings WHERE id = ?1", params![id])
+            .map_err(database_error)?;
+        if removed == 0 {
+            return Err(format!("booking {id} not found"));
+        }
+        Ok(())
+    }
+
+    pub fn booking(&self, id: BookingId) -> Result<Booking, String> {
+        let (title_id, start, end, formulation, needs_reissue): (
+            TitleId,
+            String,
+            String,
+            Option<String>,
+            bool,
+        ) = self
+            .connection
+            .query_row(
+                "SELECT title_id, local_start, local_end, formulation, needs_reissue
+                 FROM bookings WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .optional()
             .map_err(database_error)?
@@ -782,6 +878,7 @@ impl DistributionDatabase {
                 end: parse_local_time(&end)?,
             },
             formulation: parse_formulation(formulation)?,
+            needs_reissue,
         })
     }
 
@@ -1088,6 +1185,14 @@ impl DistributionDatabase {
                 file_name: kdm.file_name.clone(),
             })?;
         }
+        if !outcome.bundles.is_empty() {
+            self.connection
+                .execute(
+                    "UPDATE bookings SET needs_reissue = 0 WHERE id = ?1",
+                    params![booking_id],
+                )
+                .map_err(database_error)?;
+        }
         Ok(outcome)
     }
 }
@@ -1177,7 +1282,7 @@ mod tests {
             .unwrap();
         drop(connection);
         let database = DistributionDatabase::open(&path).unwrap();
-        assert_eq!(database.schema_version().unwrap(), 2);
+        assert_eq!(database.schema_version().unwrap(), MIGRATIONS.len() as i64);
         assert!(table_names(&database).contains(&"deliveries".to_string()));
         assert_eq!(database.cinemas().unwrap()[0].cinema.name, "Rex");
         assert!(database.deliveries().unwrap().is_empty());
@@ -1380,6 +1485,80 @@ mod tests {
         database
             .add_booking(title, &screens, local_window(), None, Utc::now())
             .unwrap()
+    }
+
+    #[test]
+    fn editing_an_issued_booking_marks_it_for_reissue_and_removing_keeps_the_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let booking = booked(&mut database);
+        let before = database.booking(booking).unwrap();
+        let mut later = before.window;
+        later.end += chrono::Duration::days(1);
+
+        database
+            .update_booking(booking, &before.screen_ids, later, None)
+            .unwrap();
+        assert!(
+            !database.booking(booking).unwrap().needs_reissue,
+            "nothing was issued yet"
+        );
+
+        let outcome = database
+            .issue_booking(booking, &settings(dir.path()), Utc::now())
+            .unwrap();
+        database
+            .deliver_bundles(&outcome, Some(booking), None, Utc::now())
+            .unwrap();
+        database
+            .update_booking(booking, &before.screen_ids, later, None)
+            .unwrap();
+        assert!(
+            !database.booking(booking).unwrap().needs_reissue,
+            "an unchanged save is no edit"
+        );
+
+        let fewer = &before.screen_ids[..1];
+        database
+            .update_booking(
+                booking,
+                fewer,
+                later,
+                Some(KdmFormulation::MultipleModifiedTransitional1),
+            )
+            .unwrap();
+        let edited = database.booking(booking).unwrap();
+        assert!(edited.needs_reissue);
+        assert_eq!(edited.screen_ids, fewer);
+        assert_eq!(edited.window, later);
+        assert_eq!(
+            edited.formulation,
+            Some(KdmFormulation::MultipleModifiedTransitional1)
+        );
+
+        database
+            .issue_booking(booking, &settings(dir.path()), Utc::now())
+            .unwrap();
+        assert!(!database.booking(booking).unwrap().needs_reissue);
+        let error = database
+            .update_booking(booking, &[], later, None)
+            .unwrap_err();
+        assert_eq!(error, "a booking needs at least one screen");
+
+        let issues = database.issues().unwrap().len();
+        let deliveries = database.deliveries().unwrap().len();
+        database.remove_booking(booking).unwrap();
+        assert!(database.bookings().unwrap().is_empty());
+        assert_eq!(database.issues().unwrap().len(), issues);
+        assert!(
+            database
+                .issues()
+                .unwrap()
+                .iter()
+                .all(|issue| issue.booking_id.is_none())
+        );
+        assert_eq!(database.deliveries().unwrap().len(), deliveries);
+        assert!(database.remove_booking(booking).is_err());
     }
 
     #[test]
