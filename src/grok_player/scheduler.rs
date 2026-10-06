@@ -400,6 +400,10 @@ impl Scheduler {
                 self.track_mut(slot).visible = visible;
                 self.recompose();
             }
+            Command::SetSubtitlePresentation(presentation) => {
+                self.compositor.set_subtitle_presentation(presentation);
+                self.recompose();
+            }
             Command::SetOverlay(rectangles) => {
                 self.overlays = rectangles;
                 self.recompose();
@@ -591,6 +595,7 @@ impl Scheduler {
             decoder_fps: self.playback_rate(),
             container_fps: timeline.map(|timeline| timeline.fps),
             eof: self.eof,
+            warnings: self.sound.warnings(),
         });
         self.shared
             .set_cached_frames(self.pool.cached_frame_count());

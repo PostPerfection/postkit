@@ -7,7 +7,7 @@ use postkit::colour::XyzToSrgb;
 use postkit::composition_timeline;
 use postkit::grok_player::{
     DecodeScale, GrokPlayer, OverlayRectangle, PictureMasks, PictureScaling, PresentationSettings,
-    SubtitleSlot,
+    SubtitlePresentation, SubtitleSlot,
 };
 use postkit::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
 use std::path::{Path, PathBuf};
@@ -735,6 +735,76 @@ fn a_subtitle_draws_in_its_own_band_only_while_its_cue_runs() {
         )
         .is_empty()
     });
+}
+
+#[test]
+fn a_subtitle_offset_while_paused_moves_the_drawn_cue() {
+    const WIDTH: u32 = 320;
+    const HEIGHT: u32 = 180;
+    // a tenth of 180 rows
+    const OFFSET_PERCENT: f32 = 10.0;
+    const OFFSET_ROWS: usize = 18;
+    let directory = tempfile::tempdir().unwrap();
+    let mxf = directory.path().join("picture.mxf");
+    let frames = vec![flat_codestreams(WIDTH, HEIGHT, 1, CINEMA_2K_PROFILE).remove(0); 24];
+    write_mxf(&mxf, &frames, None, WIDTH, HEIGHT);
+    let srt = directory.path().join("cues.srt");
+    std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:01,000\nHELLO THERE\n\n").unwrap();
+
+    let player = loaded_player(&mxf);
+    let (width, height) = (WIDTH as usize, HEIGHT as usize);
+    let plain = software_frame(&player, width, height);
+    player
+        .set_subtitle_file(SubtitleSlot::Subtitle, Some(&srt))
+        .expect("srt loads");
+    wait_for_frame(&player);
+    let unmoved = changed_rows(
+        &plain,
+        &software_frame(&player, width, height),
+        width,
+        height,
+    );
+    assert!(!unmoved.is_empty(), "the subtitle drew nothing");
+
+    forget_frames(&player);
+    player.set_subtitle_presentation(SubtitlePresentation {
+        vertical_offset_percent: OFFSET_PERCENT,
+        ..SubtitlePresentation::default()
+    });
+    wait_for_frame(&player);
+    let moved = changed_rows(
+        &plain,
+        &software_frame(&player, width, height),
+        width,
+        height,
+    );
+    let expected: Vec<usize> = unmoved.iter().map(|row| row - OFFSET_ROWS).collect();
+    assert_eq!(
+        moved, expected,
+        "the cue did not move up {OFFSET_ROWS} rows"
+    );
+
+    forget_frames(&player);
+    player.set_subtitle_presentation(SubtitlePresentation {
+        vertical_offset_percent: 1000.0,
+        ..SubtitlePresentation::default()
+    });
+    wait_for_frame(&player);
+    let at_the_top = changed_rows(
+        &plain,
+        &software_frame(&player, width, height),
+        width,
+        height,
+    );
+    assert_eq!(
+        at_the_top.len(),
+        unmoved.len(),
+        "the cue lost rows at the frame edge"
+    );
+    assert!(
+        at_the_top[0] < height / 10,
+        "the cue stopped short of the top, at rows {at_the_top:?}"
+    );
 }
 
 fn changed_rows(before: &[u8], after: &[u8], width: usize, height: usize) -> Vec<usize> {

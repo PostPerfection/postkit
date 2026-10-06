@@ -212,6 +212,8 @@ struct Shared {
     seek_frame: AtomicU64,
     emitted_sample_frames: AtomicU64,
     buffer: Mutex<VecDeque<f32>>,
+    // what the open stream fell back from
+    warnings: Mutex<Vec<String>>,
 }
 
 impl Shared {
@@ -225,6 +227,7 @@ impl Shared {
             seek_frame: AtomicU64::new(0),
             emitted_sample_frames: AtomicU64::new(0),
             buffer: Mutex::new(VecDeque::new()),
+            warnings: Mutex::new(Vec::new()),
         }
     }
 
@@ -333,6 +336,10 @@ impl Output {
         }
     }
 
+    pub(super) fn warnings(&self) -> Vec<String> {
+        self.shared.warnings.lock().unwrap().clone()
+    }
+
     // takes hold at the next seek
     pub(super) fn set_delay_milliseconds(&self, milliseconds: i64) {
         let _ = self.commands.send(Command::SetDelay(milliseconds));
@@ -398,9 +405,10 @@ fn start_stream(
     pcm_sample_rate: u32,
     device_name: Option<&str>,
     layout: SoundOutputLayout,
+    warnings: &mut Vec<String>,
 ) -> Option<OpenedStream> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        try_start_stream(shared, pcm_sample_rate, device_name, layout)
+        try_start_stream(shared, pcm_sample_rate, device_name, layout, warnings)
     }))
     .ok()
     .flatten()
@@ -411,14 +419,15 @@ fn try_start_stream(
     pcm_sample_rate: u32,
     device_name: Option<&str>,
     layout: SoundOutputLayout,
+    warnings: &mut Vec<String>,
 ) -> Option<OpenedStream> {
     let host = cpal::default_host();
-    let device = output_device(&host, device_name)?;
+    let device = output_device(&host, device_name, warnings)?;
     let ranges: Vec<SupportedStreamConfigRange> = device
         .supported_output_configs()
         .map(|ranges| ranges.collect())
         .unwrap_or_default();
-    let (supported, mix) = match surround_config(&ranges, layout, pcm_sample_rate) {
+    let (supported, mix) = match surround_config(&ranges, layout, pcm_sample_rate, warnings) {
         Some(surround) => surround,
         None => (
             stereo_config(&device, &ranges, pcm_sample_rate)?,
@@ -473,7 +482,12 @@ fn try_start_stream(
     }
 }
 
-fn output_device(host: &Host, name: Option<&str>) -> Option<Device> {
+fn warn(warnings: &mut Vec<String>, warning: String) {
+    tracing::warn!("preview sound: {warning}");
+    warnings.push(warning);
+}
+
+fn output_device(host: &Host, name: Option<&str>, warnings: &mut Vec<String>) -> Option<Device> {
     let Some(name) = name else {
         return host.default_output_device();
     };
@@ -481,8 +495,9 @@ fn output_device(host: &Host, name: Option<&str>) -> Option<Device> {
         devices.find(|device| device.name().is_ok_and(|device_name| device_name == name))
     });
     if named.is_none() {
-        tracing::warn!(
-            "preview sound: output device {name} is missing, playing on the default device"
+        warn(
+            warnings,
+            format!("output device {name} is missing, sound plays on the default device"),
         );
     }
     named.or_else(|| host.default_output_device())
@@ -512,6 +527,7 @@ fn surround_config(
     ranges: &[SupportedStreamConfigRange],
     layout: SoundOutputLayout,
     pcm_sample_rate: u32,
+    warnings: &mut Vec<String>,
 ) -> Option<(SupportedStreamConfig, OutputMix)> {
     let order: &'static [Speaker] = match layout {
         SoundOutputLayout::Stereo => return None,
@@ -541,9 +557,12 @@ fn surround_config(
             .map(SupportedStreamConfigRange::with_max_sample_rate)
     });
     let Some(config) = config else {
-        tracing::warn!(
-            "preview sound: the device offers no {} channel output, playing a stereo downmix",
-            order.len()
+        warn(
+            warnings,
+            format!(
+                "the sound device offers no {} channel output, sound plays as a stereo downmix",
+                order.len()
+            ),
         );
         return None;
     };
@@ -714,12 +733,15 @@ impl Feeder {
         // an exclusive ALSA device refuses a second stream
         self.stream = None;
         self.shared.buffer.lock().unwrap().clear();
+        let mut warnings = Vec::new();
         let opened = start_stream(
             Arc::clone(&self.shared),
             self.pcm_sample_rate,
             self.device_name.as_deref(),
             self.layout,
+            &mut warnings,
         );
+        *self.shared.warnings.lock().unwrap() = warnings;
         self.shared
             .stream_live
             .store(opened.is_some(), Ordering::Release);
@@ -1733,36 +1755,46 @@ mod tests {
     #[test]
     fn a_surround_layout_opens_with_its_channel_count() {
         let ranges = [offered(2, SampleFormat::F32), offered(6, SampleFormat::F32)];
+        let mut warnings = Vec::new();
         let (config, mix) = surround_config(
             &ranges,
             SoundOutputLayout::FivePointOne,
             DEFAULT_SAMPLE_RATE,
+            &mut warnings,
         )
         .unwrap();
         assert_eq!(config.channels(), 6);
         assert_eq!(config.sample_rate(), SampleRate(DEFAULT_SAMPLE_RATE));
         assert_eq!(mix, OutputMix::Routed(&FIVE_POINT_ONE_DEVICE_ORDER));
         // a rate the device lacks opens at its highest
-        let (config, _) =
-            surround_config(&ranges, SoundOutputLayout::FivePointOne, 96_000).unwrap();
+        let (config, _) = surround_config(
+            &ranges,
+            SoundOutputLayout::FivePointOne,
+            96_000,
+            &mut warnings,
+        )
+        .unwrap();
         assert_eq!(config.sample_rate(), SampleRate(DEFAULT_SAMPLE_RATE));
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
     fn a_layout_the_device_lacks_plays_the_stereo_downmix() {
         let ranges = [offered(2, SampleFormat::F32), offered(6, SampleFormat::F32)];
-        assert!(
-            surround_config(
-                &ranges,
-                SoundOutputLayout::SevenPointOne,
-                DEFAULT_SAMPLE_RATE
-            )
-            .is_none()
+        let mut warnings = Vec::new();
+        let opened = |layout, warnings: &mut Vec<String>| {
+            surround_config(&ranges, layout, DEFAULT_SAMPLE_RATE, warnings)
+        };
+        assert!(opened(SoundOutputLayout::SevenPointOne, &mut warnings).is_none());
+        assert_eq!(
+            warnings,
+            ["the sound device offers no 8 channel output, sound plays as a stereo downmix"]
         );
-        assert!(surround_config(&ranges, SoundOutputLayout::Stereo, DEFAULT_SAMPLE_RATE).is_none());
-        let (config, _) =
-            surround_config(&ranges, SoundOutputLayout::Automatic, DEFAULT_SAMPLE_RATE).unwrap();
+        warnings.clear();
+        assert!(opened(SoundOutputLayout::Stereo, &mut warnings).is_none());
+        let (config, _) = opened(SoundOutputLayout::Automatic, &mut warnings).unwrap();
         assert_eq!(config.channels(), 6);
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]

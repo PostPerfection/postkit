@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use crate::content_keys::ContentKeys;
 
 pub use audio::{MAXIMUM_SOUND_DELAY_MILLISECONDS, SoundOutputLayout, sound_output_device_names};
+pub use compositor::SubtitlePresentation;
 pub use presenter::{
     MAXIMUM_BRIGHTNESS, MINIMUM_BRIGHTNESS, PictureMasks, PictureRectangle, PictureScaling,
     PresentationSettings,
@@ -165,6 +166,7 @@ struct Status {
     decoder_fps: Option<f64>,
     container_fps: Option<f64>,
     eof: bool,
+    warnings: Vec<String>,
 }
 
 type UpdateCallback = Box<dyn Fn() + Send + 'static>;
@@ -180,6 +182,7 @@ enum Command {
     SetDecodeScale(DecodeScale),
     SetSubtitleFile(SubtitleSlot, Option<PathBuf>, Sender<Result<(), String>>),
     SetSubtitleVisibility(SubtitleSlot, bool),
+    SetSubtitlePresentation(SubtitlePresentation),
     SetOverlay(Vec<OverlayRectangle>),
     SetSoundOutputDevice(Option<String>),
     SetSoundOutputLayout(SoundOutputLayout),
@@ -533,6 +536,11 @@ impl GrokPlayer {
         let _ = self.send(Command::SetSubtitleVisibility(slot, visible));
     }
 
+    // drawn from the next composed frame, a paused frame composes again
+    pub fn set_subtitle_presentation(&self, presentation: SubtitlePresentation) {
+        let _ = self.send(Command::SetSubtitlePresentation(presentation));
+    }
+
     pub fn set_overlay(&self, rectangles: Vec<OverlayRectangle>) {
         let _ = self.send(Command::SetOverlay(rectangles));
     }
@@ -540,19 +548,7 @@ impl GrokPlayer {
     // ─── what the transport bar polls ──────────────────────────────────────
 
     pub fn metadata_json(&self) -> String {
-        let status = self.shared.status();
-        format!(
-            r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}}}"#,
-            json_number(status.position),
-            json_number(status.duration),
-            status.paused,
-            json_string(status.filename.as_deref()),
-            status.dropped_frames,
-            status.delayed_frames,
-            json_number(status.decoder_fps),
-            json_number(status.container_fps),
-            status.eof,
-        )
+        status_json(&self.shared.status())
     }
 
     pub fn cached_frame_count(&self) -> usize {
@@ -588,6 +584,27 @@ impl Drop for GrokPlayer {
     }
 }
 
+fn status_json(status: &Status) -> String {
+    format!(
+        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}, "warnings": [{}]}}"#,
+        json_number(status.position),
+        json_number(status.duration),
+        status.paused,
+        json_string(status.filename.as_deref()),
+        status.dropped_frames,
+        status.delayed_frames,
+        json_number(status.decoder_fps),
+        json_number(status.container_fps),
+        status.eof,
+        status
+            .warnings
+            .iter()
+            .map(|warning| json_string(Some(warning)))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 fn json_number(value: Option<f64>) -> String {
     match value {
         Some(number) if number.is_finite() => number.to_string(),
@@ -616,12 +633,13 @@ mod tests {
         assert!(metadata.contains(r#""filename": null"#), "{metadata}");
         assert!(metadata.contains(r#""cache_seconds": null"#), "{metadata}");
         assert!(metadata.contains(r#""eof": false"#), "{metadata}");
+        assert!(metadata.contains(r#""warnings": []"#), "{metadata}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&metadata)
                 .expect("metadata is JSON")
                 .as_object()
                 .map(|fields| fields.len()),
-            Some(10)
+            Some(11)
         );
     }
 
@@ -636,5 +654,21 @@ mod tests {
         assert_eq!(DecodeScale::Full.reduce(), 0);
         assert_eq!(DecodeScale::Half.reduce(), 1);
         assert_eq!(DecodeScale::Quarter.reduce(), 2);
+    }
+
+    #[test]
+    fn sound_warnings_read_back_from_the_metadata() {
+        let warnings = vec![
+            "output device \"Desk\" is missing, sound plays on the default device".to_string(),
+            "the sound device offers no 8 channel output, sound plays as a stereo downmix"
+                .to_string(),
+        ];
+        let status = Status {
+            warnings: warnings.clone(),
+            ..Status::default()
+        };
+        let metadata: serde_json::Value =
+            serde_json::from_str(&status_json(&status)).expect("metadata is JSON");
+        assert_eq!(metadata["warnings"], serde_json::json!(warnings));
     }
 }

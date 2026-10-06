@@ -91,6 +91,8 @@ pub struct BurnStyle {
     pub fade_up_ms: u64,
     /// How long a cue takes to ramp down to transparent at its end.
     pub fade_down_ms: u64,
+    // fraction of the frame height every cue moves up, stopping at the frame edge
+    pub vertical_offset_ratio: f32,
 }
 
 impl Default for BurnStyle {
@@ -117,6 +119,7 @@ impl Default for BurnStyle {
             y_scale: 1.0,
             fade_up_ms: 0,
             fade_down_ms: 0,
+            vertical_offset_ratio: 0.0,
         }
     }
 }
@@ -1313,7 +1316,17 @@ fn anchor(
         VAlign::Middle => (frame_height - block_height) / 2.0 + inset - margin,
         VAlign::Bottom => frame_height - block_height - inset,
     };
+    let y = shift_up_inside_frame(
+        y,
+        frame_height * style.vertical_offset_ratio,
+        frame_height - block_height,
+    );
     (x.round() as i32, y.round() as i32)
+}
+
+// never pulls in a cue that already crosses an edge
+fn shift_up_inside_frame(top: f32, shift: f32, lowest_top: f32) -> f32 {
+    (top - shift).clamp(top.min(0.0), top.max(lowest_top))
 }
 
 #[cfg(test)]
@@ -1954,5 +1967,52 @@ mod tests {
             err.to_string().contains("no usable font face"),
             "got: {err}"
         );
+    }
+
+    const BLOCK_WIDTH: f32 = 100.0;
+    const BLOCK_HEIGHT: f32 = 20.0;
+
+    fn offset(ratio: f32) -> BurnStyle {
+        BurnStyle {
+            vertical_offset_ratio: ratio,
+            ..BurnStyle::default()
+        }
+    }
+
+    fn top_of(cue: &StyledCue, style: &BurnStyle, block_height: f32) -> i32 {
+        anchor(cue, style, WIDTH, HEIGHT, BLOCK_WIDTH, block_height).1
+    }
+
+    #[test]
+    fn a_vertical_offset_moves_the_cue_up_by_its_share_of_the_frame() {
+        let bottom = cue("x");
+        let plain = top_of(&bottom, &BurnStyle::default(), BLOCK_HEIGHT);
+        // a quarter and a sixteenth of 256 rows
+        assert_eq!(top_of(&bottom, &offset(0.25), BLOCK_HEIGHT), plain - 64);
+        assert_eq!(top_of(&bottom, &offset(-0.0625), BLOCK_HEIGHT), plain + 16);
+    }
+
+    #[test]
+    fn a_vertical_offset_stops_at_the_frame_edge() {
+        let bottom = cue("x");
+        assert_eq!(top_of(&bottom, &offset(1.0), BLOCK_HEIGHT), 0);
+        assert_eq!(top_of(&bottom, &offset(10.0), BLOCK_HEIGHT), 0);
+        let top = StyledCue {
+            valign: Some(VAlign::Top),
+            ..cue("x")
+        };
+        assert_eq!(
+            top_of(&top, &offset(-1.0), BLOCK_HEIGHT),
+            HEIGHT as i32 - BLOCK_HEIGHT as i32
+        );
+    }
+
+    #[test]
+    fn a_vertical_offset_leaves_a_cue_already_past_the_edge_where_it_is() {
+        let taller_than_the_frame = HEIGHT as f32 + 40.0;
+        let bottom = cue("x");
+        let plain = top_of(&bottom, &BurnStyle::default(), taller_than_the_frame);
+        assert!(plain < 0, "the block crosses the top edge");
+        assert_eq!(top_of(&bottom, &offset(0.25), taller_than_the_frame), plain);
     }
 }
