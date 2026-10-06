@@ -310,6 +310,7 @@ pub fn issue_and_send_groups(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IssuedKdm {
     pub cinema: String,
     pub screen: String,
@@ -325,6 +326,7 @@ pub struct IssuedKdm {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScreenRefusal {
     pub cinema: String,
     pub screen: String,
@@ -332,6 +334,7 @@ pub struct ScreenRefusal {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DkdmIssueOutcome {
     pub cpl_id: String,
     pub content_title: String,
@@ -498,6 +501,7 @@ fn check_target(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ScreenPlan {
     pub cinema: String,
     pub screen: String,
@@ -510,6 +514,7 @@ pub struct ScreenPlan {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IssuePlan {
     pub cpl_id: String,
     pub content_title: String,

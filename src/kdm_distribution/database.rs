@@ -127,6 +127,7 @@ pub struct StoredCinema {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Title {
     pub id: TitleId,
     pub cpl_id: String,
@@ -138,6 +139,7 @@ pub struct Title {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Booking {
     pub id: BookingId,
     pub title_id: TitleId,
@@ -148,6 +150,7 @@ pub struct Booking {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IssueRecord {
     pub issued_at: String,
     pub cpl_id: String,
@@ -174,6 +177,7 @@ pub enum DeliveryResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DeliveryRecord {
     pub delivered_at: String,
     pub booking_id: Option<BookingId>,
@@ -185,6 +189,7 @@ pub struct DeliveryRecord {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportReport {
     pub cinemas: usize,
     pub screens: usize,

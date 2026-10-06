@@ -199,6 +199,7 @@ impl KdmNaming<'_> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CinemaBundle {
     pub cinema: String,
     pub emails: Vec<String>,
