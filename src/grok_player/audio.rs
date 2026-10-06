@@ -141,7 +141,9 @@ pub fn sound_output_device_names() -> Result<Vec<String>, String> {
 }
 
 enum Command {
-    Load(Vec<SoundReel>, f64),
+    Load(SoundComposition),
+    Queue(Option<SoundComposition>),
+    Advance,
     Seek(u64),
     SetPlaying(bool),
     SetDevice(Option<String>, Sender<()>),
@@ -149,6 +151,23 @@ enum Command {
     SetDelay(i64),
     Stop,
     Shutdown,
+}
+
+struct SoundComposition {
+    reels: Vec<SoundReel>,
+    fps: f64,
+    // the picture's length, the sound is cut or padded with silence to it
+    frame_count: u64,
+}
+
+impl SoundComposition {
+    fn empty() -> Self {
+        SoundComposition {
+            reels: Vec::new(),
+            fps: 0.0,
+            frame_count: 0,
+        }
+    }
 }
 
 struct SoundReel {
@@ -209,7 +228,7 @@ struct Shared {
     reels_loaded: AtomicBool,
     device_sample_rate: AtomicU32,
     output_channels: AtomicUsize,
-    seek_frame: AtomicU64,
+    seek_seconds: AtomicU64,
     emitted_sample_frames: AtomicU64,
     buffer: Mutex<VecDeque<f32>>,
     // what the open stream fell back from
@@ -224,7 +243,7 @@ impl Shared {
             reels_loaded: AtomicBool::new(false),
             device_sample_rate: AtomicU32::new(DEFAULT_SAMPLE_RATE),
             output_channels: AtomicUsize::new(STEREO_CHANNELS),
-            seek_frame: AtomicU64::new(0),
+            seek_seconds: AtomicU64::new(0.0f64.to_bits()),
             emitted_sample_frames: AtomicU64::new(0),
             buffer: Mutex::new(VecDeque::new()),
             warnings: Mutex::new(Vec::new()),
@@ -268,16 +287,48 @@ impl Output {
         }
     }
 
-    pub(super) fn load(&self, segments: Vec<KeyedSoundSegment>, fps: f64) {
+    // false when the composition has no sound to play
+    pub(super) fn load(
+        &self,
+        segments: Vec<KeyedSoundSegment>,
+        fps: f64,
+        frame_count: u64,
+    ) -> bool {
         let reels = reels_of(segments, fps);
         if reels.is_empty() {
             let _ = self.commands.send(Command::Stop);
-            return;
+            return false;
         }
         self.frames_per_second
             .store(fps.to_bits(), Ordering::Release);
         self.mark_seek(0);
-        let _ = self.commands.send(Command::Load(reels, fps));
+        let _ = self.commands.send(Command::Load(SoundComposition {
+            reels,
+            fps,
+            frame_count,
+        }));
+        true
+    }
+
+    // the feeder plays it straight after the loaded composition, silent if it has no sound
+    pub(super) fn queue(&self, segments: Vec<KeyedSoundSegment>, fps: f64, frame_count: u64) {
+        let composition = SoundComposition {
+            reels: reels_of(segments, fps),
+            fps,
+            frame_count,
+        };
+        let _ = self.commands.send(Command::Queue(Some(composition)));
+    }
+
+    pub(super) fn clear_queue(&self) {
+        let _ = self.commands.send(Command::Queue(None));
+    }
+
+    // the picture moved on to the queued composition
+    pub(super) fn advance(&self, fps: f64) {
+        self.frames_per_second
+            .store(fps.to_bits(), Ordering::Release);
+        let _ = self.commands.send(Command::Advance);
     }
 
     pub(super) fn seek(&self, frame: u64) {
@@ -292,21 +343,24 @@ impl Output {
         {
             return None;
         }
-        let fps = f64::from_bits(self.frames_per_second.load(Ordering::Acquire));
         let sample_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
-        if fps <= 0.0 || sample_rate == 0 {
+        if sample_rate == 0 {
             return None;
         }
-        let seek_seconds = self.shared.seek_frame.load(Ordering::Acquire) as f64 / fps;
+        let seek_seconds = f64::from_bits(self.shared.seek_seconds.load(Ordering::Acquire));
         let played = self.shared.emitted_sample_frames.load(Ordering::Acquire) as f64;
         Some(seek_seconds + played / f64::from(sample_rate))
     }
 
     fn mark_seek(&self, frame: u64) {
+        let fps = f64::from_bits(self.frames_per_second.load(Ordering::Acquire));
+        let seek_seconds = if fps > 0.0 { frame as f64 / fps } else { 0.0 };
         self.shared
             .emitted_sample_frames
             .store(0, Ordering::Release);
-        self.shared.seek_frame.store(frame, Ordering::Release);
+        self.shared
+            .seek_seconds
+            .store(seek_seconds.to_bits(), Ordering::Release);
     }
 
     pub(super) fn set_playing(&self, playing: bool) {
@@ -615,11 +669,14 @@ fn write_i16(shared: &Shared, dest: &mut [i16]) {
 
 struct Feeder {
     shared: Arc<Shared>,
-    reels: Vec<SoundReel>,
+    current: SoundComposition,
+    queued: Option<SoundComposition>,
+    // the composition the fill left while the picture still shows it
+    finished: Option<SoundComposition>,
     reader: Option<(PathBuf, SoundReader)>,
     next_frame: u64,
-    seek_frame: Option<u64>,
-    fps: f64,
+    // the frame of the current composition the device count starts from
+    seek_position: Option<f64>,
     pcm_sample_rate: u32,
     resampler: Option<Resampler>,
     stream: Option<Stream>,
@@ -646,27 +703,14 @@ struct AudioLayout {
 }
 
 fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
-    let mut feeder = Feeder {
-        shared,
-        reels: Vec::new(),
-        reader: None,
-        next_frame: 0,
-        seek_frame: None,
-        fps: 0.0,
-        pcm_sample_rate: DEFAULT_SAMPLE_RATE,
-        resampler: None,
-        stream: None,
-        device_name: None,
-        layout: SoundOutputLayout::default(),
-        mix: OutputMix::StereoDownmix,
-        delay_seconds: 0.0,
-        skipped_source_sample_frames: 0,
-    };
+    let mut feeder = Feeder::new(shared);
     loop {
         feeder.fill();
         match commands.recv_timeout(FEED_WAIT) {
             Ok(Command::Shutdown) | Err(RecvTimeoutError::Disconnected) => break,
-            Ok(Command::Load(reels, fps)) => feeder.load(reels, fps),
+            Ok(Command::Load(composition)) => feeder.load(composition),
+            Ok(Command::Queue(composition)) => feeder.queue(composition),
+            Ok(Command::Advance) => feeder.advance(),
             Ok(Command::Seek(frame)) => feeder.seek(frame),
             Ok(Command::SetPlaying(playing)) => {
                 feeder.shared.playing.store(playing, Ordering::Release);
@@ -691,9 +735,29 @@ fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
 }
 
 impl Feeder {
-    fn load(&mut self, reels: Vec<SoundReel>, fps: f64) {
+    fn new(shared: Arc<Shared>) -> Self {
+        Feeder {
+            shared,
+            current: SoundComposition::empty(),
+            queued: None,
+            finished: None,
+            reader: None,
+            next_frame: 0,
+            seek_position: None,
+            pcm_sample_rate: DEFAULT_SAMPLE_RATE,
+            resampler: None,
+            stream: None,
+            device_name: None,
+            layout: SoundOutputLayout::default(),
+            mix: OutputMix::StereoDownmix,
+            delay_seconds: 0.0,
+            skipped_source_sample_frames: 0,
+        }
+    }
+
+    fn load(&mut self, composition: SoundComposition) {
         self.stop();
-        let Some(first) = reels.first() else {
+        let Some(first) = composition.reels.first() else {
             return;
         };
         let opened = match open_reader(&first.path, first.key.as_ref()) {
@@ -712,8 +776,7 @@ impl Feeder {
         );
         self.pcm_sample_rate = opened.layout.sample_rate;
         self.reader = Some((first.path.clone(), opened));
-        self.fps = fps;
-        self.reels = reels;
+        self.current = composition;
         self.shared.reels_loaded.store(true, Ordering::Release);
         if self.stream.is_none() {
             self.open_stream();
@@ -721,9 +784,70 @@ impl Feeder {
         self.seek(0);
     }
 
+    fn queue(&mut self, composition: Option<SoundComposition>) {
+        let switched_early = self.finished.is_some();
+        self.undo_switch();
+        self.queued = composition;
+        // the buffer holds the start of the composition that was queued before
+        if switched_early {
+            self.resume_where_the_device_is();
+        }
+    }
+
+    fn advance(&mut self) {
+        if self.finished.take().is_some() {
+            return;
+        }
+        // the fill had not reached the end of the composition the picture left
+        if self.switch_to_queued() {
+            self.finished = None;
+            self.resume_where_the_device_is();
+        }
+    }
+
+    fn switch_to_queued(&mut self) -> bool {
+        let Some(next) = self.queued.take() else {
+            return false;
+        };
+        let next_fps = next.fps;
+        let finished = std::mem::replace(&mut self.current, next);
+        let to_next_frames =
+            |frames: f64| (frames - finished.frame_count as f64) * next_fps / finished.fps;
+        self.seek_position = self.seek_position.map(to_next_frames);
+        self.next_frame = to_next_frames(self.next_frame as f64).round().max(0.0) as u64;
+        self.skipped_source_sample_frames = 0;
+        self.finished = Some(finished);
+        true
+    }
+
+    fn undo_switch(&mut self) {
+        let Some(finished) = self.finished.take() else {
+            return;
+        };
+        let next = std::mem::replace(&mut self.current, finished);
+        let next_fps = next.fps;
+        let current = &self.current;
+        self.seek_position = self
+            .seek_position
+            .map(|frames| frames * current.fps / next_fps + current.frame_count as f64);
+        self.queued = Some(next);
+    }
+
+    fn resume_where_the_device_is(&mut self) {
+        let Some(seek_position) = self.seek_position else {
+            return;
+        };
+        let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
+        if device_rate == 0 {
+            return;
+        }
+        let played = self.shared.emitted_sample_frames.load(Ordering::Acquire) as f64;
+        self.start_at(seek_position + played * self.current.fps / f64::from(device_rate));
+    }
+
     // a device or layout change before the first load waits for that load
     fn reopen(&mut self) {
-        if self.stream.is_none() && self.reels.is_empty() {
+        if self.stream.is_none() && self.current.reels.is_empty() {
             return;
         }
         self.open_stream();
@@ -753,12 +877,17 @@ impl Feeder {
     }
 
     fn seek(&mut self, frame: u64) {
-        self.seek_frame = Some(frame);
+        self.undo_switch();
+        self.seek_position = Some(frame as f64);
+        self.start_at(frame as f64);
+    }
+
+    fn start_at(&mut self, picture_frames: f64) {
         self.reset_resampler();
         let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
         let start = sound_start(
-            frame,
-            self.fps,
+            picture_frames,
+            self.current.fps,
             self.delay_seconds,
             self.pcm_sample_rate,
             device_rate,
@@ -775,10 +904,12 @@ impl Feeder {
         self.shared.playing.store(false, Ordering::Release);
         self.shared.reels_loaded.store(false, Ordering::Release);
         self.shared.buffer.lock().unwrap().clear();
-        self.reels.clear();
+        self.current = SoundComposition::empty();
+        self.queued = None;
+        self.finished = None;
         self.reader = None;
         self.next_frame = 0;
-        self.seek_frame = None;
+        self.seek_position = None;
     }
 
     fn reset_resampler(&mut self) {
@@ -790,10 +921,7 @@ impl Feeder {
     }
 
     fn fill(&mut self) {
-        let Some(seek_frame) = self.seek_frame else {
-            return;
-        };
-        if self.reels.is_empty() {
+        if self.seek_position.is_none() {
             return;
         }
         let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
@@ -804,23 +932,26 @@ impl Feeder {
             if queued >= high_water {
                 break;
             }
-            self.catch_up(seek_frame, queued, device_rate);
+            self.catch_up(queued, device_rate);
             if !self.push_edit_unit() {
                 break;
             }
         }
     }
 
-    fn catch_up(&mut self, seek_frame: u64, queued: usize, device_rate: u32) {
-        if self.fps <= 0.0 || device_rate == 0 {
+    fn catch_up(&mut self, queued: usize, device_rate: u32) {
+        let Some(seek_position) = self.seek_position else {
+            return;
+        };
+        if self.current.fps <= 0.0 || device_rate == 0 {
             return;
         }
         let played = self.shared.emitted_sample_frames.load(Ordering::Acquire);
         let sample_frames = played + (queued / self.shared.output_channels()) as u64;
         let reached = frame_at_queue_end(
-            seek_frame,
+            seek_position,
             sample_frames,
-            self.fps,
+            self.current.fps,
             device_rate,
             self.delay_seconds,
         );
@@ -836,11 +967,22 @@ impl Feeder {
     }
 
     fn push_edit_unit(&mut self) -> bool {
-        let Some((reel, entry)) = self.location(self.next_frame) else {
+        if self.next_frame >= self.current.frame_count && !self.switch_to_queued() {
             return false;
+        }
+        let Some((reel, entry)) = self.location(self.next_frame) else {
+            self.push_silent_edit_unit();
+            return true;
         };
         if !self.ensure_reader(reel) {
             return false;
+        }
+        let Some((_, open)) = self.reader.as_ref() else {
+            return false;
+        };
+        if open.layout.sample_rate != self.pcm_sample_rate {
+            self.pcm_sample_rate = open.layout.sample_rate;
+            self.reset_resampler();
         }
         let Some((_, open)) = self.reader.as_mut() else {
             return false;
@@ -883,8 +1025,29 @@ impl Feeder {
         true
     }
 
+    // a composition whose sound is shorter than its picture
+    fn push_silent_edit_unit(&mut self) {
+        let device_rate = f64::from(self.shared.device_sample_rate.load(Ordering::Acquire));
+        let device_frame_at =
+            |edit_unit: u64| (edit_unit as f64 * device_rate / self.current.fps).round() as usize;
+        let skipped = (self.skipped_source_sample_frames as f64 * device_rate
+            / f64::from(self.pcm_sample_rate))
+        .round() as usize;
+        let sample_frames = (device_frame_at(self.next_frame + 1)
+            - device_frame_at(self.next_frame))
+        .saturating_sub(skipped);
+        self.skipped_source_sample_frames = 0;
+        let samples = sample_frames * self.shared.output_channels();
+        self.shared
+            .buffer
+            .lock()
+            .unwrap()
+            .extend(std::iter::repeat_n(0.0, samples));
+        self.next_frame += 1;
+    }
+
     fn location(&self, frame: u64) -> Option<(usize, u32)> {
-        for (index, reel) in self.reels.iter().enumerate() {
+        for (index, reel) in self.current.reels.iter().enumerate() {
             if frame < reel.first_frame {
                 continue;
             }
@@ -899,7 +1062,7 @@ impl Feeder {
     }
 
     fn ensure_reader(&mut self, reel: usize) -> bool {
-        let reel = &self.reels[reel];
+        let reel = &self.current.reels[reel];
         if self
             .reader
             .as_ref()
@@ -923,19 +1086,17 @@ impl Feeder {
 
 // the sound edit unit the device reaches once it has played sample_frames past the seek
 fn frame_at_queue_end(
-    seek_frame: u64,
+    seek_frame: f64,
     sample_frames: u64,
     fps: f64,
     sample_rate: u32,
     delay_seconds: f64,
 ) -> u64 {
     if fps <= 0.0 || sample_rate == 0 {
-        return seek_frame;
+        return seek_frame.max(0.0) as u64;
     }
     let played = sample_frames as f64 * fps / f64::from(sample_rate);
-    (seek_frame as f64 + played - delay_seconds * fps)
-        .floor()
-        .max(0.0) as u64
+    (seek_frame + played - delay_seconds * fps).floor().max(0.0) as u64
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -947,7 +1108,7 @@ struct SoundStart {
 
 // the sound under a picture frame is delay_seconds earlier in the composition
 fn sound_start(
-    seek_frame: u64,
+    picture_frames: f64,
     fps: f64,
     delay_seconds: f64,
     source_rate: u32,
@@ -956,11 +1117,11 @@ fn sound_start(
     if fps <= 0.0 {
         return SoundStart {
             leading_silence_sample_frames: 0,
-            edit_unit: seek_frame,
+            edit_unit: picture_frames.max(0.0) as u64,
             skipped_source_sample_frames: 0,
         };
     }
-    let start_frames = seek_frame as f64 - delay_seconds * fps;
+    let start_frames = picture_frames - delay_seconds * fps;
     if start_frames < 0.0 {
         let silence_seconds = -start_frames / fps;
         return SoundStart {
@@ -1430,13 +1591,25 @@ mod tests {
 
     #[test]
     fn the_queue_end_is_where_the_device_will_be() {
-        assert_eq!(frame_at_queue_end(100, 0, 24.0, 48_000, NO_DELAY), 100);
+        assert_eq!(frame_at_queue_end(100.0, 0, 24.0, 48_000, NO_DELAY), 100);
         // one edit unit of 24 fps sound is 2000 sample frames
-        assert_eq!(frame_at_queue_end(100, 2_000, 24.0, 48_000, NO_DELAY), 101);
-        assert_eq!(frame_at_queue_end(100, 1_999, 24.0, 48_000, NO_DELAY), 100);
-        assert_eq!(frame_at_queue_end(100, 96_000, 24.0, 48_000, NO_DELAY), 148);
-        assert_eq!(frame_at_queue_end(100, 96_000, 0.0, 48_000, NO_DELAY), 100);
-        assert_eq!(frame_at_queue_end(100, 96_000, 24.0, 0, NO_DELAY), 100);
+        assert_eq!(
+            frame_at_queue_end(100.0, 2_000, 24.0, 48_000, NO_DELAY),
+            101
+        );
+        assert_eq!(
+            frame_at_queue_end(100.0, 1_999, 24.0, 48_000, NO_DELAY),
+            100
+        );
+        assert_eq!(
+            frame_at_queue_end(100.0, 96_000, 24.0, 48_000, NO_DELAY),
+            148
+        );
+        assert_eq!(
+            frame_at_queue_end(100.0, 96_000, 0.0, 48_000, NO_DELAY),
+            100
+        );
+        assert_eq!(frame_at_queue_end(100.0, 96_000, 24.0, 0, NO_DELAY), 100);
     }
 
     #[test]
@@ -1652,7 +1825,18 @@ mod tests {
     }
 
     fn wrapped_sound(directory: &Path, channels: u16, labels: Option<&str>) -> PathBuf {
-        let wav = directory.join("sound.wav");
+        let one_second = DEFAULT_SAMPLE_RATE as usize * usize::from(channels);
+        wrapped_samples(directory, "sound", channels, labels, &vec![0; one_second])
+    }
+
+    fn wrapped_samples(
+        directory: &Path,
+        name: &str,
+        channels: u16,
+        labels: Option<&str>,
+        samples: &[i16],
+    ) -> PathBuf {
+        let wav = directory.join(format!("{name}.wav"));
         let spec = hound::WavSpec {
             channels,
             sample_rate: DEFAULT_SAMPLE_RATE,
@@ -1660,11 +1844,11 @@ mod tests {
             sample_format: hound::SampleFormat::Int,
         };
         let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
-        for _ in 0..DEFAULT_SAMPLE_RATE as usize * usize::from(channels) {
-            writer.write_sample(0i16).unwrap();
+        for sample in samples {
+            writer.write_sample(*sample).unwrap();
         }
         writer.finalize().unwrap();
-        let output = directory.join("sound.mxf");
+        let output = directory.join(format!("{name}.mxf"));
         let track = mxf_wrap(&MxfWrapOptions {
             input_files: vec![wav],
             output: output.clone(),
@@ -1801,7 +1985,7 @@ mod tests {
     fn a_delayed_sound_starts_earlier_in_the_composition() {
         // 250 ms at 24 fps is 6 edit units
         assert_eq!(
-            sound_start(48, 24.0, 0.25, 48_000, 48_000),
+            sound_start(48.0, 24.0, 0.25, 48_000, 48_000),
             SoundStart {
                 leading_silence_sample_frames: 0,
                 edit_unit: 42,
@@ -1809,9 +1993,9 @@ mod tests {
             }
         );
         // an advanced sound starts later
-        assert_eq!(sound_start(48, 24.0, -0.5, 48_000, 48_000).edit_unit, 60);
+        assert_eq!(sound_start(48.0, 24.0, -0.5, 48_000, 48_000).edit_unit, 60);
         assert_eq!(
-            sound_start(48, 24.0, NO_DELAY, 48_000, 48_000),
+            sound_start(48.0, 24.0, NO_DELAY, 48_000, 48_000),
             SoundStart {
                 leading_silence_sample_frames: 0,
                 edit_unit: 48,
@@ -1824,7 +2008,7 @@ mod tests {
     fn a_delay_inside_an_edit_unit_skips_source_samples() {
         // 10 ms back from frame 48 is 0.76 of edit unit 47, 1520 sample frames into it at 48 kHz
         assert_eq!(
-            sound_start(48, 24.0, 0.01, 48_000, 44_100),
+            sound_start(48.0, 24.0, 0.01, 48_000, 44_100),
             SoundStart {
                 leading_silence_sample_frames: 0,
                 edit_unit: 47,
@@ -1836,7 +2020,7 @@ mod tests {
     #[test]
     fn a_delay_before_the_first_frame_plays_silence_at_the_device_rate() {
         assert_eq!(
-            sound_start(0, 24.0, 0.1, 48_000, 44_100),
+            sound_start(0.0, 24.0, 0.1, 48_000, 44_100),
             SoundStart {
                 leading_silence_sample_frames: 4_410,
                 edit_unit: 0,
@@ -1845,17 +2029,17 @@ mod tests {
         );
         // frame 1 is 41.7 ms in, so 58.3 ms of silence is left
         assert_eq!(
-            sound_start(1, 24.0, 0.1, 48_000, 48_000).leading_silence_sample_frames,
+            sound_start(1.0, 24.0, 0.1, 48_000, 48_000).leading_silence_sample_frames,
             2_800
         );
     }
 
     #[test]
     fn the_picture_runs_the_delay_ahead_of_the_sound_it_plays_over() {
-        let (seek_frame, fps, sample_rate, delay) = (48, 24.0, 48_000, 0.25);
+        let (seek_frame, fps, sample_rate, delay) = (48.0, 24.0, 48_000, 0.25);
         let played_sample_frames = 24_000;
         let picture_seconds =
-            seek_frame as f64 / fps + played_sample_frames as f64 / f64::from(sample_rate);
+            seek_frame / fps + played_sample_frames as f64 / f64::from(sample_rate);
         let sound_edit_unit =
             frame_at_queue_end(seek_frame, played_sample_frames, fps, sample_rate, delay);
         assert_eq!(picture_seconds, 2.5);
@@ -1870,12 +2054,15 @@ mod tests {
 
     #[test]
     fn leading_silence_holds_the_queue_end_at_the_first_edit_unit() {
-        let start = sound_start(0, 24.0, 2.0, 48_000, 48_000);
+        let start = sound_start(0.0, 24.0, 2.0, 48_000, 48_000);
         assert_eq!(start.leading_silence_sample_frames, 96_000);
         let silence = start.leading_silence_sample_frames as u64;
-        assert_eq!(frame_at_queue_end(0, silence / 2, 24.0, 48_000, 2.0), 0);
-        assert_eq!(frame_at_queue_end(0, silence, 24.0, 48_000, 2.0), 0);
-        assert_eq!(frame_at_queue_end(0, silence + 2_000, 24.0, 48_000, 2.0), 1);
+        assert_eq!(frame_at_queue_end(0.0, silence / 2, 24.0, 48_000, 2.0), 0);
+        assert_eq!(frame_at_queue_end(0.0, silence, 24.0, 48_000, 2.0), 0);
+        assert_eq!(
+            frame_at_queue_end(0.0, silence + 2_000, 24.0, 48_000, 2.0),
+            1
+        );
     }
 
     #[test]
@@ -1898,5 +2085,137 @@ mod tests {
         let names = sound_output_device_names().unwrap();
         eprintln!("output devices: {names:#?}");
         assert!(!names.is_empty());
+    }
+
+    const COMPOSITION_FPS: f64 = 24.0;
+    const SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24: usize = 2_000;
+
+    fn composition_of(sound: Option<&Path>, frame_count: u64) -> SoundComposition {
+        let segments = sound
+            .map(|path| KeyedSoundSegment {
+                segment: SoundSegment {
+                    path: path.to_path_buf(),
+                    trim: None,
+                },
+                key: None,
+            })
+            .into_iter()
+            .collect();
+        SoundComposition {
+            reels: reels_of(segments, COMPOSITION_FPS),
+            fps: COMPOSITION_FPS,
+            frame_count,
+        }
+    }
+
+    fn ramp(edit_units: usize, first: i16) -> Vec<i16> {
+        let samples = edit_units * SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24 * STEREO_CHANNELS;
+        (0..samples)
+            .map(|index| first + (index % 997) as i16)
+            .collect()
+    }
+
+    fn as_played(samples: &[i16]) -> Vec<f32> {
+        samples
+            .iter()
+            .map(|sample| f32::from(*sample) / f32::from(i16::MAX))
+            .collect()
+    }
+
+    // what the device would play, taking the buffer as fast as the feeder fills it
+    fn drain_until_the_feeder_stops(feeder: &mut Feeder) -> Vec<f32> {
+        let mut played = Vec::new();
+        loop {
+            feeder.fill();
+            let drained: Vec<f32> = feeder.shared.buffer.lock().unwrap().drain(..).collect();
+            if drained.is_empty() {
+                return played;
+            }
+            feeder
+                .shared
+                .emitted_sample_frames
+                .fetch_add((drained.len() / STEREO_CHANNELS) as u64, Ordering::AcqRel);
+            played.extend(drained);
+        }
+    }
+
+    #[test]
+    fn the_queued_composition_sound_follows_with_no_gap() {
+        const FIRST_SOUND_EDIT_UNITS: usize = 6;
+        // two edit units longer than its sound, which the feeder fills with silence
+        const FIRST_PICTURE_FRAMES: u64 = 8;
+        const NEXT_EDIT_UNITS: usize = 6;
+        let directory = tempfile::tempdir().unwrap();
+        let first_samples = ramp(FIRST_SOUND_EDIT_UNITS, 1);
+        let next_samples = ramp(NEXT_EDIT_UNITS, 5_000);
+        let first = wrapped_samples(directory.path(), "first", 2, None, &first_samples);
+        let next = wrapped_samples(directory.path(), "next", 2, None, &next_samples);
+
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = composition_of(Some(&first), FIRST_PICTURE_FRAMES);
+        feeder.queue(Some(composition_of(Some(&next), NEXT_EDIT_UNITS as u64)));
+        feeder.seek(0);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+
+        let padding = (FIRST_PICTURE_FRAMES as usize - FIRST_SOUND_EDIT_UNITS)
+            * SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24
+            * STEREO_CHANNELS;
+        let mut expected = as_played(&first_samples);
+        expected.extend(std::iter::repeat_n(0.0, padding));
+        expected.extend(as_played(&next_samples));
+        assert_eq!(played.len(), expected.len());
+        assert!(
+            played == expected,
+            "the sound differs from the two compositions end to end"
+        );
+    }
+
+    #[test]
+    fn a_seek_before_the_boundary_takes_back_the_queued_sound_already_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_samples = ramp(2, 1);
+        let next_samples = ramp(2, 5_000);
+        let first = wrapped_samples(directory.path(), "first", 2, None, &first_samples);
+        let next = wrapped_samples(directory.path(), "next", 2, None, &next_samples);
+
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = composition_of(Some(&first), 2);
+        feeder.queue(Some(composition_of(Some(&next), 2)));
+        feeder.seek(0);
+        feeder.fill();
+        assert!(
+            feeder.finished.is_some(),
+            "the fill reached the queued sound"
+        );
+
+        feeder.seek(1);
+        assert!(feeder.queued.is_some(), "the queued sound is queued again");
+        let played = drain_until_the_feeder_stops(&mut feeder);
+        let mut expected =
+            as_played(&first_samples[SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24 * STEREO_CHANNELS..]);
+        expected.extend(as_played(&next_samples));
+        assert!(
+            played == expected,
+            "the seek did not play the rest of the first composition and then the next"
+        );
+    }
+
+    #[test]
+    fn a_picture_only_composition_queues_as_silence() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_samples = ramp(2, 1);
+        let first = wrapped_samples(directory.path(), "first", 2, None, &first_samples);
+
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = composition_of(Some(&first), 2);
+        feeder.queue(Some(composition_of(None, 3)));
+        feeder.seek(0);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+        let mut expected = as_played(&first_samples);
+        expected.extend(std::iter::repeat_n(
+            0.0,
+            3 * SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24 * STEREO_CHANNELS,
+        ));
+        assert!(played == expected);
     }
 }

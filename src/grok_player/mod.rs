@@ -167,12 +167,16 @@ struct Status {
     container_fps: Option<f64>,
     eof: bool,
     warnings: Vec<String>,
+    source: Option<String>,
+    queued_source: Option<String>,
 }
 
 type UpdateCallback = Box<dyn Fn() + Send + 'static>;
 
 enum Command {
     Load(PathBuf, Option<ContentKeys>, Sender<Result<(), String>>),
+    QueueNext(PathBuf, Option<ContentKeys>, Sender<Result<(), String>>),
+    ClearQueued,
     Stop,
     SetPaused(bool),
     TogglePause,
@@ -431,6 +435,19 @@ impl GrokPlayer {
             .map_err(|_| "the decode thread is gone".to_string())?
     }
 
+    // plays straight after the loaded source, a later call replaces it, and load or stop clears it
+    pub fn queue_next(&self, source: &Path, keys: Option<ContentKeys>) -> Result<(), String> {
+        let (reply, answer) = channel();
+        self.send(Command::QueueNext(source.to_path_buf(), keys, reply))?;
+        answer
+            .recv()
+            .map_err(|_| "the decode thread is gone".to_string())?
+    }
+
+    pub fn clear_queued(&self) {
+        let _ = self.send(Command::ClearQueued);
+    }
+
     pub fn stop(&self) {
         let _ = self.send(Command::Stop);
     }
@@ -586,7 +603,7 @@ impl Drop for GrokPlayer {
 
 fn status_json(status: &Status) -> String {
     format!(
-        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}, "warnings": [{}]}}"#,
+        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}, "warnings": [{}], "source": {}, "queued_source": {}}}"#,
         json_number(status.position),
         json_number(status.duration),
         status.paused,
@@ -602,6 +619,8 @@ fn status_json(status: &Status) -> String {
             .map(|warning| json_string(Some(warning)))
             .collect::<Vec<_>>()
             .join(", "),
+        json_string(status.source.as_deref()),
+        json_string(status.queued_source.as_deref()),
     )
 }
 
@@ -634,12 +653,14 @@ mod tests {
         assert!(metadata.contains(r#""cache_seconds": null"#), "{metadata}");
         assert!(metadata.contains(r#""eof": false"#), "{metadata}");
         assert!(metadata.contains(r#""warnings": []"#), "{metadata}");
+        assert!(metadata.contains(r#""source": null"#), "{metadata}");
+        assert!(metadata.contains(r#""queued_source": null"#), "{metadata}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&metadata)
                 .expect("metadata is JSON")
                 .as_object()
                 .map(|fields| fields.len()),
-            Some(11)
+            Some(13)
         );
     }
 
@@ -670,5 +691,18 @@ mod tests {
         let metadata: serde_json::Value =
             serde_json::from_str(&status_json(&status)).expect("metadata is JSON");
         assert_eq!(metadata["warnings"], serde_json::json!(warnings));
+    }
+
+    #[test]
+    fn the_metadata_names_the_current_and_the_queued_source() {
+        let status = Status {
+            source: Some("/packages/first".to_string()),
+            queued_source: Some("/packages/second".to_string()),
+            ..Status::default()
+        };
+        let metadata: serde_json::Value =
+            serde_json::from_str(&status_json(&status)).expect("metadata is JSON");
+        assert_eq!(metadata["source"], "/packages/first");
+        assert_eq!(metadata["queued_source"], "/packages/second");
     }
 }

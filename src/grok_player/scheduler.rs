@@ -1,5 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
@@ -73,6 +73,21 @@ impl Clock {
     fn frame_period_seconds(&self) -> f64 {
         1.0 / self.fps
     }
+
+    // frame_count is due when the next composition's first frame is, and that frame becomes frame 0
+    fn continued_after(&self, frame_count: u64, fps: f64) -> Clock {
+        let source = match self.source {
+            ClockSource::WallClock(start) => ClockSource::WallClock(
+                start + Duration::from_secs_f64(self.frame_offset_seconds(frame_count)),
+            ),
+            ClockSource::SoundDevice => ClockSource::SoundDevice,
+        };
+        Clock {
+            source,
+            start_frame: 0,
+            fps,
+        }
+    }
 }
 
 fn frames_to_request(
@@ -89,6 +104,11 @@ fn frames_to_request(
     (current.min(last)..=end)
         .filter(|index| !pending(*index))
         .collect()
+}
+
+struct QueuedSource {
+    source: PathBuf,
+    timeline: Timeline,
 }
 
 #[derive(Default)]
@@ -132,6 +152,11 @@ struct Scheduler {
     dropped_frames: u64,
     delayed_frames: u64,
     sound: audio::Output,
+    sound_loaded: bool,
+    // where the current composition starts on the sound device's clock
+    sound_offset_seconds: f64,
+    source: Option<PathBuf>,
+    queued: Option<QueuedSource>,
 }
 
 impl Scheduler {
@@ -159,13 +184,26 @@ impl Scheduler {
             dropped_frames: 0,
             delayed_frames: 0,
             sound: audio::Output::new(),
+            sound_loaded: false,
+            sound_offset_seconds: 0.0,
+            source: None,
+            queued: None,
         }
+    }
+
+    fn sound_position(&self) -> Option<f64> {
+        Some(self.sound.media_position_seconds()? - self.sound_offset_seconds)
+    }
+
+    fn seek_sound(&mut self, frame: u64) {
+        self.sound_offset_seconds = 0.0;
+        self.sound.seek(frame);
     }
 
     // ─── the clock ─────────────────────────────────────────────────────────
 
     fn new_clock(&self) -> Clock {
-        if self.sound.media_position_seconds().is_some() {
+        if self.sound_position().is_some() {
             return Clock::sound_device(self.current_frame, self.fps());
         }
         Clock::wall_clock(Instant::now(), self.current_frame, self.fps())
@@ -173,9 +211,7 @@ impl Scheduler {
 
     fn clock_and_elapsed(&mut self) -> Option<(Clock, f64)> {
         let clock = self.clock?;
-        if let Some(elapsed) =
-            clock.elapsed_seconds(Instant::now(), self.sound.media_position_seconds())
-        {
+        if let Some(elapsed) = clock.elapsed_seconds(Instant::now(), self.sound_position()) {
             return Some((clock, elapsed));
         }
         // the sound stream stopped, so the picture carries on from here
@@ -203,7 +239,11 @@ impl Scheduler {
         };
         let next = self.current_frame + 1;
         if next >= frame_count {
-            self.reach_end();
+            if self.queued.is_none() {
+                self.reach_end();
+            } else if elapsed >= clock.frame_offset_seconds(frame_count) {
+                self.hand_off();
+            }
             return;
         }
         if elapsed < clock.frame_offset_seconds(next) {
@@ -243,6 +283,53 @@ impl Scheduler {
         if let Some(reason) = self.pool.failure(index) {
             tracing::error!("frame {index} did not decode: {reason}");
             self.needs_publish = false;
+        }
+    }
+
+    // the next composition's frames follow this one's last frame at their own rate
+    fn hand_off(&mut self) {
+        let Some(QueuedSource {
+            source,
+            mut timeline,
+        }) = self.queued.take()
+        else {
+            return;
+        };
+        let Some(finished) = self.timeline.take() else {
+            return;
+        };
+        self.clock = self
+            .clock
+            .map(|clock| clock.continued_after(finished.frame_count, timeline.fps));
+        self.generation += 1;
+        self.in_flight.clear();
+        self.pool.rebase(finished.frame_count, self.generation);
+        self.hand_off_sound(&finished, &mut timeline);
+        self.shared
+            .set_source_size(Some((timeline.width, timeline.height)));
+        self.source = Some(source);
+        self.timeline = Some(timeline);
+        self.current_frame = 0;
+        self.eof = false;
+        // until the first frame decodes the last one stays up
+        match self.pool.decoded_at(0, self.reduce) {
+            Some(first) => self.present(0, first),
+            None => self.needs_publish = true,
+        }
+    }
+
+    fn hand_off_sound(&mut self, finished: &Timeline, next: &mut Timeline) {
+        if self.sound_loaded {
+            self.sound_offset_seconds += finished.frame_count as f64 / finished.fps;
+            self.sound.advance(next.fps);
+            return;
+        }
+        self.sound_offset_seconds = 0.0;
+        self.sound_loaded =
+            self.sound
+                .load(std::mem::take(&mut next.sound), next.fps, next.frame_count);
+        if self.sound_loaded && self.playing {
+            self.sound.set_playing(true);
         }
     }
 
@@ -307,6 +394,11 @@ impl Scheduler {
         let Some(frame_count) = self.timeline.as_ref().map(|timeline| timeline.frame_count) else {
             return;
         };
+        // the window runs on into the queued composition, its frames numbered after this one's
+        let queued_frames = self
+            .queued
+            .as_ref()
+            .map_or(0, |queued| queued.timeline.frame_count);
         let lookahead = self.pool.lookahead_frames();
         let reduce = self.reduce;
         let wanted = {
@@ -314,9 +406,12 @@ impl Scheduler {
             self.in_flight
                 .retain(|index| !pool.holds_at(*index, reduce));
             let in_flight = &self.in_flight;
-            frames_to_request(self.current_frame, frame_count, lookahead, |index| {
-                pool.holds_at(index, reduce) || in_flight.contains(&index)
-            })
+            frames_to_request(
+                self.current_frame,
+                frame_count + queued_frames,
+                lookahead,
+                |index| pool.holds_at(index, reduce) || in_flight.contains(&index),
+            )
         };
         let generation = self.generation;
         // reading a whole window at once stalls the clock
@@ -325,7 +420,13 @@ impl Scheduler {
             return;
         };
         for index in wanted.into_iter().take(batch) {
-            match timeline.codestream(index) {
+            let read = match self.queued.as_mut() {
+                Some(queued) if index >= frame_count => {
+                    queued.timeline.codestream(index - frame_count)
+                }
+                _ => timeline.codestream(index),
+            };
+            match read {
                 Ok((codestream, render, mxf)) => {
                     self.in_flight.insert(index);
                     self.pool.submit(DecodeJob {
@@ -349,9 +450,7 @@ impl Scheduler {
         let Some(clock) = self.clock else {
             return IDLE_WAIT;
         };
-        let Some(elapsed) =
-            clock.elapsed_seconds(Instant::now(), self.sound.media_position_seconds())
-        else {
+        let Some(elapsed) = clock.elapsed_seconds(Instant::now(), self.sound_position()) else {
             return IDLE_WAIT;
         };
         let ahead = clock.frame_offset_seconds(self.current_frame + 1) - elapsed;
@@ -373,6 +472,12 @@ impl Scheduler {
                 let _ = reply.send(outcome);
             }
             Command::Stop => self.stop(),
+            Command::QueueNext(source, keys, reply) => {
+                let outcome = self.queue_next(source, keys);
+                self.publish_status();
+                let _ = reply.send(outcome);
+            }
+            Command::ClearQueued => self.clear_queued(),
             Command::SetPaused(paused) => self.set_paused(paused),
             Command::TogglePause => self.set_paused(self.playing),
             Command::Seek(seconds) => {
@@ -431,8 +536,13 @@ impl Scheduler {
         let mut timeline = Timeline::open(source, keys.as_ref())?;
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
-        self.sound
-            .load(std::mem::take(&mut timeline.sound), timeline.fps);
+        self.sound_loaded = self.sound.load(
+            std::mem::take(&mut timeline.sound),
+            timeline.fps,
+            timeline.frame_count,
+        );
+        self.sound_offset_seconds = 0.0;
+        self.source = Some(source.to_path_buf());
         self.timeline = Some(timeline);
         self.current_frame = 0;
         self.needs_publish = true;
@@ -440,8 +550,41 @@ impl Scheduler {
         Ok(())
     }
 
+    fn queue_next(&mut self, source: PathBuf, keys: Option<ContentKeys>) -> Result<(), String> {
+        if self.timeline.is_none() {
+            return Err("nothing is loaded for a source to follow".to_string());
+        }
+        let mut timeline = Timeline::open(&source, keys.as_ref())?;
+        self.clear_queued();
+        if self.sound_loaded {
+            self.sound.queue(
+                std::mem::take(&mut timeline.sound),
+                timeline.fps,
+                timeline.frame_count,
+            );
+        }
+        self.queued = Some(QueuedSource { source, timeline });
+        Ok(())
+    }
+
+    fn clear_queued(&mut self) {
+        if self.queued.take().is_none() {
+            return;
+        }
+        self.sound.clear_queue();
+        let Some(frame_count) = self.timeline.as_ref().map(|timeline| timeline.frame_count) else {
+            return;
+        };
+        self.generation += 1;
+        self.in_flight.clear();
+        self.pool.forget_from(frame_count, self.generation);
+    }
+
     fn stop(&mut self) {
         self.sound.stop();
+        self.sound_loaded = false;
+        self.source = None;
+        self.queued = None;
         self.timeline = None;
         self.last_plain = None;
         self.playing = false;
@@ -486,7 +629,7 @@ impl Scheduler {
         if self.timeline.is_none() {
             return;
         }
-        self.sound.seek(self.current_frame);
+        self.seek_sound(self.current_frame);
         if self.playing {
             self.clock = Some(self.new_clock());
         }
@@ -503,13 +646,15 @@ impl Scheduler {
         if self.timeline.is_none() {
             return;
         }
-        // play on the last frame starts over, mpv's keep-open behaviour
-        if self.eof {
+        // play on the last frame starts over, mpv's keep-open behaviour, or goes on to the queued source
+        if self.eof && self.queued.is_some() {
+            self.hand_off();
+        } else if self.eof {
             self.seek_to_frame(0);
         }
         self.playing = true;
         self.clock = Some(self.new_clock());
-        self.sound.seek(self.current_frame);
+        self.seek_sound(self.current_frame);
         self.sound.set_playing(true);
     }
 
@@ -529,7 +674,7 @@ impl Scheduler {
         self.current_frame = frame.min(frame_count - 1);
         self.eof = false;
         self.presentations.clear();
-        self.sound.seek(self.current_frame);
+        self.seek_sound(self.current_frame);
         self.restart_decoding();
     }
 
@@ -594,7 +739,15 @@ impl Scheduler {
             delayed_frames: self.delayed_frames,
             decoder_fps: self.playback_rate(),
             container_fps: timeline.map(|timeline| timeline.fps),
-            eof: self.eof,
+            eof: self.eof && self.queued.is_none(),
+            source: self
+                .source
+                .as_ref()
+                .map(|source| source.display().to_string()),
+            queued_source: self
+                .queued
+                .as_ref()
+                .map(|queued| queued.source.display().to_string()),
             warnings: self.sound.warnings(),
         });
         self.shared
@@ -670,6 +823,33 @@ mod tests {
             36
         );
         assert!(clock.elapsed_seconds(now, None).is_none());
+    }
+
+    #[test]
+    fn the_next_composition_starts_when_the_last_frame_ends() {
+        let start = Instant::now();
+        // started on frame 2 of a 6 frame composition at 24 fps
+        let clock = Clock::wall_clock(start, 2, 24.0);
+        let next = clock.continued_after(6, 25.0);
+        let boundary = start + Duration::from_secs_f64(4.0 / 24.0);
+        assert_eq!(next.target_frame(elapsed(&next, boundary, None)), 0);
+        // the next composition's frames come at its own rate
+        let fourth = boundary + Duration::from_secs_f64(4.0 / 25.0);
+        assert_eq!(next.target_frame(elapsed(&next, fourth, None)), 4);
+        let before_the_boundary = boundary - Duration::from_millis(10);
+        assert_eq!(
+            next.target_frame(elapsed(&next, before_the_boundary, None)),
+            0
+        );
+    }
+
+    #[test]
+    fn the_sound_clock_continues_from_the_next_compositions_start() {
+        let next = Clock::sound_device(40, 24.0).continued_after(48, 24.0);
+        let now = Instant::now();
+        // the scheduler hands it positions with the first composition's length taken off
+        assert_eq!(next.target_frame(elapsed(&next, now, Some(0.0))), 0);
+        assert_eq!(next.target_frame(elapsed(&next, now, Some(0.5))), 12);
     }
 
     #[test]

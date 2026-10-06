@@ -807,6 +807,113 @@ fn a_subtitle_offset_while_paused_moves_the_drawn_cue() {
     );
 }
 
+// two sources whose frames carry the colours 0 to first_frames - 1 and first_frames to 9
+fn two_compositions(directory: &Path, size: u32, first_frames: usize) -> (PathBuf, PathBuf) {
+    let mut frames = flat_codestreams(size, size, DISTINCT_FRAME_COLOURS, CINEMA_2K_PROFILE);
+    let next_frames = frames.split_off(first_frames);
+    let first = directory.join("first.mxf");
+    let next = directory.join("next.mxf");
+    write_mxf(&first, &frames, None, size, size);
+    write_mxf(&next, &next_frames, None, size, size);
+    (first, next)
+}
+
+fn metadata_field(player: &GrokPlayer, field: &str) -> serde_json::Value {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&player.metadata_json()).expect("metadata is JSON");
+    metadata[field].clone()
+}
+
+#[test]
+fn a_queued_source_plays_on_from_the_last_frame_with_no_gap() {
+    const SIZE: u32 = 64;
+    const FIRST_FRAMES: usize = 5;
+    let directory = tempfile::tempdir().unwrap();
+    let (first, next) = two_compositions(directory.path(), SIZE, FIRST_FRAMES);
+    let player = loaded_player(&first);
+    player
+        .queue_next(&next, None)
+        .expect("queue the next source");
+    assert_eq!(
+        metadata_field(&player, "source"),
+        first.display().to_string()
+    );
+    assert_eq!(
+        metadata_field(&player, "queued_source"),
+        next.display().to_string()
+    );
+
+    player.set_paused(false);
+    let mut shown = vec![shown_colour(&player, SIZE as usize, SIZE as usize)];
+    let deadline = Instant::now() + PATIENCE;
+    while !player.eof_reached() {
+        assert!(Instant::now() < deadline, "playback did not reach the end");
+        let colour = shown_colour(&player, SIZE as usize, SIZE as usize);
+        if shown.last() != Some(&colour) {
+            shown.push(colour);
+        }
+        std::thread::sleep(POLL);
+    }
+    // eof is flagged on the tick that presents the last frame
+    let last_shown = shown_colour(&player, SIZE as usize, SIZE as usize);
+    if shown.last() != Some(&last_shown) {
+        shown.push(last_shown);
+    }
+    let every_frame: Vec<[u8; 3]> = (0..DISTINCT_FRAME_COLOURS).map(frame_colour).collect();
+    assert_eq!(
+        shown, every_frame,
+        "the two sources did not play every frame once, in order"
+    );
+    assert_eq!(
+        metadata_field(&player, "source"),
+        next.display().to_string()
+    );
+    assert_eq!(
+        metadata_field(&player, "queued_source"),
+        serde_json::Value::Null
+    );
+    let last = (DISTINCT_FRAME_COLOURS - FIRST_FRAMES - 1) as f64 / f64::from(FRAMES_PER_SECOND);
+    assert_eq!(player.position(), Some(last));
+}
+
+#[test]
+fn a_source_queued_at_the_end_plays_when_play_is_pressed() {
+    const SIZE: u32 = 64;
+    const FIRST_FRAMES: usize = 2;
+    let directory = tempfile::tempdir().unwrap();
+    let (first, next) = two_compositions(directory.path(), SIZE, FIRST_FRAMES);
+    let player = loaded_player(&first);
+    player.set_paused(false);
+    wait_until("the first source reached its end", || player.eof_reached());
+
+    player
+        .queue_next(&next, None)
+        .expect("queue the next source");
+    assert!(
+        !player.eof_reached(),
+        "the end is not the end with a source queued"
+    );
+    player.set_paused(false);
+    wait_until("the queued source played to its end", || {
+        player.eof_reached()
+    });
+    assert_eq!(
+        metadata_field(&player, "source"),
+        next.display().to_string()
+    );
+    assert_eq!(
+        shown_colour(&player, SIZE as usize, SIZE as usize),
+        frame_colour(DISTINCT_FRAME_COLOURS - 1)
+    );
+
+    player.queue_next(&first, None).expect("queue again");
+    player.clear_queued();
+    wait_until("clearing the queue ends it", || {
+        metadata_field(&player, "queued_source").is_null()
+    });
+    assert!(player.eof_reached());
+}
+
 fn changed_rows(before: &[u8], after: &[u8], width: usize, height: usize) -> Vec<usize> {
     (0..height)
         .filter(|row| {

@@ -141,6 +141,21 @@ impl FrameCache {
         self.frames.retain(|index, _| *index >= first);
     }
 
+    // the frames from first on become the frames from 0, and results still in flight are dropped
+    pub fn rebase(&mut self, first: u64, generation: u64) {
+        self.dropped_before = generation;
+        let kept = self.frames.split_off(&first);
+        self.frames = kept
+            .into_iter()
+            .map(|(index, held)| (index - first, held))
+            .collect();
+    }
+
+    pub fn forget_from(&mut self, first: u64, generation: u64) {
+        self.dropped_before = generation;
+        self.frames.split_off(&first);
+    }
+
     pub fn len(&self) -> usize {
         self.frames.len()
     }
@@ -425,6 +440,16 @@ impl DecodePool {
 
     pub fn forget_before(&self, first: u64) {
         self.cache.lock().unwrap().forget_before(first);
+    }
+
+    pub fn rebase(&self, first: u64, generation: u64) {
+        self.discard_queued_jobs();
+        self.cache.lock().unwrap().rebase(first, generation);
+    }
+
+    pub fn forget_from(&self, first: u64, generation: u64) {
+        self.discard_queued_jobs();
+        self.cache.lock().unwrap().forget_from(first, generation);
     }
 
     pub fn cached_frame_count(&self) -> usize {
@@ -1072,6 +1097,35 @@ mod tests {
         // 7 failed, so the answer falls back past it
         assert_eq!(cache.newest_decoded_in(3, 7), Some(5));
         assert_eq!(cache.newest_decoded_in(9, 12), None);
+    }
+
+    #[test]
+    fn a_hand_off_moves_the_next_compositions_frames_to_the_front() {
+        let mut cache = FrameCache::new();
+        for index in 0u64..6 {
+            cache.store(1, index, FULL, frame(index as u32 + 1));
+        }
+        cache.rebase(4, 2);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.decoded(0).map(|held| held.width), Some(5));
+        assert_eq!(cache.decoded(1).map(|held| held.width), Some(6));
+        assert!(
+            !cache.store(1, 2, FULL, frame(9)),
+            "a decode still in flight from before the hand-off is dropped"
+        );
+        assert!(cache.store(2, 2, FULL, frame(9)));
+    }
+
+    #[test]
+    fn a_replaced_queue_drops_only_its_own_frames() {
+        let mut cache = FrameCache::new();
+        for index in 0u64..6 {
+            cache.store(1, index, FULL, frame(2));
+        }
+        cache.forget_from(4, 2);
+        assert!(cache.holds_at(3, FULL));
+        assert!(!cache.holds_at(4, FULL));
+        assert!(!cache.store(1, 4, FULL, frame(2)));
     }
 
     #[test]
