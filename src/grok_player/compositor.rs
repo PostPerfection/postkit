@@ -81,13 +81,17 @@ impl Compositor {
                 picture.data.len()
             ));
         }
-        let bitmaps = self.raster_subtitles(
+        // a packed stereo frame is one eye's size, so cues lay out for one eye
+        let eye_bitmaps = self.raster_subtitles(
             picture.width,
             picture.height,
             layers.cue_tracks,
             layers.time_ms,
         );
-        let has_overlays = layers.overlays.iter().any(|overlay| overlay.alpha != 0);
+        let cells = EyeCells::of(picture);
+        let bitmaps = cells.bitmaps(&eye_bitmaps);
+        let overlays = cells.overlays(layers.overlays, layers.overlay_scale);
+        let has_overlays = overlays.iter().any(|overlay| overlay.alpha != 0);
         let pixels = if !has_overlays && bitmaps.is_empty() {
             ComposedPixels::Picture(picture.clone())
         } else {
@@ -96,7 +100,7 @@ impl Compositor {
                 &mut data,
                 picture.width,
                 picture.height,
-                layers.overlays,
+                &overlays,
                 layers.overlay_scale,
             );
             composite_rgb8(
@@ -112,6 +116,7 @@ impl Compositor {
             width: picture.width,
             height: picture.height,
             pixels,
+            eyes: picture.eyes,
         })
     }
 
@@ -145,6 +150,107 @@ impl Compositor {
             }
         }
         drawn
+    }
+}
+
+// where each eye sits in a frame, one cell for a mono frame
+struct EyeCells {
+    across: u32,
+    down: u32,
+    width: u32,
+    height: u32,
+}
+
+impl EyeCells {
+    fn of(picture: &Rgba8Frame) -> Self {
+        let (across, down) = picture.eyes.cells();
+        EyeCells {
+            across,
+            down,
+            width: picture.width,
+            height: picture.height,
+        }
+    }
+
+    fn origins(&self) -> impl Iterator<Item = (u32, u32)> + '_ {
+        (0..self.down).flat_map(move |row| {
+            (0..self.across).map(move |column| {
+                (
+                    column * self.width / self.across,
+                    row * self.height / self.down,
+                )
+            })
+        })
+    }
+
+    // each bitmap squeezed into every cell
+    fn bitmaps(&self, bitmaps: &[PositionedBitmap]) -> Vec<PositionedBitmap> {
+        if (self.across, self.down) == (1, 1) {
+            return bitmaps.to_vec();
+        }
+        self.origins()
+            .flat_map(|origin| {
+                bitmaps
+                    .iter()
+                    .map(move |bitmap| squeezed(bitmap, self.across, self.down, origin))
+            })
+            .collect()
+    }
+
+    // overlays are in source pixels, so the cell origin goes back through the scale
+    fn overlays(&self, overlays: &[OverlayRectangle], scale: f64) -> Vec<OverlayRectangle> {
+        if (self.across, self.down) == (1, 1) {
+            return overlays.to_vec();
+        }
+        let in_source = |pixels: u32| (f64::from(pixels) / scale).round() as i64;
+        let (across, down) = (i64::from(self.across), i64::from(self.down));
+        self.origins()
+            .flat_map(|(x, y)| {
+                overlays.iter().map(move |overlay| OverlayRectangle {
+                    x: overlay.x.div_euclid(across) + in_source(x),
+                    y: overlay.y.div_euclid(down) + in_source(y),
+                    width: overlay.width / across,
+                    height: overlay.height / down,
+                    ..*overlay
+                })
+            })
+            .collect()
+    }
+}
+
+// the bitmap at 1/across of its width and 1/down of its height, folded pixels averaged
+fn squeezed(
+    bitmap: &PositionedBitmap,
+    across: u32,
+    down: u32,
+    (origin_x, origin_y): (u32, u32),
+) -> PositionedBitmap {
+    let width = bitmap.width.div_ceil(across);
+    let height = bitmap.height.div_ceil(down);
+    let mut pixels = Vec::with_capacity((width * height) as usize * RGBA_BYTES_PER_PIXEL);
+    for row in 0..height {
+        for column in 0..width {
+            let mut sum = [0u32; RGBA_BYTES_PER_PIXEL];
+            let mut count = 0;
+            for source_row in row * down..((row + 1) * down).min(bitmap.height) {
+                for source_column in column * across..((column + 1) * across).min(bitmap.width) {
+                    let at = ((source_row * bitmap.width + source_column) as usize)
+                        * RGBA_BYTES_PER_PIXEL;
+                    for (total, sample) in sum.iter_mut().zip(&bitmap.pixels[at..]) {
+                        *total += u32::from(*sample);
+                    }
+                    count += 1;
+                }
+            }
+            pixels.extend(sum.map(|total| (total / count) as u8));
+        }
+    }
+    PositionedBitmap {
+        x: origin_x as i32 + bitmap.x.div_euclid(across as i32),
+        y: origin_y as i32 + bitmap.y.div_euclid(down as i32),
+        width,
+        height,
+        pixels,
     }
 }
 
@@ -200,6 +306,7 @@ fn scaled(value: i64, scale: f64) -> i64 {
 mod tests {
     use super::*;
 
+    use crate::grok_player::stereo::EyeArrangement;
     use crate::preview::Rgb8Frame;
     use crate::subtitle_formats::StyledRun;
 
@@ -338,6 +445,7 @@ mod tests {
             width: 4,
             height: 3,
             data: vec![0u8; 4],
+            eyes: EyeArrangement::Single,
         });
         assert!(Compositor::new().compose(&short, plain(&[], 1.0)).is_err());
     }

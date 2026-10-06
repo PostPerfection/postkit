@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use super::audio;
 use super::compositor::{Compositor, Layers};
 use super::decode_pool::{DecodeJob, DecodePool};
-use super::timeline::Timeline;
+use super::stereo::{StereoHalf, StereoOutput, StereoPair};
+use super::timeline::{StereoscopicPhase, Timeline};
 use super::{
     Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, Rgba8Frame, Shared,
     SourceOptions, Status, SubtitleSlot,
@@ -91,6 +92,9 @@ impl Clock {
     }
 }
 
+// a mono reel has one codestream a frame, read through the left eye
+const MONO_EYE: [StereoscopicPhase; 1] = [StereoscopicPhase::Left];
+
 fn open_timeline(source: &Path, options: &SourceOptions) -> Result<Timeline, String> {
     let mut timeline = Timeline::open(source, options.keys.as_ref(), &options.other_packages)?;
     if let Some(range) = options.range {
@@ -152,6 +156,7 @@ struct Scheduler {
     eof: bool,
     reduce: u8,
     display: Arc<Display>,
+    stereo_output: StereoOutput,
     clock: Option<Clock>,
     last_plain: Option<Arc<Rgba8Frame>>,
     overlays: Vec<OverlayRectangle>,
@@ -189,6 +194,7 @@ impl Scheduler {
             eof: false,
             reduce: DecodeScale::Full.reduce(),
             display: Arc::new(Display::Srgb(XyzToSrgb::new())),
+            stereo_output: StereoOutput::default(),
             clock: None,
             last_plain: None,
             overlays: Vec::new(),
@@ -457,27 +463,44 @@ impl Scheduler {
             if submitted > 0 && self.frame_due() {
                 break;
             }
-            let read = match (self.queued.as_mut(), self.timeline.as_mut()) {
+            let (timeline, frame) = match (self.queued.as_mut(), self.timeline.as_mut()) {
                 (Some(queued), _) if index >= frame_count => {
-                    queued.timeline.codestream(index - frame_count)
+                    (&mut queued.timeline, index - frame_count)
                 }
-                (_, Some(timeline)) => timeline.codestream(index),
+                (_, Some(timeline)) => (timeline, index),
                 (_, None) => return,
             };
-            match read {
-                Ok((codestream, render, mxf)) => {
-                    self.in_flight.insert(index);
-                    self.pool.submit(DecodeJob {
-                        generation,
-                        frame_index: index,
-                        codestream,
-                        reduce,
-                        render,
-                        mxf,
-                        display: self.display.clone(),
-                    });
+            let (eyes, pair) = if timeline.stereoscopic {
+                let eyes = self.stereo_output.eyes();
+                let pair =
+                    (eyes.len() > 1).then(|| StereoPair::new(self.stereo_output.arrangement()));
+                (eyes, pair)
+            } else {
+                (MONO_EYE.as_slice(), None)
+            };
+            let reads: Result<Vec<_>, String> = eyes
+                .iter()
+                .map(|eye| Ok((*eye, timeline.codestream(frame, *eye)?)))
+                .collect();
+            let reads = match reads {
+                Ok(reads) => reads,
+                Err(reason) => {
+                    self.pool.record_failure(generation, index, reduce, reason);
+                    continue;
                 }
-                Err(reason) => self.pool.record_failure(generation, index, reduce, reason),
+            };
+            self.in_flight.insert(index);
+            for (eye, (codestream, render, mxf)) in reads {
+                self.pool.submit(DecodeJob {
+                    generation,
+                    frame_index: index,
+                    codestream,
+                    reduce,
+                    render,
+                    mxf,
+                    display: self.display.clone(),
+                    stereo: pair.clone().map(|pair| StereoHalf { pair, eye }),
+                });
             }
         }
     }
@@ -551,7 +574,25 @@ impl Scheduler {
             Command::SetDisplay(display) => {
                 self.display = display;
                 self.change_frame_rendering();
-                self.pool.recolour_from(self.generation);
+                self.pool.rerender_from(self.generation);
+            }
+            Command::SetStereoOutput(output) => {
+                if self.stereo_output == output {
+                    return;
+                }
+                self.stereo_output = output;
+                let queued_stereoscopic = self
+                    .queued
+                    .as_ref()
+                    .is_some_and(|queued| queued.timeline.stereoscopic);
+                let stereoscopic = self
+                    .timeline
+                    .as_ref()
+                    .is_some_and(|timeline| timeline.stereoscopic);
+                if stereoscopic || queued_stereoscopic {
+                    self.change_frame_rendering();
+                    self.pool.rerender_from(self.generation);
+                }
             }
             Command::SetSubtitleFile(slot, file, reply) => {
                 let _ = reply.send(self.set_subtitle_file(slot, file.as_deref()));
@@ -795,6 +836,7 @@ impl Scheduler {
             decoder_fps: self.playback_rate(),
             container_fps: timeline.map(|timeline| timeline.fps),
             eof: self.eof && self.queued.is_none(),
+            stereoscopic: timeline.is_some_and(|timeline| timeline.stereoscopic),
             source: self
                 .source
                 .as_ref()

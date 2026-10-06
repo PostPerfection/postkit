@@ -1717,3 +1717,288 @@ mod display_profile {
         );
     }
 }
+
+mod stereoscopic {
+    use super::*;
+    use asdcplib::jp2k::{StereoMxfWriter, StereoscopicPhase};
+    use postkit::grok_player::{PictureMasks, StereoOutput};
+
+    const SIZE: u32 = 64;
+    // the right eye of frame n shows colour n + RIGHT_EYE_COLOUR_OFFSET
+    const RIGHT_EYE_COLOUR_OFFSET: usize = 5;
+
+    fn right_eye_colour(frame: usize) -> [u8; 3] {
+        frame_colour(frame + RIGHT_EYE_COLOUR_OFFSET)
+    }
+
+    fn write_stereo_mxf(path: &Path, left: &[Vec<u8>], right: &[Vec<u8>], width: u32, height: u32) {
+        let info = WriterInfo {
+            asset_uuid: [9; 16],
+            label_set: LabelSet::Smpte,
+            ..Default::default()
+        };
+        let mut writer = StereoMxfWriter::new();
+        writer
+            .open_write(
+                &path.to_string_lossy(),
+                &info,
+                &descriptor(&left[0], left.len() as u32, width, height),
+                16_384,
+            )
+            .unwrap();
+        for (left, right) in left.iter().zip(right) {
+            writer
+                .write_frame(left, StereoscopicPhase::Left, None, None)
+                .unwrap();
+            writer
+                .write_frame(right, StereoscopicPhase::Right, None, None)
+                .unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    // frame n's left eye is colour n and its right eye colour n + 5, both flat
+    fn stereo_mxf(directory: &Path, name: &str, width: u32, height: u32, frames: usize) -> PathBuf {
+        let left_codes: Vec<[i32; 3]> = (0..frames).map(|frame| [frame_code(frame); 3]).collect();
+        let right_codes: Vec<[i32; 3]> = (0..frames)
+            .map(|frame| [frame_code(frame + RIGHT_EYE_COLOUR_OFFSET); 3])
+            .collect();
+        let left = xyz_codestreams(width, height, &left_codes, CINEMA_2K_PROFILE);
+        let right = xyz_codestreams(width, height, &right_codes, CINEMA_2K_PROFILE);
+        let path = directory.join(name);
+        write_stereo_mxf(&path, &left, &right, width, height);
+        path
+    }
+
+    fn at(player: &GrokPlayer, x: usize, y: usize) -> [u8; 3] {
+        pixel(
+            &software_frame(player, SIZE as usize, SIZE as usize),
+            SIZE as usize,
+            x,
+            y,
+        )
+    }
+
+    fn change_output(player: &GrokPlayer, output: StereoOutput) {
+        forget_frames(player);
+        player.set_stereo_output(output);
+        wait_for_frame(player);
+    }
+
+    const QUARTER: usize = SIZE as usize / 4;
+    const THREE_QUARTERS: usize = 3 * SIZE as usize / 4;
+
+    #[test]
+    fn each_stereo_output_puts_each_eye_in_its_place() {
+        let directory = tempfile::tempdir().unwrap();
+        let mxf = stereo_mxf(directory.path(), "stereo.mxf", SIZE, SIZE, 2);
+        assert!(GrokPlayer::accepts(&mxf), "a stereoscopic MXF");
+
+        let player = loaded_player(&mxf);
+        assert_eq!(metadata_field(&player, "stereoscopic"), true);
+        assert_eq!(player.duration(), Some(2.0 / f64::from(FRAMES_PER_SECOND)));
+        assert_eq!(
+            [
+                at(&player, QUARTER, QUARTER),
+                at(&player, THREE_QUARTERS, THREE_QUARTERS)
+            ],
+            [frame_colour(0); 2],
+            "the left eye fills the frame by default"
+        );
+
+        change_output(&player, StereoOutput::RightEye);
+        assert_eq!(
+            [
+                at(&player, QUARTER, QUARTER),
+                at(&player, THREE_QUARTERS, THREE_QUARTERS)
+            ],
+            [right_eye_colour(0); 2]
+        );
+
+        change_output(&player, StereoOutput::SideBySide);
+        assert_eq!(software_size(&player), (SIZE, SIZE));
+        assert_eq!(at(&player, QUARTER, QUARTER), frame_colour(0), "left half");
+        assert_eq!(
+            at(&player, THREE_QUARTERS, QUARTER),
+            right_eye_colour(0),
+            "right half"
+        );
+
+        change_output(&player, StereoOutput::TopAndBottom);
+        assert_eq!(
+            at(&player, THREE_QUARTERS, QUARTER),
+            frame_colour(0),
+            "top half"
+        );
+        assert_eq!(
+            at(&player, QUARTER, THREE_QUARTERS),
+            right_eye_colour(0),
+            "bottom half"
+        );
+
+        forget_frames(&player);
+        player.frame_step();
+        wait_for_frame(&player);
+        assert_eq!(at(&player, QUARTER, QUARTER), frame_colour(1));
+        assert_eq!(at(&player, QUARTER, THREE_QUARTERS), right_eye_colour(1));
+    }
+
+    fn software_size(player: &GrokPlayer) -> (u32, u32) {
+        player.frame_size().expect("a frame is on screen")
+    }
+
+    #[test]
+    fn a_stereo_output_change_during_playback_drops_no_frames() {
+        const FRAMES: usize = 72;
+        let directory = tempfile::tempdir().unwrap();
+        let left = xyz_codestreams(SIZE, SIZE, &[[frame_code(0); 3]], CINEMA_2K_PROFILE).remove(0);
+        let right = xyz_codestreams(SIZE, SIZE, &[[frame_code(5); 3]], CINEMA_2K_PROFILE).remove(0);
+        let mxf = directory.path().join("stereo.mxf");
+        write_stereo_mxf(&mxf, &vec![left; FRAMES], &vec![right; FRAMES], SIZE, SIZE);
+
+        let player = loaded_player(&mxf);
+        let window = (player.lookahead_frames() + 1).min(FRAMES);
+        wait_until("the decode window filled", || {
+            player.cached_frame_count() >= window
+        });
+        player.set_paused(false);
+        wait_until("playback moved off the first frame", || {
+            player.position().is_some_and(|position| position > 0.0)
+        });
+        player.set_stereo_output(StereoOutput::SideBySide);
+        wait_until("both eyes reached the screen", || {
+            at(&player, THREE_QUARTERS, QUARTER) == frame_colour(5)
+        });
+        assert_eq!(at(&player, QUARTER, QUARTER), frame_colour(0));
+        assert!(!player.eof_reached(), "the fixture ended before the change");
+        assert_eq!(
+            dropped_frames_not_decoded(&player),
+            0,
+            "the output change dropped frames that had not decoded in time"
+        );
+    }
+
+    #[test]
+    fn a_stereo_source_queued_after_a_mono_one_takes_over_at_its_end() {
+        const MONO_FRAMES: usize = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let mono = flat_mxf(directory.path(), "mono.mxf", SIZE, SIZE, MONO_FRAMES);
+        let stereo = stereo_mxf(directory.path(), "stereo.mxf", SIZE, SIZE, 2);
+        let player = loaded_player(&mono);
+        player.set_stereo_output(StereoOutput::SideBySide);
+        player
+            .queue_next(&stereo, None)
+            .expect("queue the stereoscopic source");
+
+        let mut left_half = vec![at(&player, QUARTER, QUARTER)];
+        player.set_paused(false);
+        let deadline = Instant::now() + PATIENCE;
+        while !player.eof_reached() {
+            assert!(Instant::now() < deadline, "playback did not reach the end");
+            let colour = at(&player, QUARTER, QUARTER);
+            if left_half.last() != Some(&colour) {
+                left_half.push(colour);
+            }
+            std::thread::sleep(POLL);
+        }
+
+        // the stereo source's left eyes are colours 0 and 1 again
+        let expected = [
+            frame_colour(0),
+            frame_colour(1),
+            frame_colour(2),
+            frame_colour(0),
+            frame_colour(1),
+        ];
+        let mut remaining = expected.iter();
+        assert!(
+            left_half
+                .iter()
+                .all(|colour| remaining.any(|frame| frame == colour)),
+            "the left half did not play in order: {left_half:?}"
+        );
+        assert_eq!(left_half.last(), expected.last());
+        assert_eq!(at(&player, THREE_QUARTERS, QUARTER), right_eye_colour(1));
+        assert_eq!(metadata_field(&player, "stereoscopic"), true);
+        assert_eq!(dropped_frames_not_decoded(&player), 0);
+    }
+
+    #[test]
+    fn masks_cover_each_eyes_edges_side_by_side() {
+        const MASKED_FRACTION: f32 = 0.25;
+        let directory = tempfile::tempdir().unwrap();
+        let mxf = stereo_mxf(directory.path(), "stereo.mxf", SIZE, SIZE, 1);
+        let player = loaded_player(&mxf);
+        change_output(&player, StereoOutput::SideBySide);
+        player.set_presentation(PresentationSettings {
+            masks: PictureMasks {
+                left: MASKED_FRACTION,
+                ..PictureMasks::default()
+            },
+            ..PresentationSettings::default()
+        });
+        let half = SIZE as usize / 2;
+        // a quarter of each eye's 32 columns is masked
+        let inside_the_mask = 4;
+        let past_the_mask = 12;
+        assert_eq!(at(&player, inside_the_mask, QUARTER), [0, 0, 0]);
+        assert_eq!(at(&player, past_the_mask, QUARTER), frame_colour(0));
+        assert_eq!(at(&player, half + inside_the_mask, QUARTER), [0, 0, 0]);
+        assert_eq!(
+            at(&player, half + past_the_mask, QUARTER),
+            right_eye_colour(0)
+        );
+    }
+
+    #[test]
+    fn a_subtitle_draws_on_both_eyes_side_by_side() {
+        const WIDTH: u32 = 320;
+        const HEIGHT: u32 = 180;
+        let directory = tempfile::tempdir().unwrap();
+        let left = xyz_codestreams(WIDTH, HEIGHT, &[[frame_code(0); 3]], CINEMA_2K_PROFILE);
+        let mxf = directory.path().join("stereo.mxf");
+        write_stereo_mxf(&mxf, &left, &left, WIDTH, HEIGHT);
+        let srt = directory.path().join("cues.srt");
+        std::fs::write(&srt, "1\n00:00:00,000 --> 00:00:01,000\nHELLO THERE\n\n").unwrap();
+        let (width, height) = (WIDTH as usize, HEIGHT as usize);
+
+        let player = loaded_player(&mxf);
+        change_output(&player, StereoOutput::SideBySide);
+        let plain = software_frame(&player, width, height);
+        forget_frames(&player);
+        player
+            .set_subtitle_file(SubtitleSlot::Subtitle, Some(&srt))
+            .expect("srt loads");
+        wait_for_frame(&player);
+        let burnt = software_frame(&player, width, height);
+
+        let changed_columns: Vec<usize> = (0..width)
+            .filter(|column| {
+                (0..height).any(|row| {
+                    let at = (row * width + column) * SOFTWARE_BYTES_PER_PIXEL;
+                    plain[at..at + 3] != burnt[at..at + 3]
+                })
+            })
+            .collect();
+        let half = width / 2;
+        let in_left = changed_columns
+            .iter()
+            .filter(|column| **column < half)
+            .count();
+        let in_right = changed_columns.len() - in_left;
+        assert!(
+            in_left > 0 && in_right > 0,
+            "the cue is not on both eyes: {in_left} and {in_right} columns"
+        );
+        assert!(
+            in_left.abs_diff(in_right) <= 2,
+            "the eyes carry different cues: {in_left} and {in_right} columns"
+        );
+        assert!(
+            !changed_rows(&plain, &burnt, width, height)
+                .iter()
+                .any(|row| *row < height / 2),
+            "the cue drew outside the bottom band"
+        );
+    }
+}

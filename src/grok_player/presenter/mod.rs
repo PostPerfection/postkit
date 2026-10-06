@@ -170,17 +170,19 @@ pub(super) fn picture_placement(
     })
 }
 
-// the picture row or column a surface pixel samples, None under a mask
+// the picture row or column a surface pixel samples, None under a mask, which covers each eye's edges
 fn source_sample(
     position: usize,
     shown: u32,
     span: PictureSpan,
     picture: u32,
-    unmasked_start: f64,
-    unmasked_end: f64,
+    eye_cells: u32,
+    unmasked: (f64, f64),
 ) -> Option<usize> {
     let fraction = span.start + (position as f64 + PIXEL_CENTRE) / f64::from(shown) * span.size;
-    if fraction < unmasked_start || fraction > unmasked_end {
+    let across_cells = fraction * f64::from(eye_cells);
+    let eye_fraction = across_cells - across_cells.floor().min(f64::from(eye_cells - 1));
+    if eye_fraction < unmasked.0 || eye_fraction > unmasked.1 {
         return None;
     }
     Some(((fraction * f64::from(picture)) as usize).min(picture as usize - 1))
@@ -216,6 +218,7 @@ pub(super) fn draw_software(
     };
     let rectangle = placement.rectangle;
     let [unmasked_left, unmasked_top, unmasked_right, unmasked_bottom] = settings.unmasked_area();
+    let (eyes_across, eyes_down) = frame.eyes.cells();
     let source_columns: Vec<Option<usize>> = (0..rectangle.width as usize)
         .map(|column| {
             source_sample(
@@ -223,8 +226,8 @@ pub(super) fn draw_software(
                 rectangle.width,
                 placement.horizontal,
                 frame.width,
-                unmasked_left,
-                unmasked_right,
+                eyes_across,
+                (unmasked_left, unmasked_right),
             )
         })
         .collect();
@@ -236,8 +239,8 @@ pub(super) fn draw_software(
             rectangle.height,
             placement.vertical,
             frame.height,
-            unmasked_top,
-            unmasked_bottom,
+            eyes_down,
+            (unmasked_top, unmasked_bottom),
         ) else {
             continue;
         };
@@ -264,12 +267,14 @@ pub(super) fn draw_software(
 mod tests {
     use super::*;
     use crate::grok_player::ComposedPixels;
+    use crate::grok_player::stereo::EyeArrangement;
 
     fn drawn_frame(sample: u8) -> ComposedFrame {
         ComposedFrame {
             width: 2,
             height: 2,
             pixels: ComposedPixels::Drawn(vec![sample; 2 * 2 * RGBA_BYTES_PER_PIXEL]),
+            eyes: EyeArrangement::Single,
         }
     }
 
@@ -365,6 +370,7 @@ mod tests {
             width,
             height,
             pixels: ComposedPixels::Drawn(data),
+            eyes: EyeArrangement::Single,
         }
     }
 

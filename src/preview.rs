@@ -381,6 +381,7 @@ pub fn render_to_sequence(input: &Path, output_dir: &Path, format: Option<&str>)
 
 use crate::colour::{RenderingIntent, XyzToSrgb};
 use asdcplib::crypto::{AesDecContext, HmacContext};
+use asdcplib::jp2k::StereoscopicPhase;
 use std::io::Write as _;
 
 /// Largest picture frame we read into. DCI caps a 4K frame at 500 Mbps / 24 fps
@@ -444,6 +445,8 @@ pub struct ResolvedPicture {
     pub mastering_display_max_luminance: Option<u32>,
     pub descriptor_says_ycbcr: bool,
     pub coding_equations: Option<[u8; 16]>,
+    // a left and a right eye codestream in every edit unit
+    pub stereoscopic: bool,
 }
 
 /// A JPEG 2000 picture reader, one variant per MXF flavour.
@@ -453,6 +456,7 @@ pub struct ResolvedPicture {
 pub(crate) enum PictureReader {
     AsDcp(asdcplib::jp2k::MxfReader),
     As02(asdcplib::as02::jp2k::MxfReader),
+    Stereo(asdcplib::jp2k::StereoMxfReader),
 }
 
 impl PictureReader {
@@ -466,15 +470,32 @@ impl PictureReader {
         let opened = match &mut reader {
             PictureReader::AsDcp(r) => r.open_read(&path),
             PictureReader::As02(r) => r.open_read(&path),
+            PictureReader::Stereo(r) => r.open_read(&path),
         };
         opened.map_err(|e| PreviewError::Mxf(format!("open {}: {e}", mxf.display())))?;
         Ok(reader)
+    }
+
+    pub(crate) fn open_stereo(mxf: &Path) -> Result<Self, PreviewError> {
+        let mut reader = asdcplib::jp2k::StereoMxfReader::new();
+        reader
+            .open_read(&mxf.to_string_lossy())
+            .map_err(|e| PreviewError::Mxf(format!("open {}: {e}", mxf.display())))?;
+        Ok(PictureReader::Stereo(reader))
+    }
+
+    pub(crate) fn open_picture(resolved: &ResolvedPicture) -> Result<Self, PreviewError> {
+        if resolved.stereoscopic {
+            return Self::open_stereo(&resolved.mxf);
+        }
+        Self::open(&resolved.mxf, resolved.as02)
     }
 
     pub(crate) fn writer_info(&mut self) -> Result<asdcplib::WriterInfo, PreviewError> {
         match self {
             PictureReader::AsDcp(r) => r.writer_info(),
             PictureReader::As02(r) => r.writer_info(),
+            PictureReader::Stereo(r) => r.writer_info(),
         }
         .map_err(|e| PreviewError::Mxf(format!("writer info: {e}")))
     }
@@ -485,13 +506,14 @@ impl PictureReader {
         match self {
             PictureReader::AsDcp(r) => r.picture_descriptor(),
             PictureReader::As02(r) => r.picture_descriptor(),
+            PictureReader::Stereo(r) => r.picture_descriptor(),
         }
         .map_err(|e| PreviewError::Mxf(format!("picture descriptor: {e}")))
     }
 
     fn cdci_descriptor(&mut self) -> Option<asdcplib::as02::jp2k::CdciDescriptor> {
         match self {
-            PictureReader::AsDcp(_) => None,
+            PictureReader::AsDcp(_) | PictureReader::Stereo(_) => None,
             PictureReader::As02(r) => r.cdci_descriptor().ok(),
         }
     }
@@ -500,10 +522,13 @@ impl PictureReader {
         match self {
             PictureReader::AsDcp(r) => r.hdr_metadata(),
             PictureReader::As02(r) => r.hdr_metadata(),
+            // a DCI 3D track carries X'Y'Z' with no colour items
+            PictureReader::Stereo(_) => Ok(asdcplib::jp2k::HdrMetadata::default()),
         }
         .map_err(|e| PreviewError::Mxf(format!("hdr metadata: {e}")))
     }
 
+    // a stereoscopic track reads its left eye
     pub(crate) fn read_frame(
         &mut self,
         frame: u32,
@@ -511,9 +536,22 @@ impl PictureReader {
         dec: Option<&mut AesDecContext>,
         hmac: Option<&mut HmacContext>,
     ) -> Result<usize, PreviewError> {
+        self.read_eye_frame(frame, StereoscopicPhase::Left, buf, dec, hmac)
+    }
+
+    // a mono track has one codestream per frame, whichever eye is asked for
+    pub(crate) fn read_eye_frame(
+        &mut self,
+        frame: u32,
+        eye: StereoscopicPhase,
+        buf: &mut [u8],
+        dec: Option<&mut AesDecContext>,
+        hmac: Option<&mut HmacContext>,
+    ) -> Result<usize, PreviewError> {
         match self {
             PictureReader::AsDcp(r) => r.read_frame(frame, buf, dec, hmac),
             PictureReader::As02(r) => r.read_frame(frame, buf, dec, hmac),
+            PictureReader::Stereo(r) => r.read_frame(frame, eye, buf, dec, hmac),
         }
         .map_err(|e| PreviewError::Mxf(format!("read frame {frame}: {e}")))
     }
@@ -522,6 +560,7 @@ impl PictureReader {
         let _ = match self {
             PictureReader::AsDcp(r) => r.close(),
             PictureReader::As02(r) => r.close(),
+            PictureReader::Stereo(r) => r.close(),
         };
     }
 }
@@ -596,12 +635,15 @@ pub fn picture_key_from_keys_json(
 /// Resolve a DCP directory, CPL XML, or picture MXF to the picture essence.
 pub fn resolve_picture(source: &Path) -> Result<ResolvedPicture, PreviewError> {
     let mxf = find_picture_mxf(source)?;
-    let as02 = matches!(
-        asdcplib::essence_type(&mxf.to_string_lossy()),
-        Ok(asdcplib::EssenceType::As02Jpeg2000)
-    );
+    let essence = asdcplib::essence_type(&mxf.to_string_lossy());
+    let as02 = matches!(essence, Ok(asdcplib::EssenceType::As02Jpeg2000));
+    let stereoscopic = matches!(essence, Ok(asdcplib::EssenceType::Jpeg2000Stereo));
 
-    let mut reader = PictureReader::open(&mxf, as02)?;
+    let mut reader = if stereoscopic {
+        PictureReader::open_stereo(&mxf)?
+    } else {
+        PictureReader::open(&mxf, as02)?
+    };
     let info = reader.writer_info()?;
     let desc = reader.picture_descriptor()?;
     // a descriptor with no colour items is not an error, it reads as unsignalled
@@ -629,6 +671,7 @@ pub fn resolve_picture(source: &Path) -> Result<ResolvedPicture, PreviewError> {
         mastering_display_max_luminance: colour.mastering_display_max_luminance,
         descriptor_says_ycbcr: cdci.is_some(),
         coding_equations: cdci.and_then(|cdci| cdci.coding_equations),
+        stereoscopic,
     })
 }
 
@@ -744,8 +787,18 @@ pub(crate) fn read_j2c_frame(
     dec: Option<&mut AesDecContext>,
     hmac: Option<&mut HmacContext>,
 ) -> Result<Vec<u8>, PreviewError> {
+    read_j2c_eye_frame(reader, frame, StereoscopicPhase::Left, dec, hmac)
+}
+
+pub(crate) fn read_j2c_eye_frame(
+    reader: &mut PictureReader,
+    frame: u32,
+    eye: StereoscopicPhase,
+    dec: Option<&mut AesDecContext>,
+    hmac: Option<&mut HmacContext>,
+) -> Result<Vec<u8>, PreviewError> {
     let mut buf = vec![0u8; MAX_FRAME_BYTES];
-    let size = reader.read_frame(frame, &mut buf, dec, hmac)?;
+    let size = reader.read_eye_frame(frame, eye, &mut buf, dec, hmac)?;
     buf.truncate(size);
     // truncate keeps the whole MAX_FRAME_BYTES allocation
     buf.shrink_to_fit();
@@ -763,7 +816,7 @@ fn read_picture_codestream(
     frame: u32,
 ) -> Result<Vec<u8>, PreviewError> {
     let mut dec = dec_context(resolved, key)?;
-    let mut reader = PictureReader::open(&resolved.mxf, resolved.as02)?;
+    let mut reader = PictureReader::open_picture(resolved)?;
     let j2c = read_j2c_frame(&mut reader, frame, dec.as_mut(), None)?;
     reader.close();
     Ok(j2c)
@@ -891,7 +944,7 @@ pub fn render_dcp_frame(
     let display = Display::build(opts)?;
     let mut dec = dec_context(&resolved, opts.key)?;
 
-    let mut reader = PictureReader::open(&resolved.mxf, resolved.as02)?;
+    let mut reader = PictureReader::open_picture(&resolved)?;
     let img = decode_dcp_frame(&mut reader, dec.as_mut(), frame, &display, &resolved.mxf)?;
     reader.close();
 
@@ -1012,7 +1065,7 @@ pub fn play_dcp(opts: &DcpPreviewOptions) -> Result<(), PreviewError> {
 
     let tmp = std::env::temp_dir().join(format!("postkit-preview-{}.mkv", uuid::Uuid::new_v4()));
 
-    let mut reader = PictureReader::open(&resolved.mxf, resolved.as02)?;
+    let mut reader = PictureReader::open_picture(&resolved)?;
 
     // decode the first frame to learn the dimensions, then start the encoder
     let first = decode_dcp_frame(&mut reader, dec.as_mut(), start, &display, &resolved.mxf)?;

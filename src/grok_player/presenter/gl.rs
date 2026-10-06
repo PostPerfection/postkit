@@ -69,10 +69,13 @@ in vec2 texture_coordinate;\n\
 uniform sampler2D picture;\n\
 uniform float brightness;\n\
 uniform vec4 unmasked;\n\
+uniform vec2 eye_cells;\n\
 out vec4 fragment;\n\
 void main() {\n\
-    bool masked = any(lessThan(texture_coordinate, unmasked.xy))\n\
-        || any(greaterThan(texture_coordinate, unmasked.zw));\n\
+    vec2 across_cells = texture_coordinate * eye_cells;\n\
+    vec2 eye_coordinate = across_cells - min(floor(across_cells), eye_cells - 1.0);\n\
+    bool masked = any(lessThan(eye_coordinate, unmasked.xy))\n\
+        || any(greaterThan(eye_coordinate, unmasked.zw));\n\
     vec3 colour = clamp(texture(picture, texture_coordinate).rgb * brightness, 0.0, 1.0);\n\
     fragment = vec4(masked ? vec3(0.0) : colour, 1.0);\n\
 }\n";
@@ -98,6 +101,7 @@ type GlUseProgram = unsafe extern "C" fn(u32);
 type GlGetUniformLocation = unsafe extern "C" fn(u32, *const c_char) -> i32;
 type GlUniform1i = unsafe extern "C" fn(i32, i32);
 type GlUniform1f = unsafe extern "C" fn(i32, f32);
+type GlUniform2f = unsafe extern "C" fn(i32, f32, f32);
 type GlUniform4f = unsafe extern "C" fn(i32, f32, f32, f32, f32);
 type GlGenVertexArrays = unsafe extern "C" fn(i32, *mut u32);
 type GlBindVertexArray = unsafe extern "C" fn(u32);
@@ -137,6 +141,7 @@ struct Entries {
     get_uniform_location: GlGetUniformLocation,
     uniform1i: GlUniform1i,
     uniform1f: GlUniform1f,
+    uniform2f: GlUniform2f,
     uniform4f: GlUniform4f,
     gen_vertex_arrays: GlGenVertexArrays,
     bind_vertex_array: GlBindVertexArray,
@@ -161,6 +166,7 @@ struct Uniforms {
     crop: i32,
     brightness: i32,
     unmasked: i32,
+    eye_cells: i32,
 }
 
 pub(crate) struct GlSurface {
@@ -226,6 +232,7 @@ impl GlPresenter {
                 get_uniform_location: entry(loader, context, "glGetUniformLocation")?,
                 uniform1i: entry(loader, context, "glUniform1i")?,
                 uniform1f: entry(loader, context, "glUniform1f")?,
+                uniform2f: entry(loader, context, "glUniform2f")?,
                 uniform4f: entry(loader, context, "glUniform4f")?,
                 gen_vertex_arrays: entry(loader, context, "glGenVertexArrays")?,
                 bind_vertex_array: entry(loader, context, "glBindVertexArray")?,
@@ -256,6 +263,7 @@ impl GlPresenter {
             crop: location("crop"),
             brightness: location("brightness"),
             unmasked: location("unmasked"),
+            eye_cells: location("eye_cells"),
         };
 
         let mut vertex_array = 0u32;
@@ -369,6 +377,7 @@ impl GlPresenter {
         let rectangle = placement.rectangle;
         let [unmasked_left, unmasked_top, unmasked_right, unmasked_bottom] =
             settings.unmasked_area();
+        let (eyes_across, eyes_down) = frame.eyes.cells();
 
         let uploaded = self.upload(frame, serial);
         let entries = &self.entries;
@@ -401,6 +410,7 @@ impl GlPresenter {
                 unmasked_right as f32,
                 unmasked_bottom as f32,
             );
+            (entries.uniform2f)(uniforms.eye_cells, eyes_across as f32, eyes_down as f32);
             (entries.bind_vertex_array)(self.vertex_array);
             (entries.draw_arrays)(GL_TRIANGLE_STRIP, 0, QUAD_VERTICES);
             (entries.bind_vertex_array)(0);

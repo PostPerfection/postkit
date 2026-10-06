@@ -5,6 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use super::stereo::{EyeArrangement, StereoHalf};
 use super::timeline::DisplayRender;
 use super::{Command, OPAQUE_ALPHA, RGBA_BYTES_PER_PIXEL, Rgba8Frame};
 use crate::grok_decoder::DecodedFrame;
@@ -26,6 +27,8 @@ pub(super) struct DecodeJob {
     pub mxf: PathBuf,
     // the X'Y'Z' transform current when the scheduler asked for the frame
     pub display: Arc<Display>,
+    // one eye of a frame that shows both
+    pub stereo: Option<StereoHalf>,
 }
 
 pub(super) enum CachedFrame {
@@ -44,8 +47,8 @@ struct CachedResult {
 pub(super) struct FrameCache {
     // a seek moves this on, a decode scale change does not
     dropped_before: u64,
-    // results from earlier generations were coloured by the display transform before the current one
-    recoloured_from: u64,
+    // results from earlier generations were made with the display transform or stereo output before the current one
+    rerendered_from: u64,
     frames: BTreeMap<u64, CachedResult>,
 }
 
@@ -53,7 +56,7 @@ impl FrameCache {
     fn new() -> Self {
         FrameCache {
             dropped_before: 0,
-            recoloured_from: 0,
+            rerendered_from: 0,
             frames: BTreeMap::new(),
         }
     }
@@ -113,12 +116,12 @@ impl FrameCache {
     pub fn holds_at(&self, frame_index: u64, reduce: u8) -> bool {
         self.frames
             .get(&frame_index)
-            .is_some_and(|held| held.reduce == reduce && held.generation >= self.recoloured_from)
+            .is_some_and(|held| held.reduce == reduce && held.generation >= self.rerendered_from)
     }
 
-    // frames already decoded keep showing until their recoloured results arrive
-    pub fn recolour_from(&mut self, generation: u64) {
-        self.recoloured_from = generation;
+    // frames already decoded keep showing until their new results arrive
+    pub fn rerender_from(&mut self, generation: u64) {
+        self.rerendered_from = generation;
     }
 
     pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgba8Frame>> {
@@ -138,7 +141,7 @@ impl FrameCache {
                 reduce: held,
                 generation,
                 ..
-            }) if *held == reduce && *generation >= self.recoloured_from => Some(frame.clone()),
+            }) if *held == reduce && *generation >= self.rerendered_from => Some(frame.clone()),
             _ => None,
         }
     }
@@ -430,8 +433,8 @@ impl DecodePool {
         }
     }
 
-    pub fn recolour_from(&self, generation: u64) {
-        self.cache.lock().unwrap().recolour_from(generation);
+    pub fn rerender_from(&self, generation: u64) {
+        self.cache.lock().unwrap().rerender_from(generation);
     }
 
     pub fn record_failure(&self, generation: u64, frame_index: u64, reduce: u8, reason: String) {
@@ -512,9 +515,10 @@ fn run_worker(queue: &JobQueue<DecodeJob>, cache: &Mutex<FrameCache>, finished: 
             continue;
         }
         let reduce = job.reduce;
-        let decoded = match decode_job(job.codestream, reduce, job.render, &job.mxf, &job.display) {
-            Ok(frame) => CachedFrame::Decoded(Arc::new(Rgba8Frame::from_rgb8(&frame))),
-            Err(reason) => CachedFrame::Failed(reason),
+        let rendered = decode_job(job.codestream, reduce, job.render, &job.mxf, &job.display)
+            .map(|frame| Rgba8Frame::from_rgb8(&frame));
+        let Some(decoded) = cached_frame(job.stereo.as_ref(), rendered) else {
+            continue;
         };
         cache
             .lock()
@@ -524,6 +528,21 @@ fn run_worker(queue: &JobQueue<DecodeJob>, cache: &Mutex<FrameCache>, finished: 
             return;
         }
     }
+}
+
+// one eye waits for the other, None until both are in
+fn cached_frame(
+    stereo: Option<&StereoHalf>,
+    rendered: Result<Rgba8Frame, String>,
+) -> Option<CachedFrame> {
+    let rendered = match stereo {
+        Some(half) => half.pair.complete(half.eye, rendered)?,
+        None => rendered,
+    };
+    Some(match rendered {
+        Ok(frame) => CachedFrame::Decoded(Arc::new(frame)),
+        Err(reason) => CachedFrame::Failed(reason),
+    })
 }
 
 fn decode_job(
@@ -657,6 +676,7 @@ mod device {
         mxf: PathBuf,
         codestream: Vec<u8>,
         display: Arc<Display>,
+        stereo: Option<StereoHalf>,
     }
 
     struct RunningBatch {
@@ -893,6 +913,7 @@ mod device {
                 render: self.render,
                 mxf: self.mxf,
                 display: self.display,
+                stereo: self.stereo,
             }
         }
     }
@@ -936,6 +957,7 @@ mod device {
             mxf: job.mxf,
             codestream: job.codestream,
             display: job.display,
+            stereo: job.stereo,
         });
         state.in_flight.fetch_add(1, Ordering::AcqRel);
         unsafe {
@@ -970,20 +992,18 @@ mod device {
                     })
                     .map(|frame| Rgba8Frame::from_rgb8(&frame))
             };
-            let cached = match rendered {
-                Ok(frame) => {
-                    crate::grok_encoder::count_batch_accelerated_frame();
-                    CachedFrame::Decoded(Arc::new(frame))
-                }
-                Err(reason) => CachedFrame::Failed(reason),
-            };
-            state.cache.lock().unwrap().store(
-                context.generation,
-                context.frame_index,
-                context.reduce,
-                cached,
-            );
-            let _ = state.finished.send(Command::DecodeFinished);
+            if rendered.is_ok() {
+                crate::grok_encoder::count_batch_accelerated_frame();
+            }
+            if let Some(cached) = cached_frame(context.stereo.as_ref(), rendered) {
+                state.cache.lock().unwrap().store(
+                    context.generation,
+                    context.frame_index,
+                    context.reduce,
+                    cached,
+                );
+                let _ = state.finished.send(Command::DecodeFinished);
+            }
         }
         state.in_flight.fetch_sub(1, Ordering::AcqRel);
         state.returned.fetch_add(1, Ordering::AcqRel);
@@ -1023,6 +1043,7 @@ mod device {
             width: first.w,
             height: first.h,
             data,
+            eyes: EyeArrangement::Single,
         })
     }
 
@@ -1078,6 +1099,7 @@ mod tests {
             width,
             height: 1,
             data: vec![0; width as usize * RGBA_BYTES_PER_PIXEL],
+            eyes: EyeArrangement::Single,
         }))
     }
 
@@ -1338,6 +1360,7 @@ mod tests {
                 render,
                 mxf: PathBuf::from("run.j2c"),
                 display: Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new())),
+                stereo: None,
             });
         }
         for _ in 0..codestreams.len() {
@@ -1481,7 +1504,9 @@ mod tests {
         let mut timeline =
             super::super::timeline::Timeline::open(std::path::Path::new(&source), None, &[])
                 .expect("open");
-        let (codestream, render, mxf) = timeline.codestream(0).expect("frame 0");
+        let (codestream, render, mxf) = timeline
+            .codestream(0, super::super::timeline::StereoscopicPhase::Left)
+            .expect("frame 0");
         crate::grok_encoder::initialize(0);
         println!(
             "{}x{}, {} frames, frame 0 is {} bytes",
@@ -1639,6 +1664,7 @@ mod tests {
                 render: DisplayRender::DcpXyz,
                 mxf: PathBuf::from("run.j2c"),
                 display: Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new())),
+                stereo: None,
             });
         }
         done.recv_timeout(Duration::from_secs(60))
@@ -1668,7 +1694,9 @@ mod tests {
                     &[],
                 )
                 .expect("open");
-                let (codestream, render, _mxf) = timeline.codestream(0).expect("frame 0");
+                let (codestream, render, _mxf) = timeline
+                    .codestream(0, super::super::timeline::StereoscopicPhase::Left)
+                    .expect("frame 0");
                 (codestream, render)
             }
             Err(_) => (cinema_2k_codestream(), DisplayRender::DcpXyz),
@@ -1685,20 +1713,30 @@ mod tests {
             );
             Arc::new(Display::from_profile(Some(&path), Default::default()).unwrap())
         };
-        let sustain = |label: &str, display: &Arc<Display>| {
+        // a pair arrangement decodes the codestream as both eyes of every frame
+        let sustain = |label: &str, display: &Arc<Display>, pairs: Option<EyeArrangement>| {
+            use super::super::timeline::StereoscopicPhase;
             let (finished, _drain) = std::sync::mpsc::channel();
             let pool = DecodePool::start(finished);
             let start = std::time::Instant::now();
             for frame_index in 0..frames {
-                pool.submit(DecodeJob {
-                    generation: 0,
-                    frame_index,
-                    codestream: codestream.clone(),
-                    reduce: 0,
-                    render,
-                    mxf: std::path::PathBuf::from("bench.j2c"),
-                    display: display.clone(),
-                });
+                let pair = pairs.map(crate::grok_player::stereo::StereoPair::new);
+                let eyes = match pair {
+                    Some(_) => [StereoscopicPhase::Left, StereoscopicPhase::Right].as_slice(),
+                    None => [StereoscopicPhase::Left].as_slice(),
+                };
+                for eye in eyes {
+                    pool.submit(DecodeJob {
+                        generation: 0,
+                        frame_index,
+                        codestream: codestream.clone(),
+                        reduce: 0,
+                        render,
+                        mxf: std::path::PathBuf::from("bench.j2c"),
+                        display: display.clone(),
+                        stereo: pair.clone().map(|pair| StereoHalf { pair, eye: *eye }),
+                    });
+                }
             }
             let mut first_frame_after = None;
             while (pool.cached_frame_count() as u64) < frames {
@@ -1717,15 +1755,20 @@ mod tests {
             );
         };
         crate::grok_encoder::use_cpu();
-        sustain("cpu pool", &built_in);
+        sustain("cpu pool", &built_in, None);
+        sustain(
+            "cpu pool, both eyes side by side",
+            &built_in,
+            Some(EyeArrangement::SideBySide),
+        );
         #[cfg(feature = "icc")]
-        sustain("cpu pool, Display P3 profile", &display_p3);
+        sustain("cpu pool, Display P3 profile", &display_p3, None);
 
         #[cfg(feature = "grok-gpu")]
         match crate::grok_encoder::use_gpu_from_environment() {
             Ok(()) => {
                 let before = crate::grok_encoder::accelerated_frames();
-                sustain("device batch", &built_in);
+                sustain("device batch", &built_in, None);
                 println!(
                     "the device took {} of {frames} decodes",
                     crate::grok_encoder::accelerated_frames() - before
@@ -1733,12 +1776,23 @@ mod tests {
                 #[cfg(feature = "icc")]
                 {
                     let before = crate::grok_encoder::accelerated_frames();
-                    sustain("device batch, Display P3 profile", &display_p3);
+                    sustain("device batch, Display P3 profile", &display_p3, None);
                     println!(
                         "the device took {} of {frames} decodes",
                         crate::grok_encoder::accelerated_frames() - before
                     );
                 }
+                let before = crate::grok_encoder::accelerated_frames();
+                sustain(
+                    "device batch, both eyes side by side",
+                    &built_in,
+                    Some(EyeArrangement::SideBySide),
+                );
+                println!(
+                    "the device took {} of {} eye decodes",
+                    crate::grok_encoder::accelerated_frames() - before,
+                    frames * 2
+                );
                 crate::grok_encoder::use_cpu();
             }
             Err(reason) => println!("no device numbers: {reason}"),

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use asdcplib::crypto::{AesDecContext, HmacContext};
+pub(super) use asdcplib::jp2k::StereoscopicPhase;
 
 use super::FrameRange;
 use super::audio::{self, KeyedSoundSegment, PlayedFrames};
@@ -45,6 +46,8 @@ pub(super) struct Timeline {
     segment_starts: Vec<u64>,
     // the composition frame shown at position 0, past it frame_count frames play
     pub first_frame: u64,
+    // a reel carries a left and a right eye
+    pub stereoscopic: bool,
     pub frame_count: u64,
     pub fps: f64,
     pub width: u32,
@@ -143,6 +146,7 @@ impl Timeline {
         Ok(Timeline {
             segment_starts,
             first_frame: 0,
+            stereoscopic: opened.iter().any(|segment| segment.resolved.stereoscopic),
             frame_count,
             fps,
             width,
@@ -173,6 +177,7 @@ impl Timeline {
         Ok(Timeline {
             segment_starts: vec![0],
             first_frame: 0,
+            stereoscopic: false,
             frame_count,
             fps: CODESTREAM_DIRECTORY_FPS,
             width: header.width,
@@ -206,8 +211,12 @@ impl Timeline {
         }
     }
 
-    // frame counts from first_frame
-    pub fn codestream(&mut self, frame: u64) -> Result<(Vec<u8>, DisplayRender, PathBuf), String> {
+    // frame counts from first_frame, a mono reel reads the same codestream for either eye
+    pub fn codestream(
+        &mut self,
+        frame: u64,
+        eye: StereoscopicPhase,
+    ) -> Result<(Vec<u8>, DisplayRender, PathBuf), String> {
         let frame = frame + self.first_frame;
         match &mut self.frames {
             Frames::Codestreams { files, render } => {
@@ -222,9 +231,10 @@ impl Timeline {
                     .ok_or_else(|| format!("frame {frame} is past the end of the composition"))?;
                 let segment = &mut segments[index];
                 let local = (frame - self.segment_starts[index]) as u32 + segment.first_frame;
-                let codestream = preview::read_j2c_frame(
+                let codestream = preview::read_j2c_eye_frame(
                     &mut segment.reader,
                     local,
+                    eye,
                     segment.decrypt.as_mut(),
                     None,
                 )
@@ -255,19 +265,9 @@ fn open_segment(
     trim: Option<&composition_timeline::SegmentTrim>,
     keys: Option<&ContentKeys>,
 ) -> Result<Segment, String> {
-    if matches!(
-        asdcplib::essence_type(&path.to_string_lossy()),
-        Ok(asdcplib::EssenceType::Jpeg2000Stereo)
-    ) {
-        return Err(format!(
-            "{} is stereoscopic JPEG 2000 essence, which this player's mono reader cannot read",
-            path.display()
-        ));
-    }
     let resolved = preview::resolve_picture(path).map_err(|e| e.to_string())?;
     let (first_frame, frame_count) = trimmed_range(&resolved, trim);
-    let mut reader =
-        PictureReader::open(&resolved.mxf, resolved.as02).map_err(|e| e.to_string())?;
+    let mut reader = PictureReader::open_picture(&resolved).map_err(|e| e.to_string())?;
     let (mut decrypt, mut hmac) = picture_contexts(&mut reader, &resolved, keys)?.unzip();
     // the hmac on this one read fails a tampered frame at load
     let render = resolve_render(
@@ -377,7 +377,7 @@ pub(super) fn accepts(source: &Path, other_packages: &[PathBuf]) -> bool {
         return false;
     }
     match extension(source).as_deref() {
-        Some(MXF_EXTENSION) => preview::is_jpeg2000_mxf(source),
+        Some(MXF_EXTENSION) => is_picture_track(source),
         Some(CPL_EXTENSION) => composition_is_readable(source, other_packages),
         _ => false,
     }
@@ -388,8 +388,16 @@ fn composition_is_readable(source: &Path, other_packages: &[PathBuf]) -> bool {
         composition
             .pictures
             .first()
-            .is_some_and(|segment| preview::is_jpeg2000_mxf(&segment.path))
+            .is_some_and(|segment| is_picture_track(&segment.path))
     })
+}
+
+fn is_picture_track(path: &Path) -> bool {
+    preview::is_jpeg2000_mxf(path)
+        || matches!(
+            asdcplib::essence_type(&path.to_string_lossy()),
+            Ok(asdcplib::EssenceType::Jpeg2000Stereo)
+        )
 }
 
 fn extension(path: &Path) -> Option<String> {
@@ -459,7 +467,9 @@ pub(super) mod tests {
 
         let mut timeline = Timeline::open(&mxf, Some(&keys), &[]).unwrap();
         for (index, frame) in frames.iter().enumerate() {
-            let (codestream, render, _) = timeline.codestream(index as u64).unwrap();
+            let (codestream, render, _) = timeline
+                .codestream(index as u64, StereoscopicPhase::Left)
+                .unwrap();
             assert!(
                 codestream == *frame,
                 "frame {index} differs from its source"
@@ -602,6 +612,7 @@ pub(super) mod tests {
             mastering_display_max_luminance: None,
             descriptor_says_ycbcr: false,
             coding_equations: None,
+            stereoscopic: false,
         };
         let trim = composition_timeline::SegmentTrim {
             start_seconds: 1.0,

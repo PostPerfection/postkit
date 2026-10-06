@@ -3,6 +3,7 @@ mod compositor;
 mod decode_pool;
 mod presenter;
 mod scheduler;
+mod stereo;
 mod timeline;
 
 use std::cell::RefCell;
@@ -23,6 +24,7 @@ pub use presenter::{
     MAXIMUM_BRIGHTNESS, MINIMUM_BRIGHTNESS, PictureMasks, PictureRectangle, PictureScaling,
     PresentationSettings,
 };
+pub use stereo::StereoOutput;
 
 // the signature libmpv's mpv_opengl_init_params takes, declared here so this player needs no libmpv
 pub type GetProcAddressFn = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
@@ -85,6 +87,7 @@ struct Rgba8Frame {
     width: u32,
     height: u32,
     data: Vec<u8>,
+    eyes: stereo::EyeArrangement,
 }
 
 impl Rgba8Frame {
@@ -100,6 +103,7 @@ impl Rgba8Frame {
             width: picture.width,
             height: picture.height,
             data,
+            eyes: stereo::EyeArrangement::Single,
         }
     }
 }
@@ -114,6 +118,7 @@ struct ComposedFrame {
     width: u32,
     height: u32,
     pixels: ComposedPixels,
+    eyes: stereo::EyeArrangement,
 }
 
 impl ComposedFrame {
@@ -185,6 +190,8 @@ struct Status {
     decoder_fps: Option<f64>,
     container_fps: Option<f64>,
     eof: bool,
+    // the playing source has a left and a right eye
+    stereoscopic: bool,
     warnings: Vec<String>,
     source: Option<String>,
     queued_source: Option<String>,
@@ -204,6 +211,7 @@ enum Command {
     Step(i64),
     SetDecodeScale(DecodeScale),
     SetDisplay(Arc<crate::preview::Display>),
+    SetStereoOutput(StereoOutput),
     SetSubtitleFile(SubtitleSlot, Option<PathBuf>, Sender<Result<(), String>>),
     SetSubtitleVisibility(SubtitleSlot, bool),
     SetSubtitlePresentation(SubtitlePresentation),
@@ -327,7 +335,6 @@ impl GrokPlayer {
         }
     }
 
-    // stereoscopic essence is refused, the mono asdcplib reader cannot read it
     pub fn accepts(source: &Path) -> bool {
         timeline::accepts(source, &[])
     }
@@ -586,6 +593,11 @@ impl GrokPlayer {
         let _ = self.send(Command::SetDecodeScale(scale));
     }
 
+    // a stereoscopic source changes over as a decode scale change does, a mono source ignores it
+    pub fn set_stereo_output(&self, output: StereoOutput) {
+        let _ = self.send(Command::SetStereoOutput(output));
+    }
+
     // a monitor ICC profile for DCP X'Y'Z' pictures, None for the built-in sRGB
     pub fn set_display_profile(&self, profile: Option<&Path>) -> Result<(), String> {
         let display = crate::preview::Display::from_profile(profile, RenderingIntent::default())?;
@@ -689,7 +701,7 @@ impl Drop for GrokPlayer {
 
 fn status_json(status: &Status) -> String {
     format!(
-        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}, "warnings": [{}], "source": {}, "queued_source": {}}}"#,
+        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "container_fps": {}, "eof": {}, "stereoscopic": {}, "warnings": [{}], "source": {}, "queued_source": {}}}"#,
         json_number(status.position),
         json_number(status.duration),
         status.paused,
@@ -701,6 +713,7 @@ fn status_json(status: &Status) -> String {
         json_number(status.decoder_fps),
         json_number(status.container_fps),
         status.eof,
+        status.stereoscopic,
         status
             .warnings
             .iter()
@@ -740,6 +753,7 @@ mod tests {
         assert!(metadata.contains(r#""filename": null"#), "{metadata}");
         assert!(metadata.contains(r#""cache_seconds": null"#), "{metadata}");
         assert!(metadata.contains(r#""eof": false"#), "{metadata}");
+        assert!(metadata.contains(r#""stereoscopic": false"#), "{metadata}");
         assert!(metadata.contains(r#""warnings": []"#), "{metadata}");
         assert!(metadata.contains(r#""source": null"#), "{metadata}");
         assert!(metadata.contains(r#""queued_source": null"#), "{metadata}");
@@ -756,7 +770,7 @@ mod tests {
                 .expect("metadata is JSON")
                 .as_object()
                 .map(|fields| fields.len()),
-            Some(15)
+            Some(16)
         );
     }
 
