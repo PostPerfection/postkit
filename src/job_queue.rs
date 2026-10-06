@@ -244,14 +244,16 @@ impl<C: QueueJob> JobQueue<C> {
 
     fn record(&self, state: JobState, message: &str, job: &C) {
         record(&self.jobs_file, state, message, job);
-        if state != JobState::Queued && state != JobState::Running {
-            self.history.lock().unwrap().push(finished_job_info(
-                job.id(),
-                job.title().to_string(),
-                state,
-                message.to_string(),
-            ));
-        }
+    }
+
+    /// Put a finished job in the history, under the lock `snapshot` holds.
+    fn record_finished(&self, history: &mut Vec<JobInfo>, state: JobState, message: &str, job: &C) {
+        history.push(finished_job_info(
+            job.id(),
+            job.title().to_string(),
+            state,
+            message.to_string(),
+        ));
     }
 
     /// The id the next job gets. Taken before the job config is built, so a
@@ -273,6 +275,7 @@ impl<C: QueueJob> JobQueue<C> {
     /// Flag the running job, or drop a queued one and record it cancelled.
     /// False when no job has that id.
     pub fn cancel(&self, id: u64) -> bool {
+        let mut history = self.history.lock().unwrap();
         if self.current_id.load(Ordering::Relaxed) == id {
             // the slot still names a finished job until the worker clears it
             let state = *self.current_state.lock().unwrap();
@@ -287,13 +290,13 @@ impl<C: QueueJob> JobQueue<C> {
             let at = queue.iter().position(|job| job.id() == id);
             at.and_then(|at| queue.remove(at))
         };
-        match cancelled {
-            Some(job) => {
-                self.record(JobState::Cancelled, "", &job);
-                true
-            }
-            None => false,
-        }
+        let Some(job) = cancelled else {
+            return false;
+        };
+        self.record_finished(&mut history, JobState::Cancelled, "", &job);
+        drop(history);
+        self.record(JobState::Cancelled, "", &job);
+        true
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -328,6 +331,8 @@ impl<C: QueueJob> JobQueue<C> {
         if self.closing.load(Ordering::Relaxed) {
             return None;
         }
+        // the move from the queue to the slot happens under the list lock
+        let _listed = self.history.lock().unwrap();
         let job = self.queue.lock().unwrap().pop_front()?;
         self.current_id.store(job.id(), Ordering::Relaxed);
         *self.current_title.lock().unwrap() = job.title().to_string();
@@ -350,7 +355,11 @@ impl<C: QueueJob> JobQueue<C> {
 
     /// Record the state the job ended at and put it in the history.
     pub fn finish(&self, job: &C, state: JobState, message: &str) {
+        // the history takes the job before the slot stops listing it
+        let mut history = self.history.lock().unwrap();
+        self.record_finished(&mut history, state, message, job);
         *self.current_state.lock().unwrap() = state;
+        drop(history);
         self.record(state, message, job);
     }
 
@@ -371,7 +380,12 @@ impl<C: QueueJob> JobQueue<C> {
     // exiting with encoder threads still compressing crashes in grok's teardown
     pub fn stop_for_exit(&self) {
         self.closing.store(true, Ordering::Relaxed);
+        let mut history = self.history.lock().unwrap();
         let queued: Vec<C> = self.queue.lock().unwrap().drain(..).collect();
+        for job in &queued {
+            self.record_finished(&mut history, JobState::Cancelled, "", job);
+        }
+        drop(history);
         for job in &queued {
             self.record(JobState::Cancelled, "", job);
         }
@@ -396,6 +410,9 @@ impl<C: QueueJob> JobQueue<C> {
     /// then the finished ones newest first.
     pub fn snapshot(&self) -> Vec<JobInfo> {
         let mut jobs = Vec::new();
+        // held while the slot and the queue are read, so a job moving to the
+        // history is in exactly one of the three
+        let history = self.history.lock().unwrap();
 
         let current_id = self.current_id.load(Ordering::Relaxed);
         let state = *self.current_state.lock().unwrap();
@@ -421,7 +438,7 @@ impl<C: QueueJob> JobQueue<C> {
             });
         }
 
-        jobs.extend(self.history.lock().unwrap().iter().rev().cloned());
+        jobs.extend(history.iter().rev().cloned());
         jobs
     }
 
@@ -434,8 +451,8 @@ impl<C: QueueJob> JobQueue<C> {
     /// when the queue worker next runs, as a queued job always has.
     pub fn load_jobs_file(&self) -> usize {
         let loaded = load::<C>(&self.jobs_file);
-        let mut queue = self.queue.lock().unwrap();
         let mut history = self.history.lock().unwrap();
+        let mut queue = self.queue.lock().unwrap();
         let mut highest_id = 0;
         for stored in loaded.jobs {
             highest_id = highest_id.max(stored.config.id());
@@ -754,5 +771,81 @@ mod tests {
         assert!(!queue.cancel(job.id));
         assert!(!queue.is_cancelled());
         assert_eq!(queue.get(job.id).unwrap().state, JobState::Completed);
+    }
+
+    #[test]
+    fn a_job_is_listed_at_every_moment_of_its_life() {
+        const JOBS: u64 = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(JobQueue::new(dir.path().join("gui-jobs.jsonl")));
+        for id in 1..=JOBS {
+            let mut job = test_job();
+            job.id = id;
+            queue.submit(job);
+        }
+
+        let worker = std::thread::spawn({
+            let queue = queue.clone();
+            move || {
+                while let Some(job) = queue.take_next() {
+                    queue.start(&job);
+                    let state = if job.id % 2 == 0 {
+                        JobState::Completed
+                    } else {
+                        JobState::Failed
+                    };
+                    queue.finish(&job, state, "ended");
+                    queue.clear_current();
+                }
+            }
+        });
+
+        for id in 1..=JOBS {
+            loop {
+                let job = queue
+                    .get(id)
+                    .unwrap_or_else(|| panic!("job {id} vanished from the list"));
+                if job.state != JobState::Queued && job.state != JobState::Running {
+                    assert_eq!(job.message, "ended");
+                    break;
+                }
+            }
+        }
+        worker.join().unwrap();
+        assert_eq!(queue.snapshot().len() as u64, JOBS);
+    }
+
+    #[test]
+    fn a_cancelled_queued_job_is_listed_at_every_moment() {
+        const JOBS: u64 = 200;
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Arc::new(JobQueue::new(dir.path().join("gui-jobs.jsonl")));
+        for id in 1..=JOBS {
+            let mut job = test_job();
+            job.id = id;
+            queue.submit(job);
+        }
+
+        let canceller = std::thread::spawn({
+            let queue = queue.clone();
+            move || {
+                for id in 1..=JOBS {
+                    assert!(queue.cancel(id));
+                }
+            }
+        });
+
+        for id in 1..=JOBS {
+            loop {
+                let job = queue
+                    .get(id)
+                    .unwrap_or_else(|| panic!("job {id} vanished from the list"));
+                if job.state == JobState::Cancelled {
+                    break;
+                }
+            }
+        }
+        canceller.join().unwrap();
+        assert_eq!(queue.snapshot().len() as u64, JOBS);
     }
 }
