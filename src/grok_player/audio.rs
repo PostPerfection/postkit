@@ -156,6 +156,8 @@ enum Command {
 struct SoundComposition {
     reels: Vec<SoundReel>,
     fps: f64,
+    // the composition frame of sound frame 0, past a range's in frame
+    first_frame: u64,
     // the picture's length, the sound is cut or padded with silence to it
     frame_count: u64,
 }
@@ -173,6 +175,7 @@ impl SoundComposition {
         SoundComposition {
             reels: reels_within(reels_of(segments, frames.fps), frames),
             fps: frames.fps,
+            first_frame: frames.first_frame,
             frame_count: frames.frame_count,
         }
     }
@@ -181,6 +184,7 @@ impl SoundComposition {
         SoundComposition {
             reels: Vec::new(),
             fps: 0.0,
+            first_frame: 0,
             frame_count: 0,
         }
     }
@@ -842,6 +846,7 @@ impl Feeder {
         self.next_frame = to_next_frames(self.next_frame as f64).round().max(0.0) as u64;
         self.skipped_source_sample_frames = 0;
         self.finished = Some(finished);
+        self.log_start("the queued composition follows on");
         true
     }
 
@@ -920,9 +925,26 @@ impl Feeder {
         self.next_frame = start.edit_unit;
         self.skipped_source_sample_frames = start.skipped_source_sample_frames;
         let silence = start.leading_silence_sample_frames * self.shared.output_channels();
-        let mut buffer = self.shared.buffer.lock().unwrap();
-        buffer.clear();
-        buffer.extend(std::iter::repeat_n(0.0, silence));
+        {
+            let mut buffer = self.shared.buffer.lock().unwrap();
+            buffer.clear();
+            buffer.extend(std::iter::repeat_n(0.0, silence));
+        }
+        self.log_start("starts");
+    }
+
+    fn log_start(&self, how: &str) {
+        if self.current.fps <= 0.0 {
+            return;
+        }
+        let frame = self.current.first_frame + self.next_frame;
+        let sample = (frame as f64 * f64::from(self.pcm_sample_rate) / self.current.fps).round()
+            as u64
+            + self.skipped_source_sample_frames as u64;
+        eprintln!(
+            "[preview] sound: {how} at composition frame {frame}, sample {sample} of {} Hz",
+            self.pcm_sample_rate
+        );
     }
 
     fn stop(&mut self) {
@@ -2129,6 +2151,7 @@ mod tests {
         SoundComposition {
             reels: reels_of(segments, COMPOSITION_FPS),
             fps: COMPOSITION_FPS,
+            first_frame: 0,
             frame_count,
         }
     }
