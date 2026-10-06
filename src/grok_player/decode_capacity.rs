@@ -3,8 +3,6 @@ use std::time::Instant;
 
 // a reading averages this many recent decodes
 const SAMPLE_WINDOW: usize = 32;
-// and reads nothing from fewer
-const FEWEST_SAMPLES: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecodePath {
@@ -33,8 +31,8 @@ fn push_recent(samples: &mut VecDeque<f64>, seconds: f64) {
     }
 }
 
-fn mean(samples: &VecDeque<f64>) -> Option<f64> {
-    if samples.len() < FEWEST_SAMPLES {
+fn mean(samples: &VecDeque<f64>, fewest: usize) -> Option<f64> {
+    if samples.len() < fewest {
         return None;
     }
     Some(samples.iter().sum::<f64>() / samples.len() as f64)
@@ -91,11 +89,13 @@ impl DecodeCapacity {
     }
 
     pub fn frames_per_second(&self) -> Option<f64> {
+        // one decode per worker, which refilling the lookahead window of two per worker always gives
+        let fewest = self.workers;
         match self.latest? {
-            DecodePath::Cpu => mean(&self.cpu_frame_seconds)
+            DecodePath::Cpu => mean(&self.cpu_frame_seconds, fewest)
                 .filter(|seconds| *seconds > 0.0)
                 .map(|seconds| self.workers as f64 / seconds),
-            DecodePath::Device => mean(&self.device_frame_seconds)
+            DecodePath::Device => mean(&self.device_frame_seconds, fewest)
                 .filter(|seconds| *seconds > 0.0)
                 .map(|seconds| 1.0 / seconds),
         }
@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn nothing_reads_until_enough_decodes_are_timed() {
         let mut capacity = DecodeCapacity::new(WORKERS);
-        for _ in 1..FEWEST_SAMPLES {
+        for _ in 1..WORKERS {
             capacity.record_cpu(0, 0.1, 1);
         }
         assert_eq!(capacity.frames_per_second(), None);
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn both_eyes_of_a_frame_halve_the_reading() {
         let mut capacity = DecodeCapacity::new(WORKERS);
-        for _ in 0..FEWEST_SAMPLES {
+        for _ in 0..WORKERS {
             capacity.record_cpu(0, 0.1, 2);
         }
         assert_eq!(capacity.frames_per_second(), Some(20.0));
@@ -132,12 +132,12 @@ mod tests {
     #[test]
     fn a_restart_drops_the_old_readings_and_late_old_results() {
         let mut capacity = DecodeCapacity::new(WORKERS);
-        for _ in 0..FEWEST_SAMPLES {
+        for _ in 0..WORKERS {
             capacity.record_cpu(1, 0.1, 1);
         }
         capacity.restart(2);
         assert_eq!(capacity.frames_per_second(), None);
-        for _ in 0..FEWEST_SAMPLES {
+        for _ in 0..WORKERS {
             capacity.record_cpu(1, 1.0, 1);
             capacity.record_cpu(2, 0.05, 1);
         }
@@ -152,7 +152,7 @@ mod tests {
         // a starved stretch, then results 25 ms apart with work waiting
         capacity.record_device_return(0, at(0), 1, false);
         capacity.record_device_return(0, at(500), 1, true);
-        for result in 1..=FEWEST_SAMPLES as u64 {
+        for result in 1..=WORKERS as u64 {
             capacity.record_device_return(0, at(500 + result * 25), 1, true);
         }
         let reading = capacity.frames_per_second().expect("a device reading");
