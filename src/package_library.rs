@@ -1,5 +1,7 @@
+use crate::composition_timeline::element_blocks;
 use crate::cpl_xml::{is_composition_playlist, read_prefixed_tag, strip_urn_uuid};
-use crate::packaging::ns::{CPL_INTEROP, CPL_SMPTE};
+use crate::packaging::ns::{CPL_IMF, CPL_INTEROP, CPL_SMPTE};
+use crate::preview_colour::{DisplayPrimaries, DisplayTransfer};
 use quick_xml::NsReader;
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
@@ -10,6 +12,19 @@ const SCAN_DEPTH_LIMIT: usize = 4;
 const CPL_EXTENSION: &str = "xml";
 const ID_ELEMENT: &str = "Id";
 const CONTENT_TITLE_ELEMENT: &str = "ContentTitleText";
+const IMF_CONTENT_TITLE_ELEMENT: &str = "ContentTitle";
+const SEGMENT_LIST_ELEMENT: &str = "<SegmentList";
+const IMAGE_SEQUENCE_ELEMENT: &str = "MainImageSequence";
+const RESOURCE_ELEMENT: &str = "Resource";
+const SOURCE_DURATION_ELEMENT: &str = "SourceDuration";
+const REPEAT_COUNT_ELEMENT: &str = "RepeatCount";
+const TRACK_FILE_ID_ELEMENT: &str = "TrackFileId";
+const SOURCE_ENCODING_ELEMENT: &str = "SourceEncoding";
+const ESSENCE_DESCRIPTOR_ELEMENT: &str = "EssenceDescriptor";
+const APPLICATION_IDENTIFICATION_ELEMENT: &str = "ApplicationIdentification";
+const COLOR_PRIMARIES_ELEMENT: &str = "ColorPrimaries";
+const TRANSFER_CHARACTERISTIC_ELEMENT: &str = "TransferCharacteristic";
+const UL_URN_PREFIX: &str = "urn:smpte:ul:";
 const DURATION_ELEMENT: &str = "Duration";
 const INTRINSIC_DURATION_ELEMENT: &str = "IntrinsicDuration";
 const ENTRY_POINT_ELEMENT: &str = "EntryPoint";
@@ -23,11 +38,21 @@ fn picture_asset_pattern() -> String {
     format!(r"(?s)<{PREFIX}{PICTURE}[\s>].*?</{PREFIX}{PICTURE}>")
 }
 
-/// The DCP standard a CPL is written to, told apart by its root element's namespace.
+/// The specification a CPL is written to, told apart by its root element's
+/// namespace: a DCP's Interop or SMPTE, or an IMF composition (ST 2067-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Standard {
     Interop,
     Smpte,
+    Imf,
+}
+
+// a colour is None when the descriptor signals none or a label preview_colour cannot read
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImfPicture {
+    pub application_identification: Option<String>,
+    pub colour_primaries: Option<DisplayPrimaries>,
+    pub transfer_characteristic: Option<DisplayTransfer>,
 }
 
 /// One composition a package holds, read from its CPL alone.
@@ -38,6 +63,8 @@ pub struct CompositionEntry {
     pub duration_frames: u64,
     pub edit_rate: (u32, u32),
     pub encrypted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imf_picture: Option<ImfPicture>,
 }
 
 /// A package directory and the compositions its CPLs describe, titled after the first one.
@@ -123,7 +150,9 @@ fn collect_packages(directory: &Path, depth: usize, packages: &mut Vec<PathBuf>)
 }
 
 /// The package in `directory` as its asset map and CPLs describe it, in asset map order.
-/// No track file is opened. A directory with no CPL is an error naming the directory.
+/// No DCP track file is opened. An IMF composition's first picture track file in the
+/// package has its header read, since only the track file says it is encrypted. A
+/// directory with no CPL is an error naming the directory.
 pub fn read_package(directory: &Path) -> Result<PackageEntry, String> {
     let assetmap = crate::assetmap::find(directory)
         .ok_or_else(|| format!("{}: no asset map", directory.display()))?;
@@ -142,8 +171,8 @@ pub fn read_package(directory: &Path) -> Result<PackageEntry, String> {
         if !is_composition_playlist(&text) {
             continue;
         }
-        let (cpl_standard, composition) =
-            read_composition(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+        let (cpl_standard, composition) = read_composition(&text, directory)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         standard.get_or_insert(cpl_standard);
         compositions.push(composition);
     }
@@ -158,8 +187,16 @@ pub fn read_package(directory: &Path) -> Result<PackageEntry, String> {
     })
 }
 
-fn read_composition(cpl: &str) -> Result<(Standard, CompositionEntry), String> {
+fn read_composition(cpl: &str, directory: &Path) -> Result<(Standard, CompositionEntry), String> {
     let standard = cpl_standard(cpl)?;
+    let composition = match standard {
+        Standard::Imf => read_imf_composition(cpl, directory)?,
+        Standard::Interop | Standard::Smpte => read_dcp_composition(cpl)?,
+    };
+    Ok((standard, composition))
+}
+
+fn read_dcp_composition(cpl: &str) -> Result<CompositionEntry, String> {
     let id_text = read_prefixed_tag(cpl, ID_ELEMENT).ok_or("no Id")?;
     let id = uuid::Uuid::parse_str(strip_urn_uuid(&id_text))
         .map_err(|error| format!("Id {id_text}: {error}"))?;
@@ -186,16 +223,117 @@ fn read_composition(cpl: &str) -> Result<(Standard, CompositionEntry), String> {
     let encrypted = regex::Regex::new(KEY_ID_PATTERN)
         .map_err(|error| error.to_string())?
         .is_match(cpl);
-    Ok((
-        standard,
-        CompositionEntry {
-            id,
-            title,
-            duration_frames,
-            edit_rate,
-            encrypted,
-        },
-    ))
+    Ok(CompositionEntry {
+        id,
+        title,
+        duration_frames,
+        edit_rate,
+        encrypted,
+        imf_picture: None,
+    })
+}
+
+fn read_imf_composition(cpl: &str, directory: &Path) -> Result<CompositionEntry, String> {
+    let id = read_id(cpl)?;
+    let stated_title =
+        read_prefixed_tag(cpl, IMF_CONTENT_TITLE_ELEMENT).ok_or("no ContentTitle")?;
+    let title = quick_xml::escape::unescape(&stated_title)
+        .map_err(|error| format!("ContentTitle: {error}"))?
+        .into_owned();
+    // the segments hold resource EditRates, the composition's is stated before them
+    let head = cpl.split(SEGMENT_LIST_ELEMENT).next().unwrap_or(cpl);
+    let edit_rate = read_prefixed_tag(head, EDIT_RATE_ELEMENT)
+        .ok_or("no EditRate")
+        .and_then(|text| parse_edit_rate(&text).ok_or("EditRate is not two numbers"))?;
+    let resources: Vec<&str> = element_blocks(cpl, IMAGE_SEQUENCE_ELEMENT)
+        .into_iter()
+        .flat_map(|sequence| element_blocks(sequence, RESOURCE_ELEMENT))
+        .collect();
+    let first_resource = resources.first().ok_or("no MainImageSequence resource")?;
+    let mut duration_frames = 0;
+    for (index, resource) in resources.iter().enumerate() {
+        duration_frames += resource_duration(resource).ok_or_else(|| {
+            format!(
+                "MainImageSequence resource {} has no SourceDuration",
+                index + 1
+            )
+        })?;
+    }
+    let encrypted = picture_track_encrypted(first_resource, directory)?;
+    Ok(CompositionEntry {
+        id,
+        title,
+        duration_frames,
+        edit_rate,
+        encrypted,
+        imf_picture: Some(imf_picture(cpl, first_resource)),
+    })
+}
+
+fn read_id(cpl: &str) -> Result<uuid::Uuid, String> {
+    let id_text = read_prefixed_tag(cpl, ID_ELEMENT).ok_or("no Id")?;
+    uuid::Uuid::parse_str(strip_urn_uuid(&id_text))
+        .map_err(|error| format!("Id {id_text}: {error}"))
+}
+
+// ST 2067-3 plays a resource RepeatCount times
+fn resource_duration(resource: &str) -> Option<u64> {
+    let once = element_number(resource, SOURCE_DURATION_ELEMENT).or_else(|| {
+        let intrinsic = element_number(resource, INTRINSIC_DURATION_ELEMENT)?;
+        intrinsic.checked_sub(element_number(resource, ENTRY_POINT_ELEMENT).unwrap_or(0))
+    })?;
+    Some(once * element_number(resource, REPEAT_COUNT_ELEMENT).unwrap_or(1))
+}
+
+// a supplemental package may hold none of its pictures, which leaves it read as clear
+fn picture_track_encrypted(resource: &str, directory: &Path) -> Result<bool, String> {
+    let track_file_id = read_prefixed_tag(resource, TRACK_FILE_ID_ELEMENT)
+        .ok_or("a MainImageSequence resource has no TrackFileId")?;
+    let Some(track_file) = crate::assetmap::resolve(directory, strip_urn_uuid(&track_file_id))
+    else {
+        return Ok(false);
+    };
+    let picture =
+        crate::preview::resolve_picture(&track_file).map_err(|error| error.to_string())?;
+    if !picture.as02 {
+        return Err(format!(
+            "{} is an AS-DCP track file, which an IMF composition cannot name",
+            track_file.display()
+        ));
+    }
+    Ok(picture.encrypted)
+}
+
+fn imf_picture(cpl: &str, first_resource: &str) -> ImfPicture {
+    let source_encoding = read_prefixed_tag(first_resource, SOURCE_ENCODING_ELEMENT);
+    let descriptor = element_blocks(cpl, ESSENCE_DESCRIPTOR_ELEMENT)
+        .into_iter()
+        .find(|descriptor| read_prefixed_tag(descriptor, ID_ELEMENT) == source_encoding);
+    let label = |element: &str| {
+        descriptor
+            .and_then(|descriptor| read_prefixed_tag(descriptor, element))
+            .and_then(|text| parse_ul(&text))
+    };
+    ImfPicture {
+        application_identification: read_prefixed_tag(cpl, APPLICATION_IDENTIFICATION_ELEMENT),
+        colour_primaries: label(COLOR_PRIMARIES_ELEMENT)
+            .and_then(crate::preview_colour::primaries_of_label),
+        transfer_characteristic: label(TRANSFER_CHARACTERISTIC_ELEMENT)
+            .and_then(crate::preview_colour::transfer_of_label),
+    }
+}
+
+// urn:smpte:ul:060e2b34.04010101.04010101.01020000
+fn parse_ul(text: &str) -> Option<[u8; 16]> {
+    let digits: String = text.strip_prefix(UL_URN_PREFIX)?.split('.').collect();
+    let mut ul = [0u8; 16];
+    if digits.len() != ul.len() * 2 {
+        return None;
+    }
+    for (index, byte) in ul.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(digits.get(index * 2..index * 2 + 2)?, 16).ok()?;
+    }
+    Some(ul)
 }
 
 fn cpl_standard(cpl: &str) -> Result<Standard, String> {
@@ -203,8 +341,9 @@ fn cpl_standard(cpl: &str) -> Result<Standard, String> {
     match namespace.as_str() {
         CPL_INTEROP => Ok(Standard::Interop),
         CPL_SMPTE => Ok(Standard::Smpte),
+        CPL_IMF => Ok(Standard::Imf),
         other => Err(format!(
-            "CompositionPlaylist namespace {other} is not a DCP CPL"
+            "CompositionPlaylist namespace {other} is neither a DCP nor an IMF CPL"
         )),
     }
 }
@@ -563,6 +702,7 @@ mod tests {
                         duration_frames: 840,
                         edit_rate: (24, 1),
                         encrypted: false,
+                        imf_picture: None,
                     },
                     CompositionEntry {
                         id: uuid(TRAILER_ID),
@@ -570,10 +710,62 @@ mod tests {
                         duration_frames: 250,
                         edit_rate: (25, 1),
                         encrypted: true,
+                        imf_picture: None,
                     },
                 ],
             }
         );
+    }
+
+    #[test]
+    fn an_imp_reads_as_imf_with_its_app2e_picture() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::imp_fixture::write_imp(directory.path(), false);
+
+        let package = read_package(directory.path()).unwrap();
+
+        assert_eq!(package.standard, Standard::Imf);
+        assert_eq!(
+            package.compositions,
+            vec![CompositionEntry {
+                id: uuid(crate::imp_fixture::CPL_ID),
+                title: crate::imp_fixture::TITLE.into(),
+                duration_frames: crate::imp_fixture::FRAMES,
+                edit_rate: crate::imp_fixture::EDIT_RATE,
+                encrypted: false,
+                imf_picture: Some(ImfPicture {
+                    application_identification: Some(ns::APP2E_2020.into()),
+                    colour_primaries: Some(DisplayPrimaries::Bt709),
+                    transfer_characteristic: Some(DisplayTransfer::Bt709),
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_imp_with_an_encrypted_picture_reads_as_encrypted() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::imp_fixture::write_imp(directory.path(), true);
+
+        let package = read_package(directory.path()).unwrap();
+
+        assert!(package.compositions[0].encrypted);
+    }
+
+    #[test]
+    fn an_imf_cpl_naming_an_as_dcp_picture_is_refused_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        crate::imp_fixture::write_imp(directory.path(), false);
+        let scratch = tempfile::tempdir().unwrap();
+        let (frames, _) = crate::mxf_unwrap::tests::write_frames(scratch.path(), "dcp");
+        let picture = directory.path().join("VIDEO.mxf");
+        std::fs::remove_file(&picture).unwrap();
+        crate::mxf_unwrap::tests::wrap(frames, picture.clone(), None);
+
+        let error = read_package(directory.path()).unwrap_err();
+
+        assert!(error.contains(&picture.display().to_string()), "{error}");
+        assert!(error.contains("AS-DCP"), "{error}");
     }
 
     #[test]
@@ -630,6 +822,7 @@ mod tests {
                 duration_frames: 48,
                 edit_rate: (48, 1),
                 encrypted: false,
+                imf_picture: None,
             }]
         );
     }

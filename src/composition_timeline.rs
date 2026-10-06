@@ -25,12 +25,14 @@ pub struct PictureSegment {
     pub trim: Option<SegmentTrim>,
 }
 
-/// A MainSound track file as the composition plays it, same span rules as
+/// A sound track file as the composition plays it, same span rules as
 /// picture so the two stay on one clock.
 #[derive(Debug, PartialEq)]
 pub struct SoundSegment {
     pub path: PathBuf,
     pub trim: Option<SegmentTrim>,
+    // an AS-02 clip is read in edit units of this, a DCP reel's sound is wrapped a picture frame an edit unit
+    pub edit_rate: Option<(i32, i32)>,
 }
 
 /// Seconds into the file and seconds of it. Length is None when the CPL states
@@ -48,10 +50,11 @@ pub struct Composition {
     pub title: Option<String>,
 }
 
-/// A picture the CPL names, as the id to look up and the span to play.
-struct PictureReference {
+/// A track file the CPL names, as the id to look up and the span to play.
+struct TrackFileReference {
     asset_id: String,
     trim: Option<SegmentTrim>,
+    edit_rate: Option<(i32, i32)>,
 }
 
 /// The mpv source that plays every reel of the composition in `package_dir`.
@@ -112,15 +115,26 @@ pub fn resolve_composition(
     };
     let pictures = located(picture_references(&cpl), &paths_by_id)
         .into_iter()
-        .map(|found| found.map(|(path, trim)| PictureSegment { path, trim }))
+        .map(|found| {
+            found.map(|(path, reference)| PictureSegment {
+                path,
+                trim: reference.trim,
+            })
+        })
         .collect::<Result<Vec<_>, String>>()
         .map_err(missing_asset_error)?;
     if pictures.is_empty() {
         return Err(format!("{} names no picture", source.display()));
     }
-    let sound = located(reel_asset_references(&cpl, "MainSound"), &paths_by_id)
+    let sound = located(sound_references(&cpl), &paths_by_id)
         .into_iter()
-        .map(|found| found.map(|(path, trim)| SoundSegment { path, trim }))
+        .map(|found| {
+            found.map(|(path, reference)| SoundSegment {
+                path,
+                trim: reference.trim,
+                edit_rate: reference.edit_rate,
+            })
+        })
         .collect::<Result<Vec<_>, String>>()
         .map_err(missing_asset_error)?;
     Ok(Composition {
@@ -139,7 +153,7 @@ pub fn find_original_version_packages(
     let own_assets = asset_paths(std::slice::from_ref(&package_dir))?;
     let mut missing: Vec<String> = picture_references(&cpl)
         .into_iter()
-        .chain(reel_asset_references(&cpl, "MainSound"))
+        .chain(sound_references(&cpl))
         .map(|reference| reference.asset_id)
         .filter(|asset_id| !own_assets.contains_key(asset_id))
         .collect();
@@ -204,13 +218,13 @@ fn asset_paths(packages: &[PathBuf]) -> Result<HashMap<String, PathBuf>, String>
 
 // each reference's file, or the id no package holds
 fn located(
-    references: Vec<PictureReference>,
+    references: Vec<TrackFileReference>,
     paths_by_id: &HashMap<String, PathBuf>,
-) -> Vec<Result<(PathBuf, Option<SegmentTrim>), String>> {
+) -> Vec<Result<(PathBuf, TrackFileReference), String>> {
     references
         .into_iter()
         .map(|reference| match paths_by_id.get(&reference.asset_id) {
-            Some(path) => Ok((path.clone(), reference.trim)),
+            Some(path) => Ok((path.clone(), reference)),
             None => Err(reference.asset_id),
         })
         .collect()
@@ -226,7 +240,7 @@ fn segments_of(package_dir: &Path, assets: &[(String, String)], cpl: &str) -> Ve
 fn resolve_segments(
     package_dir: &Path,
     assets: &[(String, String)],
-    references: Vec<PictureReference>,
+    references: Vec<TrackFileReference>,
 ) -> Vec<(PathBuf, Option<SegmentTrim>)> {
     let paths_by_id: HashMap<String, PathBuf> = assets
         .iter()
@@ -235,6 +249,7 @@ fn resolve_segments(
     located(references, &paths_by_id)
         .into_iter()
         .filter_map(Result::ok)
+        .map(|(path, reference)| (path, reference.trim))
         .collect()
 }
 
@@ -258,46 +273,64 @@ fn first_cpl(package_dir: &Path, assets: &[(String, String)]) -> Option<String> 
 /// Every picture the CPL names, in composition order: a DCP CPL's reel
 /// MainPicture ids (ST 429-7), or an IMF CPL's MainImageSequence resource
 /// TrackFileIds (ST 2067-3).
-fn picture_references(cpl: &str) -> Vec<PictureReference> {
+fn picture_references(cpl: &str) -> Vec<TrackFileReference> {
     let reel_pictures = main_picture_references(cpl);
     if reel_pictures.is_empty() {
-        return image_resource_references(cpl);
+        return sequence_resource_references(cpl, "MainImageSequence");
     }
     reel_pictures
 }
 
+// an IMF CPL's other audio tracks are other languages or mixes of the same picture
+fn sound_references(cpl: &str) -> Vec<TrackFileReference> {
+    let reel_sound = reel_asset_references(cpl, "MainSound");
+    if reel_sound.is_empty() {
+        return sequence_resource_references(cpl, "MainAudioSequence");
+    }
+    reel_sound
+}
+
 /// One MainPicture per reel, so a single forward scan gives reel order.
-fn main_picture_references(cpl: &str) -> Vec<PictureReference> {
+fn main_picture_references(cpl: &str) -> Vec<TrackFileReference> {
     reel_asset_references(cpl, crate::cpl_xml::MAIN_PICTURE_ELEMENT_PATTERN)
 }
 
 /// One named reel asset per reel (MainPicture, MainSound), in reel order.
-fn reel_asset_references(cpl: &str, name: &str) -> Vec<PictureReference> {
+fn reel_asset_references(cpl: &str, name: &str) -> Vec<TrackFileReference> {
     element_blocks(cpl, name)
         .into_iter()
         .filter_map(|block| {
-            Some(PictureReference {
+            Some(TrackFileReference {
                 asset_id: uuid_in(block, "Id")?,
                 trim: segment_trim(block, "Duration", None),
+                edit_rate: None,
             })
         })
         .collect()
 }
 
-/// An image sequence may list several resources, so the sequence blocks come
-/// first and the track files are read inside each one. A resource without its
-/// own EditRate plays at the composition's.
-fn image_resource_references(cpl: &str) -> Vec<PictureReference> {
-    let composition_rate = read_prefixed_tag(cpl, "EditRate")
-        .as_deref()
-        .and_then(seconds_per_edit_unit);
-    element_blocks(cpl, "MainImageSequence")
+/// A sequence may list several resources, so the sequence blocks come first
+/// and the track files are read inside each one. Only the sequences on the
+/// first sequence's TrackId are read, one track through every segment. A
+/// resource without its own EditRate plays at the composition's.
+fn sequence_resource_references(cpl: &str, sequence_name: &str) -> Vec<TrackFileReference> {
+    let composition_edit_rate = read_prefixed_tag(cpl, "EditRate");
+    let sequences = element_blocks(cpl, sequence_name);
+    let first_track = sequences
+        .first()
+        .and_then(|sequence| uuid_in(sequence, "TrackId"));
+    sequences
         .into_iter()
+        .filter(|sequence| uuid_in(sequence, "TrackId") == first_track)
         .flat_map(|sequence| element_blocks(sequence, "Resource"))
         .filter_map(|resource| {
-            Some(PictureReference {
+            let edit_rate =
+                read_prefixed_tag(resource, "EditRate").or_else(|| composition_edit_rate.clone());
+            let seconds_per_unit = edit_rate.as_deref().and_then(seconds_per_edit_unit);
+            Some(TrackFileReference {
                 asset_id: uuid_in(resource, "TrackFileId")?,
-                trim: segment_trim(resource, "SourceDuration", composition_rate),
+                trim: segment_trim(resource, "SourceDuration", seconds_per_unit),
+                edit_rate: edit_rate.as_deref().and_then(edit_rate_numbers),
             })
         })
         .collect()
@@ -346,7 +379,7 @@ fn composition_title(cpl: &str) -> Option<String> {
 /// Each `name` element of `xml`, bounded by its own close tag and never running
 /// past the next one that opens, so a reel missing a close tag still resolves
 /// instead of swallowing the reels after it.
-fn element_blocks<'text>(xml: &'text str, name: &str) -> Vec<&'text str> {
+pub(crate) fn element_blocks<'text>(xml: &'text str, name: &str) -> Vec<&'text str> {
     let prefix = crate::cpl_xml::ELEMENT_PREFIX_PATTERN;
     let Ok(open) = regex::Regex::new(&format!(r"<{prefix}{name}\b")) else {
         return Vec::new();
@@ -380,6 +413,13 @@ fn uuid_in(block: &str, name: &str) -> Option<String> {
     let pattern = format!(r"<{prefix}{name}>\s*(?:urn:uuid:)?([0-9a-fA-F-]{{36}})");
     let found = regex::Regex::new(&pattern).ok()?.captures(block)?;
     Some(found[1].to_ascii_lowercase())
+}
+
+fn edit_rate_numbers(edit_rate: &str) -> Option<(i32, i32)> {
+    let mut parts = edit_rate.split_whitespace();
+    let numerator = parts.next()?.parse().ok()?;
+    let denominator = parts.next().unwrap_or("1").parse().ok()?;
+    Some((numerator, denominator))
 }
 
 /// An EditRate of "num den" as the seconds one edit unit lasts.
@@ -677,6 +717,130 @@ mod tests {
                 dir.path().join("VIDEO_one.mxf"),
                 dir.path().join("VIDEO_two.mxf"),
             ]
+        );
+    }
+
+    const AUDIO_TRACK_UUIDS: [&str; 2] = [
+        "a0d10000-0000-4000-8000-000000000001",
+        "a0d10000-0000-4000-8000-000000000002",
+    ];
+
+    // two segments, each with a picture resource and the same two audio tracks, English first
+    fn imf_cpl_with_two_audio_tracks(
+        pictures: [&str; 2],
+        english: [&str; 2],
+        french: [&str; 2],
+    ) -> String {
+        let audio = |track: &str, file: &str| {
+            format!(
+                "<cc:MainAudioSequence xmlns:cc=\"z\"><TrackId>urn:uuid:{track}</TrackId><ResourceList>\
+                 <Resource><EditRate>24000 1001</EditRate><TrackFileId>urn:uuid:{file}</TrackFileId>\
+                 </Resource></ResourceList></cc:MainAudioSequence>"
+            )
+        };
+        let segment = |index: usize| {
+            format!(
+                "<Segment><SequenceList><cc:MainImageSequence xmlns:cc=\"z\"><ResourceList>\
+                 <Resource><TrackFileId>urn:uuid:{}</TrackFileId></Resource></ResourceList>\
+                 </cc:MainImageSequence>{}{}</SequenceList></Segment>",
+                pictures[index],
+                audio(AUDIO_TRACK_UUIDS[0], english[index]),
+                audio(AUDIO_TRACK_UUIDS[1], french[index]),
+            )
+        };
+        format!(
+            "<?xml version=\"1.0\"?>\n<CompositionPlaylist xmlns=\"y\"><EditRate>24000 1001</EditRate>\
+             <SegmentList>{}{}</SegmentList></CompositionPlaylist>",
+            segment(0),
+            segment(1)
+        )
+    }
+
+    #[test]
+    fn an_imf_composition_plays_its_first_audio_track_through_every_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let english = [
+            "e0000000-0000-4000-8000-000000000001",
+            "e0000000-0000-4000-8000-000000000002",
+        ];
+        let french = [
+            "f0000000-0000-4000-8000-000000000001",
+            "f0000000-0000-4000-8000-000000000002",
+        ];
+        write_assetmap(
+            dir.path(),
+            "CPL_a.xml",
+            &[
+                (REEL_UUIDS[0], "VIDEO_one.mxf"),
+                (REEL_UUIDS[1], "VIDEO_two.mxf"),
+                (english[0], "AUDIO_en_one.mxf"),
+                (english[1], "AUDIO_en_two.mxf"),
+                (french[0], "AUDIO_fr_one.mxf"),
+                (french[1], "AUDIO_fr_two.mxf"),
+            ],
+        );
+        std::fs::write(
+            dir.path().join("CPL_a.xml"),
+            imf_cpl_with_two_audio_tracks([REEL_UUIDS[0], REEL_UUIDS[1]], english, french),
+        )
+        .unwrap();
+
+        let composition = resolve_composition(dir.path(), &[]).unwrap();
+
+        let sound: Vec<(PathBuf, Option<(i32, i32)>)> = composition
+            .sound
+            .into_iter()
+            .map(|segment| (segment.path, segment.edit_rate))
+            .collect();
+        assert_eq!(
+            sound,
+            vec![
+                (dir.path().join("AUDIO_en_one.mxf"), Some((24000, 1001))),
+                (dir.path().join("AUDIO_en_two.mxf"), Some((24000, 1001))),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_supplemental_imp_finds_the_audio_its_original_holds() {
+        let library = tempfile::tempdir().unwrap();
+        let english = [
+            "e0000000-0000-4000-8000-000000000001",
+            "e0000000-0000-4000-8000-000000000002",
+        ];
+        let french = [
+            "f0000000-0000-4000-8000-000000000001",
+            "f0000000-0000-4000-8000-000000000002",
+        ];
+        let supplemental = package_directory(
+            library.path(),
+            "supplemental",
+            &[(REEL_UUIDS[1], "VIDEO_new_ending.mxf")],
+        );
+        std::fs::write(
+            supplemental.join("CPL_ov.xml"),
+            imf_cpl_with_two_audio_tracks([REEL_UUIDS[0], REEL_UUIDS[1]], english, french),
+        )
+        .unwrap();
+        let original = package_directory(
+            library.path(),
+            "original",
+            &[
+                (REEL_UUIDS[0], "VIDEO_one.mxf"),
+                (english[0], "AUDIO_en_one.mxf"),
+                (english[1], "AUDIO_en_two.mxf"),
+            ],
+        );
+
+        let found = find_original_version_packages(&supplemental, std::slice::from_ref(&original));
+
+        assert_eq!(found, Ok(vec![original.clone()]));
+        let composition =
+            resolve_composition(&supplemental, std::slice::from_ref(&original)).unwrap();
+        assert_eq!(composition.sound[1].path, original.join("AUDIO_en_two.mxf"));
+        assert_eq!(
+            composition.pictures[1].path,
+            supplemental.join("VIDEO_new_ending.mxf")
         );
     }
 

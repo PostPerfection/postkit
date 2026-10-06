@@ -33,6 +33,8 @@ pub mod grok_encoder;
 pub mod grok_player;
 pub mod hash;
 pub mod hints;
+#[cfg(test)]
+mod imp_fixture;
 pub mod j2k;
 pub mod job_queue;
 pub mod kdm_distribution;

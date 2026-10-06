@@ -192,6 +192,7 @@ impl SoundComposition {
 
 struct SoundReel {
     path: PathBuf,
+    edit_rate: Option<(i32, i32)>,
     first_frame: u64,
     frame_count: u64,
     entry_edit_unit: u32,
@@ -219,18 +220,24 @@ pub(super) struct KeyedSoundSegment {
 
 // an unreadable reel is left for reels_of to skip with a warning
 pub(super) fn sound_content_key(
-    path: &Path,
+    segment: &SoundSegment,
     keys: Option<&ContentKeys>,
 ) -> Result<Option<SoundContentKey>, String> {
-    let mut reader = asdcplib::pcm::MxfReader::new();
-    if reader.open_read(&path.to_string_lossy()).is_err() {
+    let path = &segment.path;
+    let Ok(mut reader) = PcmReader::open(path, segment.edit_rate) else {
         return Ok(None);
-    }
+    };
     let Ok(info) = reader.writer_info() else {
         return Ok(None);
     };
     if !info.encrypted_essence {
         return Ok(None);
+    }
+    if matches!(reader, PcmReader::As02 { .. }) {
+        return Err(format!(
+            "{} is encrypted AS-02 sound, which asdcplib's AS-02 PCM reader cannot decrypt",
+            path.display()
+        ));
     }
     let Some(keys) = keys else {
         return Err(format!(
@@ -421,7 +428,7 @@ fn reels_of(segments: Vec<KeyedSoundSegment>, fps: f64) -> Vec<SoundReel> {
     let mut reels = Vec::new();
     for KeyedSoundSegment { segment, key } in segments {
         let (entry, stated) = trim_in_frames(segment.trim.as_ref(), fps);
-        let duration = match open_layout(&segment.path) {
+        let duration = match open_layout(&segment.path, segment.edit_rate) {
             Ok(layout) => layout.edit_units.saturating_sub(entry),
             Err(error) => {
                 tracing::warn!("preview sound: {error}");
@@ -434,6 +441,7 @@ fn reels_of(segments: Vec<KeyedSoundSegment>, fps: f64) -> Vec<SoundReel> {
         }
         reels.push(SoundReel {
             path: segment.path,
+            edit_rate: segment.edit_rate,
             first_frame,
             frame_count: frames,
             entry_edit_unit: entry,
@@ -717,7 +725,7 @@ struct Feeder {
 }
 
 struct SoundReader {
-    reader: asdcplib::pcm::MxfReader,
+    reader: PcmReader,
     layout: AudioLayout,
     decrypt: Option<AesDecContext>,
 }
@@ -789,7 +797,7 @@ impl Feeder {
         let Some(first) = composition.reels.first() else {
             return;
         };
-        let opened = match open_reader(&first.path, first.key.as_ref()) {
+        let opened = match open_reader(&first.path, first.edit_rate, first.key.as_ref()) {
             Ok(open) => open,
             Err(error) => {
                 tracing::warn!("preview sound: {error}");
@@ -1038,7 +1046,7 @@ impl Feeder {
         let mut essence = vec![0u8; layout.bytes_per_edit_unit];
         let read = match open
             .reader
-            .read_frame(entry, &mut essence, open.decrypt.as_mut(), None)
+            .read_frame(entry, &mut essence, open.decrypt.as_mut())
         {
             Ok(read) => read,
             Err(error) => {
@@ -1117,7 +1125,7 @@ impl Feeder {
         {
             return true;
         }
-        match open_reader(&reel.path, reel.key.as_ref()) {
+        match open_reader(&reel.path, reel.edit_rate, reel.key.as_ref()) {
             Ok(opened) => {
                 self.reader = Some((reel.path.clone(), opened));
                 true
@@ -1236,21 +1244,128 @@ impl Resampler {
     }
 }
 
-fn open_layout(path: &Path) -> Result<AudioLayout, String> {
-    Ok(open_reader(path, None)?.layout)
+fn open_layout(path: &Path, edit_rate: Option<(i32, i32)>) -> Result<AudioLayout, String> {
+    Ok(open_reader(path, edit_rate, None)?.layout)
 }
 
-fn open_reader(path: &Path, key: Option<&SoundContentKey>) -> Result<SoundReader, String> {
-    let mut reader = asdcplib::pcm::MxfReader::new();
-    reader
-        .open_read(&path.to_string_lossy())
-        .map_err(|error| error.to_string())?;
+// AS-DCP sound is wrapped a picture frame an edit unit, AS-02 sound is one clip read in slices of the CPL's edit rate
+enum PcmReader {
+    AsDcp(asdcplib::pcm::MxfReader),
+    As02 {
+        reader: asdcplib::as02::pcm::MxfReader,
+        edit_rate: (i32, i32),
+    },
+}
+
+impl PcmReader {
+    fn open(path: &Path, edit_rate: Option<(i32, i32)>) -> Result<PcmReader, String> {
+        let name = path.to_string_lossy();
+        let as02 = matches!(
+            asdcplib::essence_type(&name),
+            Ok(asdcplib::EssenceType::As02Pcm24b48k | asdcplib::EssenceType::As02Pcm24b96k)
+        );
+        if !as02 {
+            let mut reader = asdcplib::pcm::MxfReader::new();
+            reader.open_read(&name).map_err(|error| error.to_string())?;
+            return Ok(PcmReader::AsDcp(reader));
+        }
+        let (numerator, denominator) = edit_rate.ok_or_else(|| {
+            format!(
+                "{} is AS-02 sound and the CPL gives no edit rate to read it at",
+                path.display()
+            )
+        })?;
+        let mut reader = asdcplib::as02::pcm::MxfReader::new();
+        reader
+            .open_read(
+                &name,
+                asdcplib::Rational {
+                    numerator,
+                    denominator,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(PcmReader::As02 {
+            reader,
+            edit_rate: (numerator, denominator),
+        })
+    }
+
+    fn audio_descriptor(&mut self) -> asdcplib::Result<asdcplib::pcm::AudioDescriptor> {
+        match self {
+            PcmReader::AsDcp(reader) => reader.audio_descriptor(),
+            PcmReader::As02 { reader, .. } => reader.audio_descriptor(),
+        }
+    }
+
+    fn writer_info(&mut self) -> asdcplib::Result<asdcplib::WriterInfo> {
+        match self {
+            PcmReader::AsDcp(reader) => reader.writer_info(),
+            PcmReader::As02 { reader, .. } => reader.writer_info(),
+        }
+    }
+
+    fn mca_label_subdescriptors(
+        &mut self,
+    ) -> asdcplib::Result<Vec<asdcplib::pcm::McaLabelSubDescriptor>> {
+        match self {
+            PcmReader::AsDcp(reader) => reader.mca_label_subdescriptors(),
+            PcmReader::As02 { reader, .. } => reader.mca_label_subdescriptors(),
+        }
+    }
+
+    fn read_frame(
+        &mut self,
+        edit_unit: u32,
+        buffer: &mut [u8],
+        decrypt: Option<&mut AesDecContext>,
+    ) -> asdcplib::Result<usize> {
+        match self {
+            PcmReader::AsDcp(reader) => reader.read_frame(edit_unit, buffer, decrypt, None),
+            PcmReader::As02 { reader, .. } => reader.read_frame(edit_unit, buffer, decrypt, None),
+        }
+    }
+
+    // sample frames an edit unit and edit units in the file, at the rate the composition plays the track
+    fn edit_units(&self, descriptor: &asdcplib::pcm::AudioDescriptor) -> (u32, u32) {
+        match self {
+            PcmReader::AsDcp(_) => (
+                frames_per_edit_unit(descriptor.audio_sampling_rate, descriptor.edit_rate),
+                descriptor.container_duration,
+            ),
+            PcmReader::As02 {
+                edit_rate: (numerator, denominator),
+                ..
+            } => {
+                let edit_rate = asdcplib::Rational {
+                    numerator: *numerator,
+                    denominator: *denominator,
+                };
+                let per_edit_unit =
+                    frames_per_edit_unit(descriptor.audio_sampling_rate, edit_rate).max(1);
+                // an AS-02 descriptor counts the clip in sample frames
+                (
+                    per_edit_unit,
+                    descriptor.container_duration.div_ceil(per_edit_unit),
+                )
+            }
+        }
+    }
+}
+
+fn open_reader(
+    path: &Path,
+    edit_rate: Option<(i32, i32)>,
+    key: Option<&SoundContentKey>,
+) -> Result<SoundReader, String> {
+    let mut reader = PcmReader::open(path, edit_rate)?;
     let descriptor = reader
         .audio_descriptor()
         .map_err(|error| error.to_string())?;
     if descriptor.channel_count == 0 || descriptor.block_align == 0 {
         return Err(format!("{} names no pcm", path.display()));
     }
+    let (sample_frames_per_edit_unit, edit_units) = reader.edit_units(&descriptor);
     let speakers = source_speakers(&mut reader, descriptor.channel_count as usize);
     let decrypt = match key {
         Some(SoundContentKey(key)) => {
@@ -1268,8 +1383,8 @@ fn open_reader(path: &Path, key: Option<&SoundContentKey>) -> Result<SoundReader
             channels: descriptor.channel_count as u16,
             bits: descriptor.quantization_bits as u16,
             bytes_per_edit_unit: descriptor.block_align as usize
-                * frames_per_edit_unit(&descriptor) as usize,
-            edit_units: descriptor.container_duration,
+                * sample_frames_per_edit_unit as usize,
+            edit_units,
             sample_rate: sample_rate_of(&descriptor),
             speakers,
         },
@@ -1278,7 +1393,7 @@ fn open_reader(path: &Path, key: Option<&SoundContentKey>) -> Result<SoundReader
 }
 
 // a file with no MCA channel labels is taken to be in the default DCP order
-fn source_speakers(reader: &mut asdcplib::pcm::MxfReader, channels: usize) -> Vec<Option<Speaker>> {
+fn source_speakers(reader: &mut PcmReader, channels: usize) -> Vec<Option<Speaker>> {
     let labels = reader.mca_label_subdescriptors().unwrap_or_else(|error| {
         tracing::warn!("preview sound: MCA labels unreadable, assuming the default order: {error}");
         Vec::new()
@@ -1336,9 +1451,8 @@ fn sample_rate_of(descriptor: &asdcplib::pcm::AudioDescriptor) -> u32 {
     (rate.numerator as u32) / (rate.denominator as u32)
 }
 
-fn frames_per_edit_unit(descriptor: &asdcplib::pcm::AudioDescriptor) -> u32 {
-    let sample_rate = descriptor.audio_sampling_rate.numerator.max(0) as u64;
-    let edit = descriptor.edit_rate;
+fn frames_per_edit_unit(sampling_rate: asdcplib::Rational, edit: asdcplib::Rational) -> u32 {
+    let sample_rate = sampling_rate.numerator.max(0) as u64;
     if edit.numerator <= 0 {
         return 1;
     }
@@ -1564,7 +1678,7 @@ mod tests {
         let [sound] = timeline.sound.as_slice() else {
             panic!("the package names one sound reel");
         };
-        let mut opened = open_reader(&sound.segment.path, sound.key.as_ref()).unwrap();
+        let mut opened = open_reader(&sound.segment.path, None, sound.key.as_ref()).unwrap();
         assert!(
             opened.decrypt.is_some(),
             "the feeder builds no decrypt context"
@@ -1572,12 +1686,130 @@ mod tests {
         let mut essence = vec![0u8; opened.layout.bytes_per_edit_unit];
         let read = opened
             .reader
-            .read_frame(0, &mut essence, opened.decrypt.as_mut(), None)
+            .read_frame(0, &mut essence, opened.decrypt.as_mut())
             .unwrap();
         assert!(
             essence[..read] == first_edit_unit,
             "the first edit unit differs from the WAV"
         );
+    }
+
+    // 48000 Hz at 24000/1001 is 2002 sample frames an edit unit, which an AS-DCP edit unit never is
+    const IMF_EDIT_RATE: (i32, i32) = (24000, 1001);
+    const IMF_SAMPLE_FRAMES_PER_EDIT_UNIT: usize = 2_002;
+    const IMF_EDIT_UNITS: usize = 12;
+    const TWENTY_FOUR_BIT_FULL_SCALE: f32 = 8_388_608.0;
+
+    fn as02_sound(directory: &Path) -> PathBuf {
+        let wav = directory.join("imf-sound.wav");
+        let spec = hound::WavSpec {
+            channels: SOUND_CHANNELS,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
+        let samples =
+            IMF_EDIT_UNITS * IMF_SAMPLE_FRAMES_PER_EDIT_UNIT * usize::from(SOUND_CHANNELS);
+        for index in 0..samples {
+            writer.write_sample(i32::from(sample(index))).unwrap();
+        }
+        writer.finalize().unwrap();
+        let output = directory.join("imf-sound.mxf");
+        let track = mxf_wrap(&MxfWrapOptions {
+            input_files: vec![wav],
+            output: output.clone(),
+            essence_type: EssenceType::Pcm,
+            standard: MxfStandard::As02,
+            fps_num: IMF_EDIT_RATE.0 as u32,
+            fps_den: IMF_EDIT_RATE.1 as u32,
+            partition_size: 0,
+            encryption: None,
+            mca_config: None,
+            resource_ids: Vec::new(),
+            hdr: None,
+            asset_uuid: None,
+            timed_text_duration_frames: None,
+        });
+        assert!(track.success, "AS-02 sound wrap failed: {}", track.error);
+        output
+    }
+
+    #[test]
+    fn as02_sound_reads_in_edit_units_of_the_cpl_edit_rate() {
+        let directory = tempfile::tempdir().unwrap();
+        let sound = as02_sound(directory.path());
+
+        let mut opened = open_reader(&sound, Some(IMF_EDIT_RATE), None).unwrap();
+
+        assert_eq!(opened.layout.edit_units as usize, IMF_EDIT_UNITS);
+        let mut essence = vec![0u8; opened.layout.bytes_per_edit_unit];
+        let read = opened.reader.read_frame(1, &mut essence, None).unwrap();
+        let mut interleaved = Vec::new();
+        unpack_pcm(
+            &essence[..read],
+            usize::from(SOUND_CHANNELS),
+            opened.layout.bits,
+            &mut interleaved,
+        );
+        assert_eq!(
+            interleaved.len(),
+            IMF_SAMPLE_FRAMES_PER_EDIT_UNIT * usize::from(SOUND_CHANNELS)
+        );
+        let second_edit_unit_start = IMF_SAMPLE_FRAMES_PER_EDIT_UNIT * usize::from(SOUND_CHANNELS);
+        let expected_first =
+            i32::from(sample(second_edit_unit_start)) as f32 / TWENTY_FOUR_BIT_FULL_SCALE;
+        assert!(
+            (interleaved[0] - expected_first).abs() < 1e-6,
+            "{} against {expected_first}",
+            interleaved[0]
+        );
+    }
+
+    #[test]
+    fn an_imp_plays_its_as02_sound_for_every_picture_frame() {
+        use crate::imp_fixture::{
+            FRAMES, SAMPLE_FRAMES_PER_EDIT_UNIT, SOUND_CHANNELS as IMP_CHANNELS, write_imp,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let cpl = write_imp(&directory.path().join("imp"), false);
+
+        let mut timeline = Timeline::open(&cpl, None, &[]).unwrap();
+        let fps = timeline.fps;
+        let reels = reels_of(std::mem::take(&mut timeline.sound), fps);
+
+        let [reel] = reels.as_slice() else {
+            panic!("the IMP names one sound track file");
+        };
+        assert_eq!(reel.frame_count, FRAMES);
+        let mut opened = open_reader(&reel.path, reel.edit_rate, None).unwrap();
+        let mut essence = vec![0u8; opened.layout.bytes_per_edit_unit];
+        let read = opened.reader.read_frame(1, &mut essence, None).unwrap();
+        let mut interleaved = Vec::new();
+        unpack_pcm(
+            &essence[..read],
+            usize::from(IMP_CHANNELS),
+            opened.layout.bits,
+            &mut interleaved,
+        );
+        let second_edit_unit_start = SAMPLE_FRAMES_PER_EDIT_UNIT * usize::from(IMP_CHANNELS);
+        let expected =
+            crate::imp_fixture::sample(second_edit_unit_start) as f32 / TWENTY_FOUR_BIT_FULL_SCALE;
+        assert!(
+            (interleaved[0] - expected).abs() < 1e-6,
+            "{} against {expected}",
+            interleaved[0]
+        );
+    }
+
+    #[test]
+    fn as02_sound_without_an_edit_rate_is_refused_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let sound = as02_sound(directory.path());
+
+        let error = open_reader(&sound, None, None).err().unwrap();
+
+        assert!(error.contains("AS-02 sound"), "{error}");
     }
 
     #[test]
@@ -1924,7 +2156,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let labels = crate::mca::soundfield_to_mca_config(&crate::mca::soundfield_71()).unwrap();
         let sound = wrapped_sound(directory.path(), 8, Some(&labels));
-        let opened = open_reader(&sound, None).unwrap();
+        let opened = open_reader(&sound, None, None).unwrap();
         // the default order would make channels 7 and 8 HI and VI-N
         assert_eq!(
             opened.layout.speakers,
@@ -1946,7 +2178,7 @@ mod tests {
     fn unlabelled_sound_takes_the_default_dcp_order() {
         let directory = tempfile::tempdir().unwrap();
         let sound = wrapped_sound(directory.path(), 8, None);
-        let opened = open_reader(&sound, None).unwrap();
+        let opened = open_reader(&sound, None, None).unwrap();
         assert_eq!(opened.layout.speakers, default_dcp_speakers(8));
         assert_eq!(opened.layout.speakers[6], None, "channel 7 is HI");
     }
@@ -2143,6 +2375,7 @@ mod tests {
                 segment: SoundSegment {
                     path: path.to_path_buf(),
                     trim: None,
+                    edit_rate: None,
                 },
                 key: None,
             })
@@ -2233,7 +2466,11 @@ mod tests {
         ]
         .into_iter()
         .map(|path| KeyedSoundSegment {
-            segment: SoundSegment { path, trim: None },
+            segment: SoundSegment {
+                path,
+                trim: None,
+                edit_rate: None,
+            },
             key: None,
         })
         .collect();

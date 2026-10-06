@@ -133,7 +133,7 @@ impl Timeline {
         let sound = sound
             .into_iter()
             .map(|segment| {
-                let key = audio::sound_content_key(&segment.path, keys)?;
+                let key = audio::sound_content_key(&segment, keys)?;
                 Ok(KeyedSoundSegment { segment, key })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -476,6 +476,23 @@ pub(super) mod tests {
             );
             assert!(render == DisplayRender::DcpXyz);
         }
+    }
+
+    #[test]
+    fn an_imp_with_an_encrypted_as02_picture_reads_back_with_its_content_key() {
+        use crate::imp_fixture::{PICTURE_KEY as IMP_KEY, PICTURE_KEY_ID as IMP_KEY_ID, write_imp};
+        let directory = tempfile::tempdir().unwrap();
+        let cpl = write_imp(&directory.path().join("imp"), true);
+        let (_, frames) = write_frames(directory.path(), "imp");
+        let keys = content_keys(directory.path(), &[(IMP_KEY_ID, IMP_KEY)]);
+
+        let mut timeline = Timeline::open(&cpl, Some(&keys), &[]).unwrap();
+
+        let (codestream, _, _) = timeline.codestream(1, StereoscopicPhase::Left).unwrap();
+        assert!(codestream == frames[1], "frame 1 differs from its source");
+        assert!(
+            open_error(&cpl, None).contains("is encrypted and the preview holds no content key")
+        );
     }
 
     #[test]

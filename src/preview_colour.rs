@@ -78,7 +78,7 @@ const NARROW_CHROMA_MIDPOINT: f32 = 2048.0;
 const NARROW_CHROMA_HALF_RANGE: f32 = 1792.0;
 
 /// The colour primaries an App 2E essence descriptor signals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DisplayPrimaries {
     Bt709,
     P3D65,
@@ -86,7 +86,7 @@ pub enum DisplayPrimaries {
 }
 
 /// The transfer characteristic an App 2E essence descriptor signals.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DisplayTransfer {
     Bt709,
     Pq,
@@ -112,6 +112,27 @@ pub struct PictureColour {
     pub luma_coefficients: Option<LumaCoefficients>,
 }
 
+pub fn transfer_of_label(ul: [u8; 16]) -> Option<DisplayTransfer> {
+    [
+        (TRANSFER_CHARACTERISTIC_BT709, DisplayTransfer::Bt709),
+        (TRANSFER_CHARACTERISTIC_ST2084, DisplayTransfer::Pq),
+        // the BT.2020 transfer UL is what an App 2E HLG master signals
+        (TRANSFER_CHARACTERISTIC_BT2020, DisplayTransfer::Hlg),
+    ]
+    .into_iter()
+    .find_map(|(label, transfer)| (ul == label).then_some(transfer))
+}
+
+pub fn primaries_of_label(ul: [u8; 16]) -> Option<DisplayPrimaries> {
+    [
+        (COLOR_PRIMARIES_BT709, DisplayPrimaries::Bt709),
+        (COLOR_PRIMARIES_P3D65, DisplayPrimaries::P3D65),
+        (COLOR_PRIMARIES_BT2020, DisplayPrimaries::Bt2020),
+    ]
+    .into_iter()
+    .find_map(|(label, primaries)| (ul == label).then_some(primaries))
+}
+
 /// Resolve the descriptor's colour ULs, refusing only one this module has no
 /// reading for. Unsignalled colour reads as Rec.709: packages exist that signal
 /// nothing.
@@ -126,15 +147,11 @@ pub fn resolve_picture_colour(resolved: &ResolvedPicture) -> Result<PictureColou
             );
             DisplayTransfer::Bt709
         }
-        Some(ul) if ul == TRANSFER_CHARACTERISTIC_BT709 => DisplayTransfer::Bt709,
-        Some(ul) if ul == TRANSFER_CHARACTERISTIC_ST2084 => DisplayTransfer::Pq,
-        // the BT.2020 transfer UL is what an App 2E HLG master signals
-        Some(ul) if ul == TRANSFER_CHARACTERISTIC_BT2020 => DisplayTransfer::Hlg,
-        Some(ul) => {
-            return Err(PreviewError::Display(format!(
+        Some(ul) => transfer_of_label(ul).ok_or_else(|| {
+            PreviewError::Display(format!(
                 "{file} signals the unrecognised transfer characteristic {ul:02x?}, {UNRECOGNISED}"
-            )));
-        }
+            ))
+        })?,
     };
 
     let primaries = match resolved.color_primaries {
@@ -142,14 +159,11 @@ pub fn resolve_picture_colour(resolved: &ResolvedPicture) -> Result<PictureColou
             tracing::warn!("{file} signals no colour primaries, so the preview assumes Rec.709");
             DisplayPrimaries::Bt709
         }
-        Some(ul) if ul == COLOR_PRIMARIES_BT709 => DisplayPrimaries::Bt709,
-        Some(ul) if ul == COLOR_PRIMARIES_P3D65 => DisplayPrimaries::P3D65,
-        Some(ul) if ul == COLOR_PRIMARIES_BT2020 => DisplayPrimaries::Bt2020,
-        Some(ul) => {
-            return Err(PreviewError::Display(format!(
+        Some(ul) => primaries_of_label(ul).ok_or_else(|| {
+            PreviewError::Display(format!(
                 "{file} signals the unrecognised colour primaries {ul:02x?}, {UNRECOGNISED}"
-            )));
-        }
+            ))
+        })?,
     };
 
     let luma_coefficients = match resolved.coding_equations {
