@@ -718,7 +718,7 @@ fn find_cpl_in_dir(dir: &Path) -> Result<PathBuf, PreviewError> {
 fn resolve_via_cpl(cpl: &Path) -> Result<PathBuf, PreviewError> {
     let text = std::fs::read_to_string(cpl)?;
     let picture_uuid = first_main_picture_id(&text)
-        .ok_or_else(|| PreviewError::Resolve(format!("no MainPicture in {}", cpl.display())))?;
+        .ok_or_else(|| PreviewError::Resolve(format!("no picture asset in {}", cpl.display())))?;
 
     let dir = cpl.parent().unwrap_or(Path::new("."));
     let assetmap = find_assetmap(dir)?;
@@ -736,9 +736,12 @@ fn find_assetmap(dir: &Path) -> Result<PathBuf, PreviewError> {
 
 /// Bare UUID of the first `<MainPicture>` (any namespace prefix) in a CPL.
 fn first_main_picture_id(cpl: &str) -> Option<String> {
-    let re = regex::Regex::new(
-        r"(?s)<(?:\w+:)?MainPicture\b.*?<(?:\w+:)?Id>\s*(?:urn:uuid:)?([0-9a-fA-F-]{36})",
-    )
+    use crate::cpl_xml::{
+        ELEMENT_PREFIX_PATTERN as PREFIX, MAIN_PICTURE_ELEMENT_PATTERN as PICTURE,
+    };
+    let re = regex::Regex::new(&format!(
+        r"(?s)<{PREFIX}{PICTURE}\b.*?<{PREFIX}Id>\s*(?:urn:uuid:)?([0-9a-fA-F-]{{36}})"
+    ))
     .ok()?;
     re.captures(cpl).map(|c| c[1].to_ascii_lowercase())
 }

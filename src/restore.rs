@@ -385,9 +385,10 @@ pub fn track_files(package: &Path) -> Result<Vec<PathBuf>, RestoreError> {
 }
 
 fn track_file_ids(cpl: &str) -> Vec<String> {
-    let Ok(pattern) = regex::Regex::new(
-        r"<(?:\w+:)?TrackFileId>\s*(?:urn:uuid:)?([0-9a-fA-F-]{36})\s*</(?:\w+:)?TrackFileId>",
-    ) else {
+    let Ok(pattern) = regex::Regex::new(&format!(
+        r"<{prefix}TrackFileId>\s*(?:urn:uuid:)?([0-9a-fA-F-]{{36}})\s*</{prefix}TrackFileId>",
+        prefix = crate::cpl_xml::ELEMENT_PREFIX_PATTERN
+    )) else {
         return Vec::new();
     };
     pattern

@@ -27,9 +27,10 @@ pub fn parse_ordered(path: &Path) -> Vec<(String, String)> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    let Ok(asset) = regex::Regex::new(
-        r"(?s)<(?:\w+:)?Asset\b.*?<(?:\w+:)?Id>\s*(?:urn:uuid:)?([0-9a-fA-F-]{36})\s*</(?:\w+:)?Id>.*?<(?:\w+:)?Path>\s*([^<]+?)\s*</(?:\w+:)?Path>",
-    ) else {
+    let Ok(asset) = regex::Regex::new(&format!(
+        r"(?s)<{prefix}Asset\b.*?<{prefix}Id>\s*(?:urn:uuid:)?([0-9a-fA-F-]{{36}})\s*</{prefix}Id>.*?<{prefix}Path>\s*([^<]+?)\s*</{prefix}Path>",
+        prefix = crate::cpl_xml::ELEMENT_PREFIX_PATTERN
+    )) else {
         return Vec::new();
     };
     asset

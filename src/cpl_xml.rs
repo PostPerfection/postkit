@@ -31,11 +31,14 @@ pub const MAIN_PICTURE_ELEMENT_PATTERN: &str = r"Main(?:Stereoscopic)?Picture";
 
 // an OPL's <CompositionPlaylistId> must not match
 pub fn is_composition_playlist(xml: &str) -> bool {
-    regex::Regex::new(r"<(?:\w+:)?CompositionPlaylist[\s>]").is_ok_and(|root| root.is_match(xml))
+    regex::Regex::new(&format!(
+        r"<{ELEMENT_PREFIX_PATTERN}CompositionPlaylist[\s>]"
+    ))
+    .is_ok_and(|root| root.is_match(xml))
 }
 
 pub fn read_prefixed_tag(xml: &str, name: &str) -> Option<String> {
-    let pattern = format!(r"<(?:\w+:)?{name}(?:\s[^>]*)?>([^<]*)");
+    let pattern = format!(r"<{ELEMENT_PREFIX_PATTERN}{name}(?:\s[^>]*)?>([^<]*)");
     let found = regex::Regex::new(&pattern).ok()?.captures(xml)?;
     let text = found[1].trim();
     (!text.is_empty()).then(|| text.to_string())

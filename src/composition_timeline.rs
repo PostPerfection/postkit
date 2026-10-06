@@ -376,7 +376,8 @@ fn element_u64(block: &str, name: &str) -> Option<u64> {
 
 /// The bare lowercased uuid in the first `name` element of `block`.
 fn uuid_in(block: &str, name: &str) -> Option<String> {
-    let pattern = format!(r"<(?:\w+:)?{name}>\s*(?:urn:uuid:)?([0-9a-fA-F-]{{36}})");
+    let prefix = crate::cpl_xml::ELEMENT_PREFIX_PATTERN;
+    let pattern = format!(r"<{prefix}{name}>\s*(?:urn:uuid:)?([0-9a-fA-F-]{{36}})");
     let found = regex::Regex::new(&pattern).ok()?.captures(block)?;
     Some(found[1].to_ascii_lowercase())
 }

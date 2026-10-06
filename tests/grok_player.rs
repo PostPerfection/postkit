@@ -1931,18 +1931,18 @@ mod stereoscopic {
         )
     }
 
-    #[test]
-    fn a_3d_package_resolves_its_stereoscopic_picture_and_plays_both_eyes() {
+    const STEREOSCOPIC_PACKAGE_FRAMES: usize = 2;
+
+    // a package whose CPL names its picture the way a 3D DCP does, the CPL's path
+    fn stereoscopic_package(directory: &Path) -> PathBuf {
         const CPL_ID: &str = "cc10cc10-0000-0000-0000-000000000003";
         const PICTURE_ID: &str = "eee336f9-c2ce-48b0-81e5-a40d78956b9b";
-        const FRAMES: usize = 2;
-        let directory = tempfile::tempdir().unwrap();
         let picture = format!("picture_{PICTURE_ID}.mxf");
-        stereo_mxf(directory.path(), &picture, SIZE, SIZE, FRAMES);
+        stereo_mxf(directory, &picture, SIZE, SIZE, STEREOSCOPIC_PACKAGE_FRAMES);
         let cpl = format!("CPL_{CPL_ID}.xml");
         std::fs::write(
-            directory.path().join(&cpl),
-            stereoscopic_cpl(CPL_ID, PICTURE_ID, FRAMES),
+            directory.join(&cpl),
+            stereoscopic_cpl(CPL_ID, PICTURE_ID, STEREOSCOPIC_PACKAGE_FRAMES),
         )
         .unwrap();
         let assets = [(CPL_ID, cpl.as_str()), (PICTURE_ID, picture.as_str())]
@@ -1954,7 +1954,7 @@ mod stereoscopic {
             })
             .collect();
         std::fs::write(
-            directory.path().join("ASSETMAP.xml"),
+            directory.join("ASSETMAP.xml"),
             AssetMap {
                 uuid: "bbbbbbbb-0000-0000-0000-000000000003".into(),
                 namespace: ns::AM_SMPTE.into(),
@@ -1964,17 +1964,21 @@ mod stereoscopic {
             .to_xml(),
         )
         .unwrap();
+        directory.join(cpl)
+    }
+
+    #[test]
+    fn a_3d_package_resolves_its_stereoscopic_picture_and_plays_both_eyes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cpl = stereoscopic_package(directory.path());
 
         assert!(GrokPlayer::accepts(directory.path()), "a 3D package");
-        assert!(
-            GrokPlayer::accepts(&directory.path().join(&cpl)),
-            "a 3D CPL"
-        );
+        assert!(GrokPlayer::accepts(&cpl), "a 3D CPL");
         let player = loaded_player(directory.path());
         assert_eq!(metadata_field(&player, "stereoscopic"), true);
         assert_eq!(
             player.duration(),
-            Some(FRAMES as f64 / f64::from(FRAMES_PER_SECOND))
+            Some(STEREOSCOPIC_PACKAGE_FRAMES as f64 / f64::from(FRAMES_PER_SECOND))
         );
         change_output(&player, StereoOutput::SideBySide);
         assert_eq!(at(&player, QUARTER, QUARTER), frame_colour(0), "left half");
@@ -1983,6 +1987,32 @@ mod stereoscopic {
             right_eye_colour(0),
             "right half"
         );
+    }
+
+    #[test]
+    fn the_still_path_shows_the_left_eye_of_a_3d_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let cpl = stereoscopic_package(directory.path());
+        for source in [directory.path().to_path_buf(), cpl] {
+            let still = directory.path().join("frame0.ppm");
+            postkit::preview::render_dcp_frame(
+                &postkit::preview::DcpPreviewOptions {
+                    source: source.clone(),
+                    ..Default::default()
+                },
+                0,
+                &still,
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", source.display()));
+            let pixels = read_ppm(&still, SIZE, SIZE);
+            let centre = ((SIZE / 2 * SIZE + SIZE / 2) * 3) as usize;
+            assert_eq!(
+                pixels[centre..centre + 3],
+                frame_colour(0),
+                "{}",
+                source.display()
+            );
+        }
     }
 
     #[test]
