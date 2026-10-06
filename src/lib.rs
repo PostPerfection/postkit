@@ -35,6 +35,7 @@ pub mod hash;
 pub mod hints;
 pub mod j2k;
 pub mod job_queue;
+pub mod kdm_distribution;
 pub mod kdm_store;
 pub mod loudness;
 pub mod machine_info;

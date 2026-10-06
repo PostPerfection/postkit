@@ -21,13 +21,16 @@ grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", tag = 
 hevc_parser = "0.6"
 hex = "0.4"
 hound = "3.5.1"
+jiff = "0.2"
 lcms2 = { version = "6", optional = true }
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "rustls", "ring", "webpki-roots"] }
 libc = "0.2"
 png = "0.18"
 quick-xml = "0.37"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 regex = "1"
 ring = "0.17"
+roxmltree = "0.21"
 rsa = { version = "0.9", features = ["getrandom"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustfft = "6"
@@ -49,6 +52,7 @@ unicode-bidi = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 x509-parser = { version = "0.16", features = ["verify"] }
 zeroize = "1"
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [build-dependencies]
 pkg-config = "0.3"

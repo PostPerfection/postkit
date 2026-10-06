@@ -11,3 +11,11 @@ than the synthetic SOC+SIZ stubs the older tests build.
   Netflix Open Content's Sol Levante IMF
   (`SolLevante_IMF_DolbyVision_PQP3D65_UHD_24fps`), CC BY 4.0. It is a black
   leader frame, so it is 6.5 KB.
+
+# Facility List Messages
+
+- `flm/st430-16b-2017.xml`: the example instance published with SMPTE ST
+  430-16:2017 (`st430-16-20170714-pub.zip` on pub.smpte.org), unchanged, under
+  the BSD-style notice it carries. Its SM device chain is a CS role leaf that
+  expired in 2025, and the intermediate certificate is cut short (1152 of its
+  1155 DER bytes), so it parses but fails the certificate checks.

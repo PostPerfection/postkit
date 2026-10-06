@@ -1,0 +1,381 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Copyright (c), Society of Motion Pictures and Television Engineers. All rights 
+reserved. 
+
+Redistribution and use in source and binary forms, with or without 
+modification, are permitted provided that the following conditions are 
+met: 
+
+1. Redistributions of source code must retain the above copyright 
+notice, this list of conditions and the following disclaimer. 
+
+2. Redistributions in binary form must reproduce the above copyright 
+notice, this list of conditions and the following disclaimer in the 
+documentation and/or other materials provided with the distribution. 
+
+3. Neither the name of the copyright holder nor the names of its 
+contributors may be used to endorse or promote products derived from 
+this software without specific prior written permission. 
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS 
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED 
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A 
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT 
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, 
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED 
+TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR 
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF 
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING 
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS 
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+--> 
+
+<!--
+This document is an element of
+
+   SMPTE ST 430-16:2017 ,
+
+which is available at http://standards.smpte.org.
+
+
+To ensure interoperability, users are encouraged to:
+
+(a) retain this notice;
+
+(b) retrieve the recent versions of this document and its companion 
+defining engineering document. In particular, this document alone might 
+not be sufficient to ensure interoperability;
+
+(c) highlight and explain any modification they make to this document; and
+
+(d) report issues to the Director of Standards at https://www.smpte.org/about/staff.
+-->
+<FacilityListMessage xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                         xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
+                         xmlns="http://www.smpte-ra.org/ns/430-16/2017/FLM"
+                         xmlns:CustomNS="http://example.com/schema/test">
+
+    <MessageId>urn:uuid:48c0194e-1c0b-4ffb-abd7-9d214d7b9d98</MessageId>
+    <IssueDate>2015-06-22T18:13:51.0</IssueDate>
+    <AnnotationText>This is an example of an Extended FLM document
+    </AnnotationText>
+    <FacilityInfo>
+        <FacilityID>urn:x-facilityID:example.com:XPL:US-1600176-XPL</FacilityID>
+        <AlternateFacilityIDList>
+            <AlternateFacilityID>urn:uuid:92c614df-ecc2-410c-875c-3f5fffaf4915</AlternateFacilityID>
+            <AlternateFacilityID>http://circuitA.example.com/037</AlternateFacilityID>
+            <AlternateFacilityID>http://circuitB.example.com/958</AlternateFacilityID>
+        </AlternateFacilityIDList>
+        <FacilityName>ExampleFacility Cinema</FacilityName>
+        <FacilityTimeZone>Australia/Melbourne</FacilityTimeZone>
+        <Circuit>none</Circuit>
+        <ContactList>
+            <Contact>
+                <Name>Jane Doe</Name>
+                <CountryCode>AU</CountryCode>
+                <Phone1>+61 3 55555415 x239</Phone1>
+                <Phone2>+61 4 55597011</Phone2>
+                <Email>janedoe@facility.example.com</Email>
+                <Type>Manager</Type>
+            </Contact>
+            <Contact>
+                <Name>John Doe</Name>
+                <CountryCode>AU</CountryCode>
+                <Phone1>+61 3 55555415 x230</Phone1>
+                <Email>johndoe@facility.example.com</Email>
+                <Type>Technical Manager</Type>
+            </Contact>
+        </ContactList>
+        <AddressList>
+            <!-- Physical, Shipping, Billing -->
+            <Physical>
+                <Addressee>Examplefacility Cinema</Addressee>
+                <StreetAddress>1 StreetName Road</StreetAddress>
+                <StreetAddress2>second line if needed</StreetAddress2>
+                <City>South Melbourne</City>
+                <Province>Victoria</Province>
+                <PostalCode>3205</PostalCode>
+                <Country>AU</Country>
+            </Physical>
+        </AddressList>
+        <!-- Devices associated against the Facility itself, ie TMS -->
+        <DeviceList>
+            <Device>
+                <!-- The DeviceTypeID element shall identify the device type -->
+                <DeviceTypeID>TMS</DeviceTypeID>
+                <DeviceIdentifier idtype="CertThumbprint">YmVsc3dpY2tAZW50ZXJ0ZWNoLmNvbQ==</DeviceIdentifier>
+                <!-- OR <DeviceIdentifier idtype="DeviceUID">urn:uuid:95cabdbc-5851-4a93-b2c0-e938abe2f56b</DeviceIdentifier>-->
+                <Manufacturer>Example Manufacturer 1</Manufacturer>
+                <ModelNumber>EM1000</ModelNumber>
+                <IsActive>true</IsActive>
+                <!-- Example capabilities against Device -->
+                <Capabilities>
+                    <Resolution>2K</Resolution>
+                    <!-- Custom nameSpace go here to implement extensions -->
+                    <!--<extensionNamespace:extensionTag>ExtensionData</extensionNamespace:extensionTag>-->
+                    <CustomNS:DeviceDescription>
+                        <CustomNS:DeviceIdentifier>test</CustomNS:DeviceIdentifier>
+                        <CustomNS:DeviceTypeID>test</CustomNS:DeviceTypeID>
+                        <CustomNS:DeviceSerial>test</CustomNS:DeviceSerial>
+                        <CustomNS:VersionInfo>test</CustomNS:VersionInfo>
+                    </CustomNS:DeviceDescription>
+                </Capabilities>
+            </Device>
+        </DeviceList>
+        <!-- Facility Capabilities -->
+        <Capabilities>
+            <KDMDeliveryMethodList>
+                <DeliveryMethod>
+                    <Email>
+                        <EmailName>Person Name</EmailName>
+                        <EmailAddress>kdms_examplefacility@example.com</EmailAddress>
+                    </Email>
+                    <Email>
+                        <EmailAddress>kdms_examplefacility2@example.com</EmailAddress>
+                    </Email>
+                    <Modem>
+                        <PhoneNumber>+61 3 55555415</PhoneNumber>
+                    </Modem>
+                    <Network>
+                        <URL>ftp://username:password@kdm_upload.facility.example.com/kdm</URL>
+                    </Network>
+                    <Network>
+                        <URL>ftp://username:password@kdm_upload2.facility.example.com/kdm</URL>
+                    </Network>
+                    <Physical>
+                        <MediaType>USB</MediaType>
+                        <Detail>Detail on Physical Delivery method</Detail>
+                    </Physical>
+                    <Satellite>
+                        <Provider>Name of Satellite Company</Provider>
+                    </Satellite>
+                    <TKR>true</TKR>
+                </DeliveryMethod>
+            </KDMDeliveryMethodList>
+            <DCPDeliveryMethodList>
+                <DeliveryMethod>
+                    <Network>
+                        <URL>ftp://username:password@dcp_upload.facility.example.com/dcp</URL>
+                    </Network>
+                    <Satellite>
+                        <Provider>Name of Satellite Company</Provider>
+                    </Satellite>
+                </DeliveryMethod>
+            </DCPDeliveryMethodList>
+            <!-- Custom nameSpace go here to implement extensions -->
+            <!--<extensionNamespace:extensionTag>ExtensionData</extensionNamespace:extensionTag>-->
+        </Capabilities>
+        <!-- Custom nameSpace go here to implement extensions -->
+        <!--<extensionNamespace:extensionTag>ExtensionData</extensionNamespace:extensionTag>-->
+    </FacilityInfo>
+    <AuditoriumList>
+        <!-- repeated for each Screen -->
+        <Auditorium>
+            <AuditoriumNumberOrName>1</AuditoriumNumberOrName>
+            <AuditoriumInstallDate>2016-06-01</AuditoriumInstallDate>
+            <!-- units = foot, meter, inch, centimeter -->
+            <ScreenWidth units="foot">52</ScreenWidth>
+            <SeatingCapacity>348</SeatingCapacity>
+            <SuiteList>
+                <Suite>
+                    <Device>
+                        <DeviceTypeID>SM</DeviceTypeID>
+                        <DeviceIdentifier idtype="CertThumbprint">YmVsc3dpY2tAZW50ZXJ0ZWNoLmNvbQ==</DeviceIdentifier>
+                        <!-- OR <DeviceIdentifier idtype="DeviceUID">urn:uuid:4ab01c33-cb60-4398-a7b1-83835be3940f</DeviceIdentifier>-->
+                        <DeviceSerial>000100</DeviceSerial>
+                        <Manufacturer>Example Manufacturer Name</Manufacturer>
+                        <ModelNumber>DS1000</ModelNumber>
+                        <InstallDate>2016-10-26</InstallDate>
+                        <IsActive>true</IsActive>
+                        <Integrator>Example Integrators Name</Integrator>
+                        <VPFFinanceEntity>Example VPF Finance Entity Name</VPFFinanceEntity>
+                        <VPFStartDate>2008-01-01</VPFStartDate>
+                        <ComponentList>
+                            <!-- Each Component element shall correspond to a software, firmware
+                             or hardware component of the device -->
+                            <Component>
+                                <!-- Firmware, Software, Hardware -->
+                                <ComponentKind>Hardware</ComponentKind>
+                                <ComponentManufacturer>Example Manufacturer Name</ComponentManufacturer>
+                                <Description>Hardware version</Description>
+                                <Version>2.1</Version>
+                            </Component>
+                            <Component>
+                                <ComponentKind>Software</ComponentKind>
+                                <ComponentManufacturer>Example Manufacturer Name</ComponentManufacturer>
+                                <Description>Production Software</Description>
+                                <Version>4.0.2.13</Version>
+                            </Component>
+                            <Component>
+                                <ComponentKind>Firmware</ComponentKind>
+                                <ComponentManufacturer>Example Manufacturer Name</ComponentManufacturer>
+                                <Description>Production firmware</Description>
+                                <Version>0.91.5.4</Version>
+                            </Component>
+                        </ComponentList>
+                        <KeyInfoList>
+                            <!-- The KeyInfoList shall contain the one or more complete certificate chains
+                            associated with the device. Each KeyInfo element shall contain one or more X509Data
+                            elements, each corresponding to a single certificate, as specified in SMPTE ST 430-2 -->
+                            <ds:KeyInfo>
+                                <ds:X509Data>
+                                    <ds:X509Certificate>
+                                        <!-- Root CA Cert,  Subject: CN=.smpte-430-2.ROOT.NOT_FOR_PRODUCTION/dnQualifier=stKUkogg+7v1A62kFxS93oo1Kyk= -->
+                                        MIIEdzCCA1+gAwIBAgIBBTANBgkqhkiG9w0BAQsFADCBgjEUMBIGA1UEChMLZXhh
+                                        bXBsZS5vcmcxFDASBgNVBAsTC2V4YW1wbGUub3JnMS0wKwYDVQQDFCQuc21wdGUt
+                                        NDMwLTIuUk9PVC5OT1RfRk9SX1BST0RVQ1RJT04xJTAjBgNVBC4THHN0S1Vrb2dn
+                                        Kzd2MUE2MmtGeFM5M29vMUt5az0wHhcNMTUwNDI5MTY1OTA5WhcNMjUwNDI2MTY1
+                                        OTA5WjCBgjEUMBIGA1UEChMLZXhhbXBsZS5vcmcxFDASBgNVBAsTC2V4YW1wbGUu
+                                        b3JnMS0wKwYDVQQDFCQuc21wdGUtNDMwLTIuUk9PVC5OT1RfRk9SX1BST0RVQ1RJ
+                                        T04xJTAjBgNVBC4THHN0S1Vrb2dnKzd2MUE2MmtGeFM5M29vMUt5az0wggEiMA0G
+                                        CSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC3hVv6fiSuUPAEpgByc3Waxvvs70JQ
+                                        vvSzUkYJK4hsx7iWnwxABQ2UAmbgDRZpa0bjmZMBnYB5U4/tiiBKM4+T7Mb7RDMK
+                                        VcXy5aGBsjYznyvq9oLfNf0vmYvIYupE6UHnBkXOlyxWzaTSuEsUzqShsymNu+3u
+                                        9vGQmULm4mOxQrxeBG00L5lMsktyP/YbH95J48La/OYbKsaFRCuJMNtulQmE7RwU
+                                        jESULZ8PoPuUrz7gf3mKBx0Uulo1zCo4kFGckfJOriotGDvw20yH0aJdK2mg2y1t
+                                        sHhCPe+H/k9TbOL0AhQ1jUFW2l/VO8D4HX5u58c0q6dOFhwXxiBBm75VAgMBAAGj
+                                        gfUwgfIwEgYDVR0TAQH/BAgwBgEB/wIBAzALBgNVHQ8EBAMCAQYwHQYDVR0OBBYE
+                                        FLLSlJKIIPu79QOtpBcUvd6KNSspMIGvBgNVHSMEgacwgaSAFLLSlJKIIPu79QOt
+                                        pBcUvd6KNSspoYGIpIGFMIGCMRQwEgYDVQQKEwtleGFtcGxlLm9yZzEUMBIGA1UE
+                                        CxMLZXhhbXBsZS5vcmcxLTArBgNVBAMUJC5zbXB0ZS00MzAtMi5ST09ULk5PVF9G
+                                        T1JfUFJPRFVDVElPTjElMCMGA1UELhMcc3RLVWtvZ2crN3YxQTYya0Z4Uzkzb28x
+                                        S3lrPYIBBTANBgkqhkiG9w0BAQsFAAOCAQEAEibM+u6vPuIkX9sjcPtPhG0VNiv9
+                                        v1fBYuutQTbP9lGNOjG3PwwTqePT6KNU08uApc8Pc/g/sXla2+UjSsYf9CBa0C3A
+                                        8XGECDtyybX3E3bLgDFHGYyGoCET3NOVTNDkt5nRuCkoWdbLGcnmqQuqc1sAevrS
+                                        8JExPJ4EZoIlWqhfr38q/Ixd8scPBByhrvviTySAU/iYt1ALCVH8J/DdZOpI0+1o
+                                        2qhJ13zl5E8xok/6o8usiY2JTnAxJxl0e4jEuqzuaHjBVRbBc2yxs9KRaAp2KgR7
+                                        SKeaRQ7lOfAmqLWOlI/VjStWxbuixzZKT6xBI8ppNmGJvfeQK0NlgOv34g==
+                                    </ds:X509Certificate>
+                                    <ds:X509Certificate>
+                                        <!-- Intermediate cert, Subject: O=example.org, OU=example.org, CN=.smpte-430-2.INTERMEDIATE.NOT_FOR_PRODUCTION/dnQualifier=5ZBz5TXT1o6Sj+5FxvbXfP0OnMc= -->
+                                        MIIEfzCCA2egAwIBAgIBBjANBgkqhkiG9w0BAQsFADCBgjEUMBIGA1UEChMLZXhh
+                                        bXBsZS5vcmcxFDASBgNVBAsTC2V4YW1wbGUub3JnMS0wKwYDVQQDFCQuc21wdGUt
+                                        NDMwLTIuUk9PVC5OT1RfRk9SX1BST0RVQ1RJT04xJTAjBgNVBC4THHN0S1Vrb2dn
+                                        Kzd2MUE2MmtGeFM5M29vMUt5az0wHhcNMTUwNDI5MTY1OTA5WhcNMjUwNDI1MTY1
+                                        OTA5WjCBijEUMBIGA1UEChMLZXhhbXBsZS5vcmcxFDASBgNVBAsTC2V4YW1wbGUu
+                                        b3JnMTUwMwYDVQQDFCwuc21wdGUtNDMwLTIuSU5URVJNRURJQVRFLk5PVF9GT1Jf
+                                        UFJPRFVDVElPTjElMCMGA1UELhMcNVpCejVUWFQxbzZTais1Rnh2YlhmUDBPbk1j
+                                        PTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAMLHpkLwNKjBqGooe5m8
+                                        G+dWwli3PqjATab0Cf6X6a7CX5j0TlQ19DsUaXWb4WmBdLG/eKO9czdIJ2eQGNnC
+                                        WJjZ+CTibwFPeMCFf+n5UWq+VF4h+gdg/RSdsbKPzmjLh+fdsm/Ea20WuHBKIMGJ
+                                        f8+6WdXWsmqMmD/OS9cNBmerccAh/vX7yg8IXKJBrQ5UcknHFs3hyf5PzwfMT/G/
+                                        xVYaV1ltAOJtzaTVBuWUUiGVGLieWV8T2+ddP3+Wq1tVNTillj3pHuD+G6RmzUwM
+                                        mC4bwKfl0DshceI4YhEhVgv/sRSN8mD9YCz/bkCnKsiCSDhBliwpfQ8du2KzPDOn
+                                        GVECAwEAAaOB9TCB8jASBgNVHRMBAf8ECDAGAQH/AgECMAsGA1UdDwQEAwIBBjAd
+                                        BgNVHQ4EFgQU5ZBz5TXT1o6Sj+5FxvbXfP0OnMcwga8GA1UdIwSBpzCBpIAUstKU
+                                        kogg+7v1A62kFxS93oo1KymhgYikgYUwgYIxFDASBgNVBAoTC2V4YW1wbGUub3Jn
+                                        MRQwEgYDVQQLEwtleGFtcGxlLm9yZzEtMCsGA1UEAxQkLnNtcHRlLTQzMC0yLlJP
+                                        T1QuTk9UX0ZPUl9QUk9EVUNUSU9OMSUwIwYDVQQuExxzdEtVa29nZys3djFBNjJr
+                                        RnhTOTNvbzFLeWs9ggEFMA0GCSqGSIb3DQEBCwUAA4IBAQCrNgfIA58RlEaG3roA
+                                        fT63n3iEsybafUM1bJvwsyG6Lu7oLBmWeOORS8o+YWCG1JBrLvLD5O+QYTbMkfku
+                                        ZiEqwLbvYa/+cZ16V2v+s/3QkbXJXw6GaZP163nclbPQEbnkZSykJZqlUPa5wp5o
+                                        cN7Kuw70H+F6ViEXKe5FOuutDhtuB3IG6VlgqXuf+cGBe5V0j0wOz5hBB4Q29SI2
+                                        pxz/qqdWgA3p5IbqBQ7dsTnQPy2tKvSV+iuOG7dFlX+fwyYgIhUNrNVGNWwv1nNX
+                                        BYFbGOgS4pYrReACsv+0t+qb/ebUCpWXdRa35lyOnUG0QExvPfsjXJbdaq6x+P/q
+                                    </ds:X509Certificate>
+                                    <ds:X509Certificate>
+                                        <!--  Leaf cert, Subject: O=example.org, OU=example.org, CN=CS.smpte-430-2.LEAF.NOT_FOR_PRODUCTION/dnQualifier=DE0yXjPwlpKDI240MkE9GwVXoQM= -->
+                                        MIIEezCCA2OgAwIBAgIBBzANBgkqhkiG9w0BAQsFADCBijEUMBIGA1UEChMLZXhh
+                                        bXBsZS5vcmcxFDASBgNVBAsTC2V4YW1wbGUub3JnMTUwMwYDVQQDFCwuc21wdGUt
+                                        NDMwLTIuSU5URVJNRURJQVRFLk5PVF9GT1JfUFJPRFVDVElPTjElMCMGA1UELhMc
+                                        NVpCejVUWFQxbzZTais1Rnh2YlhmUDBPbk1jPTAeFw0xNTA0MjkxNjU5MDlaFw0y
+                                        NTA0MjQxNjU5MDlaMIGEMRQwEgYDVQQKEwtleGFtcGxlLm9yZzEUMBIGA1UECxML
+                                        ZXhhbXBsZS5vcmcxLzAtBgNVBAMUJkNTLnNtcHRlLTQzMC0yLkxFQUYuTk9UX0ZP
+                                        Ul9QUk9EVUNUSU9OMSUwIwYDVQQuExxERTB5WGpQd2xwS0RJMjQwTWtFOUd3Vlhv
+                                        UU09MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEApOJo6NLT6yG05PYP
+                                        amyYY1PHz228sjTP13lU+nyaqqvb6zpUGhWp/1SZ/+byinJdmjAJLrNABwZ4oY+1
+                                        1E/Ua955jacBlxNokLCy2yPMFvh//6eqd15pFl3VKm+Hwy9h5VOkpNPBrTA4l06k
+                                        b+EkrblKu9rliZ7wi03Pqvxcu/eCWlYdHg6aTUJmcerW/wgdnmDZBjlWmoPgb8wb
+                                        yMC0Kk965oQY+Kei+6eVyPgspLnx3Au293HYTlT8Vo0a//dV/nRlVf4x3reAgu7D
+                                        EfXIcxaaFYdjqk6wPYTUvkVULTEaYyguAf1Ju0K0IwdAZGJqTE03qTN5hUbYGgfw
+                                        wbpkQQIDAQABo4HvMIHsMAwGA1UdEwEB/wQCMAAwCwYDVR0PBAQDAgWgMB0GA1Ud
+                                        DgQWBBQMTTJeM/CWkoMjbjQyQT0bBVehAzCBrwYDVR0jBIGnMIGkgBTlkHPlNdPW
+                                        jpKP7kXG9td8/Q6cx6GBiKSBhTCBgjEUMBIGA1UEChMLZXhhbXBsZS5vcmcxFDAS
+                                        BgNVBAsTC2V4YW1wbGUub3JnMS0wKwYDVQQDFCQuc21wdGUtNDMwLTIuUk9PVC5O
+                                        T1RfRk9SX1BST0RVQ1RJT04xJTAjBgNVBC4THHN0S1Vrb2dnKzd2MUE2MmtGeFM5
+                                        M29vMUt5az2CAQYwDQYJKoZIhvcNAQELBQADggEBAAJhgETp0IHSPqy9IrdNozbH
+                                        k2U6bImHs2Gar4Du8puRn/xIxbLe4ahLPUu0pP0eM5cC5FIkP5sdejcbkwhfovSF
+                                        a/B1uWLNRTk14Kr+zhbMCmDBLjk0yX+e3Ui/3oHEQkpXEAYuXK1IrH/D+HlA8TCi
+                                        IVNPg4R0vcfi8eqRq5ttjZQ/GV7BKCrofS6ES6dOXdboe0905mvHLPdZY9DbwBYE
+                                        BykPuu6JnefSzPumUbtBDkadZoyhyMEriySckV+AQ0epIKpZmafmMwxhAowTts82
+                                        bYRNcgggsKB9pRTRBf6TvflcLjjsZof4OixKi+4hiWPvfSml3zU0z4DmBOYtR1M=
+                                    </ds:X509Certificate>
+                                </ds:X509Data>
+                            </ds:KeyInfo>
+                        </KeyInfoList>
+                        <Capabilities>
+                            <!-- 4K, 2K -->
+                            <Resolution>4K</Resolution>
+                            <WatermarkingList>
+                                <Watermarking>
+                                    <WatermarkManufacturer>Example Manufacturer Name</WatermarkManufacturer>
+                                    <!-- Picture, Audio -->
+                                    <WatermarkKind>Picture</WatermarkKind>
+                                    <WatermarkModel>PIC-2000</WatermarkModel>
+                                    <WatermarkVersion>10.0.31.2</WatermarkVersion>
+                                </Watermarking>
+                                <Watermarking>
+                                    <WatermarkManufacturer>Example Manufacturer Name</WatermarkManufacturer>
+                                    <WatermarkKind>Audio</WatermarkKind>
+                                    <WatermarkModel>AUD-2000</WatermarkModel>
+                                    <WatermarkVersion>3.2.7</WatermarkVersion>
+                                </Watermarking>
+                            </WatermarkingList>
+                            <!-- Custom nameSpace go here to implement extensions -->
+                            <!--<extensionNamespace:extensionTag>ExtensionData</extensionNamespace:extensionTag>-->
+                        </Capabilities>
+                    </Device>
+                </Suite>
+            </SuiteList>
+            <NonSecurityDeviceList>
+                <Device>
+                    <DeviceTypeID>sound</DeviceTypeID>
+                    <DeviceIdentifier idtype="DeviceUID">urn:uuid:8055c03c-3a11-417f-ac5d-f797b1069029</DeviceIdentifier>
+                    <Manufacturer>Example Manufacturer Name</Manufacturer>
+                    <ModelNumber>DS1101</ModelNumber>
+                    <InstallDate>2015-06-06</InstallDate>
+                    <IsActive>true</IsActive>
+                    <Capabilities>
+                        <!-- Custom nameSpace go here to implement extensions -->
+                        <!--<extensionNamespace:extensionTag>ExtensionData</extensionNamespace:extensionTag>-->
+                    </Capabilities>
+                </Device>
+            </NonSecurityDeviceList>
+            <Capabilities>
+                <Supports35MM>false</Supports35MM>
+                <!-- 1.85, 2.39, 1.66, 1.37, Other -->
+                <ScreenAspectRatio>2.39</ScreenAspectRatio>
+                <!-- Top, Side, Bottom, FloatingScope, FloatingFlat, SideBottom, SideTop,TopBottom, All, Fixed -->
+                <AdjustableScreenMask>Top</AdjustableScreenMask>
+                <AudioFormatList>
+                    <AudioFormat scope="http://www.smpte-ra.org/ns/430-16/2017/FLM#AudioFormat">51</AudioFormat>
+                    <AudioFormat scope="http://www.smpte-ra.org/ns/430-16/2017/FLM#AudioFormat">71</AudioFormat>
+                    <AudioFormat scope="http://www.smpte-ra.org/ns/430-16/2017/FLM#AudioFormat">Atmos</AudioFormat>
+                </AudioFormatList>
+                <LargeFormat>
+                    <Kind>LargeFormatName</Kind>
+                    <InstallDate>2012-12-12</InstallDate>
+                </LargeFormat>
+                <Digital3DSystem>
+                    <IsActive>true</IsActive>
+                    <Digital3DConfiguration>3D-System-Kind</Digital3DConfiguration>
+                    <InstallDate>2016-10-26</InstallDate>
+                    <!-- Silver, White, Other -->
+                    <ScreenType>Silver</ScreenType>
+                    <!-- unit = candela-per-square-metre OR foot-lambert -->
+                    <ScreenLuminance units="foot-lambert">14</ScreenLuminance>
+                </Digital3DSystem>
+                <ClosedCaptionSystem>
+                    <Kind>CCAP-System-Name/Model</Kind>
+                </ClosedCaptionSystem>
+                <VisuallyImpairedNarrationSystem>
+                    <Kind>VI-System-Name/Model</Kind>
+                </VisuallyImpairedNarrationSystem>
+                <HearingImpairedSystem>
+                    <Kind>HI-System-Name/Model</Kind>
+                </HearingImpairedSystem>
+            </Capabilities>
+        </Auditorium>
+    </AuditoriumList>
+</FacilityListMessage>
