@@ -75,10 +75,8 @@ impl CheckReport {
         self.warnings
             .extend(report.best_effort_failures.into_iter().map(finding));
         for skipped in report.not_checked {
-            let note = format!(
-                "{screen}: {chain}: {} not checked: {}",
-                skipped.rule, skipped.reason
-            );
+            // the same for every chain, so one note stands for all of them
+            let note = format!("{} not checked: {}", skipped.rule, skipped.reason);
             if !self.not_checked.contains(&note) {
                 self.not_checked.push(note);
             }
