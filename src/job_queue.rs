@@ -91,8 +91,9 @@ fn report(message: &str) {
     eprintln!("[jobs] {message}");
 }
 
-/// What the jobs file held: the last record per job id, ordered by id, with a
-/// job left running failed, plus how many lines could not be read.
+/// What the jobs file held: the last record per job id, in the order of those
+/// last records, with a job left running failed, plus how many lines could not
+/// be read.
 pub struct LoadedJobs<C> {
     pub jobs: Vec<StoredJob<C>>,
     pub skipped: usize,
@@ -129,13 +130,13 @@ pub fn load<C: QueueJob>(path: &Path) -> LoadedJobs<C> {
                     stored.state = JobState::Failed;
                     stored.message = INTERRUPTED_MESSAGE.to_string();
                 }
-                match jobs
+                if let Some(at) = jobs
                     .iter()
                     .position(|job| job.config.id() == stored.config.id())
                 {
-                    Some(at) => jobs[at] = stored,
-                    None => jobs.push(stored),
+                    jobs.remove(at);
                 }
+                jobs.push(stored);
             }
             Err(e) => {
                 skipped += 1;
@@ -154,7 +155,6 @@ pub fn load<C: QueueJob>(path: &Path) -> LoadedJobs<C> {
         ));
     }
 
-    jobs.sort_by_key(|job| job.config.id());
     write_all(path, &jobs);
     LoadedJobs { jobs, skipped }
 }
@@ -266,6 +266,35 @@ impl<C: QueueJob> JobQueue<C> {
     pub fn submit(&self, job: C) {
         self.record(JobState::Queued, "", &job);
         self.queue.lock().unwrap().push_back(job);
+    }
+
+    /// Move the queued job `id` so it runs before the queued job `before`, or
+    /// next when `before` is None, and record the new order. False when either
+    /// is not in the queue.
+    pub fn move_before(&self, id: u64, before: Option<u64>) -> bool {
+        let _listed = self.history.lock().unwrap();
+        let mut queue = self.queue.lock().unwrap();
+        let position = |id: u64| queue.iter().position(|job| job.id() == id);
+        let Some(from) = position(id) else {
+            return false;
+        };
+        if before == Some(id) {
+            return true;
+        }
+        let Some(to) = before.map_or(Some(0), position) else {
+            return false;
+        };
+        let jobs = queue.make_contiguous();
+        if from < to {
+            jobs[from..to].rotate_left(1);
+        } else {
+            jobs[to..=from].rotate_right(1);
+        }
+        // held across the writes or a job cancelled meanwhile comes back queued after a restart
+        for job in queue.iter() {
+            self.record(JobState::Queued, "", job);
+        }
+        true
     }
 
     pub fn has_running_job(&self) -> bool {
@@ -676,9 +705,10 @@ mod tests {
             .iter()
             .map(|job| (job.config.id, job.state))
             .collect();
+        // the queued job is cancelled before the running one stops
         assert_eq!(
             states,
-            vec![(1, JobState::Cancelled), (2, JobState::Cancelled)]
+            vec![(2, JobState::Cancelled), (1, JobState::Cancelled)]
         );
     }
 
@@ -771,6 +801,93 @@ mod tests {
         assert!(!queue.cancel(job.id));
         assert!(!queue.is_cancelled());
         assert_eq!(queue.get(job.id).unwrap().state, JobState::Completed);
+    }
+
+    fn queue_with_jobs(path: PathBuf, ids: &[u64]) -> JobQueue<TestJob> {
+        let queue = JobQueue::new(path);
+        for &id in ids {
+            let mut job = test_job();
+            job.id = id;
+            queue.submit(job);
+        }
+        queue
+    }
+
+    fn listed_ids(queue: &JobQueue<TestJob>) -> Vec<u64> {
+        queue.snapshot().iter().map(|job| job.id).collect()
+    }
+
+    #[test]
+    fn a_queued_job_moved_to_the_front_runs_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = queue_with_jobs(dir.path().join("gui-jobs.jsonl"), &[1, 2, 3]);
+        assert!(queue.move_before(3, None));
+        let taken: Vec<u64> = std::iter::from_fn(|| queue.take_next())
+            .map(|job| job.id)
+            .collect();
+        assert_eq!(taken, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn a_queued_job_moved_before_another_sits_just_ahead_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = queue_with_jobs(dir.path().join("gui-jobs.jsonl"), &[1, 2, 3, 4]);
+        assert!(queue.move_before(4, Some(2)));
+        assert_eq!(listed_ids(&queue), vec![1, 4, 2, 3]);
+        assert!(queue.move_before(1, Some(3)));
+        assert_eq!(listed_ids(&queue), vec![4, 2, 1, 3]);
+        assert!(queue.move_before(2, Some(2)));
+        assert_eq!(listed_ids(&queue), vec![4, 2, 1, 3]);
+    }
+
+    #[test]
+    fn a_move_naming_a_job_that_is_not_queued_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = queue_with_jobs(dir.path().join("gui-jobs.jsonl"), &[1, 2, 3]);
+        let running = queue.take_next().unwrap();
+        queue.start(&running);
+        assert!(!queue.move_before(1, None));
+        assert!(!queue.move_before(1, Some(3)));
+        assert!(!queue.move_before(99, None));
+        assert!(!queue.move_before(3, Some(99)));
+        assert!(!queue.move_before(3, Some(1)));
+        assert_eq!(listed_ids(&queue), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn the_moved_order_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gui-jobs.jsonl");
+        let queue = queue_with_jobs(path.clone(), &[1, 2, 3]);
+        assert!(queue.move_before(3, Some(1)));
+        assert!(queue.move_before(2, Some(1)));
+        assert_eq!(listed_ids(&queue), vec![3, 2, 1]);
+
+        let restarted: JobQueue<TestJob> = JobQueue::new(path);
+        assert_eq!(restarted.load_jobs_file(), 0);
+        assert_eq!(listed_ids(&restarted), vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn a_job_finishing_after_a_move_is_loaded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gui-jobs.jsonl");
+        let queue = queue_with_jobs(path.clone(), &[1, 2]);
+        assert!(queue.move_before(2, None));
+        let job = queue.take_next().unwrap();
+        queue.start(&job);
+        queue.finish(&job, JobState::Completed, "");
+
+        let loaded = load::<TestJob>(&path);
+        let states: Vec<(u64, JobState)> = loaded
+            .jobs
+            .iter()
+            .map(|job| (job.config.id, job.state))
+            .collect();
+        assert_eq!(
+            states,
+            vec![(1, JobState::Queued), (2, JobState::Completed)]
+        );
     }
 
     #[test]

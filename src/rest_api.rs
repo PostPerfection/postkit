@@ -55,12 +55,15 @@ pub type RouteHandler = Box<dyn Fn(&Request) -> (u16, String) + Send + Sync>;
 
 pub type ContentTypeRouteHandler = Box<dyn Fn(&Request) -> RouteResponse + Send + Sync>;
 
-// takes the one path segment after the registered prefix
+// takes the one path segment the route matched
 pub type ParameterRouteHandler = Box<dyn Fn(&Request, &str) -> (u16, String) + Send + Sync>;
 
 enum RouteAction {
     Whole(ContentTypeRouteHandler),
-    Parameter(ParameterRouteHandler),
+    Parameter {
+        suffix: String,
+        handler: ParameterRouteHandler,
+    },
 }
 
 struct Route {
@@ -154,6 +157,33 @@ impl RestServer {
         prefix: &str,
         handler: ParameterRouteHandler,
     ) {
+        self.push_parameter_route(method, prefix, "", handler);
+    }
+
+    /// Register a route with one path segment between a prefix and a suffix:
+    /// the prefix `/api/v1/jobs/` and the suffix `/move` match
+    /// `/api/v1/jobs/7/move` and hand the handler `7`.
+    pub fn route_with_parameter_and_suffix(
+        &mut self,
+        method: &str,
+        prefix: &str,
+        suffix: &str,
+        handler: ParameterRouteHandler,
+    ) {
+        assert!(
+            suffix.starts_with('/'),
+            "a parameter route suffix must start with a slash, got {suffix:?}"
+        );
+        self.push_parameter_route(method, prefix, suffix, handler);
+    }
+
+    fn push_parameter_route(
+        &mut self,
+        method: &str,
+        prefix: &str,
+        suffix: &str,
+        handler: ParameterRouteHandler,
+    ) {
         assert!(
             prefix.ends_with('/'),
             "a parameter route prefix must end in a slash, got {prefix:?}"
@@ -161,7 +191,10 @@ impl RestServer {
         self.routes.push(Route {
             method: method.to_string(),
             path: prefix.to_string(),
-            action: RouteAction::Parameter(handler),
+            action: RouteAction::Parameter {
+                suffix: suffix.to_string(),
+                handler,
+            },
         });
     }
 
@@ -240,8 +273,8 @@ impl RestServer {
                         return handler(request);
                     }
                 }
-                RouteAction::Parameter(handler) => {
-                    if let Some(parameter) = path_parameter(&route.path, &request.path) {
+                RouteAction::Parameter { suffix, handler } => {
+                    if let Some(parameter) = path_parameter(&route.path, suffix, &request.path) {
                         let (status, body) = handler(request, parameter);
                         return RouteResponse::json(status, body);
                     }
@@ -252,8 +285,8 @@ impl RestServer {
     }
 }
 
-fn path_parameter<'a>(prefix: &str, path: &'a str) -> Option<&'a str> {
-    let rest = path.strip_prefix(prefix)?;
+fn path_parameter<'a>(prefix: &str, suffix: &str, path: &'a str) -> Option<&'a str> {
+    let rest = path.strip_prefix(prefix)?.strip_suffix(suffix)?;
     (!rest.is_empty() && !rest.contains('/')).then_some(rest)
 }
 
@@ -405,6 +438,12 @@ mod tests {
             "/api/thing/",
             Box::new(|_request, parameter| (200, format!(r#"{{"id":"{parameter}"}}"#))),
         );
+        server.route_with_parameter_and_suffix(
+            "GET",
+            "/api/thing/",
+            "/part",
+            Box::new(|_request, parameter| (200, format!(r#"{{"part":"{parameter}"}}"#))),
+        );
         server
     }
 
@@ -478,6 +517,33 @@ mod tests {
         assert!(
             get(address, "/api/thing/7/8").starts_with("HTTP/1.1 404"),
             "a second segment is not a parameter"
+        );
+    }
+
+    #[test]
+    fn a_suffix_route_takes_the_segment_between_prefix_and_suffix() {
+        let address = serve(test_server());
+        let response = get(address, "/api/thing/7/part");
+        assert!(response.ends_with(r#"{"part":"7"}"#), "{response}");
+    }
+
+    #[test]
+    fn a_suffix_route_does_not_match_without_its_suffix() {
+        let address = serve(test_server());
+        let response = get(address, "/api/thing/7");
+        assert!(response.ends_with(r#"{"id":"7"}"#), "{response}");
+        assert!(
+            get(address, "/api/thing/7/other").starts_with("HTTP/1.1 404"),
+            "a different suffix is not the registered one"
+        );
+    }
+
+    #[test]
+    fn a_suffix_route_refuses_a_slash_in_the_segment() {
+        let address = serve(test_server());
+        assert!(
+            get(address, "/api/thing/7/8/part").starts_with("HTTP/1.1 404"),
+            "two segments before the suffix are not a parameter"
         );
     }
 
