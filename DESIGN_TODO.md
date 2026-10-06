@@ -25,7 +25,7 @@
 - Extract the wizards' progress event into postkit (2026-08-17, proposed, not
   accepted). Both wizards emit the same `PipelineProgress` from their src-tauri
   glue: job_id, stage, message, frame, total_frames, fps, elapsed_secs, percent.
-  Same shape as the gui_job_queue move: the event type defaults into postkit,
+  Same shape as the job_queue move: the event type defaults into postkit,
   the wizards keep the tauri emit calls.
 
 - Embedded playback hand pass. The libmpv render engine (src/mpv_render, libmpv

@@ -31,7 +31,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
 | `hash` | SHA-1 / SHA-256 file hashing |
 | `j2k` | JPEG 2000 codestream parsing, DCI validation, MXF frame extraction and bitrate analysis |
-| `job_queue` | Background job scheduling |
+| `job_queue` | The job queue every wizard process runs, with its jobs file |
 | `loudness` | Audio loudness measurement (EBU R128, Leq(m)) and gain adjustment |
 | `mca` | SMPTE ST 377-4 Multi-Channel Audio label generation |
 | `metadata_edit` | CPL/OPL metadata editor |
