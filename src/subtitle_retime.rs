@@ -4,8 +4,11 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
+use quick_xml::events::Event;
+use quick_xml::reader::Reader;
 use thiserror::Error;
 
+use crate::subtitle_formats::dcp::parse_dcp_subtitle;
 use crate::timecode::{seconds_to_timecode, timecode_to_seconds};
 
 #[derive(Debug, Error)]
@@ -65,36 +68,56 @@ fn parse_srt_time(t: &str) -> f64 {
 
 /// Latest subtitle end time in seconds, or None when the document has no parsable timing.
 ///
-/// Reads TTML/IMSC `end` attributes and Interop DCSubtitle `TimeOut` attributes.
+/// Reads DCP subtitle cue ends and TTML/IMSC `end` attributes.
 pub fn subtitle_end_time_seconds(content: &str, fps: f64) -> Option<f64> {
+    if root_is_dcp_subtitle(content) {
+        let document = parse_dcp_subtitle(content, |name| Ok(PathBuf::from(name))).ok()?;
+        let latest_end_ms = document.cues.iter().map(|cue| cue.end_ms).max()?;
+        return (latest_end_ms > 0).then(|| latest_end_ms as f64 / MILLISECONDS_PER_SECOND);
+    }
+
     let fps = if fps > 0.0 { fps } else { 24.0 };
     let mut latest: Option<f64> = None;
 
-    for attr in ["end", "TimeOut"] {
-        let needle = format!("{attr}=\"");
-        let mut rest = content;
-        while let Some(pos) = rest.find(&needle) {
-            // require an attribute boundary so "backend=" does not match "end="
-            let at_boundary = rest[..pos]
-                .chars()
-                .next_back()
-                .is_none_or(|c| c.is_whitespace());
-            let val_start = pos + needle.len();
-            let after = &rest[val_start..];
-            let Some(val_end) = after.find('"') else {
-                break;
-            };
-            if at_boundary {
-                let t = timecode_to_seconds(&after[..val_end], fps);
-                if t > 0.0 {
-                    latest = Some(latest.map_or(t, |m: f64| m.max(t)));
-                }
+    let needle = "end=\"";
+    let mut rest = content;
+    while let Some(pos) = rest.find(needle) {
+        // require an attribute boundary so "backend=" does not match "end="
+        let at_boundary = rest[..pos]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace());
+        let val_start = pos + needle.len();
+        let after = &rest[val_start..];
+        let Some(val_end) = after.find('"') else {
+            break;
+        };
+        if at_boundary {
+            let t = timecode_to_seconds(&after[..val_end], fps);
+            if t > 0.0 {
+                latest = Some(latest.map_or(t, |m: f64| m.max(t)));
             }
-            rest = &after[val_end + 1..];
         }
+        rest = &after[val_end + 1..];
     }
 
     latest
+}
+
+const MILLISECONDS_PER_SECOND: f64 = 1000.0;
+const DCP_SUBTITLE_ROOTS: [&[u8]; 2] = [b"SubtitleReel", b"DCSubtitle"];
+
+fn root_is_dcp_subtitle(content: &str) -> bool {
+    let mut reader = Reader::from_str(content);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element) | Event::Empty(element)) => {
+                return DCP_SUBTITLE_ROOTS.contains(&element.local_name().as_ref());
+            }
+            Ok(Event::Eof) | Err(_) => return false,
+            _ => {}
+        }
+    }
 }
 
 /// A single parsed SRT cue.
@@ -489,10 +512,28 @@ mod tests {
 
     #[test]
     fn derives_end_time_from_interop_timeout() {
-        let xml =
-            r#"<DCSubtitle><Subtitle TimeIn="00:00:01:00" TimeOut="00:00:10:12"/></DCSubtitle>"#;
+        let xml = r#"<DCSubtitle><Subtitle TimeIn="00:00:01:00" TimeOut="00:00:10:12"><Text>x</Text></Subtitle></DCSubtitle>"#;
         let d = subtitle_end_time_seconds(xml, 24.0).unwrap();
-        assert!((d - 10.5).abs() < 1e-6, "got {d}");
+        assert!((d - 10.048).abs() < 1e-6, "got {d}");
+    }
+
+    #[test]
+    fn derives_end_time_from_smpte_time_code_rate_and_start_time() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<SubtitleReel xmlns="http://www.smpte-ra.org/schemas/428-7/2010/DCST">
+  <EditRate>25 1</EditRate>
+  <TimeCodeRate>25</TimeCodeRate>
+  <StartTime>00:00:02:00</StartTime>
+  <SubtitleList>
+    <Font ID="theFont" Size="42">
+      <Subtitle SpotNumber="1" TimeIn="00:00:03:00" TimeOut="00:00:12:05">
+        <Text Valign="bottom" Vposition="8" Halign="center">hello</Text>
+      </Subtitle>
+    </Font>
+  </SubtitleList>
+</SubtitleReel>"#;
+        let d = subtitle_end_time_seconds(xml, 24.0).unwrap();
+        assert!((d - 10.2).abs() < 1e-6, "got {d}");
     }
 
     #[test]
