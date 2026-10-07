@@ -191,6 +191,55 @@ fn a_cropped_source_lands_centred_on_the_target_raster() {
 }
 
 #[test]
+fn an_extra_picture_filter_fades_the_fitted_picture() {
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("clip.mp4");
+    make_clip(&video, SOURCE_WIDTH, SOURCE_HEIGHT, None);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let pause = Arc::new(AtomicBool::new(false));
+    let j2k_dir = run_encode_with_options(
+        &video,
+        &dir.path().join("out"),
+        &EncodeRunOptions {
+            fps: FrameRate::whole(FRAME_COUNT as u32),
+            picture: PictureProcessing {
+                fit: Some(Fit {
+                    box_width: BOX_WIDTH,
+                    box_height: BOX_HEIGHT,
+                    raster_width: RASTER_WIDTH,
+                    raster_height: RASTER_HEIGHT,
+                }),
+                ..PictureProcessing::default()
+            },
+            // one second over a two frame clip at two frames a second: black, then half
+            extra_picture_filter: Some("fade=t=in:st=0:d=1".to_string()),
+            ..Default::default()
+        },
+        &cancel,
+        &pause,
+        |_: &PipelineProgress| {},
+        |message: &str| eprintln!("{message}"),
+    )
+    .expect("encode")
+    .j2k_dir;
+
+    let first = decode_frame(&j2k_dir.join("frame_00000000.j2c"));
+    let second = decode_frame(&j2k_dir.join("frame_00000001.j2c"));
+    assert_eq!((first.width, first.height), (RASTER_WIDTH, RASTER_HEIGHT));
+    let black_ceiling = first.full_scale / BLACK_CEILING_DIVISOR;
+    let first_peak = first.row_peak(first.height / 2);
+    let second_peak = second.row_peak(second.height / 2);
+    assert!(
+        first_peak < black_ceiling,
+        "the first frame of a fade-in is not black: peak {first_peak}"
+    );
+    assert!(
+        second_peak > black_ceiling,
+        "the second frame is still black: peak {second_peak}"
+    );
+}
+
+#[test]
 fn black_bars_are_detected_from_a_few_sampled_frames() {
     let dir = tempfile::tempdir().unwrap();
     let video = dir.path().join("barred.mp4");

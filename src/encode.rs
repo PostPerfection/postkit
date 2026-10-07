@@ -366,6 +366,8 @@ pub enum PictureFilters<'a> {
         plan: &'a crate::picture_processing::PicturePlan,
         fps: FrameRate,
         frame_range: Option<FrameRange>,
+        /// ffmpeg filters run after the plan, on the fitted and windowed frame
+        extra_filter: Option<&'a str>,
     },
     /// A caller's own chain, which changes neither the frame size nor the frame
     /// count.
@@ -414,7 +416,8 @@ fn decode_filters(picture: &PictureFilters, source_colour: &SourceColour) -> Dec
             plan,
             fps,
             frame_range,
-        } => planned_filters(plan, *fps, *frame_range),
+            extra_filter,
+        } => planned_filters(plan, *fps, *frame_range, *extra_filter),
     };
     if let Some(lut) = source_colour.decode_lut() {
         filters.items.push(format!(
@@ -429,6 +432,7 @@ fn planned_filters(
     plan: &crate::picture_processing::PicturePlan,
     fps: FrameRate,
     frame_range: Option<FrameRange>,
+    extra_filter: Option<&str>,
 ) -> DecodeFilters {
     let mut items = plan.filters.clone();
     items.insert(
@@ -444,6 +448,7 @@ fn planned_filters(
         items.splice(after_fps..after_fps, trims);
     }
     let geometry_position = plan.geometry_format_position + inserted;
+    items.extend(extra_filter.map(str::to_string));
     DecodeFilters {
         items,
         geometry_format_position: plan.changes_geometry.then_some(geometry_position),
@@ -1158,6 +1163,10 @@ pub struct StreamEncodeOptions {
     /// the decode, which decides the size of the frames the encoder receives.
     #[serde(default)]
     pub picture: crate::picture_processing::PictureProcessing,
+    /// ffmpeg filters run after `picture` and the frame window, e.g. a fade,
+    /// which sees the fitted frame and timestamps counted from the window start.
+    #[serde(default)]
+    pub extra_picture_filter: Option<String>,
     /// Subtitles burnt into each decoded frame before it is compressed. Not
     /// serialised: it carries a live font database, so a stored job names the
     /// subtitle file and rebuilds it.
@@ -1205,6 +1214,7 @@ impl Default for StreamEncodeOptions {
             rsiz: default_rsiz(),
             decode_source: DecodeSource::Video,
             picture: crate::picture_processing::PictureProcessing::default(),
+            extra_picture_filter: None,
             subtitle_burn: None,
             watermark: None,
             codestream_byte_cap: None,
@@ -1443,6 +1453,7 @@ where
                 plan: &plan,
                 fps: opts.fps,
                 frame_range: opts.frame_range,
+                extra_filter: opts.extra_picture_filter.as_deref(),
             },
             source_colour: &opts.source_colour,
             source: &source,
@@ -2052,6 +2063,7 @@ mod tests {
                 plan,
                 fps,
                 frame_range,
+                extra_filter: None,
             },
             source_colour,
         )
@@ -2107,6 +2119,52 @@ mod tests {
             .joined(),
             "yadif,fps=24,trim=start_frame=7200:end_frame=7320,setpts=PTS-STARTPTS,hqdn3d,\
              lut3d=\\'/luts/hdr_to_dci.cube\\'"
+        );
+    }
+
+    #[test]
+    fn an_extra_picture_filter_runs_after_the_fit_and_before_the_lut() {
+        let fitted = crate::picture_processing::PictureProcessing {
+            fit: Some(crate::picture_processing::Fit {
+                box_width: 1998,
+                box_height: 1080,
+                raster_width: 2048,
+                raster_height: 1080,
+            }),
+            ..crate::picture_processing::PictureProcessing::default()
+        }
+        .plan(1920, 1080)
+        .unwrap();
+        let without_fade = planned(
+            FrameRate::whole(24),
+            &SourceColour::DisplayRgb,
+            &fitted,
+            None,
+        );
+        let with_fade = decode_filters(
+            &PictureFilters::Planned {
+                plan: &fitted,
+                fps: FrameRate::whole(24),
+                frame_range: None,
+                extra_filter: Some("fade=t=in:st=0:d=1"),
+            },
+            &SourceColour::DciLut(PathBuf::from("/luts/hdr_to_dci.cube")),
+        );
+        assert!(
+            without_fade.joined().contains("pad="),
+            "{}",
+            without_fade.joined()
+        );
+        assert_eq!(
+            with_fade.joined(),
+            format!(
+                "{},fade=t=in:st=0:d=1,lut3d=\\'/luts/hdr_to_dci.cube\\'",
+                without_fade.joined()
+            )
+        );
+        assert_eq!(
+            with_fade.geometry_format_position, without_fade.geometry_format_position,
+            "the fade must not move the pixel format filter"
         );
     }
 

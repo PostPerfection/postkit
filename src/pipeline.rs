@@ -182,6 +182,9 @@ pub struct EncodeRunOptions {
     /// source decodes. Anything but the identity takes an image sequence through
     /// ffmpeg, the way a burn does.
     pub picture: PictureProcessing,
+    /// ffmpeg filters run after `picture` and the frame window, e.g. a fade.
+    /// Like any processing, it takes an image sequence through ffmpeg.
+    pub extra_picture_filter: Option<String>,
     /// Encoder threads the pipeline runs, 0 for one per available CPU
     pub encode_threads: u32,
     pub detect_picture_findings: bool,
@@ -201,6 +204,7 @@ impl Default for EncodeRunOptions {
             codestream_byte_cap: None,
             subtitle_burn: None,
             picture: PictureProcessing::default(),
+            extra_picture_filter: None,
             encode_threads: 0,
             detect_picture_findings: false,
         }
@@ -298,8 +302,9 @@ fn run_encode_and_maybe_wrap(
         _ => None,
     };
     // tiff stills only reach ffmpeg for a picture change
-    let sequence_needs_ffmpeg =
-        !options.picture.is_identity() || sequence_frame_format != Some(ImageFormat::Tiff);
+    let sequence_needs_ffmpeg = !options.picture.is_identity()
+        || options.extra_picture_filter.is_some()
+        || sequence_frame_format != Some(ImageFormat::Tiff);
     let decodes_through_ffmpeg = match input_type {
         InputType::Video => true,
         InputType::ImageSequence => sequence_needs_ffmpeg,
@@ -420,6 +425,7 @@ fn run_encode_and_maybe_wrap(
                     rsiz: options.rsiz,
                     subtitle_burn: options.subtitle_burn.clone(),
                     picture: options.picture.clone(),
+                    extra_picture_filter: options.extra_picture_filter.clone(),
                     codestream_byte_cap: options.codestream_byte_cap,
                     encode_threads: options.encode_threads,
                     detect_picture_findings: options.detect_picture_findings,
@@ -454,6 +460,7 @@ fn run_encode_and_maybe_wrap(
                 rsiz: options.rsiz,
                 subtitle_burn: options.subtitle_burn.clone(),
                 picture: options.picture.clone(),
+                extra_picture_filter: options.extra_picture_filter.clone(),
                 codestream_byte_cap: options.codestream_byte_cap,
                 encode_threads: options.encode_threads,
                 detect_picture_findings: options.detect_picture_findings,
