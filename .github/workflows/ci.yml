@@ -135,13 +135,13 @@ jobs:
           fi
 
       - name: Build
-        run: cargo build --features "async tms"
+        run: cargo build --features "async tms flm-exchange"
 
       - name: Test
-        run: cargo test --no-fail-fast --features "async tms"
+        run: cargo test --no-fail-fast --features "async tms flm-exchange"
 
       - name: Clippy
-        run: cargo clippy --all-targets --features "async tms" -- -D warnings
+        run: cargo clippy --all-targets --features "async tms flm-exchange" -- -D warnings
 
       - name: Build (grok-ffi)
         run: cargo build --features "${{ matrix.grok-features }}"
