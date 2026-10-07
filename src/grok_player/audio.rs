@@ -23,6 +23,8 @@ use cpal::{
 use zeroize::Zeroize;
 
 use super::MILLISECONDS_PER_SECOND;
+use super::levels::{ChannelMeasure, LevelHistory};
+use crate::audio_levels::{ChannelLevel, RMS_WINDOW_SECONDS, numbered_channel_label};
 use crate::composition_timeline::{SegmentTrim, SoundSegment};
 use crate::content_keys::ContentKeys;
 
@@ -56,6 +58,21 @@ enum Speaker {
     RightSurround,
     LeftRearSurround,
     RightRearSurround,
+}
+
+impl Speaker {
+    fn lane_name(self) -> &'static str {
+        match self {
+            Speaker::Left => "L",
+            Speaker::Right => "R",
+            Speaker::Centre => "C",
+            Speaker::LowFrequency => "LFE",
+            Speaker::LeftSurround => "Ls",
+            Speaker::RightSurround => "Rs",
+            Speaker::LeftRearSurround => "Lrs",
+            Speaker::RightRearSurround => "Rrs",
+        }
+    }
 }
 
 // SMPTE 429-2 channel order as libdcp's Channel enum has it, None for HI, VI-N, sync and motion
@@ -260,6 +277,8 @@ struct Shared {
     buffer: Mutex<VecDeque<f32>>,
     // what the open stream fell back from
     warnings: Mutex<Vec<String>>,
+    level_meter_on: AtomicBool,
+    levels: Mutex<LevelHistory>,
 }
 
 impl Shared {
@@ -274,11 +293,18 @@ impl Shared {
             emitted_sample_frames: AtomicU64::new(0),
             buffer: Mutex::new(VecDeque::new()),
             warnings: Mutex::new(Vec::new()),
+            level_meter_on: AtomicBool::new(false),
+            levels: Mutex::new(LevelHistory::default()),
         }
     }
 
     fn output_channels(&self) -> usize {
         self.output_channels.load(Ordering::Acquire)
+    }
+
+    fn level_window_sample_frames(&self) -> u64 {
+        let device_rate = self.device_sample_rate.load(Ordering::Acquire);
+        (RMS_WINDOW_SECONDS * f64::from(device_rate)) as u64
     }
 
     fn count_emitted(&self, samples: usize) {
@@ -411,6 +437,36 @@ impl Output {
     // takes hold at the next seek
     pub(super) fn set_delay_milliseconds(&self, milliseconds: i64) {
         let _ = self.commands.send(Command::SetDelay(milliseconds));
+    }
+
+    pub(super) fn level_meter(&self) -> SoundLevelMeter {
+        SoundLevelMeter(Arc::clone(&self.shared))
+    }
+}
+
+// the levels of the source channels at the position the device has played to
+pub(super) struct SoundLevelMeter(Arc<Shared>);
+
+impl SoundLevelMeter {
+    // off, the feeder measures nothing
+    pub(super) fn set_enabled(&self, enabled: bool) {
+        self.0.level_meter_on.store(enabled, Ordering::Release);
+        self.0.levels.lock().unwrap().forget();
+    }
+
+    // None while the meter is off or nothing with sound is loaded
+    pub(super) fn levels(&self) -> Option<Vec<ChannelLevel>> {
+        let shared = &self.0;
+        if !shared.level_meter_on.load(Ordering::Acquire)
+            || !shared.reels_loaded.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let heard =
+            shared.playing.load(Ordering::Acquire) && shared.stream_live.load(Ordering::Acquire);
+        let played = shared.emitted_sample_frames.load(Ordering::Acquire);
+        let window = shared.level_window_sample_frames();
+        shared.levels.lock().unwrap().read(played, window, heard)
     }
 }
 
@@ -737,6 +793,7 @@ struct AudioLayout {
     edit_units: u32,
     sample_rate: u32,
     speakers: Vec<Option<Speaker>>,
+    lane_names: Arc<[String]>,
 }
 
 fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
@@ -916,6 +973,7 @@ impl Feeder {
 
     fn seek(&mut self, frame: u64) {
         self.undo_switch();
+        self.shared.levels.lock().unwrap().restart();
         self.seek_position = Some(frame as f64);
         self.start_at(frame as f64);
     }
@@ -938,6 +996,8 @@ impl Feeder {
             buffer.clear();
             buffer.extend(std::iter::repeat_n(0.0, silence));
         }
+        let played = self.shared.emitted_sample_frames.load(Ordering::Acquire);
+        self.shared.levels.lock().unwrap().discard_unplayed(played);
         self.log_start("starts");
     }
 
@@ -959,6 +1019,7 @@ impl Feeder {
         self.shared.playing.store(false, Ordering::Release);
         self.shared.reels_loaded.store(false, Ordering::Release);
         self.shared.buffer.lock().unwrap().clear();
+        self.shared.levels.lock().unwrap().forget();
         self.current = SoundComposition::empty();
         self.queued = None;
         self.finished = None;
@@ -1065,6 +1126,12 @@ impl Feeder {
             (self.skipped_source_sample_frames * layout.channels as usize).min(interleaved.len());
         interleaved.drain(..skipped);
         self.skipped_source_sample_frames = 0;
+        let measured = self.shared.level_meter_on.load(Ordering::Acquire).then(|| {
+            (
+                Arc::clone(&layout.lane_names),
+                ChannelMeasure::of(&interleaved, layout.channels as usize),
+            )
+        });
         let mut mixed = Vec::new();
         self.mix.apply(&interleaved, &layout.speakers, &mut mixed);
         let device_samples = match self.resampler.as_mut() {
@@ -1075,9 +1142,31 @@ impl Feeder {
             }
             None => mixed,
         };
-        self.shared.buffer.lock().unwrap().extend(device_samples);
+        let (start, end) = self.queue_for_the_device(device_samples);
+        if let Some((lane_names, measure)) = measured {
+            let played = self.shared.emitted_sample_frames.load(Ordering::Acquire);
+            let window = self.shared.level_window_sample_frames();
+            self.shared.levels.lock().unwrap().push(
+                &lane_names,
+                start,
+                end,
+                measure,
+                played,
+                window,
+            );
+        }
         self.next_frame += 1;
         true
+    }
+
+    // where the samples will play, in sample frames past the seek the device count started from
+    fn queue_for_the_device(&self, samples: Vec<f32>) -> (u64, u64) {
+        let sample_frames = (samples.len() / self.shared.output_channels()) as u64;
+        let mut buffer = self.shared.buffer.lock().unwrap();
+        let queued = (buffer.len() / self.shared.output_channels()) as u64;
+        let start = self.shared.emitted_sample_frames.load(Ordering::Acquire) + queued;
+        buffer.extend(samples);
+        (start, start + sample_frames)
     }
 
     // a composition whose sound is shorter than its picture
@@ -1093,11 +1182,16 @@ impl Feeder {
         .saturating_sub(skipped);
         self.skipped_source_sample_frames = 0;
         let samples = sample_frames * self.shared.output_channels();
-        self.shared
-            .buffer
-            .lock()
-            .unwrap()
-            .extend(std::iter::repeat_n(0.0, samples));
+        let (start, end) = self.queue_for_the_device(vec![0.0; samples]);
+        if self.shared.level_meter_on.load(Ordering::Acquire) {
+            let played = self.shared.emitted_sample_frames.load(Ordering::Acquire);
+            let window = self.shared.level_window_sample_frames();
+            self.shared
+                .levels
+                .lock()
+                .unwrap()
+                .push_silence(start, end, played, window);
+        }
         self.next_frame += 1;
     }
 
@@ -1366,7 +1460,7 @@ fn open_reader(
         return Err(format!("{} names no pcm", path.display()));
     }
     let (sample_frames_per_edit_unit, edit_units) = reader.edit_units(&descriptor);
-    let speakers = source_speakers(&mut reader, descriptor.channel_count as usize);
+    let (speakers, lane_names) = source_speakers(&mut reader, descriptor.channel_count as usize);
     let decrypt = match key {
         Some(SoundContentKey(key)) => {
             let mut decrypt = AesDecContext::new();
@@ -1387,35 +1481,47 @@ fn open_reader(
             edit_units,
             sample_rate: sample_rate_of(&descriptor),
             speakers,
+            lane_names: Arc::from(lane_names),
         },
         decrypt,
     })
 }
 
 // a file with no MCA channel labels is taken to be in the default DCP order
-fn source_speakers(reader: &mut PcmReader, channels: usize) -> Vec<Option<Speaker>> {
+fn source_speakers(reader: &mut PcmReader, channels: usize) -> (Vec<Option<Speaker>>, Vec<String>) {
     let labels = reader.mca_label_subdescriptors().unwrap_or_else(|error| {
         tracing::warn!("preview sound: MCA labels unreadable, assuming the default order: {error}");
         Vec::new()
     });
-    let labelled: Vec<(usize, Option<Speaker>)> = labels
+    let labelled: Vec<(usize, String)> = labels
         .into_iter()
         .filter(|label| label.kind == McaLabelKind::AudioChannel)
         .filter_map(|label| {
             let index = label.channel_id?.checked_sub(1)? as usize;
-            Some((index, speaker_of_mca_tag(&label.tag_symbol)))
+            Some((index, label.tag_symbol))
         })
         .collect();
     if labelled.is_empty() {
-        return default_dcp_speakers(channels);
+        let speakers = default_dcp_speakers(channels);
+        let names = speakers
+            .iter()
+            .enumerate()
+            .map(|(index, speaker)| match speaker {
+                Some(speaker) => speaker.lane_name().to_string(),
+                None => numbered_channel_label(index),
+            })
+            .collect();
+        return (speakers, names);
     }
     let mut speakers = vec![None; channels];
-    for (index, speaker) in labelled {
-        if let Some(slot) = speakers.get_mut(index) {
-            *slot = speaker;
+    let mut names: Vec<String> = (0..channels).map(numbered_channel_label).collect();
+    for (index, tag_symbol) in labelled {
+        if index < channels {
+            speakers[index] = speaker_of_mca_tag(&tag_symbol);
+            names[index] = mca_lane(&tag_symbol).to_string();
         }
     }
-    speakers
+    (speakers, names)
 }
 
 fn default_dcp_speakers(channels: usize) -> Vec<Option<Speaker>> {
@@ -1424,12 +1530,15 @@ fn default_dcp_speakers(channels: usize) -> Vec<Option<Speaker>> {
         .collect()
 }
 
-// the symbols libdcp's mca_id_to_channel reads
-fn speaker_of_mca_tag(tag_symbol: &str) -> Option<Speaker> {
-    let symbol = tag_symbol
+fn mca_lane(tag_symbol: &str) -> &str {
+    tag_symbol
         .strip_prefix(MCA_CHANNEL_TAG_PREFIX)
         .unwrap_or(tag_symbol)
-        .to_ascii_lowercase();
+}
+
+// the symbols libdcp's mca_id_to_channel reads
+fn speaker_of_mca_tag(tag_symbol: &str) -> Option<Speaker> {
+    let symbol = mca_lane(tag_symbol).to_ascii_lowercase();
     match symbol.as_str() {
         "l" => Some(Speaker::Left),
         "r" => Some(Speaker::Right),
@@ -1552,6 +1661,7 @@ mod tests {
     use super::super::timeline::Timeline;
     use super::super::timeline::tests::content_keys;
     use super::*;
+    use crate::audio_levels::SILENCE_FLOOR_DBFS;
     use crate::mxf_unwrap::tests::{FRAME_COUNT, wrap, write_frames};
     use crate::mxf_wrap::{EssenceType, MxfEncryption, MxfStandard, MxfWrapOptions, mxf_wrap};
     use crate::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
@@ -2181,6 +2291,23 @@ mod tests {
         let opened = open_reader(&sound, None, None).unwrap();
         assert_eq!(opened.layout.speakers, default_dcp_speakers(8));
         assert_eq!(opened.layout.speakers[6], None, "channel 7 is HI");
+        assert_eq!(
+            &*opened.layout.lane_names,
+            ["L", "R", "C", "LFE", "Ls", "Rs", "Ch 7", "Ch 8"]
+        );
+    }
+
+    #[test]
+    fn the_meter_names_labelled_channels_by_their_mca_tag() {
+        let directory = tempfile::tempdir().unwrap();
+        let labels =
+            crate::mca::soundfield_to_mca_config(&crate::mca::soundfield_51_with_hi_vi()).unwrap();
+        let sound = wrapped_sound(directory.path(), 8, Some(&labels));
+        let opened = open_reader(&sound, None, None).unwrap();
+        assert_eq!(
+            &*opened.layout.lane_names,
+            ["L", "R", "C", "LFE", "Ls", "Rs", "HI", "VIN"]
+        );
     }
 
     fn offered(channels: u16, format: SampleFormat) -> SupportedStreamConfigRange {
@@ -2530,6 +2657,110 @@ mod tests {
             played == expected,
             "the seek did not play the rest of the first composition and then the next"
         );
+    }
+
+    const TONE_HERTZ: f64 = 1_000.0;
+    const HALF_SCALE: f64 = 0.5;
+    const HALF_SCALE_DBFS: f64 = -6.0206;
+    const HALF_SCALE_SINE_RMS_DBFS: f64 = -9.0309;
+    const LEVEL_TOLERANCE_DB: f64 = 0.02;
+
+    // stereo, silent and then a half scale tone on the left
+    fn silence_then_tone(silent_edit_units: usize, tone_edit_units: usize) -> Vec<i16> {
+        let silent = silent_edit_units * SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24;
+        let total = silent + tone_edit_units * SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24;
+        (0..total)
+            .flat_map(|frame| {
+                let phase = 2.0 * std::f64::consts::PI * TONE_HERTZ * frame as f64
+                    / f64::from(DEFAULT_SAMPLE_RATE);
+                let left = match frame < silent {
+                    true => 0.0,
+                    false => HALF_SCALE * phase.sin() * f64::from(i16::MAX),
+                };
+                [left.round() as i16, 0]
+            })
+            .collect()
+    }
+
+    // the device takes sample_frames from the buffer and the feeder tops it up
+    fn play(feeder: &mut Feeder, sample_frames: usize) {
+        feeder
+            .shared
+            .buffer
+            .lock()
+            .unwrap()
+            .drain(..sample_frames * STEREO_CHANNELS);
+        feeder
+            .shared
+            .emitted_sample_frames
+            .fetch_add(sample_frames as u64, Ordering::AcqRel);
+        feeder.fill();
+    }
+
+    fn assert_level(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < LEVEL_TOLERANCE_DB,
+            "{actual} dBFS, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn the_meter_reads_what_the_device_plays_not_what_the_feeder_read() {
+        const SILENT_EDIT_UNITS: usize = 6;
+        const TONE_EDIT_UNITS: usize = 18;
+        const INTO_THE_TONE_EDIT_UNITS: usize = 12;
+        let directory = tempfile::tempdir().unwrap();
+        let samples = silence_then_tone(SILENT_EDIT_UNITS, TONE_EDIT_UNITS);
+        let sound = wrapped_samples(directory.path(), "tone", 2, None, &samples);
+        let shared = Arc::new(Shared::new());
+        shared.playing.store(true, Ordering::Release);
+        shared.stream_live.store(true, Ordering::Release);
+        shared.reels_loaded.store(true, Ordering::Release);
+        let meter = SoundLevelMeter(Arc::clone(&shared));
+        meter.set_enabled(true);
+        let mut feeder = Feeder::new(shared);
+        feeder.current = composition_of(Some(&sound), (SILENT_EDIT_UNITS + TONE_EDIT_UNITS) as u64);
+        feeder.seek(0);
+        feeder.fill();
+        assert!(
+            feeder.next_frame > SILENT_EDIT_UNITS as u64,
+            "the feeder has not read ahead into the tone"
+        );
+
+        play(
+            &mut feeder,
+            (SILENT_EDIT_UNITS - 1) * SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24,
+        );
+        let in_the_silence = meter.levels().unwrap();
+        assert_eq!(in_the_silence[0].label, "L");
+        assert_eq!(in_the_silence[0].peak_dbfs, SILENCE_FLOOR_DBFS);
+        assert_eq!(in_the_silence[0].rms_dbfs, SILENCE_FLOOR_DBFS);
+
+        play(
+            &mut feeder,
+            INTO_THE_TONE_EDIT_UNITS * SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24,
+        );
+        let in_the_tone = meter.levels().unwrap();
+        assert_level(in_the_tone[0].peak_dbfs, HALF_SCALE_DBFS);
+        assert_level(in_the_tone[0].rms_dbfs, HALF_SCALE_SINE_RMS_DBFS);
+        assert_eq!(in_the_tone[1].label, "R");
+        assert_eq!(in_the_tone[1].rms_dbfs, SILENCE_FLOOR_DBFS);
+    }
+
+    #[test]
+    fn the_meter_off_measures_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let sound = wrapped_samples(directory.path(), "tone", 2, None, &silence_then_tone(0, 2));
+        let shared = Arc::new(Shared::new());
+        shared.reels_loaded.store(true, Ordering::Release);
+        let meter = SoundLevelMeter(Arc::clone(&shared));
+        let mut feeder = Feeder::new(Arc::clone(&shared));
+        feeder.current = composition_of(Some(&sound), 2);
+        feeder.seek(0);
+        feeder.fill();
+
+        assert!(meter.levels().is_none());
+        assert!(shared.levels.lock().unwrap().read(0, 0, true).is_none());
     }
 
     #[test]

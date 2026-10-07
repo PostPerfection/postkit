@@ -177,8 +177,13 @@ impl SubtitleTrack {
     }
 }
 
-pub(super) fn run(shared: Arc<Shared>, commands: Receiver<Command>, finished: Sender<Command>) {
-    let mut scheduler = Scheduler::new(shared, finished);
+pub(super) fn run(
+    shared: Arc<Shared>,
+    commands: Receiver<Command>,
+    finished: Sender<Command>,
+    sound: audio::Output,
+) {
+    let mut scheduler = Scheduler::new(shared, finished, sound);
     loop {
         scheduler.tick();
         scheduler.pump();
@@ -226,7 +231,7 @@ struct Scheduler {
 }
 
 impl Scheduler {
-    fn new(shared: Arc<Shared>, finished: Sender<Command>) -> Self {
+    fn new(shared: Arc<Shared>, finished: Sender<Command>, sound: audio::Output) -> Self {
         let pool = DecodePool::start(finished);
         shared.set_lookahead(pool.lookahead_frames());
         Scheduler {
@@ -253,7 +258,7 @@ impl Scheduler {
             dropped_frames_not_decoded: 0,
             dropped_frames_scheduler_late: 0,
             delayed_frames: 0,
-            sound: audio::Output::new(),
+            sound,
             sound_loaded: false,
             sound_offset_seconds: 0.0,
             source: None,

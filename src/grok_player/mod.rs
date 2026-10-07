@@ -2,6 +2,7 @@ mod audio;
 mod compositor;
 mod decode_capacity;
 mod decode_pool;
+mod levels;
 mod presenter;
 mod scheduler;
 mod stereo;
@@ -17,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::audio_levels::ChannelLevel;
 use crate::colour::RenderingIntent;
 use crate::content_keys::ContentKeys;
 
@@ -325,6 +327,7 @@ pub struct GrokPlayer {
     scheduler: Mutex<Option<JoinHandle<()>>>,
     presenter: Mutex<Option<presenter::GlPresenter>>,
     software: AtomicBool,
+    level_meter: audio::SoundLevelMeter,
 }
 
 impl Default for GrokPlayer {
@@ -337,10 +340,12 @@ impl GrokPlayer {
     pub fn new() -> Self {
         let (commands, receiver) = channel();
         let shared = Arc::new(Shared::new());
+        let sound = audio::Output::new();
+        let level_meter = sound.level_meter();
         let scheduler = {
             let shared = shared.clone();
             let finished = commands.clone();
-            std::thread::spawn(move || scheduler::run(shared, receiver, finished))
+            std::thread::spawn(move || scheduler::run(shared, receiver, finished, sound))
         };
         GrokPlayer {
             commands,
@@ -348,6 +353,7 @@ impl GrokPlayer {
             scheduler: Mutex::new(Some(scheduler)),
             presenter: Mutex::new(None),
             software: AtomicBool::new(false),
+            level_meter,
         }
     }
 
@@ -647,6 +653,16 @@ impl GrokPlayer {
             MAXIMUM_SOUND_DELAY_MILLISECONDS,
         );
         let _ = self.send(Command::SetSoundDelay(clamped));
+    }
+
+    // off by default, and off the sound feeder measures nothing
+    pub fn set_level_meter(&self, enabled: bool) {
+        self.level_meter.set_enabled(enabled);
+    }
+
+    // the source channels at the position the sound device has played to, None while the meter is off or there is no sound
+    pub fn audio_levels(&self) -> Option<Vec<ChannelLevel>> {
+        self.level_meter.levels()
     }
 
     // ─── subtitles and overlays ────────────────────────────────────────────
