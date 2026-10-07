@@ -52,6 +52,27 @@ fn leaf(directory: &Path, stem: &str, common_name: &str) -> Device {
     device
 }
 
+pub fn short_lived_leaf(directory: &Path, common_name: &str, validity_days: u32) -> Device {
+    let f = fixtures();
+    let device = Device {
+        certificate: directory.join("short-lived.pem"),
+        key: directory.join("short-lived.key"),
+    };
+    let options = CertOptions {
+        cert_type: CertType::Leaf,
+        common_name: common_name.to_string(),
+        organization: VENDOR.to_string(),
+        validity_days,
+        output_cert: device.certificate.clone(),
+        output_key: device.key.clone(),
+        issuer_cert: f.vendor_intermediate.clone(),
+        issuer_key: f.vendor_intermediate.with_extension("key"),
+        ..Default::default()
+    };
+    assert_eq!(generate_certificate(&options), 0, "short-lived certificate");
+    device
+}
+
 // RSA key generation is slow, so every test shares one set
 pub fn fixtures() -> &'static Fixtures {
     static FIXTURES: OnceLock<Fixtures> = OnceLock::new();

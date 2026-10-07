@@ -1,5 +1,5 @@
 // the distributor's cinemas, titles, bookings and issued KDMs in one sqlite file
-use super::bundle::name_fields_from_content_title;
+use super::bundle::{CinemaBundle, name_fields_from_content_title};
 use super::cinema::{AuthorizedDevice, CertSource, Cinema, CinemaDb, Screen};
 use super::email::{SmtpConfig, send_bundle};
 use super::formulation::ContentStandard;
@@ -22,6 +22,7 @@ pub type CinemaId = i64;
 pub type ScreenId = i64;
 pub type TitleId = i64;
 pub type BookingId = i64;
+pub type DeliveryId = i64;
 
 const LOCAL_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S";
 const SMPTE_STANDARD: &str = "smpte";
@@ -119,6 +120,22 @@ CREATE TABLE deliveries (
     r#"
 ALTER TABLE bookings ADD COLUMN needs_reissue INTEGER NOT NULL DEFAULT 0;
 "#,
+    r#"
+ALTER TABLE booking_screens ADD COLUMN issued INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE booking_screens ADD COLUMN needs_reissue INTEGER NOT NULL DEFAULT 0;
+UPDATE booking_screens SET issued = 1 WHERE EXISTS (
+    SELECT 1 FROM issues
+    JOIN screens ON screens.id = booking_screens.screen_id
+    JOIN cinemas ON cinemas.id = screens.cinema_id
+    WHERE issues.booking_id = booking_screens.booking_id
+        AND issues.cinema = cinemas.name AND issues.screen = screens.name
+);
+UPDATE booking_screens SET needs_reissue = 1 WHERE issued = 1 AND (
+    SELECT needs_reissue FROM bookings WHERE bookings.id = booking_screens.booking_id
+);
+ALTER TABLE bookings DROP COLUMN needs_reissue;
+ALTER TABLE deliveries ADD COLUMN content_title TEXT NOT NULL DEFAULT '';
+"#,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,8 +167,89 @@ pub struct Booking {
     // in each cinema's own time zone
     pub window: LocalWindow,
     pub formulation: Option<KdmFormulation>,
-    // edited after KDMs were issued, so the issued ones no longer match
-    pub needs_reissue: bool,
+    // booked screens with no KDM yet, or whose KDM no longer matches the booking or the screen
+    pub pending_screen_ids: Vec<ScreenId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum IssueScope {
+    AllScreens,
+    PendingScreens,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookingIssuePlan {
+    pub booking_id: BookingId,
+    pub plan: IssuePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookingIssueOutcome {
+    pub booking_id: BookingId,
+    pub outcome: DkdmIssueOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookingIssueFailure {
+    pub booking_id: BookingId,
+    pub content_title: String,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CinemaIssueOutcome {
+    pub issued: Vec<BookingIssueOutcome>,
+    // their screens stay pending
+    pub failed: Vec<BookingIssueFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingBookingScreens {
+    pub booking_id: BookingId,
+    pub screen_ids: Vec<ScreenId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CertificateReplacement {
+    pub old_thumbprint: String,
+    pub new_thumbprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
+pub enum ScreenChange {
+    Added {
+        screen: String,
+    },
+    Removed {
+        screen: String,
+    },
+    CertificatesChanged {
+        screen: String,
+        recipient: Option<CertificateReplacement>,
+        // the ordered list of authorized device certificates differs
+        devices_changed: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CinemaSaveReport {
+    pub cinema_id: CinemaId,
+    pub created: bool,
+    pub screens: Vec<ScreenChange>,
+    pub bookings_to_reissue: Vec<BookingId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,10 +285,20 @@ pub struct DeliveryRecord {
     pub delivered_at: String,
     pub booking_id: Option<BookingId>,
     pub cinema: String,
+    // empty for deliveries recorded before schema version 4
+    pub content_title: String,
     pub zip_name: String,
     pub zip_path: String,
     pub recipients: Vec<String>,
     pub result: DeliveryResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoredDelivery {
+    pub id: DeliveryId,
+    #[serde(flatten)]
+    pub record: DeliveryRecord,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,27 +323,51 @@ pub struct DistributionDatabase {
     connection: Connection,
 }
 
-// a booking with everything its screens need, loaded once
+struct BookedTarget {
+    screen_id: ScreenId,
+    cinema_index: usize,
+    // into that cinema's screens
+    screen_index: usize,
+}
+
+// a booking with everything the selected screens need, loaded once
 struct BookingParts {
     booking: Booking,
     title: Title,
     cinemas: Vec<StoredCinema>,
-    // (index into cinemas, index into that cinema's screens) per booked screen
-    target_indexes: Vec<(usize, usize)>,
+    selected: Vec<BookedTarget>,
 }
 
 impl BookingParts {
     fn targets(&self) -> Vec<ScreenTarget<'_>> {
-        self.target_indexes
+        self.selected
             .iter()
-            .map(|(cinema_index, screen_index)| {
-                let cinema = &self.cinemas[*cinema_index].cinema;
+            .map(|target| {
+                let cinema = &self.cinemas[target.cinema_index].cinema;
                 ScreenTarget {
                     cinema,
-                    screen: &cinema.screens[*screen_index],
+                    screen: &cinema.screens[target.screen_index],
                     window: self.booking.window,
                 }
             })
+            .collect()
+    }
+
+    fn issued_screen_ids(&self, outcome: &DkdmIssueOutcome) -> Vec<ScreenId> {
+        let issued = |cinema: &Cinema, screen: &Screen| {
+            outcome
+                .bundles
+                .iter()
+                .flat_map(|bundle| &bundle.kdms)
+                .any(|kdm| kdm.cinema == cinema.name && kdm.screen == screen.name)
+        };
+        self.selected
+            .iter()
+            .filter(|target| {
+                let cinema = &self.cinemas[target.cinema_index].cinema;
+                issued(cinema, &cinema.screens[target.screen_index])
+            })
+            .map(|target| target.screen_id)
             .collect()
     }
 
@@ -322,6 +454,67 @@ fn save_certificate(transaction: &Transaction<'_>, chain_pem: &str) -> Result<i6
         .map_err(database_error)
 }
 
+fn certificate_thumbprint(transaction: &Transaction<'_>, id: i64) -> Result<String, String> {
+    transaction
+        .query_row(
+            "SELECT thumbprint FROM certificates WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)
+}
+
+struct ScreenCertificates {
+    recipient: i64,
+    // in authorized device order
+    devices: Vec<i64>,
+}
+
+fn screen_certificates(
+    transaction: &Transaction<'_>,
+    screen_id: ScreenId,
+) -> Result<ScreenCertificates, String> {
+    let recipient = transaction
+        .query_row(
+            "SELECT recipient_certificate_id FROM screens WHERE id = ?1",
+            params![screen_id],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    let mut statement = transaction
+        .prepare(
+            "SELECT certificate_id FROM authorized_devices WHERE screen_id = ?1 ORDER BY position",
+        )
+        .map_err(database_error)?;
+    let devices = statement
+        .query_map(params![screen_id], |row| row.get(0))
+        .map_err(database_error)?
+        .collect::<Result<_, _>>()
+        .map_err(database_error)?;
+    Ok(ScreenCertificates { recipient, devices })
+}
+
+// the bookings whose KDM for the screen now needs a reissue
+fn flag_issued_screen_for_reissue(
+    transaction: &Transaction<'_>,
+    screen_id: ScreenId,
+) -> Result<Vec<BookingId>, String> {
+    transaction
+        .execute(
+            "UPDATE booking_screens SET needs_reissue = 1 WHERE screen_id = ?1 AND issued = 1",
+            params![screen_id],
+        )
+        .map_err(database_error)?;
+    let mut statement = transaction
+        .prepare("SELECT booking_id FROM booking_screens WHERE screen_id = ?1 AND issued = 1")
+        .map_err(database_error)?;
+    statement
+        .query_map(params![screen_id], |row| row.get(0))
+        .map_err(database_error)?
+        .collect::<Result<_, _>>()
+        .map_err(database_error)
+}
+
 fn certificate_pem(connection: &Connection, id: i64) -> Result<String, String> {
     connection
         .query_row(
@@ -392,8 +585,17 @@ impl DistributionDatabase {
     }
 
     // matched by name, and screens by name within it, so bookings keep their screens
-    pub fn save_cinema(&mut self, cinema: &Cinema) -> Result<CinemaId, String> {
+    pub fn save_cinema(&mut self, cinema: &Cinema) -> Result<CinemaSaveReport, String> {
         let transaction = self.connection.transaction().map_err(database_error)?;
+        let created = transaction
+            .query_row(
+                "SELECT id FROM cinemas WHERE name = ?1",
+                params![cinema.name],
+                |row| row.get::<_, CinemaId>(0),
+            )
+            .optional()
+            .map_err(database_error)?
+            .is_none();
         transaction
             .execute(
                 "INSERT INTO cinemas (name, facility_id, time_zone, emails, notes, contacts, address)
@@ -420,9 +622,29 @@ impl DistributionDatabase {
                 |row| row.get(0),
             )
             .map_err(database_error)?;
+        let existing: Vec<(ScreenId, String)> = {
+            let mut statement = transaction
+                .prepare("SELECT id, name FROM screens WHERE cinema_id = ?1")
+                .map_err(database_error)?;
+            statement
+                .query_map(params![cinema_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(database_error)?
+                .collect::<Result<_, _>>()
+                .map_err(database_error)?
+        };
 
+        let mut report = CinemaSaveReport {
+            cinema_id,
+            created,
+            screens: Vec::new(),
+            bookings_to_reissue: Vec::new(),
+        };
         let mut kept = Vec::new();
         for screen in &cinema.screens {
+            let before = match existing.iter().find(|(_, name)| *name == screen.name) {
+                Some((screen_id, _)) => Some(screen_certificates(&transaction, *screen_id)?),
+                None => None,
+            };
             let recipient = save_certificate(&transaction, &screen.cert.pem()?)?;
             transaction
                 .execute(
@@ -447,6 +669,7 @@ impl DistributionDatabase {
                     params![screen_id],
                 )
                 .map_err(database_error)?;
+            let mut device_certificates = Vec::new();
             for (position, device) in screen.authorized_devices.iter().enumerate() {
                 let certificate = save_certificate(&transaction, &device.certificate)?;
                 transaction
@@ -463,20 +686,40 @@ impl DistributionDatabase {
                         ],
                     )
                     .map_err(database_error)?;
+                device_certificates.push(certificate);
             }
             kept.push(screen_id);
+
+            let Some(before) = before else {
+                report.screens.push(ScreenChange::Added {
+                    screen: screen.name.clone(),
+                });
+                continue;
+            };
+            let recipient_replacement = if before.recipient == recipient {
+                None
+            } else {
+                Some(CertificateReplacement {
+                    old_thumbprint: certificate_thumbprint(&transaction, before.recipient)?,
+                    new_thumbprint: certificate_thumbprint(&transaction, recipient)?,
+                })
+            };
+            let devices_changed = before.devices != device_certificates;
+            if recipient_replacement.is_none() && !devices_changed {
+                continue;
+            }
+            report.screens.push(ScreenChange::CertificatesChanged {
+                screen: screen.name.clone(),
+                recipient: recipient_replacement,
+                devices_changed,
+            });
+            for booking_id in flag_issued_screen_for_reissue(&transaction, screen_id)? {
+                if !report.bookings_to_reissue.contains(&booking_id) {
+                    report.bookings_to_reissue.push(booking_id);
+                }
+            }
         }
-        let existing: Vec<ScreenId> = {
-            let mut statement = transaction
-                .prepare("SELECT id FROM screens WHERE cinema_id = ?1")
-                .map_err(database_error)?;
-            statement
-                .query_map(params![cinema_id], |row| row.get(0))
-                .map_err(database_error)?
-                .collect::<Result<_, _>>()
-                .map_err(database_error)?
-        };
-        for screen_id in existing.into_iter().filter(|id| !kept.contains(id)) {
+        for (screen_id, name) in existing.into_iter().filter(|(id, _)| !kept.contains(id)) {
             transaction
                 .execute("DELETE FROM screens WHERE id = ?1", params![screen_id])
                 .map_err(|e| {
@@ -485,9 +728,11 @@ impl DistributionDatabase {
                         cinema.name
                     )
                 })?;
+            report.screens.push(ScreenChange::Removed { screen: name });
         }
         transaction.commit().map_err(database_error)?;
-        Ok(cinema_id)
+        report.bookings_to_reissue.sort_unstable();
+        Ok(report)
     }
 
     pub fn cinema(&self, id: CinemaId) -> Result<StoredCinema, String> {
@@ -722,17 +967,30 @@ impl DistributionDatabase {
         Ok(())
     }
 
+    // a kept screen keeps its issued and reissue state
     fn write_booking_screens(
         transaction: &Transaction<'_>,
         booking_id: BookingId,
         screen_ids: &[ScreenId],
     ) -> Result<(), String> {
-        transaction
-            .execute(
-                "DELETE FROM booking_screens WHERE booking_id = ?1",
-                params![booking_id],
-            )
-            .map_err(database_error)?;
+        let booked: Vec<ScreenId> = {
+            let mut statement = transaction
+                .prepare("SELECT screen_id FROM booking_screens WHERE booking_id = ?1")
+                .map_err(database_error)?;
+            statement
+                .query_map(params![booking_id], |row| row.get(0))
+                .map_err(database_error)?
+                .collect::<Result<_, _>>()
+                .map_err(database_error)?
+        };
+        for screen_id in booked.iter().filter(|id| !screen_ids.contains(id)) {
+            transaction
+                .execute(
+                    "DELETE FROM booking_screens WHERE booking_id = ?1 AND screen_id = ?2",
+                    params![booking_id, screen_id],
+                )
+                .map_err(database_error)?;
+        }
         for screen_id in screen_ids {
             transaction
                 .execute(
@@ -774,7 +1032,7 @@ impl DistributionDatabase {
         Ok(booking_id)
     }
 
-    // a booking that already has KDMs is marked as needing a reissue when it changes
+    // a new window or formulation marks every screen already issued as needing a reissue
     pub fn update_booking(
         &mut self,
         id: BookingId,
@@ -784,36 +1042,29 @@ impl DistributionDatabase {
     ) -> Result<(), String> {
         let before = self.booking(id)?;
         self.check_booking(screen_ids, &window)?;
-        let mut sorted_screens = screen_ids.to_vec();
-        sorted_screens.sort_unstable();
-        sorted_screens.dedup();
-        let changed = before.screen_ids != sorted_screens
-            || before.window != window
-            || before.formulation != formulation;
-        let issued: bool = self
-            .connection
-            .query_row(
-                "SELECT EXISTS (SELECT 1 FROM issues WHERE booking_id = ?1)",
-                params![id],
-                |row| row.get(0),
-            )
-            .map_err(database_error)?;
+        let keys_changed = before.window != window || before.formulation != formulation;
         let transaction = self.connection.transaction().map_err(database_error)?;
         transaction
             .execute(
-                "UPDATE bookings SET local_start = ?1, local_end = ?2, formulation = ?3,
-                     needs_reissue = needs_reissue OR ?4
-                 WHERE id = ?5",
+                "UPDATE bookings SET local_start = ?1, local_end = ?2, formulation = ?3
+                 WHERE id = ?4",
                 params![
                     window.start.format(LOCAL_TIME_FORMAT).to_string(),
                     window.end.format(LOCAL_TIME_FORMAT).to_string(),
                     formulation.map(KdmFormulation::as_str),
-                    changed && issued,
                     id
                 ],
             )
             .map_err(database_error)?;
         Self::write_booking_screens(&transaction, id, screen_ids)?;
+        if keys_changed {
+            transaction
+                .execute(
+                    "UPDATE booking_screens SET needs_reissue = 1 WHERE booking_id = ?1 AND issued = 1",
+                    params![id],
+                )
+                .map_err(database_error)?;
+        }
         transaction.commit().map_err(database_error)?;
         Ok(())
     }
@@ -831,44 +1082,36 @@ impl DistributionDatabase {
     }
 
     pub fn booking(&self, id: BookingId) -> Result<Booking, String> {
-        let (title_id, start, end, formulation, needs_reissue): (
-            TitleId,
-            String,
-            String,
-            Option<String>,
-            bool,
-        ) = self
+        let (title_id, start, end, formulation): (TitleId, String, String, Option<String>) = self
             .connection
             .query_row(
-                "SELECT title_id, local_start, local_end, formulation, needs_reissue
-                 FROM bookings WHERE id = ?1",
+                "SELECT title_id, local_start, local_end, formulation FROM bookings WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(database_error)?
             .ok_or_else(|| format!("booking {id} not found"))?;
-        let screen_ids: Vec<ScreenId> = {
+        let screens: Vec<(ScreenId, bool)> = {
             let mut statement = self
                 .connection
                 .prepare(
-                    "SELECT screen_id FROM booking_screens WHERE booking_id = ?1 ORDER BY screen_id",
+                    "SELECT screen_id, issued = 0 OR needs_reissue = 1 FROM booking_screens
+                     WHERE booking_id = ?1 ORDER BY screen_id",
                 )
                 .map_err(database_error)?;
             statement
-                .query_map(params![id], |row| row.get(0))
+                .query_map(params![id], |row| Ok((row.get(0)?, row.get(1)?)))
                 .map_err(database_error)?
                 .collect::<Result<_, _>>()
                 .map_err(database_error)?
         };
+        let screen_ids = screens.iter().map(|(screen_id, _)| *screen_id).collect();
+        let pending_screen_ids = screens
+            .iter()
+            .filter(|(_, pending)| *pending)
+            .map(|(screen_id, _)| *screen_id)
+            .collect();
         Ok(Booking {
             id,
             title_id,
@@ -878,7 +1121,7 @@ impl DistributionDatabase {
                 end: parse_local_time(&end)?,
             },
             formulation: parse_formulation(formulation)?,
-            needs_reissue,
+            pending_screen_ids,
         })
     }
 
@@ -966,16 +1209,17 @@ impl DistributionDatabase {
             .collect()
     }
 
-    pub fn record_delivery(&mut self, record: &DeliveryRecord) -> Result<(), String> {
+    pub fn record_delivery(&mut self, record: &DeliveryRecord) -> Result<DeliveryId, String> {
         self.connection
             .execute(
-                "INSERT INTO deliveries (delivered_at, booking_id, cinema, zip_name, zip_path,
-                     recipients, result)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO deliveries (delivered_at, booking_id, cinema, content_title, zip_name,
+                     zip_path, recipients, result)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     record.delivered_at,
                     record.booking_id,
                     record.cinema,
+                    record.content_title,
                     record.zip_name,
                     record.zip_path,
                     to_json(&record.recipients)?,
@@ -983,41 +1227,65 @@ impl DistributionDatabase {
                 ],
             )
             .map_err(database_error)?;
-        Ok(())
+        Ok(self.connection.last_insert_rowid())
     }
 
-    pub fn deliveries(&self) -> Result<Vec<DeliveryRecord>, String> {
+    fn stored_delivery(&mut self, record: DeliveryRecord) -> Result<StoredDelivery, String> {
+        let id = self.record_delivery(&record)?;
+        Ok(StoredDelivery { id, record })
+    }
+
+    pub fn deliveries(&self) -> Result<Vec<StoredDelivery>, String> {
+        self.query_deliveries("", [])
+    }
+
+    pub fn delivery(&self, id: DeliveryId) -> Result<StoredDelivery, String> {
+        self.query_deliveries("WHERE id = ?1", [id])?
+            .pop()
+            .ok_or_else(|| format!("delivery {id} not found"))
+    }
+
+    fn query_deliveries(
+        &self,
+        condition: &str,
+        parameters: impl rusqlite::Params,
+    ) -> Result<Vec<StoredDelivery>, String> {
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT delivered_at, booking_id, cinema, zip_name, zip_path, recipients, result
-                 FROM deliveries ORDER BY id",
-            )
+            .prepare(&format!(
+                "SELECT id, delivered_at, booking_id, cinema, content_title, zip_name, zip_path,
+                     recipients, result
+                 FROM deliveries {condition} ORDER BY id"
+            ))
             .map_err(database_error)?;
         let rows = statement
-            .query_map([], |row| {
+            .query_map(parameters, |row| {
                 Ok((
-                    DeliveryRecord {
-                        delivered_at: row.get(0)?,
-                        booking_id: row.get(1)?,
-                        cinema: row.get(2)?,
-                        zip_name: row.get(3)?,
-                        zip_path: row.get(4)?,
-                        recipients: Vec::new(),
-                        result: DeliveryResult::Written,
+                    StoredDelivery {
+                        id: row.get(0)?,
+                        record: DeliveryRecord {
+                            delivered_at: row.get(1)?,
+                            booking_id: row.get(2)?,
+                            cinema: row.get(3)?,
+                            content_title: row.get(4)?,
+                            zip_name: row.get(5)?,
+                            zip_path: row.get(6)?,
+                            recipients: Vec::new(),
+                            result: DeliveryResult::Written,
+                        },
                     },
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
                 ))
             })
             .map_err(database_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(database_error)?;
         rows.into_iter()
-            .map(|(mut record, recipients, result)| {
-                record.recipients = from_json(&recipients)?;
-                record.result = from_json(&result)?;
-                Ok(record)
+            .map(|(mut delivery, recipients, result)| {
+                delivery.record.recipients = from_json(&recipients)?;
+                delivery.record.result = from_json(&result)?;
+                Ok(delivery)
             })
             .collect()
     }
@@ -1029,8 +1297,8 @@ impl DistributionDatabase {
         booking_id: Option<BookingId>,
         smtp: Option<&SmtpConfig>,
         delivered_at: DateTime<Utc>,
-    ) -> Result<Vec<DeliveryRecord>, String> {
-        let mut records = Vec::new();
+    ) -> Result<Vec<StoredDelivery>, String> {
+        let mut deliveries = Vec::new();
         for bundle in &outcome.bundles {
             let result = match smtp {
                 None => DeliveryResult::Written,
@@ -1041,10 +1309,11 @@ impl DistributionDatabase {
                     }
                 }
             };
-            let record = DeliveryRecord {
+            deliveries.push(self.stored_delivery(DeliveryRecord {
                 delivered_at: delivered_at.to_rfc3339(),
                 booking_id,
                 cinema: bundle.cinema.clone(),
+                content_title: outcome.content_title.clone(),
                 zip_name: bundle.zip_name.clone(),
                 zip_path: bundle.zip_path.display().to_string(),
                 recipients: if smtp.is_some() {
@@ -1053,11 +1322,60 @@ impl DistributionDatabase {
                     Vec::new()
                 },
                 result,
-            };
-            self.record_delivery(&record)?;
-            records.push(record);
+            })?);
         }
-        Ok(records)
+        Ok(deliveries)
+    }
+
+    // the delivery's ZIP again, to the cinema's addresses as they are now
+    pub fn resend_delivery(
+        &mut self,
+        id: DeliveryId,
+        smtp: &SmtpConfig,
+        delivered_at: DateTime<Utc>,
+    ) -> Result<StoredDelivery, String> {
+        let earlier = self.delivery(id)?.record;
+        let zip_path = PathBuf::from(&earlier.zip_path);
+        if !zip_path.is_file() {
+            return Err(format!(
+                "the ZIP {} is gone, issue the booking again",
+                zip_path.display()
+            ));
+        }
+        let emails: String = self
+            .connection
+            .query_row(
+                "SELECT emails FROM cinemas WHERE name = ?1",
+                params![earlier.cinema],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?
+            .ok_or_else(|| format!("cinema '{}' is no longer in the database", earlier.cinema))?;
+        let emails: Vec<String> = from_json(&emails)?;
+        if emails.is_empty() {
+            return Err(format!(
+                "cinema '{}' has no KDM email address, add one in Cinemas",
+                earlier.cinema
+            ));
+        }
+        let bundle = CinemaBundle {
+            cinema: earlier.cinema.clone(),
+            emails: emails.clone(),
+            zip_name: earlier.zip_name.clone(),
+            zip_path,
+            kdms: Vec::new(),
+        };
+        let result = match send_bundle(smtp, &bundle, &earlier.content_title, &emails) {
+            Ok(()) => DeliveryResult::Sent,
+            Err(e) => DeliveryResult::Failed(e),
+        };
+        self.stored_delivery(DeliveryRecord {
+            delivered_at: delivered_at.to_rfc3339(),
+            recipients: emails,
+            result,
+            ..earlier
+        })
     }
 
     // a screen whose certificate cannot be read is skipped and named in the report
@@ -1109,12 +1427,16 @@ impl DistributionDatabase {
         Ok(records.len())
     }
 
-    fn booking_parts(&self, booking_id: BookingId) -> Result<BookingParts, String> {
-        let booking = self.booking(booking_id)?;
+    // screen_ids are booked screens of the booking
+    fn booking_parts(
+        &self,
+        booking: Booking,
+        screen_ids: &[ScreenId],
+    ) -> Result<BookingParts, String> {
         let title = self.title(booking.title_id)?;
         let mut cinemas: Vec<StoredCinema> = Vec::new();
-        let mut target_indexes = Vec::new();
-        for screen_id in &booking.screen_ids {
+        let mut selected = Vec::new();
+        for screen_id in screen_ids {
             let cinema_id = self.screen_cinema(*screen_id)?;
             let cinema_index = match cinemas.iter().position(|stored| stored.id == cinema_id) {
                 Some(index) => index,
@@ -1128,36 +1450,135 @@ impl DistributionDatabase {
                 .iter()
                 .position(|id| id == screen_id)
                 .ok_or_else(|| format!("screen {screen_id} not found"))?;
-            target_indexes.push((cinema_index, screen_index));
+            selected.push(BookedTarget {
+                screen_id: *screen_id,
+                cinema_index,
+                screen_index,
+            });
         }
         Ok(BookingParts {
             booking,
             title,
             cinemas,
-            target_indexes,
+            selected,
         })
     }
 
-    // the formulation, window and check report each booked screen would get, nothing written
+    fn scoped_parts(
+        &self,
+        booking_id: BookingId,
+        scope: IssueScope,
+    ) -> Result<BookingParts, String> {
+        let booking = self.booking(booking_id)?;
+        let screen_ids = match scope {
+            IssueScope::AllScreens => booking.screen_ids.clone(),
+            IssueScope::PendingScreens => booking.pending_screen_ids.clone(),
+        };
+        self.booking_parts(booking, &screen_ids)
+    }
+
+    pub fn pending_screens_at_cinema(
+        &self,
+        cinema_id: CinemaId,
+    ) -> Result<Vec<PendingBookingScreens>, String> {
+        let cinema_screens = self.cinema(cinema_id)?.screen_ids;
+        Ok(self
+            .bookings()?
+            .into_iter()
+            .map(|booking| PendingBookingScreens {
+                booking_id: booking.id,
+                screen_ids: booking
+                    .pending_screen_ids
+                    .into_iter()
+                    .filter(|id| cinema_screens.contains(id))
+                    .collect(),
+            })
+            .filter(|pending| !pending.screen_ids.is_empty())
+            .collect())
+    }
+
+    fn cinema_parts(&self, cinema_id: CinemaId) -> Result<Vec<BookingParts>, String> {
+        self.pending_screens_at_cinema(cinema_id)?
+            .into_iter()
+            .map(|pending| {
+                self.booking_parts(self.booking(pending.booking_id)?, &pending.screen_ids)
+            })
+            .collect()
+    }
+
+    // the formulation, window and check report each selected screen would get, nothing written
     pub fn plan_booking(
         &self,
         booking_id: BookingId,
+        scope: IssueScope,
         settings: &IssueSettings,
         issue_date: DateTime<Utc>,
     ) -> Result<IssuePlan, String> {
-        let parts = self.booking_parts(booking_id)?;
+        let parts = self.scoped_parts(booking_id, scope)?;
         plan_issue(&parts.issue(settings, issue_date), &parts.targets())
     }
 
-    // every screen in the booking from the title's DKDM, each KDM recorded in the history
+    pub fn plan_cinema_pending(
+        &self,
+        cinema_id: CinemaId,
+        settings: &IssueSettings,
+        issue_date: DateTime<Utc>,
+    ) -> Result<Vec<BookingIssuePlan>, String> {
+        self.cinema_parts(cinema_id)?
+            .iter()
+            .map(|parts| {
+                Ok(BookingIssuePlan {
+                    booking_id: parts.booking.id,
+                    plan: plan_issue(&parts.issue(settings, issue_date), &parts.targets())?,
+                })
+            })
+            .collect()
+    }
+
+    // the selected screens from the title's DKDM, each KDM recorded in the history
     pub fn issue_booking(
         &mut self,
         booking_id: BookingId,
+        scope: IssueScope,
         settings: &IssueSettings,
         issue_date: DateTime<Utc>,
     ) -> Result<DkdmIssueOutcome, String> {
-        let parts = self.booking_parts(booking_id)?;
-        let title = parts.title.clone();
+        let parts = self.scoped_parts(booking_id, scope)?;
+        self.issue_parts(&parts, settings, issue_date)
+    }
+
+    // every booking's pending screens at the cinema, one issue and one ZIP per booking
+    pub fn issue_cinema_pending(
+        &mut self,
+        cinema_id: CinemaId,
+        settings: &IssueSettings,
+        issue_date: DateTime<Utc>,
+    ) -> Result<CinemaIssueOutcome, String> {
+        let mut result = CinemaIssueOutcome::default();
+        for parts in self.cinema_parts(cinema_id)? {
+            let booking_id = parts.booking.id;
+            match self.issue_parts(&parts, settings, issue_date) {
+                Ok(outcome) => result.issued.push(BookingIssueOutcome {
+                    booking_id,
+                    outcome,
+                }),
+                Err(error) => result.failed.push(BookingIssueFailure {
+                    booking_id,
+                    content_title: parts.title.content_title,
+                    error,
+                }),
+            }
+        }
+        Ok(result)
+    }
+
+    fn issue_parts(
+        &mut self,
+        parts: &BookingParts,
+        settings: &IssueSettings,
+        issue_date: DateTime<Utc>,
+    ) -> Result<DkdmIssueOutcome, String> {
+        let booking_id = parts.booking.id;
         let outcome = issue_from_dkdm(
             &parts.issue(settings, issue_date),
             &parts.targets(),
@@ -1171,8 +1592,8 @@ impl DistributionDatabase {
         for kdm in issued {
             self.record_issue(&IssueRecord {
                 issued_at: kdm.issue_date.to_rfc3339(),
-                cpl_id: title.cpl_id.clone(),
-                content_title: title.content_title.clone(),
+                cpl_id: parts.title.cpl_id.clone(),
+                content_title: parts.title.content_title.clone(),
                 booking_id: Some(booking_id),
                 cinema: Some(kdm.cinema.clone()),
                 screen: Some(kdm.screen.clone()),
@@ -1185,11 +1606,12 @@ impl DistributionDatabase {
                 file_name: kdm.file_name.clone(),
             })?;
         }
-        if !outcome.bundles.is_empty() {
+        for screen_id in parts.issued_screen_ids(&outcome) {
             self.connection
                 .execute(
-                    "UPDATE bookings SET needs_reissue = 0 WHERE id = ?1",
-                    params![booking_id],
+                    "UPDATE booking_screens SET issued = 1, needs_reissue = 0
+                     WHERE booking_id = ?1 AND screen_id = ?2",
+                    params![booking_id, screen_id],
                 )
                 .map_err(database_error)?;
         }
@@ -1202,7 +1624,7 @@ mod tests {
     use super::*;
     use crate::kdm_distribution::flm::Contact;
     use crate::kdm_distribution::test_support::{
-        DCNC_TITLE, cinemas, dkdm, fixtures, local_window, read,
+        DCNC_TITLE, chain_screen, cinemas, dkdm, fixtures, local_window, read,
     };
     use std::io::Read;
 
@@ -1288,6 +1710,92 @@ mod tests {
         assert!(database.deliveries().unwrap().is_empty());
     }
 
+    fn booking_screen_state(
+        database: &DistributionDatabase,
+        booking: BookingId,
+        screen: ScreenId,
+    ) -> (bool, bool) {
+        database
+            .connection
+            .query_row(
+                "SELECT issued, needs_reissue FROM booking_screens
+                 WHERE booking_id = ?1 AND screen_id = ?2",
+                params![booking, screen],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn a_version_3_database_moves_the_reissue_flag_onto_the_issued_screens() {
+        const VERSION_BEFORE_SCREEN_STATE: usize = 3;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kdm.sqlite");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES ({VERSION_BEFORE_SCREEN_STATE});
+                 {}
+                 INSERT INTO certificates (id, thumbprint, subject, serial, not_before, not_after,
+                     chain_pem)
+                 VALUES (1, 't', 'SM', '1', 'a', 'b', '');
+                 INSERT INTO cinemas (id, name, emails, notes, contacts)
+                 VALUES (1, 'Rex', '[]', '', '[]');
+                 INSERT INTO screens (id, cinema_id, name, recipient_certificate_id)
+                 VALUES (1, 1, '1', 1), (2, 1, '2', 1), (3, 1, '3', 1);
+                 INSERT INTO titles (id, cpl_id, content_title, dkdm_xml, dkdm_not_valid_before,
+                     dkdm_not_valid_after)
+                 VALUES (1, 'cpl', 'Feature', '', 'a', 'b');
+                 INSERT INTO bookings (id, title_id, local_start, local_end, created_at,
+                     needs_reissue)
+                 VALUES (1, 1, '2026-11-01T18:00:00', '2026-11-08T23:00:00', 'c', 1),
+                     (2, 1, '2026-11-01T18:00:00', '2026-11-08T23:00:00', 'c', 0);
+                 INSERT INTO booking_screens (booking_id, screen_id)
+                 VALUES (1, 1), (1, 2), (1, 3), (2, 1), (2, 2);
+                 INSERT INTO issues (issued_at, cpl_id, content_title, booking_id, cinema, screen,
+                     recipient_subject, recipient_serial, valid_from, valid_to, file_name)
+                 VALUES ('i', 'cpl', 'Feature', 1, 'Rex', '1', 'SM', '1', 'a', 'b', 'k1.xml'),
+                     ('i', 'cpl', 'Feature', 1, 'Rex', 'renamed', 'SM', '1', 'a', 'b', 'k3.xml'),
+                     ('i', 'cpl', 'Feature', 2, 'Rex', '1', 'SM', '1', 'a', 'b', 'k1.xml'),
+                     ('i', 'cpl', 'Feature', NULL, 'Rex', '2', 'SM', '1', 'a', 'b', 'k2.xml');
+                 INSERT INTO deliveries (delivered_at, booking_id, cinema, zip_name, zip_path,
+                     recipients, result)
+                 VALUES ('d', 1, 'Rex', 'zip', '/out/zip.zip', '[]', '{{\"kind\":\"written\"}}');",
+                MIGRATIONS[..VERSION_BEFORE_SCREEN_STATE].concat()
+            ))
+            .unwrap();
+        drop(connection);
+
+        let database = DistributionDatabase::open(&path).unwrap();
+        assert_eq!(database.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(booking_screen_state(&database, 1, 1), (true, true));
+        assert_eq!(booking_screen_state(&database, 1, 2), (false, false));
+        assert_eq!(booking_screen_state(&database, 1, 3), (false, false));
+        assert_eq!(booking_screen_state(&database, 2, 1), (true, false));
+        assert_eq!(booking_screen_state(&database, 2, 2), (false, false));
+        assert_eq!(
+            database.booking(1).unwrap().pending_screen_ids,
+            vec![1, 2, 3]
+        );
+        assert_eq!(database.booking(2).unwrap().pending_screen_ids, vec![2]);
+        let booking_columns: Vec<String> = {
+            let mut statement = database
+                .connection
+                .prepare("SELECT name FROM pragma_table_info('bookings')")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert!(!booking_columns.contains(&"needs_reissue".to_string()));
+        let deliveries = database.deliveries().unwrap();
+        assert_eq!(deliveries[0].record.content_title, "");
+        assert_eq!(deliveries[0].record.zip_path, "/out/zip.zip");
+    }
+
     #[test]
     fn a_cinema_reads_back_as_it_was_saved_and_a_resave_keeps_its_screen_ids() {
         let mut database = DistributionDatabase::open_in_memory().unwrap();
@@ -1299,14 +1807,29 @@ mod tests {
             email: Some("booth@rex.test".into()),
             ..Default::default()
         }];
-        let id = database.save_cinema(&rex).unwrap();
+        let saved = database.save_cinema(&rex).unwrap();
+        let id = saved.cinema_id;
+        assert!(saved.created);
+        assert_eq!(
+            saved.screens,
+            vec![
+                ScreenChange::Added { screen: "1".into() },
+                ScreenChange::Added { screen: "2".into() }
+            ]
+        );
         let stored = database.cinema(id).unwrap();
         assert_eq!(stored.cinema, rex);
         assert_eq!(stored.screen_ids.len(), 2);
 
         rex.screens.remove(1);
         rex.time_zone = Some("Europe/Dublin".into());
-        assert_eq!(database.save_cinema(&rex).unwrap(), id);
+        let resave = database.save_cinema(&rex).unwrap();
+        assert_eq!(resave.cinema_id, id);
+        assert!(!resave.created);
+        assert_eq!(
+            resave.screens,
+            vec![ScreenChange::Removed { screen: "2".into() }]
+        );
         let resaved = database.cinema(id).unwrap();
         assert_eq!(resaved.cinema, rex);
         assert_eq!(resaved.screen_ids, vec![stored.screen_ids[0]]);
@@ -1317,7 +1840,7 @@ mod tests {
     fn a_booked_screen_cannot_disappear() {
         let mut database = DistributionDatabase::open_in_memory().unwrap();
         let (mut rex, _) = cinemas();
-        let cinema_id = database.save_cinema(&rex).unwrap();
+        let cinema_id = database.save_cinema(&rex).unwrap().cinema_id;
         let screen_ids = database.cinema(cinema_id).unwrap().screen_ids;
         let title = database.add_title_from_dkdm(&dkdm(DCNC_TITLE, 30)).unwrap();
         database
@@ -1425,8 +1948,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut database = DistributionDatabase::open_in_memory().unwrap();
         let (rex, odeon) = cinemas();
-        let rex_id = database.save_cinema(&rex).unwrap();
-        let odeon_id = database.save_cinema(&odeon).unwrap();
+        let rex_id = database.save_cinema(&rex).unwrap().cinema_id;
+        let odeon_id = database.save_cinema(&odeon).unwrap().cinema_id;
         let mut screens = database.cinema(rex_id).unwrap().screen_ids;
         screens.extend(database.cinema(odeon_id).unwrap().screen_ids);
         let title = database.add_title_from_dkdm(&dkdm(DCNC_TITLE, 30)).unwrap();
@@ -1438,7 +1961,12 @@ mod tests {
 
         let issue_date = Utc::now() + chrono::Duration::minutes(2);
         let outcome = database
-            .issue_booking(booking, &settings(dir.path()), issue_date)
+            .issue_booking(
+                booking,
+                IssueScope::AllScreens,
+                &settings(dir.path()),
+                issue_date,
+            )
             .unwrap();
         assert!(outcome.refused.is_empty(), "{:#?}", outcome.refused);
         assert_eq!(outcome.bundles.len(), 2);
@@ -1478,7 +2006,7 @@ mod tests {
         let (rex, odeon) = cinemas();
         let mut screens = Vec::new();
         for cinema in [&rex, &odeon] {
-            let id = database.save_cinema(cinema).unwrap();
+            let id = database.save_cinema(cinema).unwrap().cinema_id;
             screens.extend(database.cinema(id).unwrap().screen_ids);
         }
         let title = database.add_title_from_dkdm(&dkdm(DCNC_TITLE, 30)).unwrap();
@@ -1487,59 +2015,104 @@ mod tests {
             .unwrap()
     }
 
+    fn pending(database: &DistributionDatabase, booking: BookingId) -> Vec<ScreenId> {
+        database.booking(booking).unwrap().pending_screen_ids
+    }
+
     #[test]
-    fn editing_an_issued_booking_marks_it_for_reissue_and_removing_keeps_the_history() {
+    fn a_new_window_or_formulation_flags_issued_screens_and_a_new_screen_set_flags_none() {
         let dir = tempfile::tempdir().unwrap();
         let mut database = DistributionDatabase::open_in_memory().unwrap();
         let booking = booked(&mut database);
         let before = database.booking(booking).unwrap();
+        let all = before.screen_ids.clone();
+        assert_eq!(before.pending_screen_ids, all, "nothing was issued yet");
         let mut later = before.window;
         later.end += chrono::Duration::days(1);
-
-        database
-            .update_booking(booking, &before.screen_ids, later, None)
-            .unwrap();
-        assert!(
-            !database.booking(booking).unwrap().needs_reissue,
-            "nothing was issued yet"
-        );
+        database.update_booking(booking, &all, later, None).unwrap();
+        assert_eq!(pending(&database, booking), all);
 
         let outcome = database
-            .issue_booking(booking, &settings(dir.path()), Utc::now())
+            .issue_booking(
+                booking,
+                IssueScope::PendingScreens,
+                &settings(dir.path()),
+                Utc::now(),
+            )
             .unwrap();
         database
             .deliver_bundles(&outcome, Some(booking), None, Utc::now())
             .unwrap();
-        database
-            .update_booking(booking, &before.screen_ids, later, None)
-            .unwrap();
+        assert!(pending(&database, booking).is_empty());
+        database.update_booking(booking, &all, later, None).unwrap();
         assert!(
-            !database.booking(booking).unwrap().needs_reissue,
+            pending(&database, booking).is_empty(),
             "an unchanged save is no edit"
         );
 
-        let fewer = &before.screen_ids[..1];
+        let rex_screens = &all[..2];
+        database
+            .update_booking(booking, rex_screens, later, None)
+            .unwrap();
+        assert_eq!(database.booking(booking).unwrap().screen_ids, rex_screens);
+        assert!(pending(&database, booking).is_empty());
+        database.update_booking(booking, &all, later, None).unwrap();
+        assert_eq!(
+            pending(&database, booking),
+            vec![all[2]],
+            "only the screen added back has no KDM"
+        );
+
+        let mut earlier_end = later;
+        earlier_end.end -= chrono::Duration::hours(2);
+        database
+            .update_booking(booking, &all, earlier_end, None)
+            .unwrap();
+        assert_eq!(pending(&database, booking), all);
+        database
+            .issue_booking(
+                booking,
+                IssueScope::PendingScreens,
+                &settings(dir.path()),
+                Utc::now(),
+            )
+            .unwrap();
         database
             .update_booking(
                 booking,
-                fewer,
-                later,
+                &all,
+                earlier_end,
                 Some(KdmFormulation::MultipleModifiedTransitional1),
             )
             .unwrap();
         let edited = database.booking(booking).unwrap();
-        assert!(edited.needs_reissue);
-        assert_eq!(edited.screen_ids, fewer);
-        assert_eq!(edited.window, later);
+        assert_eq!(edited.pending_screen_ids, all);
+        assert_eq!(edited.window, earlier_end);
         assert_eq!(
             edited.formulation,
             Some(KdmFormulation::MultipleModifiedTransitional1)
         );
 
-        database
-            .issue_booking(booking, &settings(dir.path()), Utc::now())
+        let issued_before = database.issues().unwrap().len();
+        let outcome = database
+            .issue_booking(
+                booking,
+                IssueScope::PendingScreens,
+                &settings(dir.path()),
+                Utc::now(),
+            )
             .unwrap();
-        assert!(!database.booking(booking).unwrap().needs_reissue);
+        assert_eq!(
+            outcome.refused.len(),
+            2,
+            "two screens have no devices to list"
+        );
+        assert_eq!(database.issues().unwrap().len(), issued_before + 1);
+        assert_eq!(
+            pending(&database, booking),
+            all[1..],
+            "refused screens stay pending"
+        );
         let error = database
             .update_booking(booking, &[], later, None)
             .unwrap_err();
@@ -1572,7 +2145,12 @@ mod tests {
         database.save_cinema(&odeon).unwrap();
 
         let plan = database
-            .plan_booking(booking, &settings(dir.path()), Utc::now())
+            .plan_booking(
+                booking,
+                IssueScope::AllScreens,
+                &settings(dir.path()),
+                Utc::now(),
+            )
             .unwrap();
         let formulations: Vec<Option<KdmFormulation>> = plan
             .screens
@@ -1601,7 +2179,12 @@ mod tests {
         let mut database = DistributionDatabase::open_in_memory().unwrap();
         let booking = booked(&mut database);
         let outcome = database
-            .issue_booking(booking, &settings(dir.path()), Utc::now())
+            .issue_booking(
+                booking,
+                IssueScope::AllScreens,
+                &settings(dir.path()),
+                Utc::now(),
+            )
             .unwrap();
         let written = database
             .deliver_bundles(&outcome, Some(booking), None, Utc::now())
@@ -1609,7 +2192,7 @@ mod tests {
         assert!(
             written
                 .iter()
-                .all(|record| record.result == DeliveryResult::Written)
+                .all(|delivery| delivery.record.result == DeliveryResult::Written)
         );
 
         let single = DkdmIssueOutcome {
@@ -1620,8 +2203,8 @@ mod tests {
         let sent = database
             .deliver_bundles(&single, Some(booking), Some(&smtp), Utc::now())
             .unwrap();
-        assert_eq!(sent[0].result, DeliveryResult::Sent);
-        assert_eq!(sent[0].recipients, vec!["kdm@rex.test"]);
+        assert_eq!(sent[0].record.result, DeliveryResult::Sent);
+        assert_eq!(sent[0].record.recipients, vec!["kdm@rex.test"]);
         assert!(
             transcript
                 .lock()
@@ -1636,11 +2219,248 @@ mod tests {
             .deliver_bundles(&single, Some(booking), Some(&refused), Utc::now())
             .unwrap();
         assert!(
-            matches!(&failed[0].result, DeliveryResult::Failed(reason) if reason.contains("smtp send"))
+            matches!(&failed[0].record.result, DeliveryResult::Failed(reason) if reason.contains("smtp send"))
         );
 
         let recorded = database.deliveries().unwrap();
         assert_eq!(recorded.len(), outcome.bundles.len() + 2);
         assert_eq!(recorded.last().unwrap(), &failed[0]);
+    }
+
+    #[test]
+    fn a_replaced_certificate_flags_its_screen_and_the_cinema_reissue_writes_one_zip() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let booking = booked(&mut database);
+        database
+            .issue_booking(
+                booking,
+                IssueScope::AllScreens,
+                &settings(dir.path()),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let (mut rex, odeon) = cinemas();
+        let old_thumbprint = rex.screens[0].cert_thumbprint.clone();
+        rex.screens[0] = chain_screen(
+            "1",
+            "1001",
+            &f.security_managers[2].certificate,
+            &[
+                ("LD", &f.link_decryptor.certificate),
+                ("PR", &f.projector.certificate),
+            ],
+        );
+        rex.screens[1].authorized_devices = chain_screen(
+            "2",
+            "1002",
+            &f.security_managers[1].certificate,
+            &[("LD", &f.link_decryptor.certificate)],
+        )
+        .authorized_devices;
+        let report = database.save_cinema(&rex).unwrap();
+        assert_eq!(
+            report.screens,
+            vec![
+                ScreenChange::CertificatesChanged {
+                    screen: "1".into(),
+                    recipient: Some(CertificateReplacement {
+                        old_thumbprint,
+                        new_thumbprint: rex.screens[0].cert_thumbprint.clone(),
+                    }),
+                    devices_changed: false,
+                },
+                ScreenChange::CertificatesChanged {
+                    screen: "2".into(),
+                    recipient: None,
+                    devices_changed: true,
+                },
+            ]
+        );
+        assert_eq!(report.bookings_to_reissue, vec![booking]);
+        let rex_screens = database.cinema(report.cinema_id).unwrap().screen_ids;
+        assert_eq!(pending(&database, booking), rex_screens);
+        let unchanged = database.save_cinema(&rex).unwrap();
+        assert!(unchanged.screens.is_empty(), "{:?}", unchanged.screens);
+        assert!(unchanged.bookings_to_reissue.is_empty());
+        let odeon_id = database.save_cinema(&odeon).unwrap().cinema_id;
+        assert!(
+            database
+                .pending_screens_at_cinema(odeon_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        let plans = database
+            .plan_cinema_pending(report.cinema_id, &settings(dir.path()), Utc::now())
+            .unwrap();
+        assert_eq!(plans.len(), 1);
+        let planned: Vec<&str> = plans[0]
+            .plan
+            .screens
+            .iter()
+            .map(|screen| screen.screen.as_str())
+            .collect();
+        assert_eq!(planned, vec!["1", "2"]);
+
+        let issued_before = database.issues().unwrap().len();
+        let issue_date = Utc::now() + chrono::Duration::minutes(1);
+        let outcome = database
+            .issue_cinema_pending(report.cinema_id, &settings(dir.path()), issue_date)
+            .unwrap();
+        assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
+        let outcomes = outcome.issued;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].booking_id, booking);
+        let bundles = &outcomes[0].outcome.bundles;
+        assert_eq!(bundles.len(), 1);
+        assert_eq!(bundles[0].cinema, "Rex");
+        assert_eq!(bundles[0].kdms.len(), 2);
+        assert!(
+            bundles[0]
+                .kdms
+                .iter()
+                .all(|kdm| kdm.issue_date == issue_date)
+        );
+        assert_eq!(database.issues().unwrap().len(), issued_before + 2);
+        assert!(pending(&database, booking).is_empty());
+        assert!(
+            database
+                .issue_cinema_pending(report.cinema_id, &settings(dir.path()), Utc::now())
+                .unwrap()
+                == CinemaIssueOutcome::default()
+        );
+    }
+
+    #[test]
+    fn a_booking_that_fails_at_a_cinema_is_reported_and_the_others_still_issue() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let good = booked(&mut database);
+        let rex_id = database
+            .cinemas()
+            .unwrap()
+            .into_iter()
+            .find(|stored| stored.cinema.name == "Rex")
+            .unwrap()
+            .id;
+        let rex_screens = database.cinema(rex_id).unwrap().screen_ids;
+        database
+            .connection
+            .execute(
+                "INSERT INTO titles (cpl_id, content_title, dkdm_xml, dkdm_not_valid_before,
+                     dkdm_not_valid_after)
+                 VALUES ('unreadable', 'Unreadable', 'not a KDM', '', '')",
+                [],
+            )
+            .unwrap();
+        let unreadable_title = database.connection.last_insert_rowid();
+        let failing = database
+            .add_booking(
+                unreadable_title,
+                &rex_screens,
+                local_window(),
+                None,
+                Utc::now(),
+            )
+            .unwrap();
+
+        let outcome = database
+            .issue_cinema_pending(rex_id, &settings(dir.path()), Utc::now())
+            .unwrap();
+        assert_eq!(outcome.issued.len(), 1);
+        assert_eq!(outcome.issued[0].booking_id, good);
+        assert_eq!(outcome.issued[0].outcome.bundles[0].kdms.len(), 2);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(outcome.failed[0].booking_id, failing);
+        assert_eq!(outcome.failed[0].content_title, "Unreadable");
+        assert!(!outcome.failed[0].error.is_empty());
+        assert_eq!(pending(&database, failing), rex_screens);
+        assert!(
+            pending(&database, good)
+                .iter()
+                .all(|screen| !rex_screens.contains(screen))
+        );
+    }
+
+    #[test]
+    fn a_resend_mails_the_zip_to_the_cinemas_current_addresses_as_a_new_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let booking = booked(&mut database);
+        let outcome = database
+            .issue_booking(
+                booking,
+                IssueScope::AllScreens,
+                &settings(dir.path()),
+                Utc::now(),
+            )
+            .unwrap();
+        let written = database
+            .deliver_bundles(&outcome, Some(booking), None, Utc::now())
+            .unwrap();
+        assert!(
+            written
+                .iter()
+                .all(|delivery| delivery.record.content_title == DCNC_TITLE)
+        );
+        let delivery_to = |cinema: &str| {
+            written
+                .iter()
+                .find(|delivery| delivery.record.cinema == cinema)
+                .unwrap()
+                .clone()
+        };
+        let (rex_delivery, odeon_delivery) = (delivery_to("Rex"), delivery_to("Odeon"));
+        let stored = database.cinemas().unwrap();
+        let mut rex = stored[1].cinema.clone();
+        let mut odeon = stored[0].cinema.clone();
+        rex.emails = vec!["booking@rex.test".into()];
+        database.save_cinema(&rex).unwrap();
+
+        let (smtp, transcript) = crate::kdm_distribution::test_support::fake_server();
+        let resent = database
+            .resend_delivery(rex_delivery.id, &smtp, Utc::now())
+            .unwrap();
+        assert_ne!(resent.id, rex_delivery.id);
+        assert_eq!(resent.record.result, DeliveryResult::Sent);
+        assert_eq!(resent.record.recipients, vec!["booking@rex.test"]);
+        assert_eq!(resent.record.zip_path, rex_delivery.record.zip_path);
+        assert_eq!(resent.record.content_title, DCNC_TITLE);
+        assert_eq!(resent.record.booking_id, Some(booking));
+        let transcript = transcript.lock().unwrap();
+        assert!(transcript.commands.contains("RCPT TO:<booking@rex.test>"));
+        assert!(
+            transcript
+                .body
+                .contains(&format!("Subject: {}", rex_delivery.record.zip_name))
+        );
+        assert_eq!(database.deliveries().unwrap().last().unwrap(), &resent);
+
+        odeon.emails.clear();
+        database.save_cinema(&odeon).unwrap();
+        let error = database
+            .resend_delivery(odeon_delivery.id, &smtp, Utc::now())
+            .unwrap_err();
+        assert!(error.contains("cinema 'Odeon' has no KDM email"), "{error}");
+        database.remove_booking(booking).unwrap();
+        let odeon_id = database.cinemas().unwrap()[0].id;
+        database.remove_cinema(odeon_id).unwrap();
+        let error = database
+            .resend_delivery(odeon_delivery.id, &smtp, Utc::now())
+            .unwrap_err();
+        assert!(error.contains("cinema 'Odeon' is no longer"), "{error}");
+
+        std::fs::remove_file(&rex_delivery.record.zip_path).unwrap();
+        let error = database
+            .resend_delivery(rex_delivery.id, &smtp, Utc::now())
+            .unwrap_err();
+        assert!(error.contains(&rex_delivery.record.zip_path), "{error}");
+        let error = database
+            .resend_delivery(DeliveryId::MAX, &smtp, Utc::now())
+            .unwrap_err();
+        assert!(error.contains("not found"), "{error}");
     }
 }
