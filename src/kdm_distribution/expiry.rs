@@ -1,5 +1,5 @@
 use super::cinema::Cinema;
-use super::database::{Booking, BookingId, DistributionDatabase};
+use super::database::{Booking, BookingId, CinemaId, DistributionDatabase};
 use super::window::kdm_window_in_time_zone;
 use crate::certificate::{ChainCertificate, certificate_label, chain_from_files, chain_from_pem};
 use chrono::{DateTime, Utc};
@@ -48,6 +48,15 @@ pub struct ExpiryReport {
     pub not_checked: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BookingEnding {
+    pub booking_id: BookingId,
+    pub cinema_id: CinemaId,
+    pub cinema: String,
+    pub ends_at: DateTime<Utc>,
+}
+
 fn certificate_expiry(certificate: &ChainCertificate) -> Result<(String, DateTime<Utc>), String> {
     let (_, parsed) = X509Certificate::from_der(&certificate.der)
         .map_err(|e| format!("{}: cannot be read: {e}", certificate.label))?;
@@ -71,6 +80,39 @@ fn booking_end(booking: &Booking, cinema: &Cinema) -> Result<DateTime<Utc>, Stri
         .as_deref()
         .ok_or_else(|| format!("cinema '{}' has no time zone", cinema.name))?;
     Ok(kdm_window_in_time_zone(&booking.window, zone)?.end)
+}
+
+pub fn bookings_ending_within(
+    database: &DistributionDatabase,
+    now: DateTime<Utc>,
+    within: chrono::Duration,
+) -> Result<Vec<BookingEnding>, String> {
+    let cinemas = database.cinemas()?;
+    let mut endings = Vec::new();
+    for booking in database.bookings()? {
+        for stored in &cinemas {
+            let booked = stored
+                .screen_ids
+                .iter()
+                .any(|id| booking.screen_ids.contains(id));
+            if !booked {
+                continue;
+            }
+            // expiry_report lists a cinema with no usable time zone as not checked
+            let Ok(ends_at) = booking_end(&booking, &stored.cinema) else {
+                continue;
+            };
+            if now < ends_at && ends_at <= now + within {
+                endings.push(BookingEnding {
+                    booking_id: booking.id,
+                    cinema_id: stored.id,
+                    cinema: stored.cinema.name.clone(),
+                    ends_at,
+                });
+            }
+        }
+    }
+    Ok(endings)
 }
 
 // signer_chain is the signer certificate followed by the CA certificates above it
@@ -178,6 +220,7 @@ pub fn expiry_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kdm_distribution::database::ScreenId;
     use crate::kdm_distribution::test_support::{
         DCNC_TITLE, chain_screen, cinemas, dkdm, fixtures, local_window, short_lived_leaf,
     };
@@ -265,5 +308,61 @@ mod tests {
         assert_eq!(report.signer_chain[0].bookings_ending_after, vec![open]);
         assert!(report.signer_chain[1].bookings_ending_after.is_empty());
         assert!(report.signer_chain[1].subject.contains("Distributor"));
+    }
+
+    fn local_window_ending(end: &str) -> LocalWindow {
+        let end = chrono::NaiveDateTime::parse_from_str(end, "%Y-%m-%d %H:%M").unwrap();
+        LocalWindow {
+            start: end - chrono::Duration::days(7),
+            end,
+        }
+    }
+
+    #[test]
+    fn a_booking_is_listed_at_each_cinema_where_its_local_end_falls_inside_the_span() {
+        let (rex, odeon) = cinemas();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let rex_id = database.save_cinema(&rex).unwrap().cinema_id;
+        let odeon_id = database.save_cinema(&odeon).unwrap().cinema_id;
+        let rex_screen = database.cinema(rex_id).unwrap().screen_ids[0];
+        let odeon_screen = database.cinema(odeon_id).unwrap().screen_ids[0];
+        let title = database
+            .add_title_from_dkdm(&dkdm(DCNC_TITLE, DKDM_DAYS))
+            .unwrap();
+        let mut book = |screens: &[ScreenId], end: &str| {
+            database
+                .add_booking(title, screens, local_window_ending(end), None, Utc::now())
+                .unwrap()
+        };
+        let inside = book(&[rex_screen], "2026-11-07 23:00");
+        book(&[rex_screen], "2026-11-20 23:00");
+        book(&[rex_screen], "2026-11-01 23:00");
+        // 10:00 in London is 10:00 UTC in November, in New York it is 15:00 UTC
+        let both_zones = book(&[rex_screen, odeon_screen], "2026-11-08 10:00");
+
+        let at = |time: &str| {
+            DateTime::parse_from_rfc3339(time)
+                .unwrap()
+                .with_timezone(&Utc)
+        };
+        let now = at("2026-11-05T12:00:00Z");
+        let ending = bookings_ending_within(&database, now, chrono::Duration::days(3)).unwrap();
+        assert_eq!(
+            ending,
+            vec![
+                BookingEnding {
+                    booking_id: inside,
+                    cinema_id: rex_id,
+                    cinema: "Rex".into(),
+                    ends_at: at("2026-11-07T23:00:00Z"),
+                },
+                BookingEnding {
+                    booking_id: both_zones,
+                    cinema_id: rex_id,
+                    cinema: "Rex".into(),
+                    ends_at: at("2026-11-08T10:00:00Z"),
+                },
+            ]
+        );
     }
 }
