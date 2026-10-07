@@ -10,6 +10,7 @@
 //! thread holding the GL context the render context was created with.
 
 mod ffi;
+mod level_meter;
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub use ffi::mpv_get_proc_address_fn;
 
+use crate::audio_levels::ChannelLevel;
 use crate::mpv::pick_picture_mxf;
 
 /// Pixel format libmpv writes in software mode, and the one `render_software`
@@ -91,6 +93,8 @@ pub struct MpvRenderPlayer {
     render: Mutex<*mut ffi::mpv_render_context>,
     update_callback: Mutex<Option<*mut UpdateCallback>>,
     initialized: AtomicBool,
+    // the sample rate the meter filter's window is sized for, None while the meter is off
+    level_meter_sample_rate: Mutex<Option<u32>>,
 }
 
 type UpdateCallback = Box<dyn Fn() + Send + 'static>;
@@ -116,6 +120,7 @@ impl MpvRenderPlayer {
             render: Mutex::new(ptr::null_mut()),
             update_callback: Mutex::new(None),
             initialized: AtomicBool::new(false),
+            level_meter_sample_rate: Mutex::new(None),
         };
         for (name, value) in COMMON_OPTIONS {
             player.set_option(name, value)?;
@@ -551,6 +556,59 @@ impl MpvRenderPlayer {
 
     pub fn get_duration(&self) -> Result<f64, String> {
         self.get_property_f64("duration")
+    }
+
+    // off by default, and off there is no meter filter in mpv's audio chain
+    pub fn set_level_meter(&self, enabled: bool) -> Result<(), String> {
+        let mut filter_sample_rate = self.level_meter_sample_rate.lock().unwrap();
+        if filter_sample_rate.is_some() == enabled {
+            return Ok(());
+        }
+        if !enabled {
+            self.remove_level_meter_filter()?;
+            *filter_sample_rate = None;
+            return Ok(());
+        }
+        let sample_rate = self
+            .source_sample_rate()
+            .unwrap_or(level_meter::DEFAULT_SAMPLE_RATE);
+        self.command(&["af", "add", &level_meter::filter(sample_rate)])?;
+        *filter_sample_rate = Some(sample_rate);
+        Ok(())
+    }
+
+    // the decoded channels before mpv mixes them for the device, about one audio buffer ahead of what is heard
+    pub fn audio_levels(&self) -> Option<Vec<ChannelLevel>> {
+        let mut filter_sample_rate = self.level_meter_sample_rate.lock().unwrap();
+        let filtered_at = (*filter_sample_rate)?;
+        let channel_count = self.get_property_f64("audio-params/channel-count").ok()? as usize;
+        let sample_rate = self.source_sample_rate()?;
+        // a load at another rate would stretch the window
+        if sample_rate != filtered_at {
+            self.remove_level_meter_filter().ok()?;
+            self.command(&["af", "add", &level_meter::filter(sample_rate)])
+                .ok()?;
+            *filter_sample_rate = Some(sample_rate);
+        }
+        let layout = self
+            .get_property_string("audio-params/channels")
+            .unwrap_or_default();
+        let labels = level_meter::channel_labels(&layout, channel_count);
+        let heard = !self.get_property_bool("core-idle").unwrap_or(true);
+        let metadata = self.get_property_string(&level_meter::metadata_property());
+        match (heard, metadata) {
+            (true, Ok(metadata)) => level_meter::levels_of_metadata(&metadata, labels),
+            _ => Some(labels.into_iter().map(ChannelLevel::silent).collect()),
+        }
+    }
+
+    fn source_sample_rate(&self) -> Option<u32> {
+        let rate = self.get_property_f64("audio-params/samplerate").ok()?;
+        Some(rate as u32)
+    }
+
+    fn remove_level_meter_filter(&self) -> Result<(), String> {
+        self.command(&["af", "remove", &format!("@{}", level_meter::FILTER_LABEL)])
     }
 
     /// Position, duration, pause state and filename as one JSON object, the

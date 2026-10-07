@@ -11,6 +11,11 @@
   - Padding on the device, as a measured optimisation. The pad filter runs in
     the in-process graph.
 
+- The mpv level meter reads 0.3 to 0.6 s ahead of what is heard. The `astats`
+  filter sees each block when mpv decodes it, before the audio output buffer,
+  and `af-metadata` carries no timestamp to hold a reading back by. The grok
+  player's meter is placed at the played position.
+
 - Stereoscopic JPEG 2000 stays on libmpv. `GrokPlayer::accepts` returns false for
   `EssenceType::Jpeg2000Stereo` and `load` refuses it by name, because the mono
   AS-DCP reader cannot read it. Needs asdcplib's stereo reader.
