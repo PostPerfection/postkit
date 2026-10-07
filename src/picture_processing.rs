@@ -166,19 +166,62 @@ impl Rotation {
     }
 }
 
-/// Fit the processed picture into a box and centre it on a raster.
+/// Fit the processed picture into a box and place it on a raster.
 ///
 /// The picture is scaled to the largest size that fits the box with its aspect
-/// ratio kept, then centred on a raster of `raster_width` x `raster_height` with
-/// black around it. Nothing is ever cropped here, and nothing ever grows past
-/// the box. A source smaller than the box is scaled up to it, which is what a
-/// DCI raster needs: the encoded picture has to be the raster the CPL declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// ratio kept, then sized and moved by `placement` on a raster of
+/// `raster_width` x `raster_height` with black around it. At the default
+/// placement it is centred and never grows past the box. A source smaller than
+/// the box is scaled up to it, which is what a DCI raster needs: the encoded
+/// picture has to be the raster the CPL declares.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Fit {
     pub box_width: u32,
     pub box_height: u32,
     pub raster_width: u32,
     pub raster_height: u32,
+    #[serde(default)]
+    pub placement: Placement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Placement {
+    pub scale_percent: f64,
+    pub offset_x: i32,
+    pub offset_y: i32,
+}
+
+const FITTED_SCALE_PERCENT: f64 = 100.0;
+
+impl Default for Placement {
+    fn default() -> Self {
+        Placement {
+            scale_percent: FITTED_SCALE_PERCENT,
+            offset_x: 0,
+            offset_y: 0,
+        }
+    }
+}
+
+impl Placement {
+    pub fn is_default(&self) -> bool {
+        *self == Placement::default()
+    }
+}
+
+// pad offset and overfill crop start on one axis
+fn place_on_axis(raster: u32, scaled: u32, offset: i32) -> (u32, u32) {
+    if scaled <= raster {
+        let free = raster - scaled;
+        let centred = i64::from(floor_to_even(free / 2));
+        let position = (centred + i64::from(offset)).clamp(0, i64::from(free));
+        return (floor_to_even(position as u32), 0);
+    }
+    let overflow = scaled - raster;
+    let centred = i64::from(floor_to_even(overflow / 2));
+    // the window moves against the offset
+    let window_start = (centred - i64::from(offset)).clamp(0, i64::from(overflow));
+    (0, floor_to_even(window_start as u32))
 }
 
 impl Fit {
@@ -196,10 +239,19 @@ impl Fit {
                 self.box_width, self.box_height, self.raster_width, self.raster_height
             ));
         }
+        let scale_percent = self.placement.scale_percent;
+        if !(scale_percent.is_finite() && scale_percent > 0.0) {
+            return Err(format!(
+                "picture scale is {scale_percent}%, which has to be a positive number"
+            ));
+        }
         let ratio =
             (self.box_width as f64 / width as f64).min(self.box_height as f64 / height as f64);
-        let scaled_width = floor_to_even((width as f64 * ratio) as u32).min(self.box_width);
-        let scaled_height = floor_to_even((height as f64 * ratio) as u32).min(self.box_height);
+        let fitted_width = floor_to_even((width as f64 * ratio) as u32).min(self.box_width);
+        let fitted_height = floor_to_even((height as f64 * ratio) as u32).min(self.box_height);
+        let scale = scale_percent / FITTED_SCALE_PERCENT;
+        let scaled_width = floor_to_even((fitted_width as f64 * scale) as u32);
+        let scaled_height = floor_to_even((fitted_height as f64 * scale) as u32);
         if scaled_width == 0 || scaled_height == 0 {
             return Err(format!(
                 "fitting {width}x{height} into {}x{} leaves a {scaled_width}x{scaled_height} picture",
@@ -211,7 +263,7 @@ impl Fit {
 }
 
 /// Everything done to the source picture before it is compressed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PictureProcessing {
     pub deinterlace: bool,
     pub denoise: bool,
@@ -253,6 +305,7 @@ impl PictureProcessing {
         let (rotated_width, rotated_height) =
             self.rotation.applied_to(cropped_width, cropped_height);
 
+        let placement = self.fit.map(|fit| fit.placement).unwrap_or_default();
         let (scaled_width, scaled_height, output_width, output_height) = match &self.fit {
             Some(fit) => {
                 let (scaled_width, scaled_height) =
@@ -268,16 +321,22 @@ impl PictureProcessing {
         };
         // an odd offset is rounded down by ffmpeg's pad on a subsampled source,
         // so the picture would sit a column or a row off what this plan says
-        let pad_left = floor_to_even((output_width - scaled_width) / 2);
-        let pad_top = floor_to_even((output_height - scaled_height) / 2);
+        let (pad_left, overfill_left) =
+            place_on_axis(output_width, scaled_width, placement.offset_x);
+        let (pad_top, overfill_top) =
+            place_on_axis(output_height, scaled_height, placement.offset_y);
+        let visible_width = scaled_width.min(output_width);
+        let visible_height = scaled_height.min(output_height);
 
         let scales = (scaled_width, scaled_height) != (rotated_width, rotated_height);
-        let pads = (output_width, output_height) != (scaled_width, scaled_height);
+        let crops_overfill = (visible_width, visible_height) != (scaled_width, scaled_height);
+        let pads = (output_width, output_height) != (visible_width, visible_height);
         let changes_geometry = !crop.is_none()
             || self.rotation != Rotation::None
             || self.flip_horizontal
             || self.flip_vertical
             || scales
+            || crops_overfill
             || pads;
 
         let mut filters = Vec::new();
@@ -307,6 +366,11 @@ impl PictureProcessing {
                 "scale=w={scaled_width}:h={scaled_height}:flags={SCALE_ALGORITHM}"
             ));
         }
+        if crops_overfill {
+            filters.push(format!(
+                "crop={visible_width}:{visible_height}:{overfill_left}:{overfill_top}"
+            ));
+        }
         if pads {
             filters.push(format!(
                 "pad=w={output_width}:h={output_height}:x={pad_left}:y={pad_top}:color={PAD_COLOUR}"
@@ -322,6 +386,11 @@ impl PictureProcessing {
             rotated_height,
             scaled_width,
             scaled_height,
+            placement,
+            overfill_left,
+            overfill_top,
+            visible_width,
+            visible_height,
             output_width,
             output_height,
             pad_left,
@@ -335,7 +404,7 @@ impl PictureProcessing {
 }
 
 /// The sizes and the ffmpeg filters one source size resolves to.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PicturePlan {
     pub crop: Crop,
     pub rotation: Rotation,
@@ -345,6 +414,13 @@ pub struct PicturePlan {
     pub rotated_height: u32,
     pub scaled_width: u32,
     pub scaled_height: u32,
+    pub placement: Placement,
+    // columns and rows of the scaled picture cut away left and above the raster
+    pub overfill_left: u32,
+    pub overfill_top: u32,
+    // the part of the scaled picture that lands on the raster
+    pub visible_width: u32,
+    pub visible_height: u32,
     /// Size of the frame the decode hands the encoder, which is also what the
     /// codestream declares.
     pub output_width: u32,
@@ -375,8 +451,31 @@ impl PicturePlan {
 
     /// One line naming every step, for a log or a crop indicator.
     pub fn describe(&self) -> String {
+        let scale_percent = if self.placement.scale_percent == FITTED_SCALE_PERCENT {
+            String::new()
+        } else {
+            format!(" at {}%", self.placement.scale_percent)
+        };
+        let overfill_crop = if (self.visible_width, self.visible_height)
+            == (self.scaled_width, self.scaled_height)
+        {
+            String::new()
+        } else {
+            format!(
+                ", cut to {}x{} at ({},{})",
+                self.visible_width, self.visible_height, self.overfill_left, self.overfill_top
+            )
+        };
+        let offset = if (self.placement.offset_x, self.placement.offset_y) == (0, 0) {
+            String::new()
+        } else {
+            format!(
+                ", offset ({},{})",
+                self.placement.offset_x, self.placement.offset_y
+            )
+        };
         format!(
-            "crop {}/{}/{}/{} to {}x{}, rotate {}, scale to {}x{}, pad to {}x{} at ({},{})",
+            "crop {}/{}/{}/{} to {}x{}, rotate {}, scale to {}x{}{scale_percent}{overfill_crop}, pad to {}x{} at ({},{}){offset}",
             self.crop.left,
             self.crop.right,
             self.crop.top,
@@ -754,6 +853,7 @@ mod tests {
                 box_height: 858,
                 raster_width: 2048,
                 raster_height: 1080,
+                placement: Placement::default(),
             }),
             ..PictureProcessing::default()
         };
@@ -821,6 +921,7 @@ mod tests {
                 box_height: 858,
                 raster_width: 2048,
                 raster_height: 1080,
+                placement: Placement::default(),
             }),
             ..PictureProcessing::default()
         }
@@ -836,6 +937,160 @@ mod tests {
             ]
         );
         assert!(plan.changes_geometry);
+    }
+
+    fn flat_fit(placement: Placement) -> PictureProcessing {
+        PictureProcessing {
+            fit: Some(Fit {
+                box_width: 1998,
+                box_height: 1080,
+                raster_width: 1998,
+                raster_height: 1080,
+                placement,
+            }),
+            ..PictureProcessing::default()
+        }
+    }
+
+    #[test]
+    fn a_half_scale_picture_sits_centred_with_black_around_it() {
+        let plan = flat_fit(Placement {
+            scale_percent: 50.0,
+            ..Placement::default()
+        })
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!((plan.scaled_width, plan.scaled_height), (960, 540));
+        assert_eq!((plan.pad_left, plan.pad_top), (518, 270));
+        assert_eq!(
+            plan.filters,
+            vec![
+                "scale=w=960:h=540:flags=lanczos".to_string(),
+                "pad=w=1998:h=1080:x=518:y=270:color=black".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_offset_moves_the_pad_and_stays_on_the_chroma_grid() {
+        let plan = flat_fit(Placement {
+            scale_percent: 50.0,
+            offset_x: 101,
+            offset_y: -51,
+        })
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!((plan.pad_left, plan.pad_top), (618, 218));
+        assert_eq!(
+            plan.filters.last().unwrap(),
+            "pad=w=1998:h=1080:x=618:y=218:color=black"
+        );
+        assert_eq!(
+            plan.describe(),
+            "crop 0/0/0/0 to 1920x1080, rotate none, scale to 960x540 at 50%, \
+             pad to 1998x1080 at (618,218), offset (101,-51)"
+        );
+    }
+
+    #[test]
+    fn an_offset_past_the_edge_keeps_an_underfilled_picture_on_the_raster() {
+        let plan = flat_fit(Placement {
+            scale_percent: 50.0,
+            offset_x: 5000,
+            offset_y: -5000,
+        })
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!((plan.pad_left, plan.pad_top), (1998 - 960, 0));
+    }
+
+    #[test]
+    fn an_overfilled_picture_is_cut_to_the_raster_instead_of_padded() {
+        let plan = flat_fit(Placement {
+            scale_percent: 150.0,
+            ..Placement::default()
+        })
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!((plan.scaled_width, plan.scaled_height), (2880, 1620));
+        assert_eq!((plan.visible_width, plan.visible_height), (1998, 1080));
+        assert_eq!((plan.overfill_left, plan.overfill_top), (440, 270));
+        assert_eq!((plan.pad_left, plan.pad_top), (0, 0));
+        assert_eq!(
+            plan.filters,
+            vec![
+                "scale=w=2880:h=1620:flags=lanczos".to_string(),
+                "crop=1998:1080:440:270".to_string(),
+            ]
+        );
+        assert_eq!(
+            plan.describe(),
+            "crop 0/0/0/0 to 1920x1080, rotate none, scale to 2880x1620 at 150%, \
+             cut to 1998x1080 at (440,270), pad to 1998x1080 at (0,0)"
+        );
+    }
+
+    #[test]
+    fn an_overfill_offset_moves_the_window_and_clamps_at_the_picture_edge() {
+        let moved = flat_fit(Placement {
+            scale_percent: 150.0,
+            offset_x: 100,
+            offset_y: 20,
+        })
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!((moved.overfill_left, moved.overfill_top), (340, 250));
+
+        let clamped = flat_fit(Placement {
+            scale_percent: 150.0,
+            offset_x: 10_000,
+            offset_y: -10_000,
+        })
+        .plan(1920, 1080)
+        .unwrap();
+        assert_eq!((clamped.overfill_left, clamped.overfill_top), (0, 540));
+        assert_eq!(clamped.filters.last().unwrap(), "crop=1998:1080:0:540");
+    }
+
+    #[test]
+    fn one_axis_can_overfill_while_the_other_pads() {
+        let plan = PictureProcessing {
+            fit: Some(Fit {
+                box_width: 2048,
+                box_height: 858,
+                raster_width: 2048,
+                raster_height: 1080,
+                placement: Placement {
+                    scale_percent: 110.0,
+                    ..Placement::default()
+                },
+            }),
+            ..PictureProcessing::default()
+        }
+        .plan(2048, 858)
+        .unwrap();
+        assert_eq!((plan.scaled_width, plan.scaled_height), (2252, 942));
+        assert_eq!(
+            plan.filters,
+            vec![
+                "scale=w=2252:h=942:flags=lanczos".to_string(),
+                "crop=2048:942:102:0".to_string(),
+                "pad=w=2048:h=1080:x=0:y=68:color=black".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_scale_that_is_not_a_positive_number_is_refused() {
+        for scale_percent in [0.0, -50.0, f64::NAN, f64::INFINITY] {
+            let refused = flat_fit(Placement {
+                scale_percent,
+                ..Placement::default()
+            })
+            .plan(1920, 1080)
+            .unwrap_err();
+            assert!(refused.contains("positive number"), "{refused}");
+        }
     }
 
     #[test]
@@ -870,6 +1125,7 @@ mod tests {
                 box_height: 1080,
                 raster_width: 1998,
                 raster_height: 1080,
+                placement: Placement::default(),
             }),
             ..PictureProcessing::default()
         }
@@ -935,6 +1191,7 @@ mod tests {
                 box_height: 2160,
                 raster_width: 2048,
                 raster_height: 1080,
+                placement: Placement::default(),
             }),
             ..PictureProcessing::default()
         }

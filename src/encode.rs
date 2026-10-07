@@ -2130,6 +2130,7 @@ mod tests {
                 box_height: 1080,
                 raster_width: 2048,
                 raster_height: 1080,
+                placement: crate::picture_processing::Placement::default(),
             }),
             ..crate::picture_processing::PictureProcessing::default()
         }
@@ -3076,6 +3077,7 @@ mod tests {
                 box_height: 858,
                 raster_width: 2048,
                 raster_height: 1080,
+                placement: crate::picture_processing::Placement::default(),
             }),
             ..crate::picture_processing::PictureProcessing::default()
         }
@@ -3317,6 +3319,7 @@ mod tests {
                 box_height: 48,
                 raster_width: SOLID_COLOUR_SIZE,
                 raster_height: SOLID_COLOUR_SIZE,
+                placement: crate::picture_processing::Placement::default(),
             }),
             ..crate::picture_processing::PictureProcessing::default()
         }
