@@ -6,7 +6,7 @@
 //! detection reads back the bars a clip really has.
 
 use postkit::encode::{DecodeSource, FrameRate};
-use postkit::picture_processing::{Crop, Fit, PictureProcessing};
+use postkit::picture_processing::{Crop, Fit, PictureProcessing, Placement};
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_with_options};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +34,11 @@ const CONTENT_FLOOR_DIVISOR: u16 = 2;
 
 const SEQUENCE_SIZE: u32 = 128;
 const SEQUENCE_CROP: u32 = 16;
+
+const FLAT_WIDTH: u32 = 1998;
+const FLAT_HEIGHT: u32 = 1080;
+// lanczos and the wavelet both ring, so a probe stays this far from a picture edge
+const EDGE_MARGIN: u32 = 16;
 
 /// A testsrc clip, optionally run through an extra filter chain.
 fn make_clip(video: &Path, width: u32, height: u32, filters: Option<&str>) {
@@ -98,6 +103,36 @@ impl DecodedFrame {
         let end = start + (self.width * 3) as usize;
         self.samples[start..end].iter().copied().max().unwrap_or(0)
     }
+
+    fn pixel_peak(&self, column: u32, row: u32) -> u16 {
+        let start = ((row * self.width + column) * 3) as usize;
+        self.samples[start..start + 3]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn is_black(&self, column: u32, row: u32) -> bool {
+        self.pixel_peak(column, row) < self.full_scale / BLACK_CEILING_DIVISOR
+    }
+
+    fn is_picture(&self, column: u32, row: u32) -> bool {
+        self.pixel_peak(column, row) > self.full_scale / CONTENT_FLOOR_DIVISOR
+    }
+}
+
+fn flat_placement(placement: Placement) -> PictureProcessing {
+    PictureProcessing {
+        fit: Some(Fit {
+            box_width: FLAT_WIDTH,
+            box_height: FLAT_HEIGHT,
+            raster_width: FLAT_WIDTH,
+            raster_height: FLAT_HEIGHT,
+            placement,
+        }),
+        ..PictureProcessing::default()
+    }
 }
 
 /// Decode one codestream in memory.
@@ -126,6 +161,7 @@ fn a_cropped_source_lands_centred_on_the_target_raster() {
             box_height: BOX_HEIGHT,
             raster_width: RASTER_WIDTH,
             raster_height: RASTER_HEIGHT,
+            placement: Placement::default(),
         }),
         ..PictureProcessing::default()
     };
@@ -208,6 +244,7 @@ fn an_extra_picture_filter_fades_the_fitted_picture() {
                     box_height: BOX_HEIGHT,
                     raster_width: RASTER_WIDTH,
                     raster_height: RASTER_HEIGHT,
+                    placement: Placement::default(),
                 }),
                 ..PictureProcessing::default()
             },
@@ -340,6 +377,108 @@ fn an_image_sequence_with_a_crop_encodes_at_the_cropped_size() {
             (header.width, header.height),
             (cropped, cropped),
             "the sequence has to go through ffmpeg and come out cropped"
+        );
+    }
+}
+
+#[test]
+fn a_scaled_down_picture_sits_at_its_offset_with_black_around_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("white.mp4");
+    make_clip(
+        &video,
+        SOURCE_WIDTH,
+        SOURCE_HEIGHT,
+        Some("drawbox=x=0:y=0:w=iw:h=ih:color=white:t=fill"),
+    );
+    let picture = flat_placement(Placement {
+        scale_percent: 50.0,
+        offset_x: 200,
+        offset_y: -100,
+    });
+    let plan = picture.plan(SOURCE_WIDTH, SOURCE_HEIGHT).expect("plan");
+    eprintln!("plan: {}", plan.describe());
+    let (left, top) = (plan.pad_left, plan.pad_top);
+    let (right, bottom) = (left + plan.scaled_width, top + plan.scaled_height);
+    assert_eq!((left, top, right, bottom), (718, 170, 1678, 710));
+
+    let j2k_dir = encode(&video, &dir.path().join("out"), picture);
+    let frame = decode_frame(&j2k_dir.join("frame_00000000.j2c"));
+    assert_eq!((frame.width, frame.height), (FLAT_WIDTH, FLAT_HEIGHT));
+
+    let middle_row = (top + bottom) / 2;
+    let middle_column = (left + right) / 2;
+    for (column, row) in [
+        (left + EDGE_MARGIN, middle_row),
+        (right - EDGE_MARGIN, middle_row),
+        (middle_column, top + EDGE_MARGIN),
+        (middle_column, bottom - EDGE_MARGIN),
+    ] {
+        assert!(
+            frame.is_picture(column, row),
+            "no picture at ({column},{row}): peak {}",
+            frame.pixel_peak(column, row)
+        );
+    }
+    for (column, row) in [
+        (left - EDGE_MARGIN, middle_row),
+        (right + EDGE_MARGIN, middle_row),
+        (middle_column, top - EDGE_MARGIN),
+        (middle_column, bottom + EDGE_MARGIN),
+        (EDGE_MARGIN, EDGE_MARGIN),
+        (FLAT_WIDTH - EDGE_MARGIN, FLAT_HEIGHT - EDGE_MARGIN),
+    ] {
+        assert!(
+            frame.is_black(column, row),
+            "the band at ({column},{row}) is not black: peak {}",
+            frame.pixel_peak(column, row)
+        );
+    }
+}
+
+#[test]
+fn an_overfilled_picture_fills_the_raster_and_its_window_follows_the_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("half-white.mp4");
+    // white on the left half of the source, black on the right
+    make_clip(
+        &video,
+        SOURCE_WIDTH,
+        SOURCE_HEIGHT,
+        Some(
+            "drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill,drawbox=x=0:y=0:w=iw/2:h=ih:color=white:t=fill",
+        ),
+    );
+    let middle_row = FLAT_HEIGHT / 2;
+    for offset_x in [0, 300] {
+        let picture = flat_placement(Placement {
+            scale_percent: 150.0,
+            offset_x,
+            offset_y: 0,
+        });
+        let plan = picture.plan(SOURCE_WIDTH, SOURCE_HEIGHT).expect("plan");
+        eprintln!("plan: {}", plan.describe());
+        // the white half ends at the scaled picture's middle column
+        let white_edge = plan.scaled_width / 2 - plan.overfill_left;
+        assert_eq!(white_edge, 1000 + offset_x as u32);
+
+        let j2k_dir = encode(&video, &dir.path().join(format!("out-{offset_x}")), picture);
+        let frame = decode_frame(&j2k_dir.join("frame_00000000.j2c"));
+        assert_eq!((frame.width, frame.height), (FLAT_WIDTH, FLAT_HEIGHT));
+        for (column, row) in [
+            (white_edge - EDGE_MARGIN, middle_row),
+            (EDGE_MARGIN, 1),
+            (EDGE_MARGIN, FLAT_HEIGHT - 2),
+        ] {
+            assert!(
+                frame.is_picture(column, row),
+                "offset {offset_x}: no picture at ({column},{row}), peak {}",
+                frame.pixel_peak(column, row)
+            );
+        }
+        assert!(
+            frame.is_black(white_edge + EDGE_MARGIN, middle_row),
+            "offset {offset_x}: the white half runs past column {white_edge}"
         );
     }
 }
