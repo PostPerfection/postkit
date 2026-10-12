@@ -140,7 +140,7 @@ fn libraries_match_headers() -> Result<(), String> {
     Ok(())
 }
 
-fn ready() -> Result<(), String> {
+pub(crate) fn ready() -> Result<(), String> {
     static READY: OnceLock<Result<(), String>> = OnceLock::new();
     READY
         .get_or_init(|| {

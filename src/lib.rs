@@ -57,6 +57,7 @@ pub mod packaging;
 pub mod picture_findings;
 pub mod picture_processing;
 pub mod pipeline;
+pub mod planar_rgb_filter;
 pub mod plugin;
 pub mod preferences;
 pub mod preflight;
