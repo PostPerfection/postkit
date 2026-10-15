@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 mod chain_rules;
+mod inspection;
 pub use chain_rules::*;
+pub use inspection::*;
 
 /// Certificate type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

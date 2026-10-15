@@ -1444,6 +1444,46 @@ pub fn dcp_signer_element(cert_file: &Path) -> Result<String, String> {
     ))
 }
 
+// every ds:X509Certificate by namespace, not prefix, since DCP-o-matic binds the namespace to dsig:
+pub fn extract_certificates(xml: &str) -> (Vec<Vec<u8>>, usize) {
+    use quick_xml::name::ResolveResult;
+
+    let mut reader = quick_xml::NsReader::from_str(xml);
+    let mut certificates = Vec::new();
+    let mut undecodable = 0;
+    let mut inside = false;
+    let mut base64_text = String::new();
+
+    loop {
+        match reader.read_resolved_event() {
+            Ok((namespace, Event::Start(element)))
+                if element.local_name().as_ref() == b"X509Certificate" =>
+            {
+                inside =
+                    matches!(namespace, ResolveResult::Bound(ns) if ns.0 == DSIG_NS.as_bytes());
+                base64_text.clear();
+            }
+            Ok((_, Event::Text(text))) if inside => {
+                base64_text.push_str(&String::from_utf8_lossy(text.as_ref()));
+            }
+            Ok((_, Event::End(element))) if element.local_name().as_ref() == b"X509Certificate" => {
+                if inside {
+                    let cleaned: String = base64_text.split_whitespace().collect();
+                    match b64d(&cleaned) {
+                        Ok(der) => certificates.push(der),
+                        Err(_) => undecodable += 1,
+                    }
+                }
+                inside = false;
+            }
+            Ok((_, Event::Eof)) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+
+    (certificates, undecodable)
+}
+
 /// Extract the RSA public key from a certificate, rejecting non-RSA keys.
 fn cert_rsa_public_key(cert_path: &Path) -> Result<rsa::RsaPublicKey, String> {
     use rsa::pkcs8::DecodePublicKey;
@@ -2393,5 +2433,28 @@ mod tests {
             "xmlsec1 must reject an edited xsi:type\n  {}",
             xmlsec1_cli::report(&result)
         );
+    }
+
+    #[test]
+    fn extract_certificates_reads_every_signature_certificate_by_namespace() {
+        let c = chain();
+        let signed = sign_document_enveloped(&cpl_doc(), &leaf_signer(c))
+            .expect("sign generic doc")
+            .replace("xmlns:ds=", "xmlns:dsig=")
+            .replace("ds:", "dsig:");
+        let extra = format!(
+            "<X509Certificate xmlns=\"urn:other\">AAAA</X509Certificate>\
+             <X509Certificate xmlns=\"{DSIG_NS}\">not base64</X509Certificate></CompositionPlaylist>"
+        );
+        let document = signed.replace("</CompositionPlaylist>", &extra);
+
+        let (certificates, undecodable) = extract_certificates(&document);
+
+        let expected: Vec<Vec<u8>> = [&c.signer, &c.intermediate, &c.root]
+            .iter()
+            .map(|path| cert_der(path).unwrap())
+            .collect();
+        assert_eq!(certificates, expected);
+        assert_eq!(undecodable, 1);
     }
 }

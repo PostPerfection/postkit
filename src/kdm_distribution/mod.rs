@@ -13,4 +13,4 @@ pub mod screen_checks;
 pub mod window;
 
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
