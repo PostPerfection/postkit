@@ -2,6 +2,8 @@
 use super::bundle::{CinemaBundle, name_fields_from_content_title};
 use super::cinema::{AuthorizedDevice, CertSource, Cinema, CinemaDb, Screen};
 use super::email::{SmtpConfig, send_bundle};
+#[cfg(feature = "flm-exchange")]
+use super::flm_exchange::FeedSyncState;
 use super::formulation::ContentStandard;
 use super::history;
 use super::issue::{
@@ -136,6 +138,12 @@ UPDATE booking_screens SET needs_reissue = 1 WHERE issued = 1 AND (
 ALTER TABLE bookings DROP COLUMN needs_reissue;
 ALTER TABLE deliveries ADD COLUMN content_title TEXT NOT NULL DEFAULT '';
 "#,
+    r#"
+CREATE TABLE feed_sync_states (
+    site_list_url TEXT PRIMARY KEY,
+    state TEXT NOT NULL
+);
+"#,
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -248,6 +256,7 @@ pub enum ScreenChange {
 pub struct CinemaSaveReport {
     pub cinema_id: CinemaId,
     pub created: bool,
+    pub renamed_from: Option<String>,
     pub screens: Vec<ScreenChange>,
     pub bookings_to_reissue: Vec<BookingId>,
 }
@@ -584,18 +593,74 @@ impl DistributionDatabase {
             .map_err(database_error)
     }
 
-    // matched by name, and screens by name within it, so bookings keep their screens
-    pub fn save_cinema(&mut self, cinema: &Cinema) -> Result<CinemaSaveReport, String> {
-        let transaction = self.connection.transaction().map_err(database_error)?;
-        let created = transaction
+    #[cfg(feature = "flm-exchange")]
+    pub fn feed_sync_state(&self, site_list_url: &str) -> Result<FeedSyncState, String> {
+        let state: Option<String> = self
+            .connection
             .query_row(
-                "SELECT id FROM cinemas WHERE name = ?1",
-                params![cinema.name],
-                |row| row.get::<_, CinemaId>(0),
+                "SELECT state FROM feed_sync_states WHERE site_list_url = ?1",
+                params![site_list_url],
+                |row| row.get(0),
             )
             .optional()
-            .map_err(database_error)?
-            .is_none();
+            .map_err(database_error)?;
+        state
+            .as_deref()
+            .map(from_json)
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    #[cfg(feature = "flm-exchange")]
+    pub fn save_feed_sync_state(
+        &mut self,
+        site_list_url: &str,
+        state: &FeedSyncState,
+    ) -> Result<(), String> {
+        self.connection
+            .execute(
+                "INSERT INTO feed_sync_states (site_list_url, state) VALUES (?1, ?2)
+                 ON CONFLICT (site_list_url) DO UPDATE SET state = excluded.state",
+                params![site_list_url, to_json(state)?],
+            )
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    // matched by facility id then name, screens by name within it, so bookings keep their screens
+    pub fn save_cinema(&mut self, cinema: &Cinema) -> Result<CinemaSaveReport, String> {
+        let transaction = self.connection.transaction().map_err(database_error)?;
+        let stored_name: Option<String> = transaction
+            .query_row(
+                "SELECT name FROM cinemas WHERE facility_id = ?1 OR name = ?2
+                 ORDER BY facility_id IS ?1 DESC, name = ?2 DESC, id LIMIT 1",
+                params![cinema.facility_id, cinema.name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        let created = stored_name.is_none();
+        let renamed_from = stored_name.filter(|stored_name| *stored_name != cinema.name);
+        if let Some(stored_name) = &renamed_from {
+            transaction
+                .execute(
+                    "UPDATE cinemas SET name = ?1 WHERE name = ?2",
+                    params![cinema.name, stored_name],
+                )
+                .map_err(|e| {
+                    format!(
+                        "cinema '{stored_name}' cannot be renamed to '{}': {e}",
+                        cinema.name
+                    )
+                })?;
+            // a resend finds the cinema by the name its delivery recorded
+            transaction
+                .execute(
+                    "UPDATE deliveries SET cinema = ?1 WHERE cinema = ?2",
+                    params![cinema.name, stored_name],
+                )
+                .map_err(database_error)?;
+        }
         transaction
             .execute(
                 "INSERT INTO cinemas (name, facility_id, time_zone, emails, notes, contacts, address)
@@ -636,6 +701,7 @@ impl DistributionDatabase {
         let mut report = CinemaSaveReport {
             cinema_id,
             created,
+            renamed_from,
             screens: Vec::new(),
             bookings_to_reissue: Vec::new(),
         };
@@ -1624,21 +1690,9 @@ mod tests {
     use super::*;
     use crate::kdm_distribution::flm::Contact;
     use crate::kdm_distribution::test_support::{
-        DCNC_TITLE, chain_screen, cinemas, dkdm, fixtures, local_window, read,
+        DCNC_TITLE, chain_screen, cinemas, dkdm, fixtures, issue_settings, local_window, read,
     };
     use std::io::Read;
-
-    fn settings(output_dir: &Path) -> IssueSettings {
-        let f = fixtures();
-        IssueSettings {
-            signer: f.signer(),
-            dkdm_recipient_key: f.distributor_signer_key.clone(),
-            creation_facility: "DIS".to_string(),
-            output_dir: output_dir.to_path_buf(),
-            picture_forensic_marking: PictureForensicMarking::default(),
-            audio_forensic_marking: AudioForensicMarking::default(),
-        }
-    }
 
     fn table_names(database: &DistributionDatabase) -> Vec<String> {
         let mut statement = database
@@ -1667,6 +1721,7 @@ mod tests {
                 "certificates",
                 "cinemas",
                 "deliveries",
+                "feed_sync_states",
                 "issues",
                 "schema_version",
                 "screens",
@@ -1837,6 +1892,28 @@ mod tests {
     }
 
     #[test]
+    fn a_rename_onto_another_stored_cinema_is_refused() {
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let (mut rex, odeon) = cinemas();
+        rex.facility_id = Some("urn:x-facilityID:example.com:Rex".into());
+        database.save_cinema(&rex).unwrap();
+        database.save_cinema(&odeon).unwrap();
+        rex.name = odeon.name.clone();
+        let error = database.save_cinema(&rex).unwrap_err();
+        assert!(
+            error.contains("cinema 'Rex' cannot be renamed to 'Odeon'"),
+            "{error}"
+        );
+        let names: Vec<String> = database
+            .cinemas()
+            .unwrap()
+            .into_iter()
+            .map(|stored| stored.cinema.name)
+            .collect();
+        assert_eq!(names, ["Odeon", "Rex"]);
+    }
+
+    #[test]
     fn a_booked_screen_cannot_disappear() {
         let mut database = DistributionDatabase::open_in_memory().unwrap();
         let (mut rex, _) = cinemas();
@@ -1964,7 +2041,7 @@ mod tests {
             .issue_booking(
                 booking,
                 IssueScope::AllScreens,
-                &settings(dir.path()),
+                &issue_settings(dir.path()),
                 issue_date,
             )
             .unwrap();
@@ -2036,7 +2113,7 @@ mod tests {
             .issue_booking(
                 booking,
                 IssueScope::PendingScreens,
-                &settings(dir.path()),
+                &issue_settings(dir.path()),
                 Utc::now(),
             )
             .unwrap();
@@ -2073,7 +2150,7 @@ mod tests {
             .issue_booking(
                 booking,
                 IssueScope::PendingScreens,
-                &settings(dir.path()),
+                &issue_settings(dir.path()),
                 Utc::now(),
             )
             .unwrap();
@@ -2098,7 +2175,7 @@ mod tests {
             .issue_booking(
                 booking,
                 IssueScope::PendingScreens,
-                &settings(dir.path()),
+                &issue_settings(dir.path()),
                 Utc::now(),
             )
             .unwrap();
@@ -2148,7 +2225,7 @@ mod tests {
             .plan_booking(
                 booking,
                 IssueScope::AllScreens,
-                &settings(dir.path()),
+                &issue_settings(dir.path()),
                 Utc::now(),
             )
             .unwrap();
@@ -2182,7 +2259,7 @@ mod tests {
             .issue_booking(
                 booking,
                 IssueScope::AllScreens,
-                &settings(dir.path()),
+                &issue_settings(dir.path()),
                 Utc::now(),
             )
             .unwrap();
@@ -2237,7 +2314,7 @@ mod tests {
             .issue_booking(
                 booking,
                 IssueScope::AllScreens,
-                &settings(dir.path()),
+                &issue_settings(dir.path()),
                 Utc::now(),
             )
             .unwrap();
@@ -2294,7 +2371,7 @@ mod tests {
         );
 
         let plans = database
-            .plan_cinema_pending(report.cinema_id, &settings(dir.path()), Utc::now())
+            .plan_cinema_pending(report.cinema_id, &issue_settings(dir.path()), Utc::now())
             .unwrap();
         assert_eq!(plans.len(), 1);
         let planned: Vec<&str> = plans[0]
@@ -2308,7 +2385,7 @@ mod tests {
         let issued_before = database.issues().unwrap().len();
         let issue_date = Utc::now() + chrono::Duration::minutes(1);
         let outcome = database
-            .issue_cinema_pending(report.cinema_id, &settings(dir.path()), issue_date)
+            .issue_cinema_pending(report.cinema_id, &issue_settings(dir.path()), issue_date)
             .unwrap();
         assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
         let outcomes = outcome.issued;
@@ -2328,7 +2405,7 @@ mod tests {
         assert!(pending(&database, booking).is_empty());
         assert!(
             database
-                .issue_cinema_pending(report.cinema_id, &settings(dir.path()), Utc::now())
+                .issue_cinema_pending(report.cinema_id, &issue_settings(dir.path()), Utc::now())
                 .unwrap()
                 == CinemaIssueOutcome::default()
         );
@@ -2368,7 +2445,7 @@ mod tests {
             .unwrap();
 
         let outcome = database
-            .issue_cinema_pending(rex_id, &settings(dir.path()), Utc::now())
+            .issue_cinema_pending(rex_id, &issue_settings(dir.path()), Utc::now())
             .unwrap();
         assert_eq!(outcome.issued.len(), 1);
         assert_eq!(outcome.issued[0].booking_id, good);
@@ -2394,7 +2471,7 @@ mod tests {
             .issue_booking(
                 booking,
                 IssueScope::AllScreens,
-                &settings(dir.path()),
+                &issue_settings(dir.path()),
                 Utc::now(),
             )
             .unwrap();

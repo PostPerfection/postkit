@@ -1,9 +1,10 @@
 use super::cinema::{AuthorizedDevice, CertSource, Cinema, Screen};
+use super::database::IssueSettings;
 use super::email::{Security, SmtpConfig};
 use super::window::LocalWindow;
 use crate::certificate::{
-    CertOptions, CertType, KdmConfig, KdmContentKey, build_kdm, generate_certificate,
-    generate_chain,
+    AudioForensicMarking, CertOptions, CertType, KdmConfig, KdmContentKey, PictureForensicMarking,
+    build_kdm, generate_certificate, generate_chain,
 };
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -320,6 +321,18 @@ pub fn cinemas() -> (Cinema, Cinema) {
         ..Default::default()
     };
     (rex, odeon)
+}
+
+pub fn issue_settings(output_dir: &Path) -> IssueSettings {
+    let f = fixtures();
+    IssueSettings {
+        signer: f.signer(),
+        dkdm_recipient_key: f.distributor_signer_key.clone(),
+        creation_facility: "DIS".to_string(),
+        output_dir: output_dir.to_path_buf(),
+        picture_forensic_marking: PictureForensicMarking::default(),
+        audio_forensic_marking: AudioForensicMarking::default(),
+    }
 }
 
 pub fn local_window() -> LocalWindow {

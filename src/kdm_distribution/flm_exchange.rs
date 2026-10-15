@@ -1,3 +1,5 @@
+use super::cinema::cinema_from_flm;
+use super::database::{CinemaSaveReport, DistributionDatabase};
 use super::flm::parse_flm;
 use base64::Engine;
 use chrono::{DateTime, FixedOffset, NaiveDateTime, Utc};
@@ -230,6 +232,84 @@ pub(crate) fn refresh_feed_with_root_certificates(
         failures,
         removed_facility_ids,
         state,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedFacility {
+    pub facility_id: String,
+    pub cinema: String,
+    pub report: CinemaSaveReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedImportReport {
+    pub imported: Vec<ImportedFacility>,
+    // their cinemas stay in the database
+    pub removed_facility_ids: Vec<String>,
+    pub failures: Vec<FacilityFailure>,
+}
+
+pub fn import_feed(
+    database: &mut DistributionDatabase,
+    feed: &Feed,
+) -> Result<FeedImportReport, String> {
+    let previous = database.feed_sync_state(&feed.site_list_url)?;
+    let refresh = refresh_feed(feed, &previous)?;
+    apply_feed_refresh(database, &feed.site_list_url, &previous, refresh)
+}
+
+// `previous` is the state the refresh was fetched from
+pub fn apply_feed_refresh(
+    database: &mut DistributionDatabase,
+    site_list_url: &str,
+    previous: &FeedSyncState,
+    refresh: FeedRefresh,
+) -> Result<FeedImportReport, String> {
+    // its FLMs may be older than the ones another refresh already saved
+    if database.feed_sync_state(site_list_url)? != *previous {
+        return Err(format!(
+            "the feed {site_list_url} was refreshed by another run while this one fetched, refresh again"
+        ));
+    }
+    let mut state = refresh.state;
+    let mut failures = refresh.failures;
+    let mut imported = Vec::new();
+    for flm in refresh.fetched {
+        let saved = parse_flm(&flm.xml)
+            .and_then(|message| cinema_from_flm(&message))
+            .and_then(|cinema| Ok((database.save_cinema(&cinema)?, cinema.name)));
+        match saved {
+            Ok((report, cinema)) => imported.push(ImportedFacility {
+                facility_id: flm.facility_id,
+                cinema,
+                report,
+            }),
+            Err(reason) => {
+                // the older instant fetches the FLM again on the next refresh
+                match previous.fetched_facility_modified.get(&flm.facility_id) {
+                    Some(modified) => state
+                        .fetched_facility_modified
+                        .insert(flm.facility_id.clone(), *modified),
+                    None => state.fetched_facility_modified.remove(&flm.facility_id),
+                };
+                failures.push(FacilityFailure {
+                    facility_id: flm.facility_id,
+                    reason,
+                });
+            }
+        }
+    }
+    if !failures.is_empty() {
+        // a 304 next time would skip retrying the failed facilities
+        state.site_list_etag = None;
+        state.site_list_last_modified = None;
+    }
+    database.save_feed_sync_state(site_list_url, &state)?;
+    Ok(FeedImportReport {
+        imported,
+        removed_facility_ids: refresh.removed_facility_ids,
+        failures,
     })
 }
 
@@ -652,7 +732,12 @@ fn parse_error_document(xml: &str) -> Option<ServerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kdm_distribution::test_support::{extended_flm, read};
+    use crate::kdm_distribution::database::{
+        CertificateReplacement, DeliveryRecord, DeliveryResult, IssueScope, ScreenChange,
+    };
+    use crate::kdm_distribution::test_support::{
+        DCNC_TITLE, FlmDeviceSpec, dkdm, extended_flm, fixtures, issue_settings, local_window, read,
+    };
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     };
@@ -1655,5 +1740,357 @@ mod tests {
         assert!(!printed.contains(PASSWORD), "{printed}");
         assert!(printed.contains(REDACTED));
         assert!(printed.contains(USERNAME));
+    }
+    const SECOND_MODIFIED: &str = "2026-10-02T09:00:00Z";
+
+    fn screened_flm(facility_name: &str, recipient: &Path) -> String {
+        let f = fixtures();
+        extended_flm(
+            facility_name,
+            TIME_ZONE,
+            &[(
+                "1",
+                vec![vec![FlmDeviceSpec {
+                    device_type: "SM",
+                    serial: "1001",
+                    chain_pems: vec![
+                        read(recipient),
+                        read(&f.vendor_intermediate),
+                        read(&f.vendor_root),
+                    ],
+                }]],
+            )],
+        )
+    }
+
+    fn flm_path(facility_name: &str) -> String {
+        format!("/flm/{facility_name}.xml")
+    }
+
+    fn route_cinema_site_list(server: &TestServer, etag: &str, facilities: &[(&str, &str)]) {
+        let entries: Vec<(String, &str, String)> = facilities
+            .iter()
+            .map(|(name, modified)| (facility_id(name), *modified, flm_path(name)))
+            .collect();
+        let entries: Vec<(&str, &str, &str)> = entries
+            .iter()
+            .map(|(id, modified, href)| (id.as_str(), *modified, href.as_str()))
+            .collect();
+        server.route(
+            SITE_LIST_PATH,
+            TestResponse::xml(200, site_list_xml(SITE_LIST_NAMESPACE, &entries))
+                .with_header("ETag", etag),
+        );
+    }
+
+    // Rex on the first security manager, Odeon on the second
+    fn cinema_feed_server() -> TestServer {
+        let f = fixtures();
+        let server = TestServer::plain();
+        server.route(
+            &flm_path("Rex"),
+            TestResponse::xml(
+                200,
+                screened_flm("Rex", &f.security_managers[0].certificate),
+            ),
+        );
+        server.route(
+            &flm_path("Odeon"),
+            TestResponse::xml(
+                200,
+                screened_flm("Odeon", &f.security_managers[1].certificate),
+            ),
+        );
+        route_cinema_site_list(
+            &server,
+            "\"v1\"",
+            &[("Rex", FIRST_MODIFIED), ("Odeon", FIRST_MODIFIED)],
+        );
+        server
+    }
+
+    fn imported_cinemas(report: &FeedImportReport) -> Vec<&str> {
+        report
+            .imported
+            .iter()
+            .map(|facility| facility.cinema.as_str())
+            .collect()
+    }
+
+    fn first_import(server: &TestServer) -> (DistributionDatabase, Feed) {
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let open_feed = feed(server.url(SITE_LIST_PATH), FeedAuthentication::None);
+        let report = import_feed(&mut database, &open_feed).unwrap();
+        assert_eq!(imported_cinemas(&report), ["Rex", "Odeon"]);
+        (database, open_feed)
+    }
+
+    #[test]
+    fn the_first_import_adds_every_cinema_and_an_unmodified_feed_changes_nothing() {
+        let server = cinema_feed_server();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let open_feed = feed(server.url(SITE_LIST_PATH), FeedAuthentication::None);
+
+        let first = import_feed(&mut database, &open_feed).unwrap();
+        assert!(first.failures.is_empty(), "{:?}", first.failures);
+        assert!(
+            first
+                .imported
+                .iter()
+                .all(|facility| facility.report.created)
+        );
+        assert_eq!(first.imported[0].facility_id, facility_id("Rex"));
+        let stored = database.cinemas().unwrap();
+        let names: Vec<(&str, Option<&str>, usize)> = stored
+            .iter()
+            .map(|stored| {
+                (
+                    stored.cinema.name.as_str(),
+                    stored.cinema.facility_id.as_deref(),
+                    stored.cinema.screens.len(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("Odeon", Some(facility_id("Odeon").as_str()), 1),
+                ("Rex", Some(facility_id("Rex").as_str()), 1)
+            ]
+        );
+        let state = database.feed_sync_state(&open_feed.site_list_url).unwrap();
+        assert_eq!(state.site_list_etag.as_deref(), Some("\"v1\""));
+        assert_eq!(state.fetched_facility_modified.len(), 2);
+        server.take_requests();
+
+        let second = import_feed(&mut database, &open_feed).unwrap();
+        assert_eq!(
+            second,
+            FeedImportReport {
+                imported: Vec::new(),
+                removed_facility_ids: Vec::new(),
+                failures: Vec::new(),
+            }
+        );
+        assert_eq!(paths(&server.take_requests()), [SITE_LIST_PATH]);
+        assert_eq!(database.cinemas().unwrap(), stored);
+        assert_eq!(
+            database.feed_sync_state(&open_feed.site_list_url).unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn a_facility_renamed_in_its_flm_updates_the_stored_cinema_in_place() {
+        let f = fixtures();
+        let server = cinema_feed_server();
+        let (mut database, open_feed) = first_import(&server);
+        let rex_id = database.cinemas().unwrap()[1].id;
+        database
+            .record_delivery(&DeliveryRecord {
+                delivered_at: "2026-10-01T10:00:00+00:00".into(),
+                booking_id: None,
+                cinema: "Rex".into(),
+                content_title: DCNC_TITLE.into(),
+                zip_name: "rex.zip".into(),
+                zip_path: "/out/rex.zip".into(),
+                recipients: Vec::new(),
+                result: DeliveryResult::Written,
+            })
+            .unwrap();
+
+        server.route(
+            &flm_path("Rex"),
+            TestResponse::xml(
+                200,
+                screened_flm("Rex", &f.security_managers[0].certificate).replace(
+                    "<FacilityName>Rex</FacilityName>",
+                    "<FacilityName>Rex Picturehouse</FacilityName>",
+                ),
+            ),
+        );
+        route_cinema_site_list(
+            &server,
+            "\"v2\"",
+            &[("Rex", SECOND_MODIFIED), ("Odeon", FIRST_MODIFIED)],
+        );
+        let report = import_feed(&mut database, &open_feed).unwrap();
+        assert_eq!(imported_cinemas(&report), ["Rex Picturehouse"]);
+        let renamed = &report.imported[0].report;
+        assert_eq!(renamed.cinema_id, rex_id);
+        assert!(!renamed.created);
+        assert_eq!(renamed.renamed_from.as_deref(), Some("Rex"));
+        assert!(renamed.screens.is_empty(), "{:?}", renamed.screens);
+        let names: Vec<String> = database
+            .cinemas()
+            .unwrap()
+            .into_iter()
+            .map(|stored| stored.cinema.name)
+            .collect();
+        assert_eq!(names, ["Odeon", "Rex Picturehouse"]);
+        assert_eq!(
+            database.deliveries().unwrap()[0].record.cinema,
+            "Rex Picturehouse"
+        );
+    }
+
+    #[test]
+    fn a_changed_certificate_lists_the_bookings_to_reissue() {
+        let f = fixtures();
+        let directory = tempfile::tempdir().unwrap();
+        let server = cinema_feed_server();
+        let (mut database, open_feed) = first_import(&server);
+        let rex = database.cinemas().unwrap()[1].clone();
+        let old_thumbprint = rex.cinema.screens[0].cert_thumbprint.clone();
+        let title = database.add_title_from_dkdm(&dkdm(DCNC_TITLE, 30)).unwrap();
+        let booking = database
+            .add_booking(title, &rex.screen_ids, local_window(), None, Utc::now())
+            .unwrap();
+        database
+            .issue_booking(
+                booking,
+                IssueScope::AllScreens,
+                &issue_settings(directory.path()),
+                Utc::now(),
+            )
+            .unwrap();
+
+        server.route(
+            &flm_path("Rex"),
+            TestResponse::xml(
+                200,
+                screened_flm("Rex", &f.security_managers[2].certificate),
+            ),
+        );
+        route_cinema_site_list(
+            &server,
+            "\"v2\"",
+            &[("Rex", SECOND_MODIFIED), ("Odeon", FIRST_MODIFIED)],
+        );
+        let report = import_feed(&mut database, &open_feed).unwrap();
+        assert_eq!(imported_cinemas(&report), ["Rex"]);
+        let new_thumbprint = database.cinema(rex.id).unwrap().cinema.screens[0]
+            .cert_thumbprint
+            .clone();
+        let saved = &report.imported[0].report;
+        assert_eq!(
+            saved.screens,
+            [ScreenChange::CertificatesChanged {
+                screen: "1".into(),
+                recipient: Some(CertificateReplacement {
+                    old_thumbprint,
+                    new_thumbprint,
+                }),
+                devices_changed: false,
+            }]
+        );
+        assert_eq!(saved.bookings_to_reissue, [booking]);
+        assert_eq!(
+            database.booking(booking).unwrap().pending_screen_ids,
+            rex.screen_ids
+        );
+    }
+
+    #[test]
+    fn a_facility_gone_from_the_feed_is_reported_and_its_cinema_kept() {
+        let server = cinema_feed_server();
+        let (mut database, open_feed) = first_import(&server);
+
+        route_cinema_site_list(&server, "\"v2\"", &[("Rex", FIRST_MODIFIED)]);
+        let report = import_feed(&mut database, &open_feed).unwrap();
+        assert!(report.imported.is_empty());
+        assert_eq!(report.removed_facility_ids, [facility_id("Odeon")]);
+        assert_eq!(database.cinemas().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_refresh_fetched_before_another_was_saved_is_refused() {
+        let f = fixtures();
+        let server = cinema_feed_server();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let open_feed = feed(server.url(SITE_LIST_PATH), FeedAuthentication::None);
+        let stale_previous = database.feed_sync_state(&open_feed.site_list_url).unwrap();
+        let stale = refresh_feed(&open_feed, &stale_previous).unwrap();
+
+        server.route(
+            &flm_path("Rex"),
+            TestResponse::xml(
+                200,
+                screened_flm("Rex", &f.security_managers[2].certificate),
+            ),
+        );
+        import_feed(&mut database, &open_feed).unwrap();
+        let saved_state = database.feed_sync_state(&open_feed.site_list_url).unwrap();
+        let saved_cinemas = database.cinemas().unwrap();
+
+        let error = apply_feed_refresh(
+            &mut database,
+            &open_feed.site_list_url,
+            &stale_previous,
+            stale,
+        )
+        .unwrap_err();
+        assert!(error.contains("refreshed by another run"), "{error}");
+        assert_eq!(database.cinemas().unwrap(), saved_cinemas);
+        assert_eq!(
+            database.feed_sync_state(&open_feed.site_list_url).unwrap(),
+            saved_state
+        );
+    }
+
+    #[test]
+    fn a_failed_feed_keeps_its_sync_state() {
+        let server = cinema_feed_server();
+        let (mut database, open_feed) = first_import(&server);
+        let state = database.feed_sync_state(&open_feed.site_list_url).unwrap();
+
+        server.route(SITE_LIST_PATH, TestResponse::xml(500, Vec::new()));
+        let error = import_feed(&mut database, &open_feed).unwrap_err();
+        assert!(error.contains("HTTP 500"), "{error}");
+        assert_eq!(
+            database.feed_sync_state(&open_feed.site_list_url).unwrap(),
+            state
+        );
+    }
+
+    #[test]
+    fn a_facility_that_cannot_be_saved_fails_alone_and_is_fetched_again() {
+        let f = fixtures();
+        let server = cinema_feed_server();
+        let (mut database, open_feed) = first_import(&server);
+        let screenless = extended_flm("Rex", TIME_ZONE, &[("1", vec![Vec::new()])]);
+        server.route(&flm_path("Rex"), TestResponse::xml(200, screenless));
+        route_cinema_site_list(
+            &server,
+            "\"v2\"",
+            &[("Rex", SECOND_MODIFIED), ("Odeon", FIRST_MODIFIED)],
+        );
+
+        let failed = import_feed(&mut database, &open_feed).unwrap();
+        assert!(failed.imported.is_empty());
+        assert_eq!(failed.failures.len(), 1);
+        assert_eq!(failed.failures[0].facility_id, facility_id("Rex"));
+        assert!(
+            failed.failures[0].reason.contains("SM devices"),
+            "{:?}",
+            failed.failures
+        );
+        let state = database.feed_sync_state(&open_feed.site_list_url).unwrap();
+        assert_eq!(state.site_list_etag, None);
+        assert_eq!(
+            state.fetched_facility_modified[&facility_id("Rex")],
+            parse_xml_date_time(FIRST_MODIFIED).unwrap()
+        );
+
+        server.route(
+            &flm_path("Rex"),
+            TestResponse::xml(
+                200,
+                screened_flm("Rex", &f.security_managers[0].certificate),
+            ),
+        );
+        let retried = import_feed(&mut database, &open_feed).unwrap();
+        assert_eq!(imported_cinemas(&retried), ["Rex"]);
+        assert!(retried.failures.is_empty(), "{:?}", retried.failures);
     }
 }
