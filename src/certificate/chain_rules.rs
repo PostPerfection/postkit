@@ -21,6 +21,13 @@ pub const AUTHORIZED_DEVICE_ROLES: &[&str] = &["LD", "PR"];
 // ISDCF Doc 5 Annex A marks these Best Effort for a remote SPB chain
 pub const AUTHORIZED_DEVICE_BEST_EFFORT_RULES: &[ChainRule] =
     &[ChainRule::AuthorityKeyIdentifier, ChainRule::Issuer];
+// the rules that compare a certificate with the one that issued it
+pub const ISSUER_RULES: [ChainRule; 4] = [
+    ChainRule::AuthorityKeyIdentifier,
+    ChainRule::SignatureValue,
+    ChainRule::Issuer,
+    ChainRule::ValidityDates,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChainRule {
@@ -100,6 +107,8 @@ pub struct ChainReport {
     pub failures: Vec<ChainRuleFinding>,
     pub best_effort_failures: Vec<ChainRuleFinding>,
     pub not_checked: Vec<ChainRuleSkip>,
+    // a lone leaf whose ISSUER_RULES went unchecked under LoneLeaf::IssuerRulesNotChecked
+    pub issuers_missing: bool,
 }
 
 impl ChainReport {
@@ -114,11 +123,19 @@ pub enum LeafRoles {
     AnyOf(&'static [&'static str]),
 }
 
+// a single certificate that is not self-issued, sent without its issuers
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoneLeaf {
+    Refused,
+    IssuerRulesNotChecked,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ChainContext<'a> {
     pub leaf_roles: LeafRoles,
     pub desired_times: &'a [DateTime<Utc>],
     pub best_effort_rules: &'static [ChainRule],
+    pub lone_leaf: LoneLeaf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -314,6 +331,11 @@ pub fn check_chain(chain: &[ChainCertificate], context: &ChainContext) -> ChainR
         if let Some(cert) = cert {
             check_certificate(&mut findings, &certificate.label, cert, index == 0);
         }
+    }
+    let is_lone_leaf = matches!(parsed.as_slice(), [Some(leaf)] if leaf.issuer() != leaf.subject());
+    if is_lone_leaf && context.lone_leaf == LoneLeaf::IssuerRulesNotChecked {
+        findings.report.issuers_missing = true;
+        return findings.report;
     }
     for index in 0..parsed.len() {
         let parent_index = (index + 1).min(parsed.len() - 1);
@@ -819,15 +841,20 @@ mod tests {
         }
     }
 
-    fn recipient_report(chain: &[ChainCertificate]) -> ChainReport {
+    fn recipient_report_with(chain: &[ChainCertificate], lone_leaf: LoneLeaf) -> ChainReport {
         check_chain(
             chain,
             &ChainContext {
                 leaf_roles: LeafRoles::AnyOf(KDM_RECIPIENT_ROLES),
                 desired_times: &[Utc::now()],
                 best_effort_rules: &[],
+                lone_leaf,
             },
         )
+    }
+
+    fn recipient_report(chain: &[ChainCertificate]) -> ChainReport {
+        recipient_report_with(chain, LoneLeaf::Refused)
     }
 
     fn failed_rules(report: &ChainReport) -> Vec<ChainRule> {
@@ -1011,6 +1038,7 @@ mod tests {
                 leaf_roles: LeafRoles::AnyOf(AUTHORIZED_DEVICE_ROLES),
                 desired_times: &[Utc::now()],
                 best_effort_rules: AUTHORIZED_DEVICE_BEST_EFFORT_RULES,
+                lone_leaf: LoneLeaf::Refused,
             },
         );
         let best_effort: Vec<ChainRule> = report
@@ -1025,6 +1053,28 @@ mod tests {
         );
         assert!(!failed_rules(&report).contains(&ChainRule::Issuer));
         assert!(failed_rules(&report).contains(&ChainRule::SignatureValue));
+    }
+
+    #[test]
+    fn a_lone_leaf_skips_only_the_issuer_rules_when_asked() {
+        let lone = |common_name: &str| Chain::new(common_name).build()[..1].to_vec();
+        let refused = recipient_report_with(&lone("SM.Vendor.IMB.1"), LoneLeaf::Refused);
+        assert!(failed_rules(&refused).contains(&ChainRule::Issuer));
+        assert!(!refused.issuers_missing);
+
+        let skipped =
+            recipient_report_with(&lone("SM.Vendor.IMB.1"), LoneLeaf::IssuerRulesNotChecked);
+        assert!(skipped.passed(), "{skipped:#?}");
+        assert!(skipped.issuers_missing);
+        let wrong_role =
+            recipient_report_with(&lone("LD.Vendor.LDB.1"), LoneLeaf::IssuerRulesNotChecked);
+        assert_eq!(failed_rules(&wrong_role), vec![ChainRule::Role]);
+
+        let mut broken = Chain::new("SM.Vendor.IMB.1").build();
+        broken.remove(1);
+        let report = recipient_report_with(&broken, LoneLeaf::IssuerRulesNotChecked);
+        assert!(failed_rules(&report).contains(&ChainRule::SignatureValue));
+        assert!(!report.issuers_missing);
     }
 
     #[test]

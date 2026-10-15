@@ -842,6 +842,7 @@ fn validate_chain_inner(
             leaf_roles: LeafRoles::ZeroOrMore,
             desired_times: &[desired_time],
             best_effort_rules: &[],
+            lone_leaf: LoneLeaf::Refused,
         },
     );
     if !report.passed() {

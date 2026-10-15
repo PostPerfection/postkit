@@ -2213,11 +2213,11 @@ mod tests {
     }
 
     #[test]
-    fn a_dkdm_issues_to_a_certificate_without_a_stored_title() {
+    fn a_dkdm_issues_to_a_lone_certificate_with_a_no_chain_warning() {
         let f = fixtures();
         let dir = tempfile::tempdir().unwrap();
         let mut database = DistributionDatabase::open_in_memory().unwrap();
-        let recipient = f.vendor_chain_pem(&f.security_managers[1].certificate);
+        let recipient = read(&f.security_managers[1].certificate);
         let outcome = database
             .issue_to_certificate(
                 DkdmSource::Dkdm(&dkdm(DCNC_TITLE, 30)),
@@ -2228,6 +2228,12 @@ mod tests {
             )
             .unwrap();
         let written = outcome.written.unwrap();
+        assert!(
+            written.kdm.warnings[0].starts_with("SM.Vendor.IMB.1002: recipient certificate ")
+                && written.kdm.warnings[0].contains("no chain"),
+            "{:?}",
+            written.kdm.warnings
+        );
         let name = written.path.file_name().unwrap().to_str().unwrap();
         assert!(
             name.starts_with("k_LongerThanFo3D_FTR_EN-XX_51-HI-VI_SMVendorIMB1002_"),

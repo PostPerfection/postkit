@@ -1,5 +1,5 @@
 use super::{
-    ChainCertificate, ChainContext, ChainReport, KdmMetadata, LeafRoles, cert_thumbprint,
+    ChainCertificate, ChainContext, ChainReport, KdmMetadata, LeafRoles, LoneLeaf, cert_thumbprint,
     certificate_label, certificate_roles, chain_from_pem, check_chain, distinguished_name,
     leaf_first, parse_kdm, thumbprint_base64, verify_kdm_signature,
 };
@@ -161,6 +161,7 @@ fn inspect_chain(chain: Vec<ChainCertificate>, at: DateTime<Utc>) -> ChainInspec
             leaf_roles: LeafRoles::ZeroOrMore,
             desired_times: &[at],
             best_effort_rules: &[],
+            lone_leaf: LoneLeaf::Refused,
         },
     );
     // one that does not parse is already a DER encoding failure in the check

@@ -3,8 +3,8 @@ use super::cinema::Screen;
 use super::window::KdmWindowTimes;
 use crate::certificate::{
     AUTHORIZED_DEVICE_BEST_EFFORT_RULES, AUTHORIZED_DEVICE_ROLES, ChainCertificate, ChainContext,
-    ChainReport, ChainRule, KDM_RECIPIENT_ROLES, LeafRoles, chain_from_files, chain_from_pem,
-    check_chain,
+    ChainReport, ChainRule, ISSUER_RULES, KDM_RECIPIENT_ROLES, LeafRoles, LoneLeaf,
+    chain_from_files, chain_from_pem, check_chain,
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ pub enum CertificateCheck {
     Rule(ChainRule),
     WindowInsideRecipient,
     Readable,
+    NoChain,
 }
 
 impl std::fmt::Display for CertificateCheck {
@@ -27,6 +28,7 @@ impl std::fmt::Display for CertificateCheck {
             Self::Rule(rule) => write!(f, "{rule}"),
             Self::WindowInsideRecipient => f.write_str("KDM window inside the recipient validity"),
             Self::Readable => f.write_str("readable certificate"),
+            Self::NoChain => f.write_str("no chain"),
         }
     }
 }
@@ -103,7 +105,17 @@ fn check_pem_chain(
 ) -> Option<Vec<ChainCertificate>> {
     match chain_from_pem(pem) {
         Ok(chain) => {
-            report.add_chain(screen, chain_name, check_chain(&chain, context));
+            let chain_report = check_chain(&chain, context);
+            if chain_report.issuers_missing {
+                report.warnings.push(CheckFinding {
+                    screen: screen.to_string(),
+                    chain: chain_name.to_string(),
+                    certificate: chain[0].label.clone(),
+                    check: CertificateCheck::NoChain,
+                    detail: issuer_rules_not_checked(),
+                });
+            }
+            report.add_chain(screen, chain_name, chain_report);
             Some(chain)
         }
         Err(e) => {
@@ -111,6 +123,17 @@ fn check_pem_chain(
             None
         }
     }
+}
+
+fn issuer_rules_not_checked() -> String {
+    let numbers: Vec<String> = ISSUER_RULES
+        .iter()
+        .map(|rule| rule.number_and_name().0.to_string())
+        .collect();
+    format!(
+        "it came without its issuer certificates, so ST 430-2 rules {} were not checked",
+        numbers.join(", ")
+    )
 }
 
 fn check_window_inside_leaf(
@@ -169,6 +192,7 @@ fn check_chains(
         leaf_roles: LeafRoles::AnyOf(KDM_RECIPIENT_ROLES),
         desired_times: &desired_times,
         best_effort_rules: &[],
+        lone_leaf: LoneLeaf::IssuerRulesNotChecked,
     };
     let leaf = check_pem_chain(
         &mut report,
@@ -183,6 +207,7 @@ fn check_chains(
         leaf_roles: LeafRoles::AnyOf(AUTHORIZED_DEVICE_ROLES),
         desired_times: &desired_times,
         best_effort_rules: AUTHORIZED_DEVICE_BEST_EFFORT_RULES,
+        lone_leaf: LoneLeaf::IssuerRulesNotChecked,
     };
     for device in &screen.authorized_devices {
         let chain_name = match &device.serial {
@@ -232,6 +257,7 @@ pub fn check_signer(
         leaf_roles: LeafRoles::ZeroOrMore,
         desired_times: &desired_times,
         best_effort_rules: &[],
+        lone_leaf: LoneLeaf::Refused,
     };
     report.add_chain(
         SIGNER_CHAIN_NAME,
@@ -372,19 +398,62 @@ mod tests {
     }
 
     #[test]
-    fn a_recipient_given_without_its_chain_does_not_reach_a_root() {
+    fn a_recipient_and_a_device_without_their_chains_pass_with_a_no_chain_warning() {
         let f = fixtures();
-        let screen = Screen::new(
+        let mut screen = Screen::new(
             "1",
             CertSource::Path(f.security_managers[0].certificate.clone()),
         )
         .unwrap();
+        screen.authorized_devices = vec![AuthorizedDevice {
+            device_type: "LD".into(),
+            serial: None,
+            certificate: read(&f.link_decryptor.certificate),
+        }];
         let report = check_screen(SCREEN, &screen, &window_in_days(2, 9), Utc::now());
+        assert!(report.passed(), "{:#?}", report.failures);
+        let warnings: Vec<String> = report.warnings.iter().map(ToString::to_string).collect();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
-            checks(&report).contains(&CertificateCheck::Rule(ChainRule::Issuer)),
+            warnings[0].starts_with("Rex / 1: recipient certificate ")
+                && warnings[0].contains(
+                    "no chain: it came without its issuer certificates, so ST 430-2 rules 14, 15, 17, 18 were not checked"
+                ),
+            "{warnings:?}"
+        );
+        assert!(warnings[1].starts_with("Rex / 1: authorized device LD certificate "));
+    }
+
+    #[test]
+    fn a_lone_recipient_without_the_sm_role_is_still_refused() {
+        let f = fixtures();
+        let screen =
+            Screen::new("1", CertSource::Path(f.link_decryptor.certificate.clone())).unwrap();
+        let report = check_screen(SCREEN, &screen, &window_in_days(2, 9), Utc::now());
+        assert_eq!(
+            checks(&report),
+            vec![CertificateCheck::Rule(ChainRule::Role)]
+        );
+    }
+
+    #[test]
+    fn a_chain_with_the_wrong_issuer_is_still_refused() {
+        let f = fixtures();
+        let broken = format!(
+            "{}{}{}",
+            read(&f.security_managers[0].certificate),
+            read(&f.distributor_chain[0]),
+            read(&f.distributor_chain[1])
+        );
+        let screen = Screen::new("1", CertSource::Inline(broken)).unwrap();
+        let report = check_screen(SCREEN, &screen, &window_in_days(2, 9), Utc::now());
+        let failed = checks(&report);
+        assert!(
+            failed.contains(&CertificateCheck::Rule(ChainRule::SignatureValue)),
             "{:#?}",
             report.failures
         );
+        assert!(report.warnings.is_empty(), "{:#?}", report.warnings);
     }
 
     #[test]

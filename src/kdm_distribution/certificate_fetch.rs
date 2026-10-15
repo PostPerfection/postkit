@@ -1,5 +1,5 @@
 // a projector or media block certificate downloaded by vendor and serial through the system curl
-use crate::certificate::cert_info_from_pem;
+use crate::certificate::{cert_info_from_pem, chain_from_pem, chain_to_pem};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::Path;
@@ -9,6 +9,13 @@ pub const SYSTEM_CURL: &str = "curl";
 const SFTP_SCHEME: &str = "sftp://";
 const CURL_PROTOCOLS_PREFIX: &str = "Protocols:";
 const SFTP_PROTOCOL: &str = "sftp";
+const DOLBY_LEAF_SUFFIX: &str = ".cert.sha256.pem";
+// the archive names DCP-o-matic looks for beside a Dolby or Doremi leaf
+const DOLBY_ARCHIVE_SUFFIXES: [&str; 2] = [".dcicerts.zip", ".certs.zip"];
+const DOLBY_CHAIN_MEMBER: &str = "chain.sha256.pem";
+const MAXIMUM_ARCHIVE_BYTES: usize = 1024 * 1024;
+const MAXIMUM_CHAIN_BYTES: u64 = 256 * 1024;
+const CURL_FILE_TOO_LARGE: i32 = 63;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -122,8 +129,65 @@ fn dolby_dir_url(base: &str, serial: &str) -> Result<String, String> {
 }
 
 fn dolby_pick(entries: &[String], serial: &str) -> Option<String> {
-    let want = format!("-{serial}.cert.sha256.pem");
+    let want = format!("-{serial}{DOLBY_LEAF_SUFFIX}");
     entries.iter().find(|e| e.ends_with(&want)).cloned()
+}
+
+fn dolby_archive_pick(entries: &[String], leaf_file: &str) -> Option<String> {
+    let stem = leaf_file.strip_suffix(DOLBY_LEAF_SUFFIX)?;
+    DOLBY_ARCHIVE_SUFFIXES
+        .iter()
+        .map(|suffix| format!("{stem}{suffix}"))
+        .find(|name| entries.contains(name))
+}
+
+// None when the archive holds no chain, an error when its chain starts with another certificate
+fn chain_from_archive(
+    archive: &[u8],
+    archive_name: &str,
+    leaf_pem: &str,
+) -> Result<Option<String>, String> {
+    use std::io::Read;
+    if archive.len() > MAXIMUM_ARCHIVE_BYTES {
+        return Err(format!(
+            "{archive_name} is larger than {MAXIMUM_ARCHIVE_BYTES} bytes"
+        ));
+    }
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(archive))
+        .map_err(|e| format!("{archive_name} is not a ZIP: {e}"))?;
+    let mut chain_text = None;
+    for index in 0..zip.len() {
+        let entry = zip
+            .by_index(index)
+            .map_err(|e| format!("{archive_name}: {e}"))?;
+        if entry.name().rsplit('/').next() != Some(DOLBY_CHAIN_MEMBER) {
+            continue;
+        }
+        let mut text = String::new();
+        entry
+            .take(MAXIMUM_CHAIN_BYTES + 1)
+            .read_to_string(&mut text)
+            .map_err(|e| format!("{archive_name}: {DOLBY_CHAIN_MEMBER}: {e}"))?;
+        if text.len() as u64 > MAXIMUM_CHAIN_BYTES {
+            return Err(format!(
+                "{archive_name}: {DOLBY_CHAIN_MEMBER} is larger than {MAXIMUM_CHAIN_BYTES} bytes"
+            ));
+        }
+        chain_text = Some(text);
+        break;
+    }
+    let Some(chain_text) = chain_text else {
+        return Ok(None);
+    };
+    let chain = chain_from_pem(&chain_text)
+        .map_err(|e| format!("{archive_name}: {DOLBY_CHAIN_MEMBER}: {e}"))?;
+    let leaf = chain_from_pem(leaf_pem)?;
+    if chain[0].der != leaf[0].der {
+        return Err(format!(
+            "the chain in {archive_name} does not start with the certificate listed beside it"
+        ));
+    }
+    Ok(Some(chain_to_pem(&chain)))
 }
 
 fn qube_dir_url(base: &str, qtype: &str) -> String {
@@ -214,6 +278,7 @@ fn curl_failure(code: i32) -> &'static str {
         7 => "could not connect to host",
         28 => "connection timed out",
         9 | 19 | 78 => "file not found on server",
+        CURL_FILE_TOO_LARGE => "the file is larger than allowed",
         67 => "authentication failed (check the vendor user and password)",
         _ => "download failed",
     }
@@ -287,16 +352,14 @@ fn curl_with_credentials(url: &str, creds: &Credentials) -> Result<Vec<u8>, Stri
     ))
 }
 
-fn curl(url: &str, list: bool) -> Result<Vec<u8>, String> {
+fn curl(url: &str, extra_arguments: &[&str]) -> Result<Vec<u8>, String> {
     let mut command = Command::new(SYSTEM_CURL);
     command
         .arg("-s")
         .args(["--connect-timeout", "15"])
-        .args(["--max-time", "45"]);
-    if list {
-        command.arg("-l");
-    }
-    command.arg(url);
+        .args(["--max-time", "45"])
+        .args(extra_arguments)
+        .arg(url);
     let out = command
         .output()
         .map_err(|e| format!("cannot run curl (is it installed?): {e}"))?;
@@ -308,7 +371,7 @@ fn curl(url: &str, list: bool) -> Result<Vec<u8>, String> {
 }
 
 fn listing(url: &str) -> Result<Vec<String>, String> {
-    Ok(String::from_utf8_lossy(&curl(url, true)?)
+    Ok(String::from_utf8_lossy(&curl(url, &["-l"])?)
         .lines()
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty())
@@ -340,17 +403,19 @@ fn fetch_credentialed(
     Err(format!("no certificate for serial '{serial}': {last_err}"))
 }
 
+// a Dolby leaf comes with its chain when an archive beside it holds one
 fn fetch_anonymous(
     request: &CertificateRequest<'_>,
     servers: &VendorServers,
 ) -> Result<String, String> {
     let serial = request.serial;
-    let (dir_url, file) = match request.vendor {
+    let (dir_url, entries, file) = match request.vendor {
         Vendor::Dolby => {
             let dir = dolby_dir_url(&servers.dolby, serial)?;
-            let file = dolby_pick(&listing(&dir)?, serial)
+            let entries = listing(&dir)?;
+            let file = dolby_pick(&entries, serial)
                 .ok_or_else(|| format!("no certificate for dolby serial '{serial}' at {dir}"))?;
-            (dir, file)
+            (dir, entries, file)
         }
         Vendor::Qube => {
             let qtype = request
@@ -360,17 +425,30 @@ fn fetch_anonymous(
                 format!("invalid device type '{qtype}': use letters, digits and '-' only")
             })?;
             let dir = qube_dir_url(&servers.qube, qtype);
-            let file = qube_pick(&listing(&dir)?, qtype, serial).ok_or_else(|| {
+            let entries = listing(&dir)?;
+            let file = qube_pick(&entries, qtype, serial).ok_or_else(|| {
                 format!("no certificate for qube {qtype} serial '{serial}' at {dir}")
             })?;
-            (dir, file)
+            (dir, entries, file)
         }
         Vendor::Christie | Vendor::Gdc | Vendor::Barco => {
             unreachable!("a credentialed vendor")
         }
     };
-    let bytes = curl(&format!("{dir_url}{file}"), false)?;
-    Ok(String::from_utf8_lossy(&bytes).to_string())
+    let leaf_pem = String::from_utf8_lossy(&curl(&format!("{dir_url}{file}"), &[])?).to_string();
+    let archive_name = match request.vendor {
+        Vendor::Dolby => dolby_archive_pick(&entries, &file),
+        _ => None,
+    };
+    let Some(archive_name) = archive_name else {
+        return Ok(leaf_pem);
+    };
+    let maximum_bytes = MAXIMUM_ARCHIVE_BYTES.to_string();
+    let archive = curl(
+        &format!("{dir_url}{archive_name}"),
+        &["--max-filesize", &maximum_bytes],
+    )?;
+    Ok(chain_from_archive(&archive, &archive_name, &leaf_pem)?.unwrap_or(leaf_pem))
 }
 
 // the downloaded PEM, refused unless it parses as X.509
@@ -417,6 +495,7 @@ mod tests {
     const BASIC_AUTHORIZATION_PREFIX: &str = "Authorization: Basic ";
     const DOLBY_SERIAL: &str = "218281828";
     const DOLBY_FILE: &str = "Dolby-DCP2000-218281828.cert.sha256.pem";
+    const DOLBY_ARCHIVE: &str = "Dolby-DCP2000-218281828.dcicerts.zip";
     const GDC_SERIAL: &str = "H1234";
 
     #[derive(Default)]
@@ -432,7 +511,7 @@ mod tests {
     }
 
     impl VendorServer {
-        fn start(bodies: HashMap<String, String>) -> Self {
+        fn start(bodies: HashMap<String, Vec<u8>>) -> Self {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(Mutex::new(Requests::default()));
@@ -459,14 +538,15 @@ mod tests {
                         }
                     }
                     let (status, body) = match bodies.get(path) {
-                        Some(body) => ("200 OK", body.as_str()),
-                        None => ("404 Not Found", ""),
+                        Some(body) => ("200 OK", body.as_slice()),
+                        None => ("404 Not Found", &[][..]),
                     };
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
+                    let _ = stream.write_all(body);
                 }
             });
             Self { origin, requests }
@@ -491,13 +571,85 @@ mod tests {
         VendorServer::start(HashMap::from([
             (
                 "/Certificates/218xxx/".to_string(),
-                format!("Dolby-DCP2000-218281828.cert.mpeg.pem\n{DOLBY_FILE}\n"),
+                format!("Dolby-DCP2000-218281828.cert.mpeg.pem\n{DOLBY_FILE}\n").into_bytes(),
             ),
             (
                 format!("/Certificates/218xxx/{DOLBY_FILE}"),
-                certificate_body,
+                certificate_body.into_bytes(),
             ),
         ]))
+    }
+
+    fn zip_of(members: &[(&str, String)]) -> Vec<u8> {
+        let mut buffer = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut buffer);
+        for (name, text) in members {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(text.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+        buffer.into_inner()
+    }
+
+    // the folder layout seen on Dolby's server: the leaf PEM and a ZIP holding leaf and chain
+    fn dolby_archive_server(leaf: &str, chain: String) -> VendorServer {
+        VendorServer::start(HashMap::from([
+            (
+                "/Certificates/218xxx/".to_string(),
+                format!("{DOLBY_FILE}\n{DOLBY_ARCHIVE}\n").into_bytes(),
+            ),
+            (
+                format!("/Certificates/218xxx/{DOLBY_FILE}"),
+                leaf.as_bytes().to_vec(),
+            ),
+            (
+                format!("/Certificates/218xxx/{DOLBY_ARCHIVE}"),
+                zip_of(&[
+                    ("cert.sha256.pem", leaf.to_string()),
+                    ("chain.sha256.pem", chain),
+                ]),
+            ),
+        ]))
+    }
+
+    #[test]
+    fn a_dolby_archive_beside_the_leaf_stores_the_whole_chain_leaf_first() {
+        let f = fixtures();
+        let leaf = read(&f.security_managers[0].certificate);
+        let chain = f.vendor_chain_pem(&f.security_managers[0].certificate);
+        let server = dolby_archive_server(&leaf, chain.clone());
+        let directory = tempfile::tempdir().unwrap();
+        let out = directory.path().join("screen.pem");
+
+        fetch(&dolby_request(), &server.servers(), &out).unwrap();
+        let stored = chain_from_pem(&read(&out)).unwrap();
+        let expected = chain_from_pem(&chain).unwrap();
+        assert_eq!(stored, expected);
+        assert_eq!(stored[0].der, chain_from_pem(&leaf).unwrap()[0].der);
+        assert_eq!(
+            server.paths().last().unwrap(),
+            &format!("/Certificates/218xxx/{DOLBY_ARCHIVE}")
+        );
+    }
+
+    #[test]
+    fn a_dolby_archive_whose_chain_starts_with_another_certificate_is_refused() {
+        let f = fixtures();
+        let leaf = read(&f.security_managers[0].certificate);
+        let other_chain = f.vendor_chain_pem(&f.security_managers[1].certificate);
+        let server = dolby_archive_server(&leaf, other_chain);
+        let directory = tempfile::tempdir().unwrap();
+        let out = directory.path().join("screen.pem");
+
+        let error = fetch(&dolby_request(), &server.servers(), &out).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "the chain in {DOLBY_ARCHIVE} does not start with the certificate listed beside it"
+            )
+        );
+        assert!(!out.exists());
     }
 
     fn dolby_request() -> CertificateRequest<'static> {
@@ -562,7 +714,10 @@ mod tests {
     fn a_credentialed_download_sends_the_account_and_writes_the_certificate() {
         use base64::Engine;
         let pem = read(&fixtures().security_managers[1].certificate);
-        let server = VendorServer::start(HashMap::from([(gdc_path(GDC_SERIAL), pem.clone())]));
+        let server = VendorServer::start(HashMap::from([(
+            gdc_path(GDC_SERIAL),
+            pem.clone().into_bytes(),
+        )]));
         let credentials = Credentials {
             user: "projectionist".into(),
             password: "hunter2".into(),
