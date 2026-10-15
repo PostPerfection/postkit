@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 
+#[cfg(feature = "ffmpeg")]
+pub(crate) mod detection_graph;
+
 /// ffmpeg's blackdetect default: a black run shorter than this is not reported.
 const BLACK_MINIMUM_DURATION_SECONDS: f64 = 2.0;
 /// ffmpeg's blackdetect default: a pixel at or below this fraction of full
@@ -79,23 +82,6 @@ fn detection_filters() -> String {
         "blackdetect=black_min_duration={BLACK_MINIMUM_DURATION_SECONDS}:\
          pixel_black_th={BLACK_PIXEL_THRESHOLD},\
          freezedetect=duration={FREEZE_MINIMUM_DURATION_SECONDS}"
-    )
-}
-
-/// Run blackdetect and freezedetect on a copy of the finished frames, leaving
-/// `picture_filters` as the chain the encoder reads.
-pub(crate) fn with_detection_branch(picture_filters: &str) -> String {
-    format!(
-        "{picture_filters},split=2[picture][detect];[detect]{},nullsink;[picture]null",
-        detection_filters()
-    )
-}
-
-// the same branch ending in a labelled output, for a graph built in process
-pub(crate) fn with_detection_sink(picture_filters: &str, sink_label: &str) -> String {
-    format!(
-        "{picture_filters},split=2[picture][detect];[detect]{}[{sink_label}];[picture]null",
-        detection_filters()
     )
 }
 
@@ -241,16 +227,6 @@ mod tests {
         std::fs::write(&not_video, "this is not picture essence").unwrap();
         let error = detect_in_essence(&not_video, 24.0, 24).unwrap_err();
         assert!(!error.trim().is_empty(), "the reason has to be named");
-    }
-
-    #[test]
-    fn the_detection_branch_leaves_the_picture_chain_alone() {
-        assert_eq!(
-            with_detection_branch("fps=24,lut3d=/luts/hdr.cube"),
-            "fps=24,lut3d=/luts/hdr.cube,split=2[picture][detect];\
-             [detect]blackdetect=black_min_duration=2:pixel_black_th=0.1,\
-             freezedetect=duration=2,nullsink;[picture]null"
-        );
     }
 
     #[test]

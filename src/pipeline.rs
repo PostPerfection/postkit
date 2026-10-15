@@ -12,6 +12,7 @@ use crate::encode::{
     FrameRate, ImageFormat, InputType, SourceColour, StreamEncodeOptions, StreamProgress,
     check_codestream_size, encode_tiff_sequence_inprocess, stream_encode_inprocess_with_mxf_feed,
 };
+use crate::mxf_unwrap::CANCELLED;
 use crate::picture_processing::PictureProcessing;
 
 /// Progress information emitted during encode.
@@ -53,8 +54,6 @@ impl PipelineProgress {
         )
     }
 }
-
-pub(crate) const CANCELLED: &str = "Cancelled";
 
 const SECONDS_PER_MINUTE: u64 = 60;
 

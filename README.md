@@ -78,10 +78,10 @@ Cargo features: `grok-ffi` (J2K encoder), `libmpv` (embedded player), `async`
 (tokio), `icc` (monitor-ICC display path in `preview`/`colour` and
 `GrokPlayer::set_display_profile`, matrix-shaper RGB display profiles only, links
 the system liblcms2 or builds the copy lcms2-sys bundles).
-All off by default.
+All off by default, except `ffmpeg` (in-process video decode).
 
-Every build links the FFmpeg 8.1.3 LGPL libraries through ffmpeg-next 9, and
-the `libmpv` feature links libmpv. Both come from one
+The `ffmpeg` feature links the FFmpeg 8.1.3 LGPL libraries through ffmpeg-next
+9, and the `libmpv` feature links libmpv. Both come from one
 [PostPerfection/ffmpeg-mpv-builds](https://github.com/PostPerfection/ffmpeg-mpv-builds)
 release. Unpack the archive for the platform and point the build at it the way
 its setup action does: on Linux and macOS put its `lib/pkgconfig` first on

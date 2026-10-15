@@ -19,6 +19,7 @@ pub mod dolby_compliance;
 pub mod dolby_vision;
 pub mod edl_import;
 pub mod encode;
+#[cfg(feature = "ffmpeg")]
 mod ffmpeg_decode;
 pub mod ffmpeg_input;
 pub mod file_uri;
@@ -56,7 +57,9 @@ pub mod package_library;
 pub mod packaging;
 pub mod picture_findings;
 pub mod picture_processing;
+#[cfg(feature = "ffmpeg")]
 pub mod pipeline;
+#[cfg(feature = "ffmpeg")]
 pub mod planar_rgb_filter;
 pub mod plugin;
 pub mod preferences;

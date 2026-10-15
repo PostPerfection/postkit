@@ -16,7 +16,7 @@ cosmic-text = { version = "0.17", default-features = false, features = ["std", "
 dirs = "6"
 dolby_vision = { version = "3.4", features = ["xml"] }
 ebur128 = "0.1.10"
-ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "filter"] }
+ffmpeg-next = { version = "9", default-features = false, features = ["codec", "format", "filter"], optional = true }
 grokj2k-sys = { git = "https://github.com/GrokImageCompression/grok.git", tag = "v20.4.3", optional = true }
 hevc_parser = "0.6"
 hex = "0.4"
@@ -60,11 +60,12 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2-zli
 
 [build-dependencies]
 pkg-config = "0.3"
-postkit-ffmpeg-link-search = { path = "ffmpeg-link-search" }
+postkit-ffmpeg-link-search = { path = "ffmpeg-link-search", optional = true }
 
 [features]
-default = []
+default = ["ffmpeg"]
 async = ["dep:tokio"]
+ffmpeg = ["dep:ffmpeg-next", "dep:postkit-ffmpeg-link-search"]
 grok-ffi = ["dep:grokj2k-sys", "dep:cpal"]
 grok-gpu = ["grok-ffi"]
 flm-exchange = ["dep:rustls", "dep:ureq", "dep:url"]
@@ -84,7 +85,7 @@ required-features = ["grok-ffi"]
 
 [[test]]
 name = "mxf_wrap_memory"
-required-features = ["grok-ffi"]
+required-features = ["grok-ffi", "ffmpeg"]
 
 [[test]]
 name = "dolby_compliance"
@@ -104,27 +105,27 @@ required-features = ["grok-ffi"]
 
 [[test]]
 name = "video_encode_e2e"
-required-features = ["grok-ffi"]
+required-features = ["grok-ffi", "ffmpeg"]
 
 [[test]]
 name = "subtitle_burn_e2e"
-required-features = ["grok-ffi"]
+required-features = ["grok-ffi", "ffmpeg"]
 
 [[test]]
 name = "picture_processing_e2e"
-required-features = ["grok-ffi"]
+required-features = ["grok-ffi", "ffmpeg"]
 
 [[test]]
 name = "jpeg_sequence_e2e"
-required-features = ["grok-ffi"]
+required-features = ["grok-ffi", "ffmpeg"]
 
 [[test]]
 name = "overlapped_wrap_e2e"
-required-features = ["grok-ffi"]
+required-features = ["grok-ffi", "ffmpeg"]
 
 [[test]]
 name = "imf_encode"
-required-features = ["grok-ffi"]
+required-features = ["grok-ffi", "ffmpeg"]
 
 [[test]]
 name = "app2e_conformance"
@@ -132,7 +133,7 @@ required-features = ["grok-ffi"]
 
 [[test]]
 name = "in_process_decode_memory"
-required-features = ["grok-ffi"]
+required-features = ["grok-ffi", "ffmpeg"]
 
 [[test]]
 name = "grok_gpu"
@@ -140,8 +141,24 @@ required-features = ["grok-gpu"]
 
 [[test]]
 name = "grok_gpu_yuv"
-required-features = ["grok-gpu"]
+required-features = ["grok-gpu", "ffmpeg"]
 
 [[test]]
 name = "grok_gpu_rgb48le"
-required-features = ["grok-gpu"]
+required-features = ["grok-gpu", "ffmpeg"]
+
+[[test]]
+name = "hdr_dcdm"
+required-features = ["ffmpeg"]
+
+[[test]]
+name = "decode_matrix"
+required-features = ["ffmpeg"]
+
+[[test]]
+name = "decode_failure"
+required-features = ["ffmpeg"]
+
+[[test]]
+name = "picture_mxf_e2e"
+required-features = ["ffmpeg"]

@@ -1,9 +1,10 @@
-use crate::pipeline::CANCELLED;
 use crate::preview::{MAX_FRAME_BYTES, PictureReader, PreviewError};
 use asdcplib::EssenceType;
 use asdcplib::jp2k::PictureDescriptor;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+pub(crate) const CANCELLED: &str = "Cancelled";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PictureMxfInfo {

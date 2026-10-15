@@ -1003,7 +1003,10 @@ impl GraphSettings {
             front.extend(upright_filters(matrix));
         }
         let caller_graph = if self.detect_picture_findings {
-            crate::picture_findings::with_detection_sink(&self.picture_filters, FINDINGS_SINK)
+            crate::picture_findings::detection_graph::with_detection_sink(
+                &self.picture_filters,
+                FINDINGS_SINK,
+            )
         } else {
             self.picture_filters.clone()
         };

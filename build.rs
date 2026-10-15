@@ -20,6 +20,7 @@ fn main() {
         detect_grok_plugin_num_threads(&header_text);
         detect_grok_display_output_thresholds(&header_text);
     }
+    #[cfg(feature = "ffmpeg")]
     postkit_ffmpeg_link_search::emit_ffmpeg_link_search();
     if std::env::var_os("CARGO_FEATURE_LIBMPV").is_none() {
         return;

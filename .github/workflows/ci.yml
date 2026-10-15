@@ -143,6 +143,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --features "async tms flm-exchange" -- -D warnings
 
+      - name: Clippy (no ffmpeg)
+        run: cargo clippy --all-targets --no-default-features --features "async tms flm-exchange" -- -D warnings
+
       - name: Build (grok-ffi)
         run: cargo build --features "${{ matrix.grok-features }}"
 
