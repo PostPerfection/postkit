@@ -146,7 +146,11 @@ pub fn certificate_details(der: &[u8], at: DateTime<Utc>) -> Result<CertificateD
     })
 }
 
-fn inspect_chain(chain: Vec<ChainCertificate>, at: DateTime<Utc>) -> ChainInspection {
+fn inspect_chain(
+    chain: Vec<ChainCertificate>,
+    at: DateTime<Utc>,
+    lone_leaf: LoneLeaf,
+) -> ChainInspection {
     let (chain, ordering_error) = if chain.is_empty() {
         (chain, None)
     } else {
@@ -161,7 +165,7 @@ fn inspect_chain(chain: Vec<ChainCertificate>, at: DateTime<Utc>) -> ChainInspec
             leaf_roles: LeafRoles::ZeroOrMore,
             desired_times: &[at],
             best_effort_rules: &[],
-            lone_leaf: LoneLeaf::Refused,
+            lone_leaf,
         },
     );
     // one that does not parse is already a DER encoding failure in the check
@@ -177,7 +181,11 @@ fn inspect_chain(chain: Vec<ChainCertificate>, at: DateTime<Utc>) -> ChainInspec
 }
 
 pub fn inspect_certificate_pem(pem: &str, at: DateTime<Utc>) -> Result<ChainInspection, String> {
-    Ok(inspect_chain(chain_from_pem(pem)?, at))
+    Ok(inspect_chain(
+        chain_from_pem(pem)?,
+        at,
+        LoneLeaf::IssuerRulesNotChecked,
+    ))
 }
 
 pub fn inspect_kdm(kdm_xml: &str, at: DateTime<Utc>) -> Result<KdmInspection, String> {
@@ -209,7 +217,8 @@ pub fn inspect_kdm(kdm_xml: &str, at: DateTime<Utc>) -> Result<KdmInspection, St
         metadata,
         key_ids,
         signature,
-        signer_chain: inspect_chain(chain, at),
+        // a KDM has to carry its signer's whole chain
+        signer_chain: inspect_chain(chain, at, LoneLeaf::Refused),
         undecodable_certificates,
     })
 }
@@ -377,6 +386,7 @@ impl Display for FileInspection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::certificate::{ISSUER_RULES, NO_CHAIN_REASON};
     use crate::kdm_distribution::test_support::{
         CPL_ID, DISTRIBUTOR, VENDOR, dkdm, fixtures, read,
     };
@@ -454,6 +464,25 @@ mod tests {
         let text = inspection.to_string();
         assert!(text.contains("Certificate 3 of 3\n"), "{text}");
         assert!(text.contains("Chain check: passed\n"), "{text}");
+    }
+
+    #[test]
+    fn a_lone_leaf_passes_with_its_issuer_rules_not_checked_for_lack_of_a_chain() {
+        let f = fixtures();
+        let inspection =
+            inspect_certificate_pem(&read(&f.security_managers[0].certificate), Utc::now())
+                .unwrap();
+        assert!(inspection.check.passed(), "{:?}", inspection.check);
+        assert!(inspection.check.issuers_missing);
+        let text = inspection.to_string();
+        assert!(text.contains("Chain check: passed\n"), "{text}");
+        for rule in ISSUER_RULES {
+            let line = format!("Not checked: {rule}: {NO_CHAIN_REASON}\n");
+            assert!(text.contains(&line), "{line} missing from {text}");
+        }
+        let json = serde_json::to_value(&inspection).unwrap();
+        assert_eq!(json["check"]["issuers_missing"], true);
+        assert_eq!(json["check"]["not_checked"][1]["reason"], NO_CHAIN_REASON);
     }
 
     #[test]

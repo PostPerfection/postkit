@@ -13,6 +13,7 @@ const REQUIRED_RSA_MODULUS_BITS: usize = 2048;
 const REQUIRED_RSA_PUBLIC_EXPONENT: u64 = 65537;
 // ST 430-2 5.3.4: roles end at the leftmost period of the CommonName
 const ROLE_SEPARATOR: char = '.';
+pub const NO_CHAIN_REASON: &str = "no chain, the certificate came without its issuer certificates";
 const REVOCATION_NOT_CHECKED: &str =
     "no revocation list is held, so revoked keys and certificates are not checked";
 
@@ -335,6 +336,13 @@ pub fn check_chain(chain: &[ChainCertificate], context: &ChainContext) -> ChainR
     let is_lone_leaf = matches!(parsed.as_slice(), [Some(leaf)] if leaf.issuer() != leaf.subject());
     if is_lone_leaf && context.lone_leaf == LoneLeaf::IssuerRulesNotChecked {
         findings.report.issuers_missing = true;
+        findings
+            .report
+            .not_checked
+            .extend(ISSUER_RULES.map(|rule| ChainRuleSkip {
+                rule,
+                reason: NO_CHAIN_REASON.to_string(),
+            }));
         return findings.report;
     }
     for index in 0..parsed.len() {
@@ -1066,6 +1074,13 @@ mod tests {
             recipient_report_with(&lone("SM.Vendor.IMB.1"), LoneLeaf::IssuerRulesNotChecked);
         assert!(skipped.passed(), "{skipped:#?}");
         assert!(skipped.issuers_missing);
+        let unchecked: Vec<ChainRule> = skipped
+            .not_checked
+            .iter()
+            .filter(|skip| skip.reason == NO_CHAIN_REASON)
+            .map(|skip| skip.rule)
+            .collect();
+        assert_eq!(unchecked, ISSUER_RULES);
         let wrong_role =
             recipient_report_with(&lone("LD.Vendor.LDB.1"), LoneLeaf::IssuerRulesNotChecked);
         assert_eq!(failed_rules(&wrong_role), vec![ChainRule::Role]);

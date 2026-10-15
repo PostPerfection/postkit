@@ -76,7 +76,12 @@ impl CheckReport {
             .extend(report.failures.into_iter().map(finding));
         self.warnings
             .extend(report.best_effort_failures.into_iter().map(finding));
-        for skipped in report.not_checked {
+        // the no chain warning already names the issuer rules
+        let skips = report
+            .not_checked
+            .into_iter()
+            .filter(|skipped| !(report.issuers_missing && ISSUER_RULES.contains(&skipped.rule)));
+        for skipped in skips {
             // the same for every chain, so one note stands for all of them
             let note = format!("{} not checked: {}", skipped.rule, skipped.reason);
             if !self.not_checked.contains(&note) {
