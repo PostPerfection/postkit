@@ -1350,6 +1350,9 @@ const X509_ISSUER_NAME_ELEMENT: &str = "ds:X509IssuerName";
 const AUTH_PUBLIC_ID: &str = "ID_AuthenticatedPublic";
 const AUTH_PRIVATE_ID: &str = "ID_AuthenticatedPrivate";
 
+/// The attribute the KDM ds:Reference URIs name their targets by.
+const KDM_ID_ATTRIBUTE: &str = "Id";
+
 /// Check a validity timestamp is the exact 25-byte form ST 430-1 requires.
 ///
 /// The key block has no room for anything else, so a bad value has to be an
@@ -1764,7 +1767,7 @@ fn build_kdm_xml(
     crate::xmldsig::sign_enveloped(
         &unsigned,
         &[AUTH_PUBLIC_ID, AUTH_PRIVATE_ID],
-        "Id",
+        KDM_ID_ATTRIBUTE,
         None,
         &signer_identity,
     )
@@ -1860,6 +1863,7 @@ pub fn rewrap_dkdm(config: &RewrapConfig) -> Result<GeneratedKdm, String> {
 
     let dkdm_xml = std::fs::read_to_string(&config.dkdm_file)
         .map_err(|e| format!("cannot read DKDM {}: {e}", config.dkdm_file.display()))?;
+    verify_kdm_signature(&dkdm_xml)?;
     let parsed = parse_kdm_xml(&dkdm_xml)?;
     if parsed.cipher_values.is_empty() {
         return Err("DKDM has no EncryptedKey CipherValue in AuthenticatedPrivate".into());
@@ -2293,6 +2297,7 @@ pub fn parse_kdm(kdm_xml: &str) -> Result<KdmMetadata, String> {
 /// check rejects it) rather than returning garbage keys. The returned keys are
 /// zeroed on drop and never logged.
 pub fn unwrap_kdm(kdm_xml: &str, recipient_key_file: &Path) -> Result<UnwrappedKdm, String> {
+    verify_kdm_signature(kdm_xml)?;
     let parsed = parse_kdm_xml(kdm_xml)?;
     if parsed.cipher_values.is_empty() {
         return Err("KDM has no EncryptedKey CipherValue in AuthenticatedPrivate".into());
@@ -2327,6 +2332,34 @@ pub fn unwrap_kdm(kdm_xml: &str, recipient_key_file: &Path) -> Result<UnwrappedK
     }
     let cpl_id = cpl_uuid.expect("at least one key block was decrypted");
     Ok(UnwrappedKdm { cpl_id, keys })
+}
+
+// Trusts whatever signing certificate the KDM embeds.
+fn verify_kdm_signature(kdm_xml: &str) -> Result<(), String> {
+    if !kdm_has_signature(kdm_xml)? {
+        return Err("KDM carries no signature".into());
+    }
+    crate::xmldsig::verify_enveloped(kdm_xml, KDM_ID_ATTRIBUTE, None)
+        .map_err(|e| format!("KDM signature is invalid: {e}"))
+}
+
+fn kdm_has_signature(kdm_xml: &str) -> Result<bool, String> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(kdm_xml);
+    loop {
+        match reader
+            .read_event()
+            .map_err(|e| format!("KDM is not valid XML: {e}"))?
+        {
+            Event::Start(e) | Event::Empty(e) if e.local_name().as_ref() == b"Signature" => {
+                return Ok(true);
+            }
+            Event::Eof => return Ok(false),
+            _ => {}
+        }
+    }
 }
 
 /// Decrypt a KDM file's content keys with the recipient's RSA private key.
@@ -3994,6 +4027,44 @@ mod tests {
         format!("{}{encoded}{}", &xml[..start], &xml[end..])
     }
 
+    fn remove_kdm_signature(xml: &str) -> String {
+        let start = xml.find("<ds:Signature").expect("no ds:Signature");
+        let end = xml
+            .find("</ds:Signature>")
+            .expect("no closing ds:Signature")
+            + "</ds:Signature>".len();
+        format!("{}{}", &xml[..start], &xml[end..])
+    }
+
+    // Signs with the root, as test_config and build_stand_in_dkdm do.
+    fn resign_kdm(f: &Fixtures, xml: &str) -> String {
+        crate::xmldsig::sign_enveloped(
+            &remove_kdm_signature(xml),
+            &[AUTH_PUBLIC_ID, AUTH_PRIVATE_ID],
+            KDM_ID_ATTRIBUTE,
+            None,
+            &XmlSigner {
+                cert_file: f.root.clone(),
+                key_file: f.root_key.clone(),
+                chain_files: vec![],
+            },
+        )
+        .expect("re-sign kdm")
+    }
+
+    fn with_a_later_end_date(xml: &str) -> String {
+        let start = xml
+            .find("<ContentKeysNotValidAfter>")
+            .expect("no ContentKeysNotValidAfter")
+            + "<ContentKeysNotValidAfter>".len();
+        let end = xml
+            .find("</ContentKeysNotValidAfter>")
+            .expect("no closing ContentKeysNotValidAfter");
+        let edited = format!("{}{}{}", &xml[..start], in_days(365), &xml[end..]);
+        assert_ne!(edited, xml, "the edit must change the KDM");
+        edited
+    }
+
     // libdcp takes the key block layout from its decrypted length, so a KDM
     // written before ST 430-1 still unwraps here.
     #[test]
@@ -4021,7 +4092,10 @@ mod tests {
         legacy_block.drain(52..56);
         assert_eq!(legacy_block.len(), KDM_KEY_BLOCK_LEN_LEGACY);
 
-        let xml = splice_cipher_value(&kdm.xml, &encrypt_to_recipient(f, &legacy_block));
+        let xml = resign_kdm(
+            f,
+            &splice_cipher_value(&kdm.xml, &encrypt_to_recipient(f, &legacy_block)),
+        );
         let unwrapped = unwrap_kdm(&xml, &f.signer_key).expect("unwrap legacy key block");
         assert_eq!(unwrapped.cpl_id, cpl);
         assert_eq!(unwrapped.keys.len(), 1);
@@ -4032,12 +4106,112 @@ mod tests {
             "a 134-byte block carries no key type"
         );
 
-        let short = splice_cipher_value(&kdm.xml, &encrypt_to_recipient(f, &smpte_block[..130]));
+        let short = resign_kdm(
+            f,
+            &splice_cipher_value(&kdm.xml, &encrypt_to_recipient(f, &smpte_block[..130])),
+        );
         let err = unwrap_kdm(&short, &f.signer_key).expect_err("130 bytes must be refused");
         assert!(
             err.contains("138") && err.contains("134"),
             "the error must name both layouts, got: {err}"
         );
+    }
+
+    fn signed_kdm_with_one_key(f: &Fixtures) -> String {
+        let mut config = test_config(f, PathBuf::from("unused"));
+        config.content_keys = vec![KdmContentKey {
+            key_type: *b"MDIK",
+            key_id: uuid::Uuid::new_v4(),
+            content_key: [0xE5u8; 16],
+        }];
+        build_kdm(&config).expect("build kdm").xml
+    }
+
+    #[test]
+    fn unwrap_refuses_a_kdm_edited_after_signing() {
+        let f = fixtures();
+        let xml = signed_kdm_with_one_key(f);
+        unwrap_kdm(&xml, &f.signer_key).expect("the signed KDM must unwrap");
+
+        let err = unwrap_kdm(&with_a_later_end_date(&xml), &f.signer_key)
+            .expect_err("an edited KDM must be refused");
+        assert!(
+            err.contains("KDM signature is invalid") && err.contains("digest mismatch"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unwrap_refuses_an_unsigned_kdm() {
+        let f = fixtures();
+        let xml = remove_kdm_signature(&signed_kdm_with_one_key(f));
+        let err = unwrap_kdm(&xml, &f.signer_key).expect_err("an unsigned KDM must be refused");
+        assert!(err.contains("KDM carries no signature"), "got: {err}");
+    }
+
+    fn rewrap_config_for_stand_in_dkdm(f: &Fixtures, dkdm_file: PathBuf) -> RewrapConfig {
+        RewrapConfig {
+            dkdm_file,
+            dkdm_recipient_key_file: f.signer_key.clone(),
+            recipient_cert_file: f.root.clone(),
+            signer_cert_file: f.root.clone(),
+            signer_key_file: f.root_key.clone(),
+            signer_chain_files: vec![],
+            output_file: PathBuf::from("unused"),
+            valid_from: String::new(),
+            valid_to: String::new(),
+            device_cert_files: vec![],
+            formulation: KdmFormulation::default(),
+            picture_forensic_marking: PictureForensicMarking::default(),
+            audio_forensic_marking: AudioForensicMarking::default(),
+            issue_date: None,
+        }
+    }
+
+    fn stand_in_dkdm_with_one_key(f: &Fixtures) -> String {
+        build_stand_in_dkdm(
+            f,
+            &f.signer,
+            &[KdmKey {
+                key_type: *b"MDIK",
+                key_id: uuid::Uuid::new_v4(),
+                content_key: [0xF6u8; 16],
+            }],
+        )
+    }
+
+    #[test]
+    fn rewrap_refuses_a_dkdm_edited_after_signing() {
+        let f = fixtures();
+        let dkdm_xml = stand_in_dkdm_with_one_key(f);
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        let config = rewrap_config_for_stand_in_dkdm(f, dkdm_path.clone());
+
+        std::fs::write(&dkdm_path, &dkdm_xml).unwrap();
+        rewrap_dkdm(&config).expect("the signed DKDM must re-wrap");
+
+        std::fs::write(&dkdm_path, with_a_later_end_date(&dkdm_xml)).unwrap();
+        let err = rewrap_dkdm(&config).expect_err("an edited DKDM must be refused");
+        assert!(
+            err.contains("KDM signature is invalid") && err.contains("digest mismatch"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rewrap_refuses_an_unsigned_dkdm() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let dkdm_path = dir.path().join("dkdm.xml");
+        std::fs::write(
+            &dkdm_path,
+            remove_kdm_signature(&stand_in_dkdm_with_one_key(f)),
+        )
+        .unwrap();
+        let err = rewrap_dkdm(&rewrap_config_for_stand_in_dkdm(f, dkdm_path))
+            .expect_err("an unsigned DKDM must be refused");
+        assert!(err.contains("KDM carries no signature"), "got: {err}");
     }
 
     // The wrong recipient key must fail the OAEP unpad (or the structure-id
