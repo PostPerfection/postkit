@@ -1436,12 +1436,10 @@ fn a_frame_range_plays_from_its_in_frame_to_the_frame_before_its_out_frame() {
     forget_frames(&player);
     player.frame_back_step();
     player.frame_step();
-    wait_for_frame(&player);
-    assert_eq!(
-        shown_colour(&player, width, height),
-        frame_colour(4),
-        "a step back at the in frame left the range"
-    );
+    // the back step shows the in frame again, so the next frame composed can still be frame 3
+    wait_until("a step back at the in frame stayed in the range", || {
+        shown_colour(&player, width, height) == frame_colour(4)
+    });
     forget_frames(&player);
     player.seek_absolute(0.0);
     wait_for_frame(&player);
