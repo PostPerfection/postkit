@@ -154,23 +154,9 @@ fn collect_packages(directory: &Path, depth: usize, packages: &mut Vec<PathBuf>)
 /// package has its header read, since only the track file says it is encrypted. A
 /// directory with no CPL is an error naming the directory.
 pub fn read_package(directory: &Path) -> Result<PackageEntry, String> {
-    let assetmap = crate::assetmap::find(directory)
-        .ok_or_else(|| format!("{}: no asset map", directory.display()))?;
     let mut compositions = Vec::new();
     let mut standard = None;
-    for (_, relative) in crate::assetmap::parse_ordered(&assetmap) {
-        let path = directory.join(relative);
-        let is_xml = path
-            .extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case(CPL_EXTENSION));
-        if !is_xml {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path)
-            .map_err(|error| format!("{}: {error}", path.display()))?;
-        if !is_composition_playlist(&text) {
-            continue;
-        }
+    for (path, text) in composition_playlist_files(directory)? {
         let (cpl_standard, composition) = read_composition(&text, directory)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         standard.get_or_insert(cpl_standard);
@@ -185,6 +171,29 @@ pub fn read_package(directory: &Path) -> Result<PackageEntry, String> {
         standard,
         compositions,
     })
+}
+
+pub(crate) fn composition_playlist_files(
+    directory: &Path,
+) -> Result<Vec<(PathBuf, String)>, String> {
+    let assetmap = crate::assetmap::find(directory)
+        .ok_or_else(|| format!("{}: no asset map", directory.display()))?;
+    let mut files = Vec::new();
+    for (_, relative) in crate::assetmap::parse_ordered(&assetmap) {
+        let path = directory.join(relative);
+        let is_xml = path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case(CPL_EXTENSION));
+        if !is_xml {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if is_composition_playlist(&text) {
+            files.push((path, text));
+        }
+    }
+    Ok(files)
 }
 
 fn read_composition(cpl: &str, directory: &Path) -> Result<(Standard, CompositionEntry), String> {
@@ -336,7 +345,7 @@ fn parse_ul(text: &str) -> Option<[u8; 16]> {
     Some(ul)
 }
 
-fn cpl_standard(cpl: &str) -> Result<Standard, String> {
+pub fn cpl_standard(cpl: &str) -> Result<Standard, String> {
     let namespace = root_namespace(cpl).ok_or("CompositionPlaylist has no namespace")?;
     match namespace.as_str() {
         CPL_INTEROP => Ok(Standard::Interop),
