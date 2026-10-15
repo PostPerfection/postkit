@@ -1,7 +1,7 @@
 use super::bundle::{
     CinemaBundle, KdmNaming, name_fields_from_content_title, write_files, write_zip,
 };
-use super::cinema::{Cinema, Recipient, Screen};
+use super::cinema::{AuthorizedDevice, CertSource, Cinema, Recipient, Screen};
 use super::formulation::{
     ContentStandard, FormulationFlagNames, choose_formulation, resolve_formulation,
 };
@@ -373,6 +373,10 @@ struct WrittenKdm {
 }
 
 fn screen_label(cinema: &Cinema, screen: &Screen) -> String {
+    // a KDM to a certificate file has no cinema
+    if cinema.name.is_empty() {
+        return screen.name.clone();
+    }
     format!("{} / {}", cinema.name, screen.name)
 }
 
@@ -641,6 +645,14 @@ fn write_screen(
     })
 }
 
+fn dkdm_on_disk(issue: &DkdmIssue<'_>) -> Result<(tempfile::TempDir, PathBuf), String> {
+    let temporary = tempfile::tempdir().map_err(|e| format!("cannot create temp dir: {e}"))?;
+    let dkdm_file = temporary.path().join("dkdm.xml");
+    std::fs::write(&dkdm_file, issue.dkdm_xml)
+        .map_err(|e| format!("cannot write {}: {e}", dkdm_file.display()))?;
+    Ok((temporary, dkdm_file))
+}
+
 // re-wraps the DKDM once per screen and writes one ZIP per cinema into output_dir, with its
 // KDMs beside it in a folder of the same name
 pub fn issue_from_dkdm(
@@ -649,10 +661,7 @@ pub fn issue_from_dkdm(
     output_dir: &Path,
 ) -> Result<DkdmIssueOutcome, String> {
     let facts = DkdmFacts::read(issue)?;
-    let temporary = tempfile::tempdir().map_err(|e| format!("cannot create temp dir: {e}"))?;
-    let dkdm_file = temporary.path().join("dkdm.xml");
-    std::fs::write(&dkdm_file, issue.dkdm_xml)
-        .map_err(|e| format!("cannot write {}: {e}", dkdm_file.display()))?;
+    let (temporary, dkdm_file) = dkdm_on_disk(issue)?;
 
     let mut outcome = DkdmIssueOutcome {
         cpl_id: facts.cpl_id.clone(),
@@ -713,6 +722,108 @@ pub fn issue_from_dkdm(
             kdms: kdms.iter().map(|kdm| kdm.issued.clone()).collect(),
         });
     }
+    Ok(outcome)
+}
+
+// a recipient that is no screen in the database
+#[derive(Debug, Clone, Copy)]
+pub struct CertificateTarget<'a> {
+    // PEM, leaf first when it carries its chain
+    pub recipient: &'a str,
+    // PEM each, listed by a device list formulation
+    pub trusted_devices: &'a [String],
+    // names the KDM file, the recipient's subject when None
+    pub media_block_serial: Option<&'a str>,
+    pub window: LocalWindow,
+    pub time_zone: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WrittenKdmFile {
+    pub kdm: IssuedKdm,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CertificateIssueOutcome {
+    pub cpl_id: String,
+    pub content_title: String,
+    // None when a check refused the KDM
+    pub written: Option<WrittenKdmFile>,
+    pub refusals: Vec<String>,
+    pub not_checked: Vec<String>,
+}
+
+fn certificate_screen(target: &CertificateTarget<'_>) -> Result<Screen, String> {
+    let mut screen = Screen::new("", CertSource::Inline(target.recipient.to_string()))?;
+    screen.name = screen.cert_subject.clone();
+    screen.device_serial = target.media_block_serial.map(str::to_string);
+    screen.authorized_devices = target
+        .trusted_devices
+        .iter()
+        .map(|pem| AuthorizedDevice {
+            // an unreadable device certificate is refused by the checks
+            device_type: cert_info_from_pem(pem)
+                .map(|info| info.subject_cn)
+                .unwrap_or_default(),
+            serial: None,
+            certificate: pem.clone(),
+        })
+        .collect();
+    Ok(screen)
+}
+
+// one KDM file in output_dir, after the checks a booked screen passes
+pub fn issue_to_certificate(
+    issue: &DkdmIssue<'_>,
+    target: &CertificateTarget<'_>,
+    output_dir: &Path,
+) -> Result<CertificateIssueOutcome, String> {
+    let facts = DkdmFacts::read(issue)?;
+    let screen = certificate_screen(target)?;
+    let cinema = Cinema {
+        time_zone: Some(target.time_zone.to_string()),
+        ..Default::default()
+    };
+    let screen_target = ScreenTarget {
+        cinema: &cinema,
+        screen: &screen,
+        window: target.window,
+    };
+    let mut outcome = CertificateIssueOutcome {
+        cpl_id: facts.cpl_id.clone(),
+        content_title: facts.content_title.clone(),
+        ..Default::default()
+    };
+    let (temporary, dkdm_file) = dkdm_on_disk(issue)?;
+    let result =
+        check_target(issue, &facts, &screen_target, &mut outcome.not_checked).and_then(|checked| {
+            write_screen(
+                issue,
+                &facts,
+                &dkdm_file,
+                temporary.path(),
+                &screen_target,
+                checked,
+            )
+        });
+    let kdm = match result {
+        Ok(kdm) => kdm,
+        Err(reasons) => {
+            outcome.refusals = reasons;
+            return Ok(outcome);
+        }
+    };
+    std::fs::create_dir_all(output_dir)
+        .map_err(|e| format!("cannot create {}: {e}", output_dir.display()))?;
+    let path = output_dir.join(&kdm.issued.file_name);
+    crate::fs::write_atomic(&path, kdm.xml.as_bytes())?;
+    outcome.written = Some(WrittenKdmFile {
+        kdm: kdm.issued,
+        path,
+    });
     Ok(outcome)
 }
 

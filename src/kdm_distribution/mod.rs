@@ -1,4 +1,5 @@
 pub mod bundle;
+pub mod certificate_fetch;
 pub mod cinema;
 pub mod database;
 pub mod email;

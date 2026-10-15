@@ -7,8 +7,8 @@ use super::flm_exchange::FeedSyncState;
 use super::formulation::ContentStandard;
 use super::history;
 use super::issue::{
-    DkdmIssue, DkdmIssueOutcome, IssuePlan, IssuedKdm, KdmSigner, ScreenTarget, issue_from_dkdm,
-    plan_issue,
+    CertificateIssueOutcome, CertificateTarget, DkdmIssue, DkdmIssueOutcome, IssuePlan, IssuedKdm,
+    KdmSigner, ScreenTarget, issue_from_dkdm, issue_to_certificate, plan_issue,
 };
 use super::window::LocalWindow;
 use crate::certificate::{
@@ -326,6 +326,12 @@ pub struct IssueSettings {
     pub output_dir: PathBuf,
     pub picture_forensic_marking: PictureForensicMarking,
     pub audio_forensic_marking: AudioForensicMarking,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum DkdmSource<'a> {
+    Title(TitleId),
+    Dkdm(&'a str),
 }
 
 pub struct DistributionDatabase {
@@ -1638,6 +1644,55 @@ impl DistributionDatabase {
         Ok(result)
     }
 
+    // one KDM to a recipient outside any booking, recorded in the issues with no booking
+    pub fn issue_to_certificate(
+        &mut self,
+        source: DkdmSource<'_>,
+        target: &CertificateTarget<'_>,
+        formulation: Option<KdmFormulation>,
+        settings: &IssueSettings,
+        issue_date: DateTime<Utc>,
+    ) -> Result<CertificateIssueOutcome, String> {
+        let (dkdm_xml, standard) = match source {
+            DkdmSource::Title(id) => {
+                let title = self.title(id)?;
+                (title.dkdm_xml, title.standard)
+            }
+            DkdmSource::Dkdm(xml) => (xml.to_string(), None),
+        };
+        let issue = DkdmIssue {
+            dkdm_xml: &dkdm_xml,
+            dkdm_recipient_key: &settings.dkdm_recipient_key,
+            signer: &settings.signer,
+            standard,
+            formulation,
+            picture_forensic_marking: settings.picture_forensic_marking,
+            audio_forensic_marking: settings.audio_forensic_marking,
+            creation_facility: &settings.creation_facility,
+            issue_date,
+        };
+        let outcome = issue_to_certificate(&issue, target, &settings.output_dir)?;
+        if let Some(written) = &outcome.written {
+            let kdm = &written.kdm;
+            self.record_issue(&IssueRecord {
+                issued_at: kdm.issue_date.to_rfc3339(),
+                cpl_id: outcome.cpl_id.clone(),
+                content_title: outcome.content_title.clone(),
+                booking_id: None,
+                cinema: None,
+                screen: None,
+                recipient_subject: kdm.recipient_subject.clone(),
+                recipient_serial: kdm.recipient_serial.clone(),
+                recipient_thumbprint: Some(kdm.recipient_thumbprint.clone()),
+                formulation: Some(kdm.formulation),
+                valid_from: kdm.not_valid_before.clone(),
+                valid_to: kdm.not_valid_after.clone(),
+                file_name: kdm.file_name.clone(),
+            })?;
+        }
+        Ok(outcome)
+    }
+
     fn issue_parts(
         &mut self,
         parts: &BookingParts,
@@ -1690,7 +1745,8 @@ mod tests {
     use super::*;
     use crate::kdm_distribution::flm::Contact;
     use crate::kdm_distribution::test_support::{
-        DCNC_TITLE, chain_screen, cinemas, dkdm, fixtures, issue_settings, local_window, read,
+        CPL_ID, DCNC_TITLE, chain_screen, cinemas, content_keys, dkdm, fixtures, issue_settings,
+        local_window, read,
     };
     use std::io::Read;
 
@@ -2077,6 +2133,141 @@ mod tests {
             Some(KdmFormulation::MultipleModifiedTransitional1)
         );
         assert_eq!(issues[2].cinema.as_deref(), Some("Odeon"));
+    }
+
+    fn certificate_target<'a>(
+        recipient: &'a str,
+        trusted_devices: &'a [String],
+        media_block_serial: Option<&'a str>,
+    ) -> CertificateTarget<'a> {
+        CertificateTarget {
+            recipient,
+            trusted_devices,
+            media_block_serial,
+            window: local_window(),
+            time_zone: "Europe/London",
+        }
+    }
+
+    #[test]
+    fn a_kdm_to_a_certificate_file_unwraps_to_the_title_keys_and_is_recorded_without_a_booking() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let title = database.add_title_from_dkdm(&dkdm(DCNC_TITLE, 30)).unwrap();
+        let recipient = f.vendor_chain_pem(&f.security_managers[0].certificate);
+        let devices = [
+            f.vendor_chain_pem(&f.link_decryptor.certificate),
+            f.vendor_chain_pem(&f.projector.certificate),
+        ];
+        let issue_date = Utc::now() + chrono::Duration::minutes(2);
+        let outcome = database
+            .issue_to_certificate(
+                DkdmSource::Title(title),
+                &certificate_target(&recipient, &devices, Some("1001")),
+                None,
+                &issue_settings(dir.path()),
+                issue_date,
+            )
+            .unwrap();
+        assert!(outcome.refusals.is_empty(), "{:?}", outcome.refusals);
+        let written = outcome.written.unwrap();
+
+        let window = local_window();
+        let dates = format!(
+            "{}_{}",
+            window.start.format("%Y%m%d"),
+            window.end.format("%Y%m%d")
+        );
+        assert_eq!(
+            written.path,
+            dir.path().join(format!(
+                "k_LongerThanFo3D_FTR_EN-XX_51-HI-VI_1001_{dates}_DIS_OV_US-13.xml"
+            ))
+        );
+        assert_eq!(
+            written.kdm.formulation,
+            KdmFormulation::MultipleModifiedTransitional1
+        );
+        let xml = read(&written.path);
+        let unwrapped = crate::certificate::unwrap_kdm(&xml, &f.security_managers[0].key).unwrap();
+        for key in content_keys() {
+            assert_eq!(unwrapped.content_key(&key.key_id), Some(&key.content_key));
+        }
+        for device in [&f.link_decryptor.certificate, &f.projector.certificate] {
+            let thumbprint = crate::certificate::cert_info_from_file(device)
+                .unwrap()
+                .thumbprint;
+            assert!(xml.contains(&thumbprint), "{} is listed", device.display());
+        }
+
+        let issues = database.issues().unwrap();
+        assert_eq!(issues.len(), 1);
+        let issue = &issues[0];
+        assert_eq!(issue.booking_id, None);
+        assert_eq!(issue.cpl_id, CPL_ID);
+        assert_eq!(issue.content_title, DCNC_TITLE);
+        assert_eq!(issue.issued_at, issue_date.to_rfc3339());
+        assert_eq!(issue.recipient_subject, written.kdm.recipient_subject);
+        assert_eq!(issue.file_name, written.kdm.file_name);
+    }
+
+    #[test]
+    fn a_dkdm_issues_to_a_certificate_without_a_stored_title() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let recipient = f.vendor_chain_pem(&f.security_managers[1].certificate);
+        let outcome = database
+            .issue_to_certificate(
+                DkdmSource::Dkdm(&dkdm(DCNC_TITLE, 30)),
+                &certificate_target(&recipient, &[], None),
+                Some(KdmFormulation::ModifiedTransitional1),
+                &issue_settings(dir.path()),
+                Utc::now(),
+            )
+            .unwrap();
+        let written = outcome.written.unwrap();
+        let name = written.path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("k_LongerThanFo3D_FTR_EN-XX_51-HI-VI_SMVendorIMB1002_"),
+            "the subject names a KDM with no media block serial: {name}"
+        );
+        let unwrapped =
+            crate::certificate::unwrap_kdm(&read(&written.path), &f.security_managers[1].key)
+                .unwrap();
+        assert_eq!(unwrapped.keys.len(), content_keys().len());
+        assert_eq!(database.issues().unwrap().len(), 1);
+        assert!(database.titles().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_certificate_failing_a_check_is_refused_with_the_rule_and_nothing_written() {
+        let f = fixtures();
+        let dir = tempfile::tempdir().unwrap();
+        let mut database = DistributionDatabase::open_in_memory().unwrap();
+        let title = database.add_title_from_dkdm(&dkdm(DCNC_TITLE, 30)).unwrap();
+        let wrong_role = f.vendor_chain_pem(&f.link_decryptor.certificate);
+        let outcome = database
+            .issue_to_certificate(
+                DkdmSource::Title(title),
+                &certificate_target(&wrong_role, &[], None),
+                None,
+                &issue_settings(dir.path()),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(outcome.written.is_none());
+        let role_rule = crate::certificate::ChainRule::Role.to_string();
+        assert!(
+            outcome.refusals.iter().any(|reason| reason
+                .starts_with("LD.Vendor.LDB.2001: recipient certificate")
+                && reason.contains(&role_rule)),
+            "{:?}",
+            outcome.refusals
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert!(database.issues().unwrap().is_empty());
     }
 
     fn booked(database: &mut DistributionDatabase) -> BookingId {
