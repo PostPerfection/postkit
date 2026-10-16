@@ -9,7 +9,7 @@ description = "Shared library for DCP Wizard, IMF Wizard, and DCP Doctor"
 aes = "0.9"
 allsorts = "0.17"
 ar-reshaper = "1.5"
-asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "c8c24cc2d3ed4d22460b744e55b0b840ed98cbfa" }
+asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "084fd449cd90408078ee53b6b097522226e01153" }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 cmac = "0.8"
@@ -84,7 +84,7 @@ libmpv = []
 tms = ["dep:ssh2", "dep:suppaftp"]
 
 [dev-dependencies]
-asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "c8c24cc2d3ed4d22460b744e55b0b840ed98cbfa" }
+asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "084fd449cd90408078ee53b6b097522226e01153" }
 skrifa = "0.45"
 # the tms config file is the app's to read; these tests stand in for one
 toml = "1"
