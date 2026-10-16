@@ -15,6 +15,7 @@ pub mod ass;
 pub mod bidi;
 pub mod dcp;
 pub mod fcpxml;
+pub mod imsc;
 pub mod interop;
 pub mod mks;
 pub mod pac;

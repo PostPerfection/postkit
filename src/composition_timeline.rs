@@ -8,6 +8,7 @@
 
 use crate::cpl_xml::read_prefixed_tag;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// The one mpv source that plays a composition, and the title to show for it.
@@ -43,12 +44,14 @@ pub struct SegmentTrim {
     pub length_seconds: Option<f64>,
 }
 
-// an ST 429-5 timed text MXF or an Interop subtitle XML
+// an ST 429-5 or AS-02 timed text MXF, or an Interop subtitle XML
 #[derive(Debug, PartialEq)]
 pub struct SubtitleSegment {
     pub path: PathBuf,
-    // the reel it plays in, which is the picture segment of the same index
-    pub reel: usize,
+    // the reels it plays across, which are the picture segments of the same indices
+    pub reels: Range<usize>,
+    // after the first reel's start, nonzero for an IMF resource that follows another in its sequence
+    pub offset_seconds: f64,
     pub trim: Option<SegmentTrim>,
     pub language: Option<String>,
 }
@@ -59,8 +62,6 @@ pub struct Composition {
     pub sound: Vec<SoundSegment>,
     pub subtitles: Vec<SubtitleSegment>,
     pub captions: Vec<SubtitleSegment>,
-    // an IMF composition's IMSC subtitles, which the player has no reader for
-    pub unread_subtitles: bool,
     pub title: Option<String>,
 }
 
@@ -69,6 +70,13 @@ struct TrackFileReference {
     asset_id: String,
     trim: Option<SegmentTrim>,
     edit_rate: Option<(i32, i32)>,
+}
+
+struct SubtitleReference {
+    reels: Range<usize>,
+    offset_seconds: f64,
+    track_file: TrackFileReference,
+    language: Option<String>,
 }
 
 /// The mpv source that plays every reel of the composition in `package_dir`.
@@ -151,18 +159,20 @@ pub fn resolve_composition(
         })
         .collect::<Result<Vec<_>, String>>()
         .map_err(missing_asset_error)?;
-    let subtitle_segments = |element: &str| {
-        reel_subtitle_references(&cpl, element)
+    let subtitle_segments = |references: Vec<SubtitleReference>| {
+        references
             .into_iter()
-            .map(|(reel, reference, language)| {
+            .map(|reference| {
+                let asset_id = reference.track_file.asset_id;
                 let path = paths_by_id
-                    .get(&reference.asset_id)
-                    .ok_or_else(|| missing_asset_error(reference.asset_id.clone()))?;
+                    .get(&asset_id)
+                    .ok_or_else(|| missing_asset_error(asset_id.clone()))?;
                 Ok(SubtitleSegment {
                     path: path.clone(),
-                    reel,
-                    trim: reference.trim,
-                    language,
+                    reels: reference.reels,
+                    offset_seconds: reference.offset_seconds,
+                    trim: reference.track_file.trim,
+                    language: reference.language,
                 })
             })
             .collect::<Result<Vec<_>, String>>()
@@ -170,9 +180,11 @@ pub fn resolve_composition(
     Ok(Composition {
         pictures,
         sound,
-        subtitles: subtitle_segments(MAIN_SUBTITLE_ELEMENT)?,
-        captions: subtitle_segments(CLOSED_CAPTION_ELEMENT_PATTERN)?,
-        unread_subtitles: !element_blocks(&cpl, IMF_SUBTITLES_SEQUENCE_ELEMENT).is_empty(),
+        subtitles: subtitle_segments(subtitle_references(&cpl))?,
+        captions: subtitle_segments(reel_subtitle_references(
+            &cpl,
+            CLOSED_CAPTION_ELEMENT_PATTERN,
+        ))?,
         title: composition_title(&cpl),
     })
 }
@@ -182,11 +194,18 @@ const IMF_SUBTITLES_SEQUENCE_ELEMENT: &str = "SubtitlesSequence";
 // ST 429-12 names it ClosedCaption, the Interop CPL MainClosedCaption
 const CLOSED_CAPTION_ELEMENT_PATTERN: &str = "(?:Main)?ClosedCaption";
 
-// every track of the kind in each reel, a reel can carry one a language, with the reel's index
-fn reel_subtitle_references(
-    cpl: &str,
-    element: &str,
-) -> Vec<(usize, TrackFileReference, Option<String>)> {
+// a DCP's MainSubtitle tracks and an IMF's SubtitlesSequence resources
+fn subtitle_references(cpl: &str) -> Vec<SubtitleReference> {
+    let mut references = reel_subtitle_references(cpl, MAIN_SUBTITLE_ELEMENT);
+    references.extend(segment_subtitle_references(
+        cpl,
+        IMF_SUBTITLES_SEQUENCE_ELEMENT,
+    ));
+    references
+}
+
+// every track of the kind in each reel, a reel can carry one a language
+fn reel_subtitle_references(cpl: &str, element: &str) -> Vec<SubtitleReference> {
     element_blocks(cpl, "Reel")
         .into_iter()
         .enumerate()
@@ -194,15 +213,66 @@ fn reel_subtitle_references(
             element_blocks(block, element)
                 .into_iter()
                 .filter_map(move |track| {
-                    let reference = TrackFileReference {
-                        asset_id: uuid_in(track, "Id")?,
-                        trim: segment_trim(track, "Duration", None),
-                        edit_rate: None,
-                    };
-                    Some((reel, reference, read_prefixed_tag(track, "Language")))
+                    Some(SubtitleReference {
+                        reels: reel..reel + 1,
+                        offset_seconds: 0.0,
+                        track_file: TrackFileReference {
+                            asset_id: uuid_in(track, "Id")?,
+                            trim: segment_trim(track, "Duration", None),
+                            edit_rate: None,
+                        },
+                        language: read_prefixed_tag(track, "Language"),
+                    })
                 })
         })
         .collect()
+}
+
+// a Segment's sequence plays its resources one after another across the picture reels the Segment holds
+fn segment_subtitle_references(cpl: &str, sequence_name: &str) -> Vec<SubtitleReference> {
+    let composition_edit_rate = read_prefixed_tag(cpl, "EditRate");
+    let mut first_reel = 0;
+    let mut references = Vec::new();
+    for segment in element_blocks(cpl, "Segment") {
+        let picture_count = sequence_resource_references(segment, "MainImageSequence").len();
+        let reels = first_reel..first_reel + picture_count;
+        first_reel += picture_count;
+        for sequence in element_blocks(segment, sequence_name) {
+            let mut offset_seconds = 0.0;
+            for resource in element_blocks(sequence, "Resource") {
+                let edit_rate = read_prefixed_tag(resource, "EditRate")
+                    .or_else(|| composition_edit_rate.clone());
+                let Some(seconds_per_unit) = edit_rate.as_deref().and_then(seconds_per_edit_unit)
+                else {
+                    continue;
+                };
+                let entry_point = element_u64(resource, "EntryPoint").unwrap_or(0);
+                let Some(played_units) = element_u64(resource, "SourceDuration").or_else(|| {
+                    Some(element_u64(resource, "IntrinsicDuration")?.saturating_sub(entry_point))
+                }) else {
+                    continue;
+                };
+                let length_seconds = played_units as f64 * seconds_per_unit;
+                if let Some(asset_id) = uuid_in(resource, "TrackFileId") {
+                    references.push(SubtitleReference {
+                        reels: reels.clone(),
+                        offset_seconds,
+                        track_file: TrackFileReference {
+                            asset_id,
+                            trim: Some(SegmentTrim {
+                                start_seconds: entry_point as f64 * seconds_per_unit,
+                                length_seconds: Some(length_seconds),
+                            }),
+                            edit_rate: edit_rate.as_deref().and_then(edit_rate_numbers),
+                        },
+                        language: None,
+                    });
+                }
+                offset_seconds += length_seconds;
+            }
+        }
+    }
+    references
 }
 
 // the library packages holding the pictures and sound the CPL's own package lacks
@@ -216,14 +286,13 @@ pub fn find_original_version_packages(
         .into_iter()
         .chain(sound_references(&cpl))
         .chain(
-            reel_subtitle_references(&cpl, MAIN_SUBTITLE_ELEMENT)
+            subtitle_references(&cpl)
                 .into_iter()
-                .map(|(_, reference, _)| reference),
-        )
-        .chain(
-            reel_subtitle_references(&cpl, CLOSED_CAPTION_ELEMENT_PATTERN)
-                .into_iter()
-                .map(|(_, reference, _)| reference),
+                .chain(reel_subtitle_references(
+                    &cpl,
+                    CLOSED_CAPTION_ELEMENT_PATTERN,
+                ))
+                .map(|reference| reference.track_file),
         )
         .map(|reference| reference.asset_id)
         .filter(|asset_id| !own_assets.contains_key(asset_id))
@@ -873,19 +942,83 @@ mod tests {
     }
 
     #[test]
-    fn an_imf_subtitles_sequence_is_marked_unread() {
+    fn an_imf_subtitles_sequence_plays_across_its_segments_picture_reels() {
         let dir = tempfile::tempdir().unwrap();
-        write_assetmap(dir.path(), "CPL_a.xml", &[(REEL_UUIDS[0], "VIDEO_one.mxf")]);
-        let with_subtitles = imf_cpl(&REEL_UUIDS[..1]).replace(
-            "</SequenceList>",
-            "<cc:SubtitlesSequence xmlns:cc=\"z\"><ResourceList/></cc:SubtitlesSequence></SequenceList>",
+        let subtitle_ids = [
+            "5e000000-0000-4000-8000-00000000000a",
+            "5e000000-0000-4000-8000-00000000000b",
+        ];
+        write_assetmap(
+            dir.path(),
+            "CPL_a.xml",
+            &[
+                (REEL_UUIDS[0], "VIDEO_one.mxf"),
+                (REEL_UUIDS[1], "VIDEO_two.mxf"),
+                (REEL_UUIDS[2], "VIDEO_three.mxf"),
+                (subtitle_ids[0], "first_tt.mxf"),
+                (subtitle_ids[1], "second_tt.mxf"),
+            ],
         );
-        std::fs::write(dir.path().join("CPL_a.xml"), with_subtitles).unwrap();
+        let picture = |id: &str| {
+            format!(
+                "<Resource><EditRate>24 1</EditRate><IntrinsicDuration>48</IntrinsicDuration>\
+                 <TrackFileId>urn:uuid:{id}</TrackFileId></Resource>"
+            )
+        };
+        let segment = |pictures: &str, subtitles: &str| {
+            format!(
+                "<Segment><SequenceList>\
+                 <cc:MainImageSequence><TrackId>urn:uuid:7a000000-0000-4000-8000-000000000001</TrackId>\
+                 <ResourceList>{pictures}</ResourceList></cc:MainImageSequence>{subtitles}\
+                 </SequenceList></Segment>"
+            )
+        };
+        let subtitles = format!(
+            "<cc:SubtitlesSequence><ResourceList>\
+             <Resource><EditRate>24 1</EditRate><IntrinsicDuration>96</IntrinsicDuration>\
+             <EntryPoint>24</EntryPoint><SourceDuration>24</SourceDuration>\
+             <TrackFileId>urn:uuid:{}</TrackFileId></Resource>\
+             <Resource><IntrinsicDuration>48</IntrinsicDuration>\
+             <TrackFileId>urn:uuid:{}</TrackFileId></Resource>\
+             </ResourceList></cc:SubtitlesSequence>",
+            subtitle_ids[0], subtitle_ids[1]
+        );
+        let cpl = format!(
+            "<?xml version=\"1.0\"?>\n<CompositionPlaylist xmlns=\"y\" xmlns:cc=\"z\">\
+             <EditRate>24 1</EditRate><SegmentList>{}{}</SegmentList></CompositionPlaylist>",
+            segment(&(picture(REEL_UUIDS[0]) + &picture(REEL_UUIDS[1])), ""),
+            segment(&picture(REEL_UUIDS[2]), &subtitles),
+        );
+        std::fs::write(dir.path().join("CPL_a.xml"), cpl).unwrap();
 
         let composition = resolve_composition(dir.path(), &[]).unwrap();
 
-        assert!(composition.unread_subtitles);
-        assert!(composition.subtitles.is_empty());
+        assert_eq!(composition.pictures.len(), 3);
+        assert_eq!(
+            composition.subtitles,
+            vec![
+                SubtitleSegment {
+                    path: dir.path().join("first_tt.mxf"),
+                    reels: 2..3,
+                    offset_seconds: 0.0,
+                    trim: Some(SegmentTrim {
+                        start_seconds: 1.0,
+                        length_seconds: Some(1.0),
+                    }),
+                    language: None,
+                },
+                SubtitleSegment {
+                    path: dir.path().join("second_tt.mxf"),
+                    reels: 2..3,
+                    offset_seconds: 1.0,
+                    trim: Some(SegmentTrim {
+                        start_seconds: 0.0,
+                        length_seconds: Some(2.0),
+                    }),
+                    language: None,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -1304,7 +1437,8 @@ mod tests {
             composition.subtitles,
             vec![SubtitleSegment {
                 path: original_version.join("ov_subtitle.mxf"),
-                reel: 0,
+                reels: 0..1,
+                offset_seconds: 0.0,
                 trim: None,
                 language: Some("fr".to_string()),
             }]

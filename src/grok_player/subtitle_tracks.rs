@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
 
+use asdcplib::crypto::AesDecContext;
+
 use crate::composition_timeline::SubtitleSegment;
 use crate::content_keys::ContentKeys;
 use crate::subtitle_formats::dcp::{DcpSubtitleDocument, parse_dcp_subtitle};
+use crate::subtitle_formats::imsc::{ImscDocument, parse_imsc};
 use crate::subtitle_formats::interop::resolve_png;
 use crate::subtitle_formats::{StyledCue, SubtitleError};
 
@@ -12,8 +15,7 @@ const MXF_EXTENSION: &str = "mxf";
 const URN_UUID_PREFIX: &str = "urn:uuid:";
 const PNG_EXTENSION: &str = "png";
 const FIRST_RESOURCE_BUFFER_BYTES: usize = 256 * 1024;
-const UNREAD_IMSC_WARNING: &str =
-    "this IMF composition's IMSC subtitles do not show, the player reads DCP subtitles only";
+const IMSC_IMAGE_WARNING: &str = "this IMF composition's IMSC image subtitles do not show, the player reads the IMSC text profile only";
 
 // one language's cues on the composition clock
 #[derive(Debug, Default, Clone)]
@@ -40,7 +42,6 @@ pub(super) struct Reels {
 pub(super) fn load(
     subtitles: &[SubtitleSegment],
     captions: &[SubtitleSegment],
-    unread_subtitles: bool,
     reels: &Reels,
     keys: Option<&ContentKeys>,
 ) -> Result<CompositionSubtitles, String> {
@@ -53,12 +54,43 @@ pub(super) fn load(
         .transpose()
         .map_err(|error| format!("cannot make a directory for subtitle images: {error}"))?;
     let image_directory = images.as_ref().map(|directory| directory.path());
+    let (subtitles, subtitle_background_images) =
+        load_track(subtitles, reels, keys, image_directory)?;
+    let (captions, caption_background_images) = load_track(captions, reels, keys, image_directory)?;
+    let background_image_count = subtitle_background_images + caption_background_images;
     Ok(CompositionSubtitles {
-        subtitles: load_track(subtitles, reels, keys, image_directory)?,
-        captions: load_track(captions, reels, keys, image_directory)?,
-        warning: unread_subtitles.then(|| UNREAD_IMSC_WARNING.to_string()),
+        subtitles,
+        captions,
+        warning: (background_image_count > 0).then(|| IMSC_IMAGE_WARNING.to_string()),
         _images: images,
     })
+}
+
+// a DCP document, or an IMSC one whose background images no cue carries
+struct TrackDocument {
+    language: Option<String>,
+    cues: Vec<StyledCue>,
+    background_image_count: usize,
+}
+
+impl From<DcpSubtitleDocument> for TrackDocument {
+    fn from(document: DcpSubtitleDocument) -> Self {
+        TrackDocument {
+            language: document.language,
+            cues: document.cues,
+            background_image_count: 0,
+        }
+    }
+}
+
+impl From<ImscDocument> for TrackDocument {
+    fn from(document: ImscDocument) -> Self {
+        TrackDocument {
+            language: document.language,
+            cues: document.cues,
+            background_image_count: document.background_image_count,
+        }
+    }
 }
 
 fn load_track(
@@ -66,16 +98,19 @@ fn load_track(
     reels: &Reels,
     keys: Option<&ContentKeys>,
     image_directory: Option<&Path>,
-) -> Result<Vec<CompositionTrack>, String> {
+) -> Result<(Vec<CompositionTrack>, usize), String> {
     let mut tracks: Vec<CompositionTrack> = Vec::new();
+    let mut background_image_count = 0;
     for segment in segments {
-        let (Some(&reel_start), Some(&reel_length)) = (
-            reels.starts_seconds.get(segment.reel),
-            reels.lengths_seconds.get(segment.reel),
+        let (Some(&reel_start), Some(reel_lengths)) = (
+            reels.starts_seconds.get(segment.reels.start),
+            reels.lengths_seconds.get(segment.reels.clone()),
         ) else {
             continue;
         };
         let document = read_document(&segment.path, keys, image_directory)?;
+        background_image_count += document.background_image_count;
+        let span_seconds = reel_lengths.iter().sum::<f64>() - segment.offset_seconds;
         let entry_ms =
             to_milliseconds(segment.trim.as_ref().map_or(0.0, |trim| trim.start_seconds));
         let played_ms = to_milliseconds(
@@ -83,10 +118,10 @@ fn load_track(
                 .trim
                 .as_ref()
                 .and_then(|trim| trim.length_seconds)
-                .unwrap_or(reel_length)
-                .min(reel_length),
+                .unwrap_or(span_seconds)
+                .min(span_seconds),
         );
-        let reel_start_ms = to_milliseconds(reel_start);
+        let reel_start_ms = to_milliseconds(reel_start + segment.offset_seconds);
         let language = segment.language.clone().or(document.language);
         let index = match tracks.iter().position(|track| track.language == language) {
             Some(index) => index,
@@ -108,7 +143,7 @@ fn load_track(
             track.cues.push(cue);
         }
     }
-    Ok(tracks)
+    Ok((tracks, background_image_count))
 }
 
 fn to_milliseconds(seconds: f64) -> u64 {
@@ -120,12 +155,23 @@ fn is_mxf(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(MXF_EXTENSION))
 }
 
+fn is_imsc_track_file(path: &Path) -> bool {
+    matches!(
+        asdcplib::essence_type(&path.to_string_lossy()),
+        Ok(asdcplib::EssenceType::As02TimedText)
+    )
+}
+
 fn read_document(
     path: &Path,
     keys: Option<&ContentKeys>,
     image_directory: Option<&Path>,
-) -> Result<DcpSubtitleDocument, String> {
+) -> Result<TrackDocument, String> {
     let named = |error: SubtitleError| format!("{}: {error}", path.display());
+    if is_mxf(path) && is_imsc_track_file(path) {
+        let xml = read_imsc_track(path, keys)?;
+        return parse_imsc(&xml).map(TrackDocument::from).map_err(named);
+    }
     if let (true, Some(image_directory)) = (is_mxf(path), image_directory) {
         let xml = read_timed_text_track(path, keys, image_directory)?;
         return parse_dcp_subtitle(&xml, |reference| {
@@ -140,12 +186,44 @@ fn read_document(
                 .then_some(image.clone())
                 .ok_or(SubtitleError::MissingImage(image))
         })
+        .map(TrackDocument::from)
         .map_err(named);
     }
     let xml =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let beside = path.parent().unwrap_or(Path::new("."));
-    parse_dcp_subtitle(&xml, |name| resolve_png(beside, name.trim())).map_err(named)
+    parse_dcp_subtitle(&xml, |name| resolve_png(beside, name.trim()))
+        .map(TrackDocument::from)
+        .map_err(named)
+}
+
+fn decryption(
+    path: &Path,
+    info: &asdcplib::WriterInfo,
+    keys: Option<&ContentKeys>,
+) -> Result<Option<AesDecContext>, String> {
+    match (info.encrypted_essence, keys) {
+        (false, _) => Ok(None),
+        (true, Some(keys)) => Ok(Some(keys.decrypt_context(info, "subtitle")?)),
+        (true, None) => Err(format!(
+            "{} is encrypted and the preview holds no content key for it",
+            path.display()
+        )),
+    }
+}
+
+// an AS-02 track file carries one IMSC document, its image profile PNGs are not read
+fn read_imsc_track(path: &Path, keys: Option<&ContentKeys>) -> Result<String, String> {
+    let named = |error: asdcplib::Error| format!("{}: {error}", path.display());
+    let mut reader = asdcplib::as02::timed_text::MxfReader::new();
+    reader.open_read(&path.to_string_lossy()).map_err(named)?;
+    let info = reader.writer_info().map_err(named)?;
+    let mut decrypt = decryption(path, &info, keys)?;
+    let xml =
+        read_resource(|buffer| reader.read_timed_text_resource(buffer, decrypt.as_mut(), None))
+            .map_err(named)?;
+    reader.close().map_err(named)?;
+    String::from_utf8(xml).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 // the XML, and every PNG ancillary resource written to `image_directory` as <uuid>.png, fonts left out
@@ -158,16 +236,7 @@ fn read_timed_text_track(
     let mut reader = asdcplib::timed_text::MxfReader::new();
     reader.open_read(&path.to_string_lossy()).map_err(named)?;
     let info = reader.writer_info().map_err(named)?;
-    let mut decrypt = match (info.encrypted_essence, keys) {
-        (false, _) => None,
-        (true, Some(keys)) => Some(keys.decrypt_context(&info, "subtitle")?),
-        (true, None) => {
-            return Err(format!(
-                "{} is encrypted and the preview holds no content key for it",
-                path.display()
-            ));
-        }
-    };
+    let mut decrypt = decryption(path, &info, keys)?;
     let xml =
         read_resource(|buffer| reader.read_timed_text_resource(buffer, decrypt.as_mut(), None))
             .map_err(named)?;
@@ -209,6 +278,7 @@ fn read_resource(
 mod tests {
     use super::super::timeline::Timeline;
     use super::super::timeline::tests::content_keys;
+    use crate::composition_timeline::{SegmentTrim, SubtitleSegment};
     use crate::mxf_unwrap::tests::{FRAME_COUNT, wrap, write_frames};
     use crate::mxf_wrap::{EssenceType, MxfEncryption, MxfStandard, MxfWrapOptions, mxf_wrap};
     use crate::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
@@ -439,5 +509,86 @@ mod tests {
         assert!(loaded.subtitles.is_empty());
         assert_eq!(loaded.captions[0].cues.len(), 1);
         assert_eq!(loaded.captions[0].language.as_deref(), Some("en"));
+    }
+
+    const IMSC_TEXT: &str = r#"<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttp="http://www.w3.org/ns/ttml#parameter"
+        xml:lang="en" ttp:frameRate="24"><body><div>
+        <p begin="12f" end="36f">entered mid cue</p>
+        <p begin="2s" end="3s">Hello<br/>world</p>
+        <p begin="7s" end="8s">after the trim</p>
+        </div></body></tt>"#;
+
+    const IMSC_IMAGE: &str = r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="en"
+        xmlns:smpte="http://www.smpte-ra.org/schemas/2052-1/2010/smpte-tt"><body>
+        <div begin="1s" end="2s" smpte:backgroundImage="Event1.png"/></body></tt>"#;
+
+    fn imsc_track_file(directory: &Path, name: &str, document: &str) -> PathBuf {
+        let xml = directory.join(name).with_extension("ttml");
+        std::fs::write(&xml, document).unwrap();
+        let output = directory.join(name).with_extension("mxf");
+        let track = mxf_wrap(&MxfWrapOptions {
+            input_files: vec![xml],
+            output: output.clone(),
+            essence_type: EssenceType::TimedText,
+            standard: MxfStandard::As02,
+            fps_num: FRAMES_PER_SECOND,
+            fps_den: 1,
+            partition_size: 0,
+            encryption: None,
+            mca_config: None,
+            resource_ids: Vec::new(),
+            hdr: None,
+            asset_uuid: None,
+            timed_text_duration_frames: Some(10 * FRAMES_PER_SECOND),
+        });
+        assert!(
+            track.success,
+            "AS-02 timed text wrap failed: {}",
+            track.error
+        );
+        output
+    }
+
+    #[test]
+    fn an_imsc_track_file_shows_its_text_on_the_composition_clock_and_warns_of_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = imsc_track_file(directory.path(), "text", IMSC_TEXT);
+        let image = imsc_track_file(directory.path(), "image", IMSC_IMAGE);
+        // half a second into the second reel, playing 5 s of the file from 1 s in
+        let segment = |path: PathBuf| SubtitleSegment {
+            path,
+            reels: 1..2,
+            offset_seconds: 0.5,
+            trim: Some(SegmentTrim {
+                start_seconds: 1.0,
+                length_seconds: Some(5.0),
+            }),
+            language: None,
+        };
+        let reels = super::Reels {
+            starts_seconds: vec![0.0, 10.0],
+            lengths_seconds: vec![10.0, 10.0],
+        };
+
+        let loaded = super::load(&[segment(text), segment(image)], &[], &reels, None).unwrap();
+
+        let [track] = loaded.subtitles.as_slice() else {
+            panic!("both documents are English, so one track");
+        };
+        assert_eq!(track.language.as_deref(), Some("en"));
+        let cues: Vec<(u64, u64, String)> = track
+            .cues
+            .iter()
+            .map(|cue| (cue.start_ms, cue.end_ms, cue.plain_text()))
+            .collect();
+        assert_eq!(
+            cues,
+            vec![
+                (10500, 11000, "entered mid cue".to_string()),
+                (11500, 12500, "Hello\nworld".to_string()),
+            ]
+        );
+        let warning = loaded.warning.expect("the image document warns");
+        assert!(warning.contains("image"), "{warning}");
     }
 }

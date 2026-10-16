@@ -97,11 +97,7 @@ impl Timeline {
             composition.pictures,
             composition.title,
             composition.sound,
-            Some((
-                composition.subtitles,
-                composition.captions,
-                composition.unread_subtitles,
-            )),
+            Some((composition.subtitles, composition.captions)),
             keys,
         )
     }
@@ -111,7 +107,7 @@ impl Timeline {
         segments: Vec<composition_timeline::PictureSegment>,
         title: Option<String>,
         sound: Vec<SoundSegment>,
-        subtitles_and_captions: Option<(Vec<SubtitleSegment>, Vec<SubtitleSegment>, bool)>,
+        subtitles_and_captions: Option<(Vec<SubtitleSegment>, Vec<SubtitleSegment>)>,
         keys: Option<&ContentKeys>,
     ) -> Result<Self, String> {
         let listed: Vec<(PathBuf, Option<composition_timeline::SegmentTrim>)> =
@@ -166,9 +162,7 @@ impl Timeline {
                 .collect(),
         };
         let subtitles = subtitles_and_captions
-            .map(|(subtitles, captions, unread)| {
-                subtitle_tracks::load(&subtitles, &captions, unread, &reels, keys)
-            })
+            .map(|(subtitles, captions)| subtitle_tracks::load(&subtitles, &captions, &reels, keys))
             .transpose()?;
         Ok(Timeline {
             segment_starts,
