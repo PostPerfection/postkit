@@ -1,15 +1,18 @@
 use std::sync::Arc;
 
 use super::{
-    ComposedFrame, ComposedPixels, OPAQUE_ALPHA, OverlayRectangle, RGBA_BYTES_PER_PIXEL, Rgba8Frame,
+    ComposedFrame, ComposedPixels, OPAQUE_ALPHA, OverlayRectangle, RGBA_SAMPLES_PER_PIXEL,
+    RgbaFrame, RgbaSample, RgbaSamples,
 };
 use crate::subtitle_formats::{Rgba, StyledCue};
 use crate::subtitle_raster::{
-    BurnStyle, BurnStyleOverrides, PositionedBitmap, SubtitleRasterizer, composite_rgb8,
-    find_system_sans_font,
+    BurnStyle, BurnStyleOverrides, PositionedBitmap, SubtitleRasterizer, find_system_sans_font,
 };
 
 const OPAQUE: u32 = OPAQUE_ALPHA as u32;
+const BITMAP_BYTES_PER_PIXEL: usize = 4;
+const BITMAP_ALPHA: usize = 3;
+const COLOUR_SAMPLES_PER_PIXEL: usize = 3;
 const PERCENT: f32 = 100.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -69,16 +72,16 @@ impl Compositor {
 
     pub fn compose(
         &mut self,
-        picture: &Arc<Rgba8Frame>,
+        picture: &Arc<RgbaFrame>,
         layers: Layers<'_>,
     ) -> Result<ComposedFrame, String> {
-        let expected = picture.width as usize * picture.height as usize * RGBA_BYTES_PER_PIXEL;
-        if picture.data.len() != expected {
+        let expected = picture.width as usize * picture.height as usize * RGBA_SAMPLES_PER_PIXEL;
+        if picture.samples.len() != expected {
             return Err(format!(
-                "a {}x{} frame carries {} bytes, not the {expected} it should",
+                "a {}x{} frame carries {} samples, not the {expected} it should",
                 picture.width,
                 picture.height,
-                picture.data.len()
+                picture.samples.len()
             ));
         }
         // a packed stereo frame is one eye's size, so cues lay out for one eye
@@ -95,22 +98,19 @@ impl Compositor {
         let pixels = if !has_overlays && bitmaps.is_empty() {
             ComposedPixels::Picture(picture.clone())
         } else {
-            let mut data = picture.data.clone();
-            draw_overlays(
-                &mut data,
-                picture.width,
-                picture.height,
-                &overlays,
-                layers.overlay_scale,
-            );
-            composite_rgb8(
-                &mut data,
-                picture.width,
-                picture.height,
-                RGBA_BYTES_PER_PIXEL,
-                &bitmaps,
-            );
-            ComposedPixels::Drawn(data)
+            let (width, height) = (picture.width, picture.height);
+            let mut samples = picture.samples.clone();
+            match &mut samples {
+                RgbaSamples::Eight(data) => {
+                    draw_overlays(data, width, height, &overlays, layers.overlay_scale);
+                    composite_cues(data, width, height, &bitmaps);
+                }
+                RgbaSamples::Sixteen(data) => {
+                    draw_overlays(data, width, height, &overlays, layers.overlay_scale);
+                    composite_cues(data, width, height, &bitmaps);
+                }
+            }
+            ComposedPixels::Drawn(samples)
         };
         Ok(ComposedFrame {
             width: picture.width,
@@ -162,7 +162,7 @@ struct EyeCells {
 }
 
 impl EyeCells {
-    fn of(picture: &Rgba8Frame) -> Self {
+    fn of(picture: &RgbaFrame) -> Self {
         let (across, down) = picture.eyes.cells();
         EyeCells {
             across,
@@ -227,15 +227,15 @@ fn squeezed(
 ) -> PositionedBitmap {
     let width = bitmap.width.div_ceil(across);
     let height = bitmap.height.div_ceil(down);
-    let mut pixels = Vec::with_capacity((width * height) as usize * RGBA_BYTES_PER_PIXEL);
+    let mut pixels = Vec::with_capacity((width * height) as usize * BITMAP_BYTES_PER_PIXEL);
     for row in 0..height {
         for column in 0..width {
-            let mut sum = [0u32; RGBA_BYTES_PER_PIXEL];
+            let mut sum = [0u32; BITMAP_BYTES_PER_PIXEL];
             let mut count = 0;
             for source_row in row * down..((row + 1) * down).min(bitmap.height) {
                 for source_column in column * across..((column + 1) * across).min(bitmap.width) {
                     let at = ((source_row * bitmap.width + source_column) as usize)
-                        * RGBA_BYTES_PER_PIXEL;
+                        * BITMAP_BYTES_PER_PIXEL;
                     for (total, sample) in sum.iter_mut().zip(&bitmap.pixels[at..]) {
                         *total += u32::from(*sample);
                     }
@@ -267,14 +267,14 @@ fn showing_without_run_colours(cues: &[StyledCue], time_ms: u64) -> Vec<StyledCu
         .collect()
 }
 
-fn draw_overlays(
-    data: &mut [u8],
+fn draw_overlays<S: RgbaSample>(
+    data: &mut [S],
     width: u32,
     height: u32,
     overlays: &[OverlayRectangle],
     scale: f64,
 ) {
-    let stride = width as usize * RGBA_BYTES_PER_PIXEL;
+    let stride = width as usize * RGBA_SAMPLES_PER_PIXEL;
     for overlay in overlays {
         if overlay.alpha == 0 {
             continue;
@@ -286,12 +286,49 @@ fn draw_overlays(
         let alpha = u32::from(overlay.alpha);
         for row in top..bottom {
             for column in left..right {
-                let at = row * stride + column * RGBA_BYTES_PER_PIXEL;
+                let at = row * stride + column * RGBA_SAMPLES_PER_PIXEL;
                 for (channel, &source) in overlay.colour.iter().enumerate() {
-                    let destination = u32::from(data[at + channel]);
-                    let mixed =
-                        (u32::from(source) * alpha + destination * (OPAQUE - alpha) + 127) / OPAQUE;
-                    data[at + channel] = mixed.min(OPAQUE) as u8;
+                    let source: u32 = S::from_eight_bit(source).into();
+                    let destination: u32 = data[at + channel].into();
+                    let mixed = (source * alpha + destination * (OPAQUE - alpha) + 127) / OPAQUE;
+                    data[at + channel] = S::from_wide(mixed.min(S::OPAQUE.into()));
+                }
+            }
+        }
+    }
+}
+
+// subtitle_raster's composite_rgb8 at either sample depth, the 8 bit cue colour scaled up to it
+fn composite_cues<S: RgbaSample>(
+    data: &mut [S],
+    width: u32,
+    height: u32,
+    bitmaps: &[PositionedBitmap],
+) {
+    for bitmap in bitmaps {
+        for row in 0..bitmap.height as i32 {
+            let frame_y = bitmap.y + row;
+            if frame_y < 0 || frame_y >= height as i32 {
+                continue;
+            }
+            for column in 0..bitmap.width as i32 {
+                let frame_x = bitmap.x + column;
+                if frame_x < 0 || frame_x >= width as i32 {
+                    continue;
+                }
+                let source = ((row as usize) * (bitmap.width as usize) + column as usize)
+                    * BITMAP_BYTES_PER_PIXEL;
+                let alpha = u32::from(bitmap.pixels[source + BITMAP_ALPHA]);
+                if alpha == 0 {
+                    continue;
+                }
+                let at =
+                    (frame_y as usize * width as usize + frame_x as usize) * RGBA_SAMPLES_PER_PIXEL;
+                for channel in 0..COLOUR_SAMPLES_PER_PIXEL {
+                    let colour: u32 = S::from_eight_bit(bitmap.pixels[source + channel]).into();
+                    let destination: u32 = data[at + channel].into();
+                    let mixed = (colour * alpha + destination * (OPAQUE - alpha) + 127) / OPAQUE;
+                    data[at + channel] = S::from_wide(mixed.min(S::OPAQUE.into()));
                 }
             }
         }
@@ -312,17 +349,36 @@ mod tests {
 
     const GREY: u8 = 100;
 
-    fn grey(width: u32, height: u32) -> Arc<Rgba8Frame> {
+    fn grey(width: u32, height: u32) -> Arc<RgbaFrame> {
         const RGB_BYTES_PER_PIXEL: usize = 3;
-        Arc::new(Rgba8Frame::from_rgb8(&Rgb8Frame {
+        Arc::new(RgbaFrame::from_rgb8(&Rgb8Frame {
             width,
             height,
             data: vec![GREY; width as usize * height as usize * RGB_BYTES_PER_PIXEL],
         }))
     }
 
-    fn pixel(data: &[u8], width: usize, x: usize, y: usize) -> [u8; 4] {
-        let at = (y * width + x) * RGBA_BYTES_PER_PIXEL;
+    fn grey16(width: u32, height: u32, sample: u16) -> Arc<RgbaFrame> {
+        let rgb = vec![sample; width as usize * height as usize * 3];
+        Arc::new(RgbaFrame::from_rgb16(width, height, &rgb))
+    }
+
+    fn eight_bit(samples: &RgbaSamples) -> &[u8] {
+        let RgbaSamples::Eight(samples) = samples else {
+            panic!("the frame is not 8 bit");
+        };
+        samples
+    }
+
+    fn sixteen_bit(samples: &RgbaSamples) -> &[u16] {
+        let RgbaSamples::Sixteen(samples) = samples else {
+            panic!("the frame is not 16 bit");
+        };
+        samples
+    }
+
+    fn pixel<S: Copy>(data: &[S], width: usize, x: usize, y: usize) -> [S; 4] {
+        let at = (y * width + x) * RGBA_SAMPLES_PER_PIXEL;
         [data[at], data[at + 1], data[at + 2], data[at + 3]]
     }
 
@@ -337,7 +393,7 @@ mod tests {
 
     #[test]
     fn an_overlay_lands_where_the_reduce_factor_puts_it() {
-        let mut data = vec![0u8; 8 * 8 * RGBA_BYTES_PER_PIXEL];
+        let mut data = vec![0u8; 8 * 8 * RGBA_SAMPLES_PER_PIXEL];
         let overlay = OverlayRectangle {
             x: 8,
             y: 8,
@@ -360,7 +416,7 @@ mod tests {
 
     #[test]
     fn a_half_alpha_overlay_mixes_with_what_is_under_it() {
-        let mut data = grey(2, 2).data.clone();
+        let mut data = eight_bit(&grey(2, 2).samples).to_vec();
         draw_overlays(
             &mut data,
             2,
@@ -397,14 +453,17 @@ mod tests {
         let composed = Compositor::new()
             .compose(&picture, plain(&overlays, 1.0))
             .unwrap();
-        assert_ne!(composed.data().as_ptr(), picture.data.as_ptr());
+        assert_ne!(
+            eight_bit(composed.samples()).as_ptr(),
+            eight_bit(&picture.samples).as_ptr()
+        );
         assert_eq!(
-            pixel(composed.data(), 2, 0, 0),
+            pixel(eight_bit(composed.samples()), 2, 0, 0),
             [255, 0, 0, OPAQUE_ALPHA],
             "the overlay is on the first pixel"
         );
         assert_eq!(
-            pixel(composed.data(), 2, 1, 0),
+            pixel(eight_bit(composed.samples()), 2, 1, 0),
             [GREY, GREY, GREY, OPAQUE_ALPHA],
             "the pixel beside it is untouched"
         );
@@ -412,7 +471,7 @@ mod tests {
 
     #[test]
     fn a_cue_bitmap_lands_on_the_colour_bytes_of_a_four_byte_pixel() {
-        let mut data = grey(2, 1).data.clone();
+        let mut data = eight_bit(&grey(2, 1).samples).to_vec();
         let cue = PositionedBitmap {
             x: 1,
             y: 0,
@@ -420,7 +479,7 @@ mod tests {
             height: 1,
             pixels: vec![255, 0, 0, 255],
         };
-        composite_rgb8(&mut data, 2, 1, RGBA_BYTES_PER_PIXEL, &[cue]);
+        composite_cues(&mut data, 2, 1, &[cue]);
         assert_eq!(pixel(&data, 2, 1, 0), [255, 0, 0, OPAQUE_ALPHA]);
         assert_eq!(pixel(&data, 2, 0, 0), [GREY, GREY, GREY, OPAQUE_ALPHA]);
     }
@@ -433,18 +492,18 @@ mod tests {
             .unwrap();
         assert_eq!((composed.width, composed.height), (4, 3));
         assert_eq!(
-            composed.data().as_ptr(),
-            picture.data.as_ptr(),
+            eight_bit(composed.samples()).as_ptr(),
+            eight_bit(&picture.samples).as_ptr(),
             "the composed frame shares the decoded buffer"
         );
     }
 
     #[test]
     fn a_frame_whose_bytes_do_not_match_its_size_is_refused() {
-        let short = Arc::new(Rgba8Frame {
+        let short = Arc::new(RgbaFrame {
             width: 4,
             height: 3,
-            data: vec![0u8; 4],
+            samples: RgbaSamples::Eight(vec![0u8; 4]),
             eyes: EyeArrangement::Single,
         });
         assert!(Compositor::new().compose(&short, plain(&[], 1.0)).is_err());
@@ -465,7 +524,10 @@ mod tests {
     const CUE_FRAME_WIDTH: u32 = 640;
     const CUE_FRAME_HEIGHT: u32 = 360;
 
-    fn composed_red_cue(presentation: SubtitlePresentation) -> Vec<u8> {
+    fn composed_red_cue(
+        picture: Arc<RgbaFrame>,
+        presentation: SubtitlePresentation,
+    ) -> RgbaSamples {
         let red_text = StyledRun {
             color: Some(RED),
             ..StyledRun::plain("HELLO THERE")
@@ -481,14 +543,14 @@ mod tests {
             time_ms: 0,
         };
         compositor
-            .compose(&grey(CUE_FRAME_WIDTH, CUE_FRAME_HEIGHT), layers)
+            .compose(&picture, layers)
             .unwrap()
-            .data()
-            .to_vec()
+            .samples()
+            .clone()
     }
 
     fn positions_where(data: &[u8], wanted: impl Fn([u8; 4]) -> bool) -> Vec<usize> {
-        data.as_chunks::<RGBA_BYTES_PER_PIXEL>()
+        data.as_chunks::<RGBA_SAMPLES_PER_PIXEL>()
             .0
             .iter()
             .enumerate()
@@ -499,23 +561,74 @@ mod tests {
 
     #[test]
     fn a_colour_override_replaces_the_cue_colour_and_keeps_the_shadow() {
-        let own = composed_red_cue(SubtitlePresentation::default());
-        let overridden = composed_red_cue(SubtitlePresentation {
-            colour: Some(GREEN),
-            ..SubtitlePresentation::default()
-        });
+        let picture = grey(CUE_FRAME_WIDTH, CUE_FRAME_HEIGHT);
+        let own = composed_red_cue(picture.clone(), SubtitlePresentation::default());
+        let own = eight_bit(&own);
+        let overridden = composed_red_cue(
+            picture,
+            SubtitlePresentation {
+                colour: Some(GREEN),
+                ..SubtitlePresentation::default()
+            },
+        );
+        let overridden = eight_bit(&overridden);
         let solid_red = |[red, green, blue, _]: [u8; 4]| red > 200 && green < 60 && blue < 60;
         let solid_green = |[red, green, blue, _]: [u8; 4]| green > 200 && red < 60 && blue < 60;
         let shadow = |[red, green, blue, _]: [u8; 4]| [red, green, blue] == [0, 0, 0];
-        let red_text = positions_where(&own, solid_red);
+        let red_text = positions_where(own, solid_red);
         assert!(!red_text.is_empty(), "the cue drew no red text");
-        assert!(positions_where(&overridden, solid_red).is_empty());
-        assert_eq!(positions_where(&overridden, solid_green), red_text);
-        let shadow_pixels = positions_where(&own, shadow);
+        assert!(positions_where(overridden, solid_red).is_empty());
+        assert_eq!(positions_where(overridden, solid_green), red_text);
+        let shadow_pixels = positions_where(own, shadow);
         assert!(
             !shadow_pixels.is_empty(),
             "the default style drew no shadow"
         );
-        assert_eq!(positions_where(&overridden, shadow), shadow_pixels);
+        assert_eq!(positions_where(overridden, shadow), shadow_pixels);
+    }
+
+    #[test]
+    fn a_cue_lands_on_a_sixteen_bit_frame_as_it_does_on_an_eight_bit_one() {
+        let presentation = SubtitlePresentation::default();
+        let narrow = composed_red_cue(grey(CUE_FRAME_WIDTH, CUE_FRAME_HEIGHT), presentation);
+        let narrow = eight_bit(&narrow);
+        let deep_grey = grey16(CUE_FRAME_WIDTH, CUE_FRAME_HEIGHT, u16::from_eight_bit(GREY));
+        let deep = composed_red_cue(deep_grey, presentation);
+        let deep: Vec<u8> = sixteen_bit(&deep)
+            .iter()
+            .map(|sample| sample.to_eight_bit())
+            .collect();
+        let solid_red = |[red, green, blue, _]: [u8; 4]| red > 200 && green < 60 && blue < 60;
+        assert!(!positions_where(&deep, solid_red).is_empty());
+        for (position, (deep, narrow)) in deep.iter().zip(narrow).enumerate() {
+            assert!(
+                deep.abs_diff(*narrow) <= 1,
+                "sample {position} is {deep} on the 16 bit frame and {narrow} on the 8 bit one"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overlay_mixes_into_a_sixteen_bit_frame_at_sixteen_bits() {
+        const DARK: u16 = 1000;
+        let picture = grey16(2, 1, DARK);
+        let overlays = [OverlayRectangle {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            colour: [255, 0, 0],
+            alpha: 128,
+        }];
+        let composed = Compositor::new()
+            .compose(&picture, plain(&overlays, 1.0))
+            .unwrap();
+        let samples = sixteen_bit(composed.samples());
+        let mixed = |source: u32| ((source * 128 + u32::from(DARK) * 127 + 127) / 255) as u16;
+        assert_eq!(
+            pixel(samples, 2, 0, 0),
+            [mixed(65535), mixed(0), mixed(0), u16::MAX]
+        );
+        assert_eq!(pixel(samples, 2, 1, 0), [DARK, DARK, DARK, u16::MAX]);
     }
 }

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use super::decode_capacity::DecodeCapacity;
 use super::stereo::{EyeArrangement, StereoHalf};
 use super::timeline::DisplayRender;
-use super::{Command, OPAQUE_ALPHA, RGBA_BYTES_PER_PIXEL, Rgba8Frame};
+use super::{Command, OPAQUE_ALPHA, RGBA_SAMPLES_PER_PIXEL, RgbaFrame, RgbaSamples};
 use crate::grok_decoder::DecodedFrame;
 use crate::preview::{self, Display, FrameRender, Rgb8Frame};
 
@@ -30,10 +30,12 @@ pub(super) struct DecodeJob {
     pub display: Arc<Display>,
     // one eye of a frame that shows both
     pub stereo: Option<StereoHalf>,
+    // a DCP frame's colour comes out at 16 bits for a host framebuffer of 10 bits or more
+    pub deep_colour: bool,
 }
 
 pub(super) enum CachedFrame {
-    Decoded(Arc<Rgba8Frame>),
+    Decoded(Arc<RgbaFrame>),
     Failed(String),
 }
 
@@ -125,7 +127,7 @@ impl FrameCache {
         self.rerendered_from = generation;
     }
 
-    pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgba8Frame>> {
+    pub fn decoded(&self, frame_index: u64) -> Option<Arc<RgbaFrame>> {
         match self.frames.get(&frame_index) {
             Some(CachedResult {
                 frame: CachedFrame::Decoded(frame),
@@ -135,7 +137,7 @@ impl FrameCache {
         }
     }
 
-    pub fn decoded_at(&self, frame_index: u64, reduce: u8) -> Option<Arc<Rgba8Frame>> {
+    pub fn decoded_at(&self, frame_index: u64, reduce: u8) -> Option<Arc<RgbaFrame>> {
         match self.frames.get(&frame_index) {
             Some(CachedResult {
                 frame: CachedFrame::Decoded(frame),
@@ -463,11 +465,11 @@ impl DecodePool {
         self.cache.lock().unwrap().holds_at(frame_index, reduce)
     }
 
-    pub fn decoded(&self, frame_index: u64) -> Option<Arc<Rgba8Frame>> {
+    pub fn decoded(&self, frame_index: u64) -> Option<Arc<RgbaFrame>> {
         self.cache.lock().unwrap().decoded(frame_index)
     }
 
-    pub fn decoded_at(&self, frame_index: u64, reduce: u8) -> Option<Arc<Rgba8Frame>> {
+    pub fn decoded_at(&self, frame_index: u64, reduce: u8) -> Option<Arc<RgbaFrame>> {
         self.cache.lock().unwrap().decoded_at(frame_index, reduce)
     }
 
@@ -534,8 +536,14 @@ fn run_worker(
         }
         let reduce = job.reduce;
         let started = Instant::now();
-        let rendered = decode_job(job.codestream, reduce, job.render, &job.mxf, &job.display)
-            .map(|frame| Rgba8Frame::from_rgb8(&frame));
+        let rendered = decode_job(
+            job.codestream,
+            reduce,
+            job.render,
+            &job.mxf,
+            &job.display,
+            job.deep_colour,
+        );
         capacity.lock().unwrap().record_cpu(
             job.generation,
             started.elapsed().as_secs_f64(),
@@ -561,7 +569,7 @@ pub(super) fn jobs_per_frame(stereo: Option<&StereoHalf>) -> usize {
 // one eye waits for the other, None until both are in
 fn cached_frame(
     stereo: Option<&StereoHalf>,
-    rendered: Result<Rgba8Frame, String>,
+    rendered: Result<RgbaFrame, String>,
 ) -> Option<CachedFrame> {
     let rendered = match stereo {
         Some(half) => half.pair.complete(half.eye, rendered)?,
@@ -579,10 +587,11 @@ fn decode_job(
     render: DisplayRender,
     mxf: &std::path::Path,
     display: &Display,
-) -> Result<Rgb8Frame, String> {
+    deep_colour: bool,
+) -> Result<RgbaFrame, String> {
     let decoded =
         crate::grok_decoder::decode_with_threads(codestream, reduce, SINGLE_DECODE_THREAD)?;
-    render_decoded(&decoded, render, mxf, display)
+    render_decoded(&decoded, render, mxf, display, deep_colour)
 }
 
 fn render_decoded(
@@ -590,13 +599,26 @@ fn render_decoded(
     render: DisplayRender,
     mxf: &std::path::Path,
     display: &Display,
-) -> Result<Rgb8Frame, String> {
+    deep_colour: bool,
+) -> Result<RgbaFrame, String> {
     let render = match render {
+        DisplayRender::DcpXyz if deep_colour => return dcp_rgba16(decoded, display),
         DisplayRender::DcpXyz => FrameRender::Dcp(display),
         DisplayRender::Imf(ref colour) => FrameRender::Imf(colour),
-        DisplayRender::PlainRgb => return plain_rgb8(decoded, mxf),
+        DisplayRender::PlainRgb => {
+            return plain_rgb8(decoded, mxf).map(|frame| RgbaFrame::from_rgb8(&frame));
+        }
     };
-    preview::display_frame_from_decoded(decoded, render, mxf).map_err(|e| e.to_string())
+    preview::display_frame_from_decoded(decoded, render, mxf)
+        .map(|frame| RgbaFrame::from_rgb8(&frame))
+        .map_err(|e| e.to_string())
+}
+
+fn dcp_rgba16(decoded: &DecodedFrame, display: &Display) -> Result<RgbaFrame, String> {
+    let raw = decoded.to_xyz12le()?;
+    let mut rgb = Vec::new();
+    display.apply16(&raw, &mut rgb);
+    Ok(RgbaFrame::from_rgb16(decoded.width, decoded.height, &rgb))
 }
 
 fn plain_rgb8(decoded: &DecodedFrame, mxf: &std::path::Path) -> Result<Rgb8Frame, String> {
@@ -708,6 +730,7 @@ mod device {
         codestream: Vec<u8>,
         display: Arc<Display>,
         stereo: Option<StereoHalf>,
+        deep_colour: bool,
     }
 
     struct RunningBatch {
@@ -952,6 +975,7 @@ mod device {
                 mxf: self.mxf,
                 display: self.display,
                 stereo: self.stereo,
+                deep_colour: self.deep_colour,
             }
         }
     }
@@ -1060,6 +1084,7 @@ mod device {
             codestream: job.codestream,
             display: job.display,
             stereo: job.stereo,
+            deep_colour: job.deep_colour,
         });
         state.in_flight.fetch_add(1, Ordering::AcqRel);
         unsafe {
@@ -1088,11 +1113,15 @@ mod device {
             let rendered = if state.rgb8_on_device.load(Ordering::Acquire) {
                 read_device_rgba8(image)
             } else {
-                read_device_image(image)
-                    .and_then(|decoded| {
-                        render_decoded(&decoded, context.render, &context.mxf, &context.display)
-                    })
-                    .map(|frame| Rgba8Frame::from_rgb8(&frame))
+                read_device_image(image).and_then(|decoded| {
+                    render_decoded(
+                        &decoded,
+                        context.render,
+                        &context.mxf,
+                        &context.display,
+                        context.deep_colour,
+                    )
+                })
             };
             if rendered.is_ok() {
                 crate::grok_encoder::count_batch_accelerated_frame();
@@ -1120,7 +1149,7 @@ mod device {
     }
 
     // the device's interleaved 8 bit RGB frame: comps[0] carries the whole buffer
-    fn read_device_rgba8(image: &grokj2k_sys::grk_image) -> Result<Rgba8Frame, String> {
+    fn read_device_rgba8(image: &grokj2k_sys::grk_image) -> Result<RgbaFrame, String> {
         if image.comps.is_null() || image.numcomps < RGB_COMPONENT_COUNT as u16 {
             return Err(
                 "the device returned an 8 bit RGB frame without three components".to_string(),
@@ -1140,7 +1169,7 @@ mod device {
         } else {
             first.stride as usize
         };
-        let mut data = Vec::with_capacity(width * height * RGBA_BYTES_PER_PIXEL);
+        let mut data = Vec::with_capacity(width * height * RGBA_SAMPLES_PER_PIXEL);
         for row_index in 0..height {
             let start = unsafe { (first.data as *const u8).add(row_index * stride) };
             let row = unsafe { std::slice::from_raw_parts(start, row_bytes) };
@@ -1149,10 +1178,10 @@ mod device {
                 data.push(OPAQUE_ALPHA);
             }
         }
-        Ok(Rgba8Frame {
+        Ok(RgbaFrame {
             width: first.w,
             height: first.h,
-            data,
+            samples: RgbaSamples::Eight(data),
             eyes: EyeArrangement::Single,
         })
     }
@@ -1205,10 +1234,10 @@ mod tests {
     const QUARTER: u8 = 2;
 
     fn frame(width: u32) -> CachedFrame {
-        CachedFrame::Decoded(Arc::new(Rgba8Frame {
+        CachedFrame::Decoded(Arc::new(RgbaFrame {
             width,
             height: 1,
-            data: vec![0; width as usize * RGBA_BYTES_PER_PIXEL],
+            samples: RgbaSamples::Eight(vec![0; width as usize * RGBA_SAMPLES_PER_PIXEL]),
             eyes: EyeArrangement::Single,
         }))
     }
@@ -1364,6 +1393,38 @@ mod tests {
         )
     }
 
+    #[test]
+    fn a_deep_colour_job_renders_a_dcp_frame_at_sixteen_bits() {
+        const QUARTER_SCALE: u8 = 2;
+        let codestream = cinema_2k_codestream();
+        let display = Display::Srgb(crate::colour::XyzToSrgb::new());
+        let mxf = std::path::Path::new("deep.j2c");
+        let job = |deep_colour| {
+            decode_job(
+                codestream.clone(),
+                QUARTER_SCALE,
+                DisplayRender::DcpXyz,
+                mxf,
+                &display,
+                deep_colour,
+            )
+            .expect("decode")
+        };
+        let RgbaSamples::Eight(narrow) = job(false).samples else {
+            panic!("the job without deep colour is not 8 bit");
+        };
+        let RgbaSamples::Sixteen(deep) = job(true).samples else {
+            panic!("the deep colour job is not 16 bit");
+        };
+        assert_eq!(narrow.len(), deep.len());
+        for (position, (narrow, deep)) in narrow.iter().zip(&deep).enumerate() {
+            assert!(
+                (deep >> 8).abs_diff(u16::from(*narrow)) <= 1,
+                "sample {position} is {deep} at 16 bits and {narrow} at 8 bits"
+            );
+        }
+    }
+
     #[cfg(feature = "grok-gpu")]
     fn imf_2k_codestream_of_frame(frame_index: u32) -> Vec<u8> {
         const WIDTH: u32 = 1920;
@@ -1465,6 +1526,7 @@ mod tests {
             mxf: PathBuf::from("run.j2c"),
             display,
             stereo: None,
+            deep_colour: false,
         };
         let built_in = Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new()));
         let profile = display_p3(directory.path());
@@ -1582,9 +1644,10 @@ mod tests {
         let mut histogram = [0usize; 256];
         for (device, cpu) in on_device.iter().zip(&on_cpu) {
             for &(x, y) in &interiors {
-                let at = ((y * device.width + x) as usize) * RGBA_BYTES_PER_PIXEL;
+                let at = ((y * device.width + x) as usize) * RGBA_SAMPLES_PER_PIXEL;
                 for channel in 0..RGB_COMPONENT_COUNT {
-                    let difference = device.data[at + channel].abs_diff(cpu.data[at + channel]);
+                    let difference = eight_bit_samples(device)[at + channel]
+                        .abs_diff(eight_bit_samples(cpu)[at + channel]);
                     histogram[usize::from(difference)] += 1;
                 }
             }
@@ -1613,13 +1676,21 @@ mod tests {
         assert_eq!(route(0, false), Route::Cpu, "the plugin is off");
     }
 
+    #[cfg(feature = "grok-gpu")]
+    fn eight_bit_samples(frame: &RgbaFrame) -> &[u8] {
+        let RgbaSamples::Eight(samples) = &frame.samples else {
+            panic!("the frame is not 8 bit");
+        };
+        samples
+    }
+
     // every frame of a run through a pool, in frame order
     #[cfg(feature = "grok-gpu")]
     fn decode_run_through_a_pool(
         codestreams: &[Vec<u8>],
         render: DisplayRender,
         display: &Arc<Display>,
-    ) -> Vec<Arc<Rgba8Frame>> {
+    ) -> Vec<Arc<RgbaFrame>> {
         let (finished, done) = std::sync::mpsc::channel();
         let pool = DecodePool::start(finished);
         pool.restart(1);
@@ -1633,6 +1704,7 @@ mod tests {
                 mxf: PathBuf::from("run.j2c"),
                 display: display.clone(),
                 stereo: None,
+                deep_colour: false,
             });
         }
         for _ in 0..codestreams.len() {
@@ -1683,28 +1755,31 @@ mod tests {
                 "frame {index}"
             );
             assert!(
-                device.data[RGB_COMPONENT_COUNT..]
+                eight_bit_samples(device)[RGB_COMPONENT_COUNT..]
                     .iter()
-                    .step_by(RGBA_BYTES_PER_PIXEL)
+                    .step_by(RGBA_SAMPLES_PER_PIXEL)
                     .all(|alpha| *alpha == OPAQUE_ALPHA),
                 "frame {index}: the device left a frame with a transparent pixel"
             );
             let mut histogram = [0usize; 256];
             let mut first_large = None;
             // alpha is 255 on both sides and would flatter the statistics
-            let pixels = device
-                .data
-                .as_chunks::<RGBA_BYTES_PER_PIXEL>()
+            let pixels = eight_bit_samples(device)
+                .as_chunks::<RGBA_SAMPLES_PER_PIXEL>()
                 .0
                 .iter()
-                .zip(cpu.data.as_chunks::<RGBA_BYTES_PER_PIXEL>().0);
+                .zip(
+                    eight_bit_samples(cpu)
+                        .as_chunks::<RGBA_SAMPLES_PER_PIXEL>()
+                        .0,
+                );
             for (pixel_index, (device_pixel, cpu_pixel)) in pixels.enumerate() {
                 for channel in 0..RGB_COMPONENT_COUNT {
                     let (a, b) = (device_pixel[channel], cpu_pixel[channel]);
                     let difference = (i32::from(a) - i32::from(b)).unsigned_abs() as usize;
                     histogram[difference] += 1;
                     if difference > tolerance && first_large.is_none() {
-                        first_large = Some((pixel_index * RGBA_BYTES_PER_PIXEL + channel, a, b));
+                        first_large = Some((pixel_index * RGBA_SAMPLES_PER_PIXEL + channel, a, b));
                     }
                 }
             }
@@ -1831,7 +1906,8 @@ mod tests {
             std::hint::black_box(&rgb8);
         });
         milliseconds("decode_job, decode and colour on one thread", &mut || {
-            let frame = decode_job(codestream.clone(), 0, render, &mxf, &display).expect("decode");
+            let frame =
+                decode_job(codestream.clone(), 0, render, &mxf, &display, false).expect("decode");
             std::hint::black_box(frame);
         });
 
@@ -1851,8 +1927,8 @@ mod tests {
                 let device_frames = crate::grok_encoder::accelerated_frames() - before;
                 println!("the device took {device_frames} of {RUNS} decodes");
                 milliseconds("decode_job on the device, decode and colour", &mut || {
-                    let frame =
-                        decode_job(codestream.clone(), 0, render, &mxf, &display).expect("decode");
+                    let frame = decode_job(codestream.clone(), 0, render, &mxf, &display, false)
+                        .expect("decode");
                     std::hint::black_box(frame);
                 });
                 crate::grok_encoder::use_cpu();
@@ -1880,10 +1956,11 @@ mod tests {
                     DisplayRender::DcpXyz,
                     path,
                     &display,
+                    false,
                 )
                 .expect("decode");
                 size = (frame.width, frame.height);
-                std::hint::black_box(Rgba8Frame::from_rgb8(&frame));
+                std::hint::black_box(frame);
             }
             println!(
                 "reduce {reduce}: {:.1} ms a frame at {}x{}",
@@ -1938,6 +2015,7 @@ mod tests {
                 mxf: PathBuf::from("run.j2c"),
                 display: Arc::new(Display::Srgb(crate::colour::XyzToSrgb::new())),
                 stereo: None,
+                deep_colour: false,
             });
         }
         done.recv_timeout(Duration::from_secs(60))
@@ -2008,6 +2086,7 @@ mod tests {
                         mxf: std::path::PathBuf::from("bench.j2c"),
                         display: display.clone(),
                         stereo: pair.clone().map(|pair| StereoHalf { pair, eye: *eye }),
+                        deep_colour: false,
                     });
                 }
             }

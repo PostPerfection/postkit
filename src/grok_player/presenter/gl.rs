@@ -2,13 +2,15 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::super::{ComposedFrame, GetProcAddressFn, RGBA_BYTES_PER_PIXEL};
+use super::super::{ComposedFrame, GetProcAddressFn, RGBA_SAMPLES_PER_PIXEL, RgbaSamples};
 use super::{PresentationSettings, picture_placement};
 
 const GL_TEXTURE_2D: u32 = 0x0DE1;
 const GL_RGBA: u32 = 0x1908;
 const GL_RGBA8: i32 = 0x8058;
+const GL_RGBA16: i32 = 0x805B;
 const GL_UNSIGNED_BYTE: u32 = 0x1401;
+const GL_UNSIGNED_SHORT: u32 = 0x1403;
 const GL_TEXTURE_MAG_FILTER: u32 = 0x2800;
 const GL_TEXTURE_MIN_FILTER: u32 = 0x2801;
 const GL_TEXTURE_WRAP_S: u32 = 0x2802;
@@ -42,6 +44,32 @@ const TEXTURE_COORDINATE_ATTRIBUTE: u32 = 1;
 const COMPONENTS_PER_ATTRIBUTE: i32 = 2;
 const FLOATS_PER_VERTEX: i32 = 4;
 const PICTURE_TEXTURE_UNIT: i32 = 0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TextureFormat {
+    internal_format: i32,
+    sample_type: u32,
+    unpack_alignment: i32,
+}
+
+const EIGHT_BIT_TEXTURE: TextureFormat = TextureFormat {
+    internal_format: GL_RGBA8,
+    sample_type: GL_UNSIGNED_BYTE,
+    unpack_alignment: (RGBA_SAMPLES_PER_PIXEL * size_of::<u8>()) as i32,
+};
+
+const SIXTEEN_BIT_TEXTURE: TextureFormat = TextureFormat {
+    internal_format: GL_RGBA16,
+    sample_type: GL_UNSIGNED_SHORT,
+    unpack_alignment: (RGBA_SAMPLES_PER_PIXEL * size_of::<u16>()) as i32,
+};
+
+fn texture_source(samples: &RgbaSamples) -> (TextureFormat, *const c_void) {
+    match samples {
+        RgbaSamples::Eight(samples) => (EIGHT_BIT_TEXTURE, samples.as_ptr() as *const c_void),
+        RgbaSamples::Sixteen(samples) => (SIXTEEN_BIT_TEXTURE, samples.as_ptr() as *const c_void),
+    }
+}
 
 // flip_y follows mpv: true puts the first texture row, the picture's top, at gl's top
 const QUAD: [f32; 16] = [
@@ -182,8 +210,9 @@ pub(crate) struct GlPresenter {
     program: u32,
     vertex_array: u32,
     texture: u32,
-    // a decode scale change reallocates the texture
+    // a decode scale or depth change reallocates the texture
     texture_size: (u32, u32),
+    texture_format: TextureFormat,
     uploaded_serial: u64,
     uniforms: Uniforms,
     // GL_APPLE_client_storage only: same GPU as the GL context. A 3060 decode
@@ -331,6 +360,7 @@ impl GlPresenter {
             vertex_array,
             texture,
             texture_size: (0, 0),
+            texture_format: EIGHT_BIT_TEXTURE,
             uploaded_serial: 0,
             uniforms,
             client_storage,
@@ -420,27 +450,28 @@ impl GlPresenter {
 
     fn upload(&mut self, frame: Arc<ComposedFrame>, serial: u64) -> Option<Duration> {
         let size = (frame.width, frame.height);
-        if serial == self.uploaded_serial && size == self.texture_size {
+        let (format, pixels) = texture_source(frame.samples());
+        let same_texture = size == self.texture_size && format == self.texture_format;
+        if serial == self.uploaded_serial && same_texture {
             return None;
         }
         let started = Instant::now();
-        let pixels = frame.data().as_ptr() as *const c_void;
         let entries = &self.entries;
         unsafe {
             (entries.bind_texture)(GL_TEXTURE_2D, self.texture);
-            (entries.pixel_storei)(GL_UNPACK_ALIGNMENT, RGBA_BYTES_PER_PIXEL as i32);
+            (entries.pixel_storei)(GL_UNPACK_ALIGNMENT, format.unpack_alignment);
             // client storage: TexImage2D keeps this pointer as the store, no copy.
             // otherwise SubImage copies into the existing allocation when the size matches.
-            if self.client_storage || size != self.texture_size {
+            if self.client_storage || !same_texture {
                 (entries.tex_image_2d)(
                     GL_TEXTURE_2D,
                     0,
-                    GL_RGBA8,
+                    format.internal_format,
                     frame.width as i32,
                     frame.height as i32,
                     0,
                     GL_RGBA,
-                    GL_UNSIGNED_BYTE,
+                    format.sample_type,
                     pixels,
                 );
             } else {
@@ -452,12 +483,13 @@ impl GlPresenter {
                     frame.width as i32,
                     frame.height as i32,
                     GL_RGBA,
-                    GL_UNSIGNED_BYTE,
+                    format.sample_type,
                     pixels,
                 );
             }
         }
         self.texture_size = size;
+        self.texture_format = format;
         self.uploaded_serial = serial;
         self.backing = Some(frame);
         Some(started.elapsed())

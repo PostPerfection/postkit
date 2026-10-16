@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
@@ -11,7 +12,7 @@ use super::stereo::{StereoHalf, StereoOutput, StereoPair};
 use super::subtitle_tracks::CompositionTrack;
 use super::timeline::{StereoscopicPhase, Timeline};
 use super::{
-    Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, Rgba8Frame, Shared,
+    Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, RgbaFrame, Shared,
     SourceOptions, Status, SubtitleSlot, TrackStatus,
 };
 use crate::colour::XyzToSrgb;
@@ -210,7 +211,7 @@ struct Scheduler {
     display: Arc<Display>,
     stereo_output: StereoOutput,
     clock: Option<Clock>,
-    last_plain: Option<Arc<Rgba8Frame>>,
+    last_plain: Option<Arc<RgbaFrame>>,
     overlays: Vec<OverlayRectangle>,
     subtitle: SubtitleTrack,
     caption: SubtitleTrack,
@@ -438,7 +439,7 @@ impl Scheduler {
         self.shared.fire_update();
     }
 
-    fn present(&mut self, index: u64, plain: Arc<Rgba8Frame>) {
+    fn present(&mut self, index: u64, plain: Arc<RgbaFrame>) {
         self.current_frame = index;
         self.last_plain = Some(plain.clone());
         self.compose_and_publish(&plain);
@@ -449,7 +450,7 @@ impl Scheduler {
         }
     }
 
-    fn compose_and_publish(&mut self, picture: &Arc<Rgba8Frame>) {
+    fn compose_and_publish(&mut self, picture: &Arc<RgbaFrame>) {
         let Some(timeline) = self.timeline.as_ref() else {
             return;
         };
@@ -549,6 +550,7 @@ impl Scheduler {
                     mxf,
                     display: self.display.clone(),
                     stereo,
+                    deep_colour: self.shared.deep_colour.load(Ordering::Acquire),
                 });
             }
         }

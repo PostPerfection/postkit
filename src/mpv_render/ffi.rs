@@ -19,6 +19,7 @@ pub const MPV_RENDER_PARAM_API_TYPE: c_int = 1;
 pub const MPV_RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 pub const MPV_RENDER_PARAM_OPENGL_FBO: c_int = 3;
 pub const MPV_RENDER_PARAM_FLIP_Y: c_int = 4;
+pub const MPV_RENDER_PARAM_DEPTH: c_int = 5;
 pub const MPV_RENDER_PARAM_X11_DISPLAY: c_int = 8;
 pub const MPV_RENDER_PARAM_WL_DISPLAY: c_int = 9;
 pub const MPV_RENDER_PARAM_ADVANCED_CONTROL: c_int = 10;

@@ -83,30 +83,107 @@ pub struct OverlayRectangle {
     pub alpha: u8,
 }
 
-const RGBA_BYTES_PER_PIXEL: usize = 4;
+const RGBA_SAMPLES_PER_PIXEL: usize = 4;
+const RGB_SAMPLES_PER_PIXEL: usize = 3;
 const OPAQUE_ALPHA: u8 = 255;
+const EIGHT_TO_SIXTEEN_BIT_SCALE: u16 = 257;
+
+trait RgbaSample: Copy + Into<u32> {
+    const OPAQUE: Self;
+    fn from_eight_bit(sample: u8) -> Self;
+    // the value is within the sample's range
+    fn from_wide(value: u32) -> Self;
+    fn to_eight_bit(self) -> u8;
+}
+
+impl RgbaSample for u8 {
+    const OPAQUE: Self = OPAQUE_ALPHA;
+
+    fn from_eight_bit(sample: u8) -> Self {
+        sample
+    }
+
+    fn from_wide(value: u32) -> Self {
+        value as u8
+    }
+
+    fn to_eight_bit(self) -> u8 {
+        self
+    }
+}
+
+impl RgbaSample for u16 {
+    const OPAQUE: Self = u16::MAX;
+
+    fn from_eight_bit(sample: u8) -> Self {
+        u16::from(sample) * EIGHT_TO_SIXTEEN_BIT_SCALE
+    }
+
+    fn from_wide(value: u32) -> Self {
+        value as u16
+    }
+
+    fn to_eight_bit(self) -> u8 {
+        let scale = u32::from(EIGHT_TO_SIXTEEN_BIT_SCALE);
+        ((u32::from(self) + scale / 2) / scale) as u8
+    }
+}
+
+fn with_opaque_alpha<S: RgbaSample>(rgb: &[S]) -> Vec<S> {
+    let mut rgba = Vec::with_capacity(rgb.len() / RGB_SAMPLES_PER_PIXEL * RGBA_SAMPLES_PER_PIXEL);
+    for colour in rgb.as_chunks::<RGB_SAMPLES_PER_PIXEL>().0 {
+        rgba.extend_from_slice(colour);
+        rgba.push(S::OPAQUE);
+    }
+    rgba
+}
+
+// 16 bit for a DCP frame the cpu coloured for a deep host framebuffer
+#[derive(Clone)]
+enum RgbaSamples {
+    Eight(Vec<u8>),
+    Sixteen(Vec<u16>),
+}
+
+impl RgbaSamples {
+    fn len(&self) -> usize {
+        match self {
+            RgbaSamples::Eight(samples) => samples.len(),
+            RgbaSamples::Sixteen(samples) => samples.len(),
+        }
+    }
+
+    fn widened(self) -> Vec<u16> {
+        match self {
+            RgbaSamples::Eight(samples) => samples.into_iter().map(u16::from_eight_bit).collect(),
+            RgbaSamples::Sixteen(samples) => samples,
+        }
+    }
+}
 
 // a 4K gl upload costs 12.3 ms as rgb8 against 2.3 ms as rgba8 on the amd display gpu
-struct Rgba8Frame {
+struct RgbaFrame {
     width: u32,
     height: u32,
-    data: Vec<u8>,
+    samples: RgbaSamples,
     eyes: stereo::EyeArrangement,
 }
 
-impl Rgba8Frame {
+impl RgbaFrame {
     fn from_rgb8(picture: &crate::preview::Rgb8Frame) -> Self {
-        const RGB_BYTES_PER_PIXEL: usize = 3;
-        let pixels = picture.width as usize * picture.height as usize;
-        let mut data = Vec::with_capacity(pixels * RGBA_BYTES_PER_PIXEL);
-        for colour in picture.data.as_chunks::<RGB_BYTES_PER_PIXEL>().0 {
-            data.extend_from_slice(colour);
-            data.push(OPAQUE_ALPHA);
-        }
-        Rgba8Frame {
+        RgbaFrame {
             width: picture.width,
             height: picture.height,
-            data,
+            samples: RgbaSamples::Eight(with_opaque_alpha(&picture.data)),
+            eyes: stereo::EyeArrangement::Single,
+        }
+    }
+
+    fn from_rgb16(width: u32, height: u32, rgb: &[u16]) -> Self {
+        RgbaFrame {
+            width,
+            height,
+            samples: RgbaSamples::Sixteen(with_opaque_alpha(rgb)),
             eyes: stereo::EyeArrangement::Single,
         }
     }
@@ -114,8 +191,8 @@ impl Rgba8Frame {
 
 enum ComposedPixels {
     // nothing drawn, so the decoded frame is shared
-    Picture(Arc<Rgba8Frame>),
-    Drawn(Vec<u8>),
+    Picture(Arc<RgbaFrame>),
+    Drawn(RgbaSamples),
 }
 
 struct ComposedFrame {
@@ -126,10 +203,10 @@ struct ComposedFrame {
 }
 
 impl ComposedFrame {
-    fn data(&self) -> &[u8] {
+    fn samples(&self) -> &RgbaSamples {
         match &self.pixels {
-            ComposedPixels::Picture(picture) => &picture.data,
-            ComposedPixels::Drawn(data) => data,
+            ComposedPixels::Picture(picture) => &picture.samples,
+            ComposedPixels::Drawn(samples) => samples,
         }
     }
 }
@@ -253,6 +330,8 @@ struct Shared {
     lookahead_frames: AtomicUsize,
     presentation: Mutex<PresentationSettings>,
     presentation_changed: AtomicBool,
+    // the host's framebuffer holds 10 bits or more per channel
+    deep_colour: AtomicBool,
 }
 
 impl Shared {
@@ -271,6 +350,7 @@ impl Shared {
             lookahead_frames: AtomicUsize::new(0),
             presentation: Mutex::new(PresentationSettings::default()),
             presentation_changed: AtomicBool::new(false),
+            deep_colour: AtomicBool::new(false),
         }
     }
 
@@ -367,10 +447,12 @@ impl GrokPlayer {
 
     // ─── render backends ───────────────────────────────────────────────────
 
+    // deep_colour: the surface holds 10 bits or more per channel
     pub fn init_opengl(
         &self,
         get_proc_address: GetProcAddressFn,
         get_proc_address_ctx: *mut c_void,
+        deep_colour: bool,
     ) -> Result<(), String> {
         let mut presenter = self.presenter.lock().unwrap();
         if presenter.is_some() {
@@ -380,6 +462,9 @@ impl GrokPlayer {
             get_proc_address,
             get_proc_address_ctx,
         )?);
+        self.shared
+            .deep_colour
+            .store(deep_colour, Ordering::Release);
         Ok(())
     }
 
@@ -397,7 +482,11 @@ impl GrokPlayer {
         width: i32,
         height: i32,
         flip_y: bool,
+        deep_colour: bool,
     ) -> Result<(), String> {
+        self.shared
+            .deep_colour
+            .store(deep_colour, Ordering::Release);
         let mut presenter = self.presenter.lock().unwrap();
         let presenter = presenter
             .as_mut()

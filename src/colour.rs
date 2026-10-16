@@ -1057,6 +1057,8 @@ pub struct XyzToSrgb {
     mat: [[f32; 3]; 3],
     /// quantised linear sRGB → 8-bit sRGB (OETF)
     oetf: Vec<u8>,
+    // 16 bit linear steps, 4096 would band the shadows at 16 bit
+    oetf16: Vec<u16>,
 }
 
 impl Default for XyzToSrgb {
@@ -1078,7 +1080,19 @@ impl XyzToSrgb {
         let oetf = (0..=4095u32)
             .map(|i| (srgb_oetf(i as f32 / 4095.0) * 255.0 + 0.5) as u8)
             .collect();
-        Self { expand, mat, oetf }
+        let sixteen_bit_full_scale = f32::from(u16::MAX);
+        let oetf16 = (0..=u16::MAX)
+            .map(|i| {
+                (srgb_oetf(f32::from(i) / sixteen_bit_full_scale) * sixteen_bit_full_scale + 0.5)
+                    as u16
+            })
+            .collect();
+        Self {
+            expand,
+            mat,
+            oetf,
+            oetf16,
+        }
     }
 
     /// One pixel from 12-bit X'Y'Z' code values to 8-bit sRGB.
@@ -1110,6 +1124,25 @@ impl XyzToSrgb {
             out.extend_from_slice(&self.pixel(x, y, z));
         }
     }
+
+    // full scale, 65535 is white
+    pub fn pixel16(&self, x: u16, y: u16, z: u16) -> [u16; 3] {
+        let xyz = [x, y, z].map(|code| self.expand[usize::from(code.min(4095))]);
+        let rgb = mat_vec(&self.mat, xyz);
+        let full_scale = f32::from(u16::MAX);
+        rgb.map(|linear| self.oetf16[(linear.clamp(0.0, 1.0) * full_scale + 0.5) as usize])
+    }
+
+    pub fn frame_xyz12le_to_srgb16(&self, raw: &[u8], out: &mut Vec<u16>) {
+        out.clear();
+        out.reserve(raw.len() / 2);
+        for px in raw.as_chunks::<6>().0 {
+            let x = u16::from_le_bytes([px[0], px[1]]) >> 4;
+            let y = u16::from_le_bytes([px[2], px[3]]) >> 4;
+            let z = u16::from_le_bytes([px[4], px[5]]) >> 4;
+            out.extend_from_slice(&self.pixel16(x, y, z));
+        }
+    }
 }
 
 #[cfg(feature = "icc")]
@@ -1126,10 +1159,13 @@ pub(crate) mod icc {
     const D50_WHITE_XYZ: [f32; 3] = [0.964_212, 1.0, 0.825_188];
     const MAXIMUM_CODE: u16 = 4095;
     const EIGHT_BIT_FULL_SCALE: f32 = 255.0;
+    const SIXTEEN_BIT_FULL_SCALE: f32 = 65535.0;
     const XYZ12LE_BYTES_PER_PIXEL: usize = 6;
     const RGB_CHANNELS: usize = 3;
     // output table steps follow the f32 exponent, finer towards black where display curves are steepest
     const OUTPUT_TABLE_MANTISSA_BITS: u32 = 7;
+    // 7 bits leave steps of hundreds of 16 bit codes near white
+    const DEEP_OUTPUT_TABLE_MANTISSA_BITS: u32 = 12;
     const F32_MANTISSA_BITS: u32 = 23;
     // linear light below this shows as black on any display curve
     const OUTPUT_TABLE_DARKEST: f32 = 1.0 / (1u32 << 24) as f32;
@@ -1162,6 +1198,8 @@ pub(crate) mod icc {
         matrix: [[f32; 3]; 3],
         // each channel's 8-bit code, indexed by output_table_index of its linear value
         output_tables: [Vec<u8>; RGB_CHANNELS],
+        // each channel's 16-bit code, on the finer DEEP_OUTPUT_TABLE_MANTISSA_BITS spacing
+        deep_output_tables: [Vec<u16>; RGB_CHANNELS],
     }
 
     fn map_intent(i: RenderingIntent) -> Intent {
@@ -1173,28 +1211,47 @@ pub(crate) mod icc {
         }
     }
 
-    fn output_table_bits(linear: f32) -> u32 {
-        linear.to_bits() >> (F32_MANTISSA_BITS - OUTPUT_TABLE_MANTISSA_BITS)
+    fn output_table_bits(linear: f32, mantissa_bits: u32) -> u32 {
+        linear.to_bits() >> (F32_MANTISSA_BITS - mantissa_bits)
     }
 
-    fn output_table_index(linear: f32) -> usize {
+    fn output_table_index(linear: f32, mantissa_bits: u32) -> usize {
         if linear.is_nan() || linear <= OUTPUT_TABLE_DARKEST {
             return 0;
         }
-        (output_table_bits(linear.min(1.0)) - output_table_bits(OUTPUT_TABLE_DARKEST)) as usize
+        (output_table_bits(linear.min(1.0), mantissa_bits)
+            - output_table_bits(OUTPUT_TABLE_DARKEST, mantissa_bits)) as usize
     }
 
     // the linear light where a table entry's range starts
-    fn output_table_start(index: usize) -> f32 {
-        let first = output_table_bits(OUTPUT_TABLE_DARKEST) + index as u32;
-        f32::from_bits(first << (F32_MANTISSA_BITS - OUTPUT_TABLE_MANTISSA_BITS))
+    fn output_table_start(index: usize, mantissa_bits: u32) -> f32 {
+        let first = output_table_bits(OUTPUT_TABLE_DARKEST, mantissa_bits) + index as u32;
+        f32::from_bits(first << (F32_MANTISSA_BITS - mantissa_bits))
     }
 
     // the middle of the linear range each table entry covers
-    fn output_table_linear(index: usize) -> f32 {
-        let low = output_table_start(index);
-        let high = output_table_start(index + 1);
+    fn output_table_linear(index: usize, mantissa_bits: u32) -> f32 {
+        let low = output_table_start(index, mantissa_bits);
+        let high = output_table_start(index + 1, mantissa_bits);
         ((low + high) / 2.0).min(1.0)
+    }
+
+    // each channel's encoded value of a grey at every table entry's linear light
+    fn encoded_greys(
+        out_of_pcs: &Transform<[f32; 3], [f32; 3]>,
+        device_to_pcs: &[[f32; 3]; 3],
+        mantissa_bits: u32,
+    ) -> Vec<[f32; 3]> {
+        let entries = output_table_index(1.0, mantissa_bits) + 1;
+        let greys: Vec<[f32; 3]> = (0..entries)
+            .map(|index| {
+                let linear = output_table_linear(index, mantissa_bits);
+                mat_vec(device_to_pcs, [linear; 3])
+            })
+            .collect();
+        let mut encoded = vec![[0.0f32; 3]; entries];
+        out_of_pcs.transform_pixels(&greys, &mut encoded);
+        encoded
     }
 
     fn inverse(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
@@ -1299,25 +1356,26 @@ pub(crate) mod icc {
             }
 
             // a grey of linear value v reads every channel's curve at v
-            let entries = output_table_index(1.0) + 1;
-            let greys: Vec<[f32; 3]> = (0..entries)
-                .map(|index| {
-                    let linear = output_table_linear(index);
-                    mat_vec(&device_to_pcs, [linear; 3])
-                })
-                .collect();
-            let mut encoded = vec![[0.0f32; 3]; entries];
-            out_of_pcs.transform_pixels(&greys, &mut encoded);
+            let encoded = encoded_greys(&out_of_pcs, &device_to_pcs, OUTPUT_TABLE_MANTISSA_BITS);
             let output_tables = std::array::from_fn(|channel| {
                 encoded
                     .iter()
                     .map(|rgb| (rgb[channel].clamp(0.0, 1.0) * EIGHT_BIT_FULL_SCALE + 0.5) as u8)
                     .collect()
             });
+            let deep_encoded =
+                encoded_greys(&out_of_pcs, &device_to_pcs, DEEP_OUTPUT_TABLE_MANTISSA_BITS);
+            let deep_output_tables = std::array::from_fn(|channel| {
+                deep_encoded
+                    .iter()
+                    .map(|rgb| (rgb[channel].clamp(0.0, 1.0) * SIXTEEN_BIT_FULL_SCALE + 0.5) as u16)
+                    .collect()
+            });
             Ok(Self {
                 expand: dcdm_expansion_table(),
                 matrix,
                 output_tables,
+                deep_output_tables,
             })
         }
 
@@ -1331,7 +1389,7 @@ pub(crate) mod icc {
                         match table.iter().position(|&shown| usize::from(shown) >= code) {
                             // every light shows at least the darkest entry's code
                             Some(0) => f32::MIN,
-                            Some(index) => output_table_start(index),
+                            Some(index) => output_table_start(index, OUTPUT_TABLE_MANTISSA_BITS),
                             None => f32::MAX,
                         }
                     })
@@ -1348,7 +1406,18 @@ pub(crate) mod icc {
             let xyz = [x, y, z].map(|code| self.expand[usize::from(code.min(MAXIMUM_CODE))]);
             let rgb = mat_vec(&self.matrix, xyz);
             std::array::from_fn(|channel| {
-                self.output_tables[channel][output_table_index(rgb[channel])]
+                self.output_tables[channel]
+                    [output_table_index(rgb[channel], OUTPUT_TABLE_MANTISSA_BITS)]
+            })
+        }
+
+        // full scale, 65535 is the profile's white
+        pub fn pixel16(&self, x: u16, y: u16, z: u16) -> [u16; 3] {
+            let xyz = [x, y, z].map(|code| self.expand[usize::from(code.min(MAXIMUM_CODE))]);
+            let rgb = mat_vec(&self.matrix, xyz);
+            std::array::from_fn(|channel| {
+                self.deep_output_tables[channel]
+                    [output_table_index(rgb[channel], DEEP_OUTPUT_TABLE_MANTISSA_BITS)]
             })
         }
 
@@ -1361,6 +1430,17 @@ pub(crate) mod icc {
                 let y = u16::from_le_bytes([px[2], px[3]]) >> 4;
                 let z = u16::from_le_bytes([px[4], px[5]]) >> 4;
                 out.extend_from_slice(&self.pixel(x, y, z));
+            }
+        }
+
+        pub fn frame_xyz12le_to_rgb16(&self, raw: &[u8], out: &mut Vec<u16>) {
+            out.clear();
+            out.reserve(raw.len() / XYZ12LE_BYTES_PER_PIXEL * RGB_CHANNELS);
+            for px in raw.as_chunks::<XYZ12LE_BYTES_PER_PIXEL>().0 {
+                let x = u16::from_le_bytes([px[0], px[1]]) >> 4;
+                let y = u16::from_le_bytes([px[2], px[3]]) >> 4;
+                let z = u16::from_le_bytes([px[4], px[5]]) >> 4;
+                out.extend_from_slice(&self.pixel16(x, y, z));
             }
         }
     }
@@ -1491,6 +1571,24 @@ pub(crate) mod icc {
             }
         }
 
+        #[test]
+        fn the_sixteen_bit_transform_agrees_with_the_eight_bit_one() {
+            let directory = tempfile::tempdir().unwrap();
+            for profile in [Profile::new_srgb(), display_p3_profile()] {
+                let path = written(&profile, directory.path(), "display.icc");
+                let transform =
+                    XyzToIcc::new(&path, RenderingIntent::RelativeColorimetric).unwrap();
+                assert_eq!(transform.pixel16(0, 0, 0), [0, 0, 0]);
+                // the brightest code clips red on both profiles
+                assert_eq!(transform.pixel(4095, 4095, 4095)[0], u8::MAX);
+                assert_eq!(transform.pixel16(4095, 4095, 4095)[0], u16::MAX);
+                crate::colour::tests_display::assert_sixteen_bit_follows_eight_bit(
+                    |[x, y, z]| transform.pixel(x, y, z),
+                    |[x, y, z]| transform.pixel16(x, y, z),
+                );
+            }
+        }
+
         // the largest code whose threshold the light reaches, 0 when none does, as grok.h states
         fn device_code(thresholds: &[f32], light: f32) -> usize {
             thresholds
@@ -1519,11 +1617,11 @@ pub(crate) mod icc {
                 // every entry's start, the light just below it, and lights outside 0 to 1
                 let mut lights = vec![-1.0, 0.0, OUTPUT_TABLE_DARKEST, 1.0, 1.5, f32::MAX];
                 for index in 0..entries {
-                    let start = output_table_start(index);
+                    let start = output_table_start(index, OUTPUT_TABLE_MANTISSA_BITS);
                     lights.extend([
                         start,
                         f32::from_bits(start.to_bits() - 1),
-                        output_table_linear(index),
+                        output_table_linear(index, OUTPUT_TABLE_MANTISSA_BITS),
                     ]);
                 }
                 for (channel, table) in transform.output_tables.iter().enumerate() {
@@ -1536,7 +1634,9 @@ pub(crate) mod icc {
                     for &light in &lights {
                         assert_eq!(
                             device_code(thresholds, light),
-                            usize::from(table[output_table_index(light)]),
+                            usize::from(
+                                table[output_table_index(light, OUTPUT_TABLE_MANTISSA_BITS)]
+                            ),
                             "{name} channel {channel} at light {light:e}"
                         );
                     }
@@ -1734,6 +1834,79 @@ mod tests_display {
         t.frame_xyz12le_to_srgb8(&raw, &mut out);
         assert_eq!(&out[0..3], &t.pixel(2000, 2048, 2100));
         assert_eq!(&out[3..6], &[0, 0, 0]);
+        let mut deep = Vec::new();
+        t.frame_xyz12le_to_srgb16(&raw, &mut deep);
+        assert_eq!(&deep[0..3], &t.pixel16(2000, 2048, 2100));
+        assert_eq!(&deep[3..6], &[0, 0, 0]);
+    }
+
+    // grey codes, then colours whose channels move apart
+    pub(crate) fn code_sweep() -> impl Iterator<Item = [u16; 3]> {
+        let greys = (0..=4095u16).map(|code| [code; 3]);
+        let colours = (0..=4095u16).map(|code| [code, 4095 - code, code / 2]);
+        greys.chain(colours)
+    }
+
+    // the high byte of the 16 bit result against the 8 bit one, at most 1 apart
+    pub(crate) fn assert_sixteen_bit_follows_eight_bit(
+        eight_bit: impl Fn([u16; 3]) -> [u8; 3],
+        sixteen_bit: impl Fn([u16; 3]) -> [u16; 3],
+    ) {
+        for codes in code_sweep() {
+            let narrow = eight_bit(codes);
+            let deep = sixteen_bit(codes);
+            for channel in 0..3 {
+                let high_byte = deep[channel] >> 8;
+                assert!(
+                    high_byte.abs_diff(u16::from(narrow[channel])) <= 1,
+                    "codes {codes:?} gave {deep:?} at 16 bits and {narrow:?} at 8 bits"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_sixteen_bit_transform_spans_black_to_full_scale() {
+        let t = XyzToSrgb::new();
+        assert_eq!(t.pixel16(0, 0, 0), [0, 0, 0]);
+        // no code clips all three channels, the brightest one clips red
+        assert_eq!(t.pixel(4095, 4095, 4095)[0], u8::MAX);
+        assert_eq!(t.pixel16(4095, 4095, 4095)[0], u16::MAX);
+    }
+
+    #[test]
+    fn the_sixteen_bit_transform_agrees_with_the_eight_bit_one() {
+        let t = XyzToSrgb::new();
+        assert_sixteen_bit_follows_eight_bit(
+            |[x, y, z]| t.pixel(x, y, z),
+            |[x, y, z]| t.pixel16(x, y, z),
+        );
+    }
+
+    #[test]
+    fn the_sixteen_bit_transform_keeps_steps_the_eight_bit_one_rounds_away() {
+        let t = XyzToSrgb::new();
+        let distinct = |values: Vec<u16>| {
+            let mut values = values;
+            values.dedup();
+            values.len()
+        };
+        let grey_ramp = 1000..1100u16;
+        let narrow = distinct(
+            grey_ramp
+                .clone()
+                .map(|code| u16::from(t.pixel(code, code, code)[1]))
+                .collect(),
+        );
+        let deep = distinct(
+            grey_ramp
+                .map(|code| t.pixel16(code, code, code)[1])
+                .collect(),
+        );
+        assert!(
+            deep > narrow * 4,
+            "100 grey codes gave {deep} levels at 16 bits and {narrow} at 8 bits"
+        );
     }
 
     // Generate an sRGB ICC in-test and push D65 white through the ICC engine.

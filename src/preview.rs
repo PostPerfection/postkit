@@ -873,6 +873,15 @@ impl Display {
             Display::Icc(t) => t.frame_xyz12le_to_rgb8(raw, out),
         }
     }
+
+    #[cfg(feature = "grok-ffi")]
+    pub(crate) fn apply16(&self, raw: &[u8], out: &mut Vec<u16>) {
+        match self {
+            Display::Srgb(t) => t.frame_xyz12le_to_srgb16(raw, out),
+            #[cfg(feature = "icc")]
+            Display::Icc(t) => t.frame_xyz12le_to_rgb16(raw, out),
+        }
+    }
 }
 
 pub(crate) enum FrameRender<'a> {

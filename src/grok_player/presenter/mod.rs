@@ -1,6 +1,6 @@
 mod gl;
 
-use super::{ComposedFrame, RGBA_BYTES_PER_PIXEL};
+use super::{ComposedFrame, RGBA_SAMPLES_PER_PIXEL, RgbaSample, RgbaSamples};
 pub(super) use gl::{GlPresenter, GlSurface};
 
 // the software surface is rgb0, mpv's format, so the fourth byte stays zero
@@ -188,6 +188,11 @@ fn source_sample(
     Some(((fraction * f64::from(picture)) as usize).min(picture as usize - 1))
 }
 
+// the software target is 8 bit
+fn eight_bit_colour<S: RgbaSample>(samples: &[S], at: usize) -> [u8; COLOUR_BYTES_PER_PIXEL] {
+    std::array::from_fn(|channel| samples[at + channel].to_eight_bit())
+}
+
 fn brightness_table(brightness: f32) -> [u8; SAMPLE_VALUES] {
     std::array::from_fn(|sample| (sample as f32 * brightness).round().min(LARGEST_SAMPLE) as u8)
 }
@@ -248,15 +253,19 @@ pub(super) fn draw_software(
             let Some(source_column) = source_column else {
                 continue;
             };
-            let source = (source_row * frame.width as usize + source_column) * RGBA_BYTES_PER_PIXEL;
+            let source =
+                (source_row * frame.width as usize + source_column) * RGBA_SAMPLES_PER_PIXEL;
             let at = ((rectangle.y as usize + row) * width + rectangle.x as usize + column)
                 * SOFTWARE_BYTES_PER_PIXEL;
-            let colour = &frame.data()[source..source + COLOUR_BYTES_PER_PIXEL];
+            let colour = match frame.samples() {
+                RgbaSamples::Eight(samples) => eight_bit_colour(samples, source),
+                RgbaSamples::Sixteen(samples) => eight_bit_colour(samples, source),
+            };
             for (shown, sample) in target[at..at + COLOUR_BYTES_PER_PIXEL]
                 .iter_mut()
                 .zip(colour)
             {
-                *shown = brightness[usize::from(*sample)];
+                *shown = brightness[usize::from(sample)];
             }
         }
     }
@@ -273,7 +282,10 @@ mod tests {
         ComposedFrame {
             width: 2,
             height: 2,
-            pixels: ComposedPixels::Drawn(vec![sample; 2 * 2 * RGBA_BYTES_PER_PIXEL]),
+            pixels: ComposedPixels::Drawn(RgbaSamples::Eight(vec![
+                sample;
+                2 * 2 * RGBA_SAMPLES_PER_PIXEL
+            ])),
             eyes: EyeArrangement::Single,
         }
     }
@@ -369,7 +381,7 @@ mod tests {
         ComposedFrame {
             width,
             height,
-            pixels: ComposedPixels::Drawn(data),
+            pixels: ComposedPixels::Drawn(RgbaSamples::Eight(data)),
             eyes: EyeArrangement::Single,
         }
     }
@@ -505,6 +517,30 @@ mod tests {
             ..PresentationSettings::default()
         };
         assert_eq!(draw_grey(&frame, 2, 1, dimmer), [50, 100]);
+    }
+
+    #[test]
+    fn a_sixteen_bit_frame_draws_rounded_to_eight_bits() {
+        let samples = [0, 100, 100, 255].map(u16::from_eight_bit);
+        let samples = [samples[0], samples[1] + 128, samples[2] + 129, samples[3]]
+            .into_iter()
+            .flat_map(|sample| [sample, sample, sample, u16::MAX])
+            .collect();
+        let frame = ComposedFrame {
+            width: 4,
+            height: 1,
+            pixels: ComposedPixels::Drawn(RgbaSamples::Sixteen(samples)),
+            eyes: EyeArrangement::Single,
+        };
+        assert_eq!(
+            draw_grey(&frame, 4, 1, PresentationSettings::default()),
+            [0, 100, 101, 255]
+        );
+        let brighter = PresentationSettings {
+            brightness: 2.0,
+            ..PresentationSettings::default()
+        };
+        assert_eq!(draw_grey(&frame, 4, 1, brighter), [0, 200, 202, 255]);
     }
 
     #[test]

@@ -27,6 +27,9 @@ use crate::mpv::pick_picture_mxf;
 /// promises its callers.
 const SOFTWARE_PIXEL_FORMAT: &str = "rgb0";
 const BYTES_PER_PIXEL: usize = 4;
+// both deep hosts give at least 10 bits a channel, 0 is mpv's own 8 bit default
+const DEEP_COLOUR_DITHER_BITS: c_int = 10;
+const DEFAULT_DITHER_BITS: c_int = 0;
 
 pub fn client_api_version() -> String {
     let version = unsafe { ffi::mpv_client_api_version() };
@@ -287,13 +290,15 @@ impl MpvRenderPlayer {
     /// Draw the current frame into an OpenGL framebuffer. Must run on the thread
     /// whose current GL context was passed to [`Self::init_opengl`].
     ///
-    /// `flip_y` is true for GTK-style top-left origin surfaces.
+    /// `flip_y` is true for GTK-style top-left origin surfaces. `deep_colour` is
+    /// true when the framebuffer holds 10 bits or more per channel.
     pub fn render_opengl(
         &self,
         framebuffer: i32,
         width: i32,
         height: i32,
         flip_y: bool,
+        deep_colour: bool,
     ) -> Result<(), String> {
         let render = self.render.lock().unwrap();
         if render.is_null() {
@@ -304,6 +309,12 @@ impl MpvRenderPlayer {
             w: width,
             h: height,
             internal_format: 0,
+        };
+        // mpv's gl backend ignores internal_format and dithers to this depth
+        let mut depth: c_int = if deep_colour {
+            DEEP_COLOUR_DITHER_BITS
+        } else {
+            DEFAULT_DITHER_BITS
         };
         let mut flip: c_int = if flip_y { 1 } else { 0 };
         // never wait for the frame's display time: this runs on the app's main
@@ -318,6 +329,10 @@ impl MpvRenderPlayer {
             ffi::mpv_render_param {
                 param_type: ffi::MPV_RENDER_PARAM_FLIP_Y,
                 data: &mut flip as *mut _ as *mut c_void,
+            },
+            ffi::mpv_render_param {
+                param_type: ffi::MPV_RENDER_PARAM_DEPTH,
+                data: &mut depth as *mut _ as *mut c_void,
             },
             ffi::mpv_render_param {
                 param_type: ffi::MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME,
