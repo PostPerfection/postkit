@@ -53,6 +53,7 @@ pub mod mpv_render;
 pub mod mxf_unwrap;
 pub mod mxf_wrap;
 pub mod otioz_import;
+pub mod output_protection;
 pub mod package_edit;
 pub mod package_library;
 pub mod packaging;
