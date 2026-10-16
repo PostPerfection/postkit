@@ -58,7 +58,7 @@ url = { version = "2", optional = true }
 uuid = { version = "1", features = ["v4", "serde"] }
 x509-parser = { version = "0.16", features = ["verify"] }
 zeroize = "1"
-zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # reads each connector's HDCP Content Protection property

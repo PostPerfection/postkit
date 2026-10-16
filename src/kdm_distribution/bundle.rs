@@ -212,7 +212,7 @@ pub fn zip_files(files: &[(String, Vec<u8>)]) -> Result<Vec<u8>, String> {
     let mut buf = std::io::Cursor::new(Vec::new());
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
-        let opts: zip::write::FileOptions<'_, ()> =
+        let opts: zip::write::SimpleFileOptions =
             zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, bytes) in files {
             zip.start_file(name, opts)

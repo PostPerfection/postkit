@@ -1093,7 +1093,7 @@ mod tests {
                 let mut entry = archive.by_index(index).unwrap();
                 let mut content = String::new();
                 entry.read_to_string(&mut content).unwrap();
-                (entry.name().to_string(), content)
+                (entry.name().unwrap().to_string(), content)
             })
             .collect()
     }

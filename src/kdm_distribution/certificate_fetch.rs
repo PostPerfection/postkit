@@ -160,7 +160,8 @@ fn chain_from_archive(
         let entry = zip
             .by_index(index)
             .map_err(|e| format!("{archive_name}: {e}"))?;
-        if entry.name().rsplit('/').next() != Some(DOLBY_CHAIN_MEMBER) {
+        let name = entry.name().map_err(|e| format!("{archive_name}: {e}"))?;
+        if name.rsplit('/').next() != Some(DOLBY_CHAIN_MEMBER) {
             continue;
         }
         let mut text = String::new();

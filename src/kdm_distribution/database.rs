@@ -2115,7 +2115,7 @@ mod tests {
                 let mut xml = String::new();
                 entry.read_to_string(&mut xml).unwrap();
                 assert!(parse_kdm(&xml).is_ok());
-                zipped.push(entry.name().to_string());
+                zipped.push(entry.name().unwrap().to_string());
             }
         }
         let recorded: Vec<String> = issues.iter().map(|issue| issue.file_name.clone()).collect();
