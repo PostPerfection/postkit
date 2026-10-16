@@ -146,6 +146,7 @@ fn next_paragraph(buffer: &[u8], index: &mut usize) -> Option<StyledCue> {
         valign: Some(valign),
         vposition,
         image: None,
+        image_area: None,
     })
 }
 

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use asdcplib::crypto::AesDecContext;
+use sha1::{Digest, Sha1};
 
 use crate::composition_timeline::SubtitleSegment;
 use crate::content_keys::ContentKeys;
@@ -15,7 +16,6 @@ const MXF_EXTENSION: &str = "mxf";
 const URN_UUID_PREFIX: &str = "urn:uuid:";
 const PNG_EXTENSION: &str = "png";
 const FIRST_RESOURCE_BUFFER_BYTES: usize = 256 * 1024;
-const IMSC_IMAGE_WARNING: &str = "this IMF composition's IMSC image subtitles do not show, the player reads the IMSC text profile only";
 
 // one language's cues on the composition clock
 #[derive(Debug, Default, Clone)]
@@ -28,7 +28,8 @@ pub(super) struct CompositionSubtitles {
     // one track a language, in the order the CPL first names them
     pub subtitles: Vec<CompositionTrack>,
     pub captions: Vec<CompositionTrack>,
-    pub warning: Option<String>,
+    // one for each document naming images its track file does not carry
+    pub warnings: Vec<String>,
     // the PNGs timed text track files carry, written out for the raster to read
     _images: Option<tempfile::TempDir>,
 }
@@ -54,23 +55,22 @@ pub(super) fn load(
         .transpose()
         .map_err(|error| format!("cannot make a directory for subtitle images: {error}"))?;
     let image_directory = images.as_ref().map(|directory| directory.path());
-    let (subtitles, subtitle_background_images) =
-        load_track(subtitles, reels, keys, image_directory)?;
-    let (captions, caption_background_images) = load_track(captions, reels, keys, image_directory)?;
-    let background_image_count = subtitle_background_images + caption_background_images;
+    let mut warnings = Vec::new();
+    let subtitles = load_track(subtitles, reels, keys, image_directory, &mut warnings)?;
+    let captions = load_track(captions, reels, keys, image_directory, &mut warnings)?;
     Ok(CompositionSubtitles {
         subtitles,
         captions,
-        warning: (background_image_count > 0).then(|| IMSC_IMAGE_WARNING.to_string()),
+        warnings,
         _images: images,
     })
 }
 
-// a DCP document, or an IMSC one whose background images no cue carries
+// a DCP document, or an IMSC one with the resolver's error for each image it lacks
 struct TrackDocument {
     language: Option<String>,
     cues: Vec<StyledCue>,
-    background_image_count: usize,
+    unresolved_images: Vec<String>,
 }
 
 impl From<DcpSubtitleDocument> for TrackDocument {
@@ -78,7 +78,7 @@ impl From<DcpSubtitleDocument> for TrackDocument {
         TrackDocument {
             language: document.language,
             cues: document.cues,
-            background_image_count: 0,
+            unresolved_images: Vec::new(),
         }
     }
 }
@@ -88,7 +88,7 @@ impl From<ImscDocument> for TrackDocument {
         TrackDocument {
             language: document.language,
             cues: document.cues,
-            background_image_count: document.background_image_count,
+            unresolved_images: document.unresolved_images,
         }
     }
 }
@@ -98,9 +98,9 @@ fn load_track(
     reels: &Reels,
     keys: Option<&ContentKeys>,
     image_directory: Option<&Path>,
-) -> Result<(Vec<CompositionTrack>, usize), String> {
+    warnings: &mut Vec<String>,
+) -> Result<Vec<CompositionTrack>, String> {
     let mut tracks: Vec<CompositionTrack> = Vec::new();
-    let mut background_image_count = 0;
     for segment in segments {
         let (Some(&reel_start), Some(reel_lengths)) = (
             reels.starts_seconds.get(segment.reels.start),
@@ -109,7 +109,13 @@ fn load_track(
             continue;
         };
         let document = read_document(&segment.path, keys, image_directory)?;
-        background_image_count += document.background_image_count;
+        if !document.unresolved_images.is_empty() {
+            warnings.push(format!(
+                "{}: {}",
+                segment.path.display(),
+                document.unresolved_images.join(", ")
+            ));
+        }
         let span_seconds = reel_lengths.iter().sum::<f64>() - segment.offset_seconds;
         let entry_ms =
             to_milliseconds(segment.trim.as_ref().map_or(0.0, |trim| trim.start_seconds));
@@ -143,7 +149,7 @@ fn load_track(
             track.cues.push(cue);
         }
     }
-    Ok((tracks, background_image_count))
+    Ok(tracks)
 }
 
 fn to_milliseconds(seconds: f64) -> u64 {
@@ -168,26 +174,18 @@ fn read_document(
     image_directory: Option<&Path>,
 ) -> Result<TrackDocument, String> {
     let named = |error: SubtitleError| format!("{}: {error}", path.display());
-    if is_mxf(path) && is_imsc_track_file(path) {
-        let xml = read_imsc_track(path, keys)?;
-        return parse_imsc(&xml).map(TrackDocument::from).map_err(named);
-    }
     if let (true, Some(image_directory)) = (is_mxf(path), image_directory) {
+        let resource = |reference: &str| resource_png(image_directory, reference);
+        if is_imsc_track_file(path) {
+            let xml = read_imsc_track(path, keys, image_directory)?;
+            return parse_imsc(&xml, resource)
+                .map(TrackDocument::from)
+                .map_err(named);
+        }
         let xml = read_timed_text_track(path, keys, image_directory)?;
-        return parse_dcp_subtitle(&xml, |reference| {
-            let id = reference
-                .trim()
-                .strip_prefix(URN_UUID_PREFIX)
-                .unwrap_or(reference.trim())
-                .to_ascii_lowercase();
-            let image = image_directory.join(id).with_extension(PNG_EXTENSION);
-            image
-                .exists()
-                .then_some(image.clone())
-                .ok_or(SubtitleError::MissingImage(image))
-        })
-        .map(TrackDocument::from)
-        .map_err(named);
+        return parse_dcp_subtitle(&xml, resource)
+            .map(TrackDocument::from)
+            .map_err(named);
     }
     let xml =
         std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -195,6 +193,33 @@ fn read_document(
     parse_dcp_subtitle(&xml, |name| resolve_png(beside, name.trim()))
         .map(TrackDocument::from)
         .map_err(named)
+}
+
+// a urn:uuid reference, a bare uuid or a file name, to the PNG resource written out under its id
+fn resource_png(image_directory: &Path, reference: &str) -> Result<PathBuf, SubtitleError> {
+    let reference = reference.trim();
+    let id = uuid::Uuid::parse_str(reference.strip_prefix(URN_UUID_PREFIX).unwrap_or(reference))
+        .unwrap_or_else(|_| png_name_id(reference));
+    let image = image_directory
+        .join(id.to_string())
+        .with_extension(PNG_EXTENSION);
+    image
+        .exists()
+        .then_some(image)
+        .ok_or_else(|| SubtitleError::MissingImage(PathBuf::from(reference)))
+}
+
+// ST 2067-2 5.4.5 ids a PNG named by file as the type 5 uuid of its base name in the URL namespace
+fn png_name_id(reference: &str) -> uuid::Uuid {
+    let base_name = reference.rsplit('/').next().unwrap_or(reference);
+    let digest = Sha1::new()
+        .chain_update(uuid::Uuid::NAMESPACE_URL.as_bytes())
+        .chain_update(base_name.as_bytes())
+        .finalize();
+    let mut bytes = uuid::Bytes::default();
+    let length = bytes.len();
+    bytes.copy_from_slice(&digest[..length]);
+    uuid::Builder::from_sha1_bytes(bytes).into_uuid()
 }
 
 fn decryption(
@@ -212,8 +237,12 @@ fn decryption(
     }
 }
 
-// an AS-02 track file carries one IMSC document, its image profile PNGs are not read
-fn read_imsc_track(path: &Path, keys: Option<&ContentKeys>) -> Result<String, String> {
+// an AS-02 track file carries one IMSC document
+fn read_imsc_track(
+    path: &Path,
+    keys: Option<&ContentKeys>,
+    image_directory: &Path,
+) -> Result<String, String> {
     let named = |error: asdcplib::Error| format!("{}: {error}", path.display());
     let mut reader = asdcplib::as02::timed_text::MxfReader::new();
     reader.open_read(&path.to_string_lossy()).map_err(named)?;
@@ -222,6 +251,13 @@ fn read_imsc_track(path: &Path, keys: Option<&ContentKeys>) -> Result<String, St
     let xml =
         read_resource(|buffer| reader.read_timed_text_resource(buffer, decrypt.as_mut(), None))
             .map_err(named)?;
+    let resources = (0..reader.ancillary_resource_count().map_err(named)?)
+        .map(|index| reader.ancillary_resource_info(index))
+        .collect::<asdcplib::Result<Vec<_>>>()
+        .map_err(named)?;
+    write_png_resources(path, &resources, image_directory, |uuid, buffer| {
+        reader.read_ancillary_resource(uuid, buffer, decrypt.as_mut(), None)
+    })?;
     reader.close().map_err(named)?;
     String::from_utf8(xml).map_err(|error| format!("{}: {error}", path.display()))
 }
@@ -240,23 +276,36 @@ fn read_timed_text_track(
     let xml =
         read_resource(|buffer| reader.read_timed_text_resource(buffer, decrypt.as_mut(), None))
             .map_err(named)?;
-    let resource_count = reader.ancillary_resource_count().map_err(named)?;
-    for index in 0..resource_count {
-        let resource = reader.ancillary_resource_info(index).map_err(named)?;
+    let resources = (0..reader.ancillary_resource_count().map_err(named)?)
+        .map(|index| reader.ancillary_resource_info(index))
+        .collect::<asdcplib::Result<Vec<_>>>()
+        .map_err(named)?;
+    write_png_resources(path, &resources, image_directory, |uuid, buffer| {
+        reader.read_ancillary_resource(uuid, buffer, decrypt.as_mut(), None)
+    })?;
+    reader.close().map_err(named)?;
+    String::from_utf8(xml).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+// each PNG to `image_directory` as <uuid>.png, fonts left out
+fn write_png_resources(
+    path: &Path,
+    resources: &[asdcplib::timed_text::AncillaryResourceInfo],
+    image_directory: &Path,
+    mut read: impl FnMut(&[u8; 16], &mut [u8]) -> asdcplib::Result<usize>,
+) -> Result<(), String> {
+    for resource in resources {
         if resource.mime_type != asdcplib::timed_text::MimeType::Png {
             continue;
         }
-        let bytes = read_resource(|buffer| {
-            reader.read_ancillary_resource(&resource.uuid, buffer, decrypt.as_mut(), None)
-        })
-        .map_err(named)?;
+        let bytes = read_resource(|buffer| read(&resource.uuid, buffer))
+            .map_err(|error| format!("{}: {error}", path.display()))?;
         let file: PathBuf = image_directory
             .join(uuid::Uuid::from_bytes(resource.uuid).to_string())
             .with_extension(PNG_EXTENSION);
         std::fs::write(&file, bytes).map_err(|error| format!("{}: {error}", file.display()))?;
     }
-    reader.close().map_err(named)?;
-    String::from_utf8(xml).map_err(|error| format!("{}: {error}", path.display()))
+    Ok(())
 }
 
 fn read_resource(
@@ -549,13 +598,9 @@ mod tests {
         output
     }
 
-    #[test]
-    fn an_imsc_track_file_shows_its_text_on_the_composition_clock_and_warns_of_images() {
-        let directory = tempfile::tempdir().unwrap();
-        let text = imsc_track_file(directory.path(), "text", IMSC_TEXT);
-        let image = imsc_track_file(directory.path(), "image", IMSC_IMAGE);
-        // half a second into the second reel, playing 5 s of the file from 1 s in
-        let segment = |path: PathBuf| SubtitleSegment {
+    // half a second into the second reel, playing 5 s of the file from 1 s in
+    fn trimmed_segment(path: PathBuf) -> SubtitleSegment {
+        SubtitleSegment {
             path,
             reels: 1..2,
             offset_seconds: 0.5,
@@ -564,13 +609,29 @@ mod tests {
                 length_seconds: Some(5.0),
             }),
             language: None,
-        };
-        let reels = super::Reels {
+        }
+    }
+
+    fn two_reels() -> super::Reels {
+        super::Reels {
             starts_seconds: vec![0.0, 10.0],
             lengths_seconds: vec![10.0, 10.0],
-        };
+        }
+    }
 
-        let loaded = super::load(&[segment(text), segment(image)], &[], &reels, None).unwrap();
+    #[test]
+    fn an_imsc_track_file_shows_its_text_on_the_composition_clock_and_warns_of_unresolved_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let text = imsc_track_file(directory.path(), "text", IMSC_TEXT);
+        let image = imsc_track_file(directory.path(), "image", IMSC_IMAGE);
+
+        let loaded = super::load(
+            &[trimmed_segment(text), trimmed_segment(image.clone())],
+            &[],
+            &two_reels(),
+            None,
+        )
+        .unwrap();
 
         let [track] = loaded.subtitles.as_slice() else {
             panic!("both documents are English, so one track");
@@ -588,7 +649,125 @@ mod tests {
                 (11500, 12500, "Hello\nworld".to_string()),
             ]
         );
-        let warning = loaded.warning.expect("the image document warns");
-        assert!(warning.contains("image"), "{warning}");
+        let [warning] = loaded.warnings.as_slice() else {
+            panic!("one warning for the image document: {:?}", loaded.warnings);
+        };
+        assert!(
+            warning.contains(&image.display().to_string()) && warning.contains("Event1.png"),
+            "{warning}"
+        );
+    }
+
+    // through asdcplib's writer, since mxf_wrap refuses AS-02 resources
+    fn as02_image_track_file(
+        directory: &Path,
+        document: &str,
+        image_id: uuid::Uuid,
+        png_bytes: &[u8],
+    ) -> PathBuf {
+        let track_file = directory.join("image.mxf");
+        let mut writer = asdcplib::as02::timed_text::MxfWriter::new();
+        writer
+            .open_write_with_resources(
+                &track_file.to_string_lossy(),
+                &asdcplib::WriterInfo::default(),
+                &asdcplib::timed_text::TimedTextDescriptor {
+                    edit_rate: asdcplib::Rational::new(FRAMES_PER_SECOND as i32, 1),
+                    container_duration: 10 * FRAMES_PER_SECOND,
+                    asset_id: *uuid::Uuid::new_v4().as_bytes(),
+                    namespace_uri: "http://www.w3.org/ns/ttml/profile/imsc1/image".to_string(),
+                    ucs_encoding: "UTF-8".to_string(),
+                },
+                &[asdcplib::timed_text::AncillaryResourceInfo {
+                    uuid: *image_id.as_bytes(),
+                    mime_type: asdcplib::timed_text::MimeType::Png,
+                }],
+                16_384,
+            )
+            .unwrap();
+        writer
+            .write_timed_text_resource(document, None, None)
+            .unwrap();
+        writer
+            .write_ancillary_resource(png_bytes, image_id.as_bytes(), "image/png", None, None)
+            .unwrap();
+        writer.finalize().unwrap();
+        track_file
+    }
+
+    #[test]
+    fn an_imsc_image_track_file_shows_its_png_in_its_region_on_the_composition_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let image_id = uuid::Uuid::parse_str(IMAGE_ID).unwrap();
+        let document = format!(
+            r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="en"
+            xmlns:tts="http://www.w3.org/ns/ttml#styling"
+            xmlns:smpte="http://www.smpte-ra.org/schemas/2052-1/2010/smpte-tt" tts:extent="3840px 2160px">
+            <head><layout><region xml:id="cropped" tts:origin="1152px 1728px" tts:extent="1536px 108px"/></layout></head>
+            <body><div region="cropped" begin="2s" end="3s" smpte:backgroundImage="urn:uuid:{image_id}"/></body></tt>"#
+        );
+        let png = directory.path().join("cropped.png");
+        write_png(&png);
+        let png_bytes = std::fs::read(&png).unwrap();
+        let track_file = as02_image_track_file(directory.path(), &document, image_id, &png_bytes);
+
+        let loaded = super::load(&[trimmed_segment(track_file)], &[], &two_reels(), None).unwrap();
+
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let [track] = loaded.subtitles.as_slice() else {
+            panic!("one track");
+        };
+        let [cue] = track.cues.as_slice() else {
+            panic!("one image cue: {:?}", track.cues);
+        };
+        assert_eq!((cue.start_ms, cue.end_ms), (11500, 12500));
+        let image = cue.image.as_deref().expect("an image cue");
+        assert_eq!(std::fs::read(image).unwrap(), png_bytes);
+        assert_eq!(
+            cue.image_area,
+            Some(crate::subtitle_formats::FrameArea {
+                left: 30.0,
+                top: 80.0,
+                width: 40.0,
+                height: 5.0,
+            })
+        );
+    }
+
+    #[test]
+    fn an_imsc_image_named_by_file_is_found_by_its_name_based_resource_id() {
+        // the id asdcplib's as-02-wrap gives Event1.png, which the Plugfest image reel carries
+        let event_1_id = uuid::Uuid::parse_str("3dab08a2-6aab-57c3-bd80-e07d58bece3f").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let png = directory.path().join("Event1.png");
+        write_png(&png);
+        let png_bytes = std::fs::read(&png).unwrap();
+        let track_file = as02_image_track_file(
+            directory.path(),
+            r#"<tt xmlns="http://www.w3.org/ns/ttml" xml:lang="en"
+            xmlns:smpte="http://www.smpte-ra.org/schemas/2052-1/2010/smpte-tt"><body>
+            <div begin="2s" end="3s" smpte:backgroundImage="images/Event1.png"/>
+            <div begin="4s" end="5s" smpte:backgroundImage="Event2.png"/></body></tt>"#,
+            event_1_id,
+            &png_bytes,
+        );
+
+        let loaded = super::load(&[trimmed_segment(track_file)], &[], &two_reels(), None).unwrap();
+
+        let [cue] = loaded.subtitles[0].cues.as_slice() else {
+            panic!("one image cue: {:?}", loaded.subtitles[0].cues);
+        };
+        assert_eq!((cue.start_ms, cue.end_ms), (11500, 12500));
+        assert_eq!(
+            std::fs::read(cue.image.as_deref().unwrap()).unwrap(),
+            png_bytes
+        );
+        let [warning] = loaded.warnings.as_slice() else {
+            panic!("one warning for Event2.png: {:?}", loaded.warnings);
+        };
+        assert!(
+            warning.contains("Event2.png") && !warning.contains("Event1.png"),
+            "{warning}"
+        );
     }
 }

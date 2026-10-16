@@ -964,7 +964,8 @@ impl Scheduler {
                 .chain(
                     timeline
                         .and_then(|timeline| timeline.subtitles.as_ref())
-                        .and_then(|subtitles| subtitles.warning.clone()),
+                        .into_iter()
+                        .flat_map(|subtitles| subtitles.warnings.iter().cloned()),
                 )
                 .collect(),
             subtitle_track: self.subtitle.status(),

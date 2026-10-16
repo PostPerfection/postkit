@@ -26,7 +26,9 @@ use cosmic_text::{
 };
 
 use crate::grok_encoder::SampleOrder;
-use crate::subtitle_formats::{HAlign, Rgba, StyledCue, StyledRun, SubtitleError, VAlign};
+use crate::subtitle_formats::{
+    FrameArea, HAlign, Rgba, StyledCue, StyledRun, SubtitleError, VAlign,
+};
 
 /// Text height as a fraction of frame height when the caller names none. 1/22nd
 /// of the picture is about the DCI house style for a 2K subtitle.
@@ -1175,9 +1177,10 @@ fn fade_alpha(cue: &StyledCue, time_ms: u64, style: &BurnStyle) -> u8 {
     up.min(down) as u8
 }
 
-/// Decode a bitmap cue's PNG and place it. The image is scaled down to fit the
-/// frame if it is larger, and otherwise used at its own size, matching how an
-/// Interop bitmap sub is authored against a known picture size.
+/// Decode a bitmap cue's PNG and place it. An image with an `image_area` is
+/// stretched over that area. Otherwise it is scaled down to fit the frame if it
+/// is larger, and used at its own size, matching how an Interop bitmap sub is
+/// authored against a known picture size.
 fn render_bitmap_cue(
     path: &Path,
     cue: &StyledCue,
@@ -1186,41 +1189,54 @@ fn render_bitmap_cue(
     style: &BurnStyle,
 ) -> Result<PositionedBitmap, SubtitleError> {
     let (image_width, image_height, pixels) = decode_png_rgba(path)?;
-    let scale = (width as f32 / image_width as f32)
-        .min(height as f32 / image_height as f32)
-        .min(1.0);
-    let (scaled_width, scaled_height, scaled) = if scale >= 1.0 {
-        (image_width, image_height, pixels)
+    let (x, y, target_width, target_height) = match cue.image_area {
+        Some(area) => area_box(area, width, height),
+        None => {
+            let scale = (width as f32 / image_width as f32)
+                .min(height as f32 / image_height as f32)
+                .min(1.0);
+            let target_width = ((image_width as f32 * scale).round() as u32).max(1);
+            let target_height = ((image_height as f32 * scale).round() as u32).max(1);
+            let (x, y) = anchor(
+                cue,
+                style,
+                width,
+                height,
+                target_width as f32,
+                target_height as f32,
+            );
+            (x, y, target_width, target_height)
+        }
+    };
+    let scaled = if (target_width, target_height) == (image_width, image_height) {
+        pixels
     } else {
-        let target_width = ((image_width as f32 * scale).round() as u32).max(1);
-        let target_height = ((image_height as f32 * scale).round() as u32).max(1);
-        (
+        nearest_neighbour(
+            &pixels,
+            image_width,
+            image_height,
             target_width,
             target_height,
-            nearest_neighbour(
-                &pixels,
-                image_width,
-                image_height,
-                target_width,
-                target_height,
-            ),
         )
     };
-    let (x, y) = anchor(
-        cue,
-        style,
-        width,
-        height,
-        scaled_width as f32,
-        scaled_height as f32,
-    );
     Ok(PositionedBitmap {
         x,
         y,
-        width: scaled_width,
-        height: scaled_height,
+        width: target_width,
+        height: target_height,
         pixels: scaled,
     })
+}
+
+// left, top, width and height in frame pixels
+fn area_box(area: FrameArea, width: u32, height: u32) -> (i32, i32, u32, u32) {
+    let pixels = |percent: f32, frame: u32| percent / PERCENT_DIVISOR * frame as f32;
+    (
+        pixels(area.left, width).round() as i32,
+        pixels(area.top, height).round() as i32,
+        pixels(area.width, width).round().max(1.0) as u32,
+        pixels(area.height, height).round().max(1.0) as u32,
+    )
 }
 
 /// Decode a PNG to un-premultiplied RGBA8.
@@ -1575,6 +1591,39 @@ mod tests {
             out[0].y + 32 <= HEIGHT as i32,
             "bottom-anchored bitmap ran off the frame"
         );
+    }
+
+    #[test]
+    fn a_bitmap_cue_with_an_area_is_stretched_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let png_path = dir.path().join("cue.png");
+        write_solid_png(&png_path, 64, 32, [0, 255, 0, 255]);
+        let mut cue = StyledCue::text(0, 1000, Vec::new());
+        cue.image = Some(png_path);
+        cue.valign = Some(VAlign::Bottom);
+        cue.image_area = Some(FrameArea {
+            left: 25.0,
+            top: 50.0,
+            width: 50.0,
+            height: 10.0,
+        });
+        let mut raster = SubtitleRasterizer::new(None).unwrap();
+        let out = raster
+            .render(&[cue], 500, WIDTH, HEIGHT, &BurnStyle::default())
+            .unwrap();
+        let [bitmap] = out.as_slice() else {
+            panic!("one bitmap, got {}", out.len());
+        };
+        assert_eq!(
+            (bitmap.x, bitmap.y, bitmap.width, bitmap.height),
+            (
+                (WIDTH / 4) as i32,
+                (HEIGHT / 2) as i32,
+                WIDTH / 2,
+                (HEIGHT as f32 / 10.0).round() as u32
+            )
+        );
+        assert_eq!(&bitmap.pixels[..4], &[0, 255, 0, 255]);
     }
 
     fn write_solid_png(path: &Path, width: u32, height: u32, rgba: [u8; 4]) {

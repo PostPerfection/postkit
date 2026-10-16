@@ -183,6 +183,7 @@ fn parse_dialogue(
         valign: valign.or(base.valign),
         vposition: None,
         image: None,
+        image_area: None,
     })
 }
 

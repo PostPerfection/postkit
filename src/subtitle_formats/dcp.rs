@@ -156,6 +156,7 @@ pub fn parse_dcp_subtitle(
                                 valign: placed.valign,
                                 vposition: placed.vposition,
                                 image: Some(image(text.trim())?),
+                                image_area: None,
                             });
                         }
                     }
@@ -261,6 +262,7 @@ fn text_cue(start_ms: u64, end_ms: u64, mut lines: Vec<Line>) -> StyledCue {
         valign,
         vposition,
         image: None,
+        image_area: None,
     }
 }
 

@@ -69,6 +69,7 @@ pub fn parse_interop_png(xml_path: &Path) -> Result<Vec<StyledCue>, SubtitleErro
                         valign: attrs.valign,
                         vposition: attrs.vposition,
                         image: Some(path),
+                        image_area: None,
                     });
                 }
             }

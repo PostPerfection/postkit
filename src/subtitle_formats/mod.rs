@@ -57,6 +57,15 @@ pub enum VAlign {
     Bottom,
 }
 
+// in percent of the frame, from its top left corner
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameArea {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
 /// 8-bit RGBA colour (matches SMPTE subtitle FontColor ARGB channels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rgba {
@@ -134,6 +143,8 @@ pub struct StyledCue {
     pub vposition: Option<f32>,
     /// bitmap-subtitle image path (Interop PNG subs), resolved and validated.
     pub image: Option<PathBuf>,
+    // the image is stretched over this area, in place of align, valign and vposition
+    pub image_area: Option<FrameArea>,
 }
 
 impl StyledCue {
@@ -147,6 +158,7 @@ impl StyledCue {
             valign: None,
             vposition: None,
             image: None,
+            image_area: None,
         }
     }
 
