@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+use crate::composition_timeline::{PictureSegment, SegmentTrim, edl_segment, edl_uri};
 use crate::encode::{FrameRate, InputType, SourceColour};
 use crate::picture_processing::PictureProcessing;
 use crate::subtitle_retime::{SrtCue, format_srt, parse_srt};
@@ -19,6 +20,8 @@ const SMALLEST_24_BIT_SAMPLE: i32 = -(1 << 23);
 const BITS_PER_BYTE: u16 = 8;
 const MILLISECONDS_PER_SECOND: u64 = 1000;
 const COPY_BUFFER_BYTES: usize = 1 << 20;
+// the sound plays as a second stream beside the joined pictures, not as one more segment after them
+const EDL_SEPARATE_STREAM: &str = "!new_stream;!no_clip";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Timeline {
@@ -265,7 +268,7 @@ fn single_clip_frame_count(picture: &Path) -> Result<u64, String> {
 const SINGLE_CLIP_PICTURES: &str =
     "a one-clip timeline takes a video, a picture MXF, or a directory of images or codestreams";
 
-pub(crate) fn clip_name(index: usize, clip: &Clip) -> String {
+pub fn clip_name(index: usize, clip: &Clip) -> String {
     format!("clip {} ({})", index + 1, clip.picture.display())
 }
 
@@ -596,6 +599,37 @@ pub fn join_subtitles(timeline: &Timeline, output: &Path) -> Result<Option<PathB
     std::fs::write(output, format_srt(&joined))
         .map_err(|e| format!("cannot write {}: {e}", output.display()))?;
     Ok(Some(output.to_path_buf()))
+}
+
+pub fn mpv_edl_uri(timeline: &Timeline, sound: Option<&Path>) -> String {
+    let fps = timeline.fps;
+    let pictures: Vec<PictureSegment> = timeline
+        .clips
+        .iter()
+        .map(|clip| PictureSegment {
+            path: clip.picture.clone(),
+            trim: Some(SegmentTrim {
+                start_seconds: seconds_at(clip.in_frame, fps),
+                length_seconds: Some(seconds_at(clip.frame_count(), fps)),
+            }),
+        })
+        .collect();
+    let picture_uri = edl_uri(&pictures);
+    let Some(sound) = sound else {
+        return picture_uri;
+    };
+    let whole_timeline = SegmentTrim {
+        start_seconds: 0.0,
+        length_seconds: Some(seconds_at(timeline.total_frames(), fps)),
+    };
+    format!(
+        "{picture_uri};{EDL_SEPARATE_STREAM};{}",
+        edl_segment(sound, Some(&whole_timeline))
+    )
+}
+
+fn seconds_at(frame: u64, fps: FrameRate) -> f64 {
+    frame as f64 * f64::from(fps.denominator) / f64::from(fps.numerator)
 }
 
 #[cfg(test)]
@@ -1020,5 +1054,22 @@ mod tests {
         let timeline = timeline(vec![clip(Path::new("/a.mov"), 0, 1, ClipSound::None)]);
         assert_eq!(join_subtitles(&timeline, &output).unwrap(), None);
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn the_edl_trims_each_clip_and_plays_the_sound_beside_them() {
+        let timeline = timeline(vec![
+            clip(Path::new("/media/a,b.mov"), 12, 36, ClipSound::None),
+            clip(Path::new("/media/c.mov"), 0, 48, ClipSound::None),
+        ]);
+        assert_eq!(
+            mpv_edl_uri(&timeline, Some(Path::new("/work/sound.wav"))),
+            "edl://%14%/media/a,b.mov,0.5,1;%12%/media/c.mov,0,2;!new_stream;!no_clip;\
+             %15%/work/sound.wav,0,3"
+        );
+        assert_eq!(
+            mpv_edl_uri(&timeline, None),
+            "edl://%14%/media/a,b.mov,0.5,1;%12%/media/c.mov,0,2"
+        );
     }
 }

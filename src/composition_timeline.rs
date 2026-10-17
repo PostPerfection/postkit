@@ -574,15 +574,18 @@ fn seconds_per_edit_unit(edit_rate: &str) -> Option<f64> {
 /// `;`, played as a single virtual timeline. Every path is length-prefixed as
 /// `%<bytes>%<path>` because a bare value may not hold `,`, `;`, newline or `!`.
 /// A trimmed reel adds the positional `,start,length` in seconds.
-fn edl_uri(segments: &[PictureSegment]) -> String {
-    let segments: Vec<String> = segments.iter().map(edl_segment).collect();
+pub(crate) fn edl_uri(segments: &[PictureSegment]) -> String {
+    let segments: Vec<String> = segments
+        .iter()
+        .map(|segment| edl_segment(&segment.path, segment.trim.as_ref()))
+        .collect();
     format!("edl://{}", segments.join(";"))
 }
 
-fn edl_segment(segment: &PictureSegment) -> String {
-    let path = segment.path.to_string_lossy();
+pub(crate) fn edl_segment(path: &Path, trim: Option<&SegmentTrim>) -> String {
+    let path = path.to_string_lossy();
     let file = format!("%{}%{path}", path.len());
-    let Some(trim) = &segment.trim else {
+    let Some(trim) = trim else {
         return file;
     };
     match trim.length_seconds {
