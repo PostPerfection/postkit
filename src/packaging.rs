@@ -442,16 +442,69 @@ impl ImfTrackKind {
     }
 }
 
-/// One resource of an IMF CPL, pointing at a track file.
+/// One resource of an IMF CPL, playing a window of a track file.
 #[derive(Debug, Clone)]
 pub struct ImfResource {
     /// Bare UUID of the referenced track file.
     pub track_file_uuid: String,
+    /// The track file's own length, written as IntrinsicDuration.
     pub duration: u64,
-    pub kind: ImfTrackKind,
+    /// First edit unit played. 0, the ST 2067-3 default, is not written.
+    pub entry_point: u64,
+    pub source_duration: u64,
     /// Bare UUID linking this resource to an EssenceDescriptorList entry
     /// (ST 2067-2 SourceEncoding). None keeps the resource unchanged.
     pub source_encoding: Option<String>,
+}
+
+impl ImfResource {
+    pub fn whole_track_file(
+        track_file_uuid: String,
+        duration: u64,
+        source_encoding: Option<String>,
+    ) -> ImfResource {
+        ImfResource {
+            track_file_uuid,
+            duration,
+            entry_point: 0,
+            source_duration: duration,
+            source_encoding,
+        }
+    }
+}
+
+/// One virtual track's resources inside one segment, played in order.
+#[derive(Debug, Clone)]
+pub struct ImfSequence {
+    /// Bare UUID, the same in every segment the virtual track plays through.
+    pub track_id: String,
+    pub kind: ImfTrackKind,
+    pub resources: Vec<ImfResource>,
+}
+
+impl ImfSequence {
+    /// A virtual track of its own playing one whole track file.
+    pub fn whole_track_file(
+        kind: ImfTrackKind,
+        track_file_uuid: String,
+        duration: u64,
+        source_encoding: Option<String>,
+    ) -> ImfSequence {
+        ImfSequence {
+            track_id: uuid::Uuid::new_v4().to_string(),
+            kind,
+            resources: vec![ImfResource::whole_track_file(
+                track_file_uuid,
+                duration,
+                source_encoding,
+            )],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ImfSegment {
+    pub sequences: Vec<ImfSequence>,
 }
 
 /// One entry of an IMF CPL EssenceDescriptorList (ST 2067-3): an Id matched by a
@@ -482,7 +535,7 @@ pub struct ImfCpl {
     pub issue_date: String,
     pub fps_num: u32,
     pub fps_den: u32,
-    pub resources: Vec<ImfResource>,
+    pub segments: Vec<ImfSegment>,
     /// Composition languages (RFC 5646) written as a ST 2067-3 LocaleList. Empty
     /// keeps the output unchanged.
     pub languages: Vec<String>,
@@ -593,30 +646,29 @@ impl ImfCpl {
         }
         xml.push_str("  </ExtensionProperties>\n");
         xml.push_str("  <SegmentList>\n");
-        xml.push_str("    <Segment>\n");
-        let _ = writeln!(xml, "      <Id>urn:uuid:{}</Id>", uuid::Uuid::new_v4());
-        xml.push_str("      <SequenceList>\n");
-
-        // one virtual track per essence kind, image then audio then subtitle
-        for kind in [
-            ImfTrackKind::Image,
-            ImfTrackKind::Audio,
-            ImfTrackKind::Subtitle,
-        ] {
-            for r in self.resources.iter().filter(|r| r.kind == kind) {
-                self.write_sequence(&mut xml, r, fps_num, fps_den);
+        for segment in &self.segments {
+            xml.push_str("    <Segment>\n");
+            let _ = writeln!(xml, "      <Id>urn:uuid:{}</Id>", uuid::Uuid::new_v4());
+            xml.push_str("      <SequenceList>\n");
+            for kind in [
+                ImfTrackKind::Image,
+                ImfTrackKind::Audio,
+                ImfTrackKind::Subtitle,
+            ] {
+                for sequence in segment.sequences.iter().filter(|s| s.kind == kind) {
+                    self.write_sequence(&mut xml, sequence, fps_num, fps_den);
+                }
             }
+            xml.push_str("      </SequenceList>\n");
+            xml.push_str("    </Segment>\n");
         }
-
-        xml.push_str("      </SequenceList>\n");
-        xml.push_str("    </Segment>\n");
         xml.push_str("  </SegmentList>\n");
         xml.push_str("</CompositionPlaylist>\n");
         xml
     }
 
-    fn write_sequence(&self, xml: &mut String, r: &ImfResource, fps_num: u32, fps_den: u32) {
-        let el = r.kind.sequence_element();
+    fn write_sequence(&self, xml: &mut String, sequence: &ImfSequence, fps_num: u32, fps_den: u32) {
+        let el = sequence.kind.sequence_element();
         let _ = writeln!(
             xml,
             "        <cc:{el} xmlns:cc=\"{}\">",
@@ -626,47 +678,60 @@ impl ImfCpl {
         let _ = writeln!(
             xml,
             "          <TrackId>urn:uuid:{}</TrackId>",
-            uuid::Uuid::new_v4()
+            sequence.track_id
         );
         // a SequenceType takes Id, TrackId and ResourceList, no edit rate of its own
         xml.push_str("          <ResourceList>\n");
-        // BaseResourceType is abstract, so a track file resource names its type
-        xml.push_str("            <Resource xsi:type=\"TrackFileResourceType\">\n");
-        let _ = writeln!(
-            xml,
-            "              <Id>urn:uuid:{}</Id>",
-            uuid::Uuid::new_v4()
-        );
-        // the BaseResourceType children come first, then what TrackFileResourceType adds
-        let _ = writeln!(
-            xml,
-            "              <EditRate>{fps_num} {fps_den}</EditRate>"
-        );
-        let _ = writeln!(
-            xml,
-            "              <IntrinsicDuration>{}</IntrinsicDuration>",
-            r.duration
-        );
-        let _ = writeln!(
-            xml,
-            "              <SourceDuration>{}</SourceDuration>",
-            r.duration
-        );
-        if let Some(se) = &r.source_encoding {
-            let _ = writeln!(
-                xml,
-                "              <SourceEncoding>urn:uuid:{se}</SourceEncoding>"
-            );
+        for r in &sequence.resources {
+            write_resource(xml, r, fps_num, fps_den);
         }
-        let _ = writeln!(
-            xml,
-            "              <TrackFileId>urn:uuid:{}</TrackFileId>",
-            r.track_file_uuid
-        );
-        xml.push_str("            </Resource>\n");
         xml.push_str("          </ResourceList>\n");
         let _ = writeln!(xml, "        </cc:{el}>");
     }
+}
+
+fn write_resource(xml: &mut String, r: &ImfResource, fps_num: u32, fps_den: u32) {
+    // BaseResourceType is abstract, so a track file resource names its type
+    xml.push_str("            <Resource xsi:type=\"TrackFileResourceType\">\n");
+    let _ = writeln!(
+        xml,
+        "              <Id>urn:uuid:{}</Id>",
+        uuid::Uuid::new_v4()
+    );
+    // the BaseResourceType children come first, then what TrackFileResourceType adds
+    let _ = writeln!(
+        xml,
+        "              <EditRate>{fps_num} {fps_den}</EditRate>"
+    );
+    let _ = writeln!(
+        xml,
+        "              <IntrinsicDuration>{}</IntrinsicDuration>",
+        r.duration
+    );
+    if r.entry_point != 0 {
+        let _ = writeln!(
+            xml,
+            "              <EntryPoint>{}</EntryPoint>",
+            r.entry_point
+        );
+    }
+    let _ = writeln!(
+        xml,
+        "              <SourceDuration>{}</SourceDuration>",
+        r.source_duration
+    );
+    if let Some(se) = &r.source_encoding {
+        let _ = writeln!(
+            xml,
+            "              <SourceEncoding>urn:uuid:{se}</SourceEncoding>"
+        );
+    }
+    let _ = writeln!(
+        xml,
+        "              <TrackFileId>urn:uuid:{}</TrackFileId>",
+        r.track_file_uuid
+    );
+    xml.push_str("            </Resource>\n");
 }
 
 #[cfg(test)]
@@ -1239,20 +1304,12 @@ mod tests {
             issue_date: "2024-01-01T00:00:00+00:00".into(),
             fps_num: 24,
             fps_den: 1,
-            resources: vec![
-                ImfResource {
-                    track_file_uuid: "aud".into(),
-                    duration: 240,
-                    kind: ImfTrackKind::Audio,
-                    source_encoding: None,
-                },
-                ImfResource {
-                    track_file_uuid: "vid".into(),
-                    duration: 240,
-                    kind: ImfTrackKind::Image,
-                    source_encoding: None,
-                },
-            ],
+            segments: vec![ImfSegment {
+                sequences: vec![
+                    ImfSequence::whole_track_file(ImfTrackKind::Audio, "aud".into(), 240, None),
+                    ImfSequence::whole_track_file(ImfTrackKind::Image, "vid".into(), 240, None),
+                ],
+            }],
             languages: vec![],
             essence_descriptors: vec![],
             max_cll: None,
@@ -1315,11 +1372,13 @@ mod tests {
             uuid: "cpl".into(),
             fps_num: 24,
             fps_den: 1,
-            resources: vec![ImfResource {
-                track_file_uuid: "pic".into(),
-                duration: 240,
-                kind: ImfTrackKind::Image,
-                source_encoding: Some("desc".into()),
+            segments: vec![ImfSegment {
+                sequences: vec![ImfSequence::whole_track_file(
+                    ImfTrackKind::Image,
+                    "pic".into(),
+                    240,
+                    Some("desc".into()),
+                )],
             }],
             ..Default::default()
         };
@@ -1359,6 +1418,148 @@ mod tests {
         assert!(
             !head.contains("<EditRate>"),
             "sequence carries an edit rate: {head}"
+        );
+    }
+
+    // the generated Id and TrackId values, which are fresh on every write
+    fn masked_ids(xml: &str) -> String {
+        let mut masked = String::new();
+        for line in xml.lines() {
+            let trimmed = line.trim_start();
+            let indent = &line[..line.len() - trimmed.len()];
+            let element = ["Id", "TrackId"]
+                .into_iter()
+                .find(|element| trimmed.starts_with(&format!("<{element}>")));
+            match element {
+                Some(element) => {
+                    let _ = writeln!(masked, "{indent}<{element}>masked</{element}>");
+                }
+                None => {
+                    let _ = writeln!(masked, "{line}");
+                }
+            }
+        }
+        masked
+    }
+
+    fn segment_list(xml: &str) -> &str {
+        let open = xml.find("  <SegmentList>").unwrap();
+        let close = xml.find("  </SegmentList>\n").unwrap();
+        &xml[open..close + "  </SegmentList>\n".len()]
+    }
+
+    #[test]
+    fn one_whole_track_file_writes_one_segment_with_no_entry_point() {
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            segments: vec![ImfSegment {
+                sequences: vec![ImfSequence::whole_track_file(
+                    ImfTrackKind::Image,
+                    "pic".into(),
+                    240,
+                    Some("desc".into()),
+                )],
+            }],
+            ..Default::default()
+        };
+        let cc = ns::CPL_IMF_CC;
+        assert_eq!(
+            masked_ids(segment_list(&cpl.to_xml())),
+            format!(
+                "  <SegmentList>\n\
+                 \x20   <Segment>\n\
+                 \x20     <Id>masked</Id>\n\
+                 \x20     <SequenceList>\n\
+                 \x20       <cc:MainImageSequence xmlns:cc=\"{cc}\">\n\
+                 \x20         <Id>masked</Id>\n\
+                 \x20         <TrackId>masked</TrackId>\n\
+                 \x20         <ResourceList>\n\
+                 \x20           <Resource xsi:type=\"TrackFileResourceType\">\n\
+                 \x20             <Id>masked</Id>\n\
+                 \x20             <EditRate>24 1</EditRate>\n\
+                 \x20             <IntrinsicDuration>240</IntrinsicDuration>\n\
+                 \x20             <SourceDuration>240</SourceDuration>\n\
+                 \x20             <SourceEncoding>urn:uuid:desc</SourceEncoding>\n\
+                 \x20             <TrackFileId>urn:uuid:pic</TrackFileId>\n\
+                 \x20           </Resource>\n\
+                 \x20         </ResourceList>\n\
+                 \x20       </cc:MainImageSequence>\n\
+                 \x20     </SequenceList>\n\
+                 \x20   </Segment>\n\
+                 \x20 </SegmentList>\n"
+            )
+        );
+    }
+
+    fn values_of<'a>(xml: &'a str, element: &str) -> Vec<&'a str> {
+        let open = format!("<{element}>");
+        let close = format!("</{element}>");
+        xml.split(open.as_str())
+            .skip(1)
+            .map(|rest| rest.split(close.as_str()).next().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_track_file_split_over_two_segments_keeps_one_track_id() {
+        let first_clip = |entry_point, source_duration| ImfResource {
+            track_file_uuid: "first".into(),
+            duration: 6,
+            entry_point,
+            source_duration,
+            source_encoding: None,
+        };
+        let picture = |resources| ImfSequence {
+            track_id: "picture-track".into(),
+            kind: ImfTrackKind::Image,
+            resources,
+        };
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            segments: vec![
+                ImfSegment {
+                    sequences: vec![picture(vec![first_clip(0, 4)])],
+                },
+                ImfSegment {
+                    sequences: vec![picture(vec![
+                        first_clip(4, 2),
+                        ImfResource::whole_track_file("second".into(), 6, None),
+                    ])],
+                },
+            ],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        let segments: Vec<&str> = xml.split("<Segment>").skip(1).collect();
+        assert_eq!(segments.len(), 2, "{xml}");
+        assert_eq!(
+            values_of(&xml, "TrackId"),
+            vec!["urn:uuid:picture-track"; 2]
+        );
+        let segment_ids: Vec<&str> = segments
+            .iter()
+            .map(|segment| values_of(segment, "Id")[0])
+            .collect();
+        assert_ne!(segment_ids[0], segment_ids[1]);
+        let sequence_ids: Vec<&str> = segments
+            .iter()
+            .map(|segment| values_of(segment, "Id")[1])
+            .collect();
+        assert_ne!(sequence_ids[0], sequence_ids[1]);
+        assert_eq!(values_of(segments[0], "EntryPoint"), Vec::<&str>::new());
+        assert_eq!(values_of(segments[1], "EntryPoint"), vec!["4"]);
+        assert_eq!(values_of(&xml, "SourceDuration"), vec!["4", "2", "6"]);
+        assert_eq!(values_of(&xml, "IntrinsicDuration"), vec!["6", "6", "6"]);
+        let resource = segments[1].split("<Resource ").nth(1).unwrap();
+        assert!(
+            resource.find("<IntrinsicDuration>").unwrap() < resource.find("<EntryPoint>").unwrap()
+                && resource.find("<EntryPoint>").unwrap()
+                    < resource.find("<SourceDuration>").unwrap(),
+            "EntryPoint sits between IntrinsicDuration and SourceDuration: {resource}"
         );
     }
 
@@ -1473,11 +1674,13 @@ mod tests {
             uuid: "cpl".into(),
             fps_num: 24,
             fps_den: 1,
-            resources: vec![ImfResource {
-                track_file_uuid: "aud".into(),
-                duration: 240,
-                kind: ImfTrackKind::Audio,
-                source_encoding: Some(se.into()),
+            segments: vec![ImfSegment {
+                sequences: vec![ImfSequence::whole_track_file(
+                    ImfTrackKind::Audio,
+                    "aud".into(),
+                    240,
+                    Some(se.into()),
+                )],
             }],
             essence_descriptors: vec![ImfEssenceDescriptor {
                 id: se.into(),
@@ -1559,12 +1762,22 @@ mod tests {
                 issue_date: "2024-01-01T00:00:00+00:00".into(),
                 fps_num: 24,
                 fps_den: 1,
-                resources: vec![ImfResource {
-                    track_file_uuid: "aaaaaaaa-1111-2222-3333-444444444444".into(),
-                    duration: 240,
-                    kind: ImfTrackKind::Audio,
-                    source_encoding: Some(se.into()),
-                }],
+                // a second segment plays the rest of the same track file through the same track
+                segments: [(0, 100), (100, 140)]
+                    .map(|(entry_point, source_duration)| ImfSegment {
+                        sequences: vec![ImfSequence {
+                            track_id: "bbbbbbbb-1111-2222-3333-444444444444".into(),
+                            kind: ImfTrackKind::Audio,
+                            resources: vec![ImfResource {
+                                track_file_uuid: "aaaaaaaa-1111-2222-3333-444444444444".into(),
+                                duration: 240,
+                                entry_point,
+                                source_duration,
+                                source_encoding: Some(se.into()),
+                            }],
+                        }],
+                    })
+                    .to_vec(),
                 languages: vec!["de-DE".into(), "en-US".into()],
                 essence_descriptors: vec![ImfEssenceDescriptor {
                     id: se.into(),

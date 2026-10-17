@@ -400,7 +400,7 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::packaging::{
-        AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ImfCpl, ImfResource, ImfTrackKind,
+        AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ImfCpl, ImfSegment, ImfSequence, ImfTrackKind,
         PackingList, PklAsset, ns,
     };
 
@@ -448,11 +448,13 @@ mod tests {
             issue_date: "2026-08-17T09:00:00+00:00".into(),
             fps_num: 24,
             fps_den: 1,
-            resources: vec![ImfResource {
-                track_file_uuid: PICTURE_ID.into(),
-                duration: 480,
-                kind: ImfTrackKind::Image,
-                source_encoding: None,
+            segments: vec![ImfSegment {
+                sequences: vec![ImfSequence::whole_track_file(
+                    ImfTrackKind::Image,
+                    PICTURE_ID.into(),
+                    480,
+                    None,
+                )],
             }],
             ..Default::default()
         }

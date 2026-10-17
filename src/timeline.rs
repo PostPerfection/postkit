@@ -175,6 +175,96 @@ impl Clip {
     }
 }
 
+pub enum TimelineShape {
+    SingleClip(SingleClipBuild),
+    MultiClip,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SingleClipBuild {
+    pub picture: PathBuf,
+    pub trim_start_frames: u64,
+    pub trim_end_frames: u64,
+    pub audio: Option<PathBuf>,
+    // the picture's own sound is not taken either
+    pub silent: bool,
+    pub subtitle: Option<PathBuf>,
+    // the subtitle is timed against the clip's source
+    pub subtitle_from_clip: bool,
+    pub reel_split_frames: Vec<u64>,
+}
+
+pub fn shape(timeline: &Timeline) -> Result<TimelineShape, String> {
+    let [clip] = timeline.clips.as_slice() else {
+        return Ok(TimelineShape::MultiClip);
+    };
+    timeline.check()?;
+    let name = clip_name(0, clip);
+    if clip.source_colour != SourceColour::default() {
+        return Err(format!(
+            "{name} carries its own source colour, and a one-clip timeline takes the colour from \
+             --source-colourspace"
+        ));
+    }
+    if !clip.picture_processing.is_identity() {
+        return Err(format!(
+            "{name} carries its own picture processing, and a one-clip timeline takes it from the \
+             picture flags"
+        ));
+    }
+    refuse_two_subtitle_sources(timeline)?;
+    let source_frames =
+        single_clip_frame_count(&clip.picture).map_err(|e| format!("{name}: {e}"))?;
+    let audio = match (&timeline.sound, &clip.sound) {
+        (SoundTrack::Override(path), _) | (SoundTrack::PerClip, ClipSound::File(path)) => {
+            Some(path.clone())
+        }
+        (SoundTrack::PerClip, _) => None,
+    };
+    Ok(TimelineShape::SingleClip(SingleClipBuild {
+        picture: clip.picture.clone(),
+        trim_start_frames: clip.in_frame,
+        trim_end_frames: source_frames - clip.out_frame,
+        audio,
+        silent: timeline.sound == SoundTrack::PerClip && clip.sound == ClipSound::None,
+        subtitle: clip.subtitle.clone().or_else(|| timeline.subtitle.clone()),
+        subtitle_from_clip: clip.subtitle.is_some(),
+        reel_split_frames: timeline.reel_starts.clone(),
+    }))
+}
+
+pub fn refuse_two_subtitle_sources(timeline: &Timeline) -> Result<(), String> {
+    let Some((index, clip)) = timeline
+        .clips
+        .iter()
+        .enumerate()
+        .find(|(_, clip)| clip.subtitle.is_some())
+    else {
+        return Ok(());
+    };
+    match &timeline.subtitle {
+        Some(subtitle) => Err(format!(
+            "the timeline's subtitle {} and the subtitle of {} both time the subtitle track: keep \
+             one",
+            subtitle.display(),
+            clip_name(index, clip)
+        )),
+        None => Ok(()),
+    }
+}
+
+// counted the way a create command counts the picture it trims
+fn single_clip_frame_count(picture: &Path) -> Result<u64, String> {
+    match crate::encode::detect_input_type(picture) {
+        InputType::ImageSequence if !picture.is_dir() => Err(SINGLE_CLIP_PICTURES.to_string()),
+        InputType::Unknown => Err(SINGLE_CLIP_PICTURES.to_string()),
+        _ => Ok(probe_source(picture)?.frames),
+    }
+}
+
+const SINGLE_CLIP_PICTURES: &str =
+    "a one-clip timeline takes a video, a picture MXF, or a directory of images or codestreams";
+
 pub(crate) fn clip_name(index: usize, clip: &Clip) -> String {
     format!("clip {} ({})", index + 1, clip.picture.display())
 }
@@ -571,6 +661,104 @@ mod tests {
             .samples::<i32>()
             .map(Result::unwrap)
             .collect()
+    }
+
+    const CODESTREAM_FRAMES: u64 = 10;
+
+    fn codestream_directory(directory: &Path) -> PathBuf {
+        std::fs::create_dir_all(directory).unwrap();
+        for frame in 0..CODESTREAM_FRAMES {
+            std::fs::write(directory.join(format!("frame_{frame:08}.j2c")), [0u8]).unwrap();
+        }
+        directory.to_path_buf()
+    }
+
+    #[test]
+    fn one_clip_maps_its_in_and_out_points_onto_the_trims() {
+        let directory = tempfile::tempdir().unwrap();
+        let picture = codestream_directory(&directory.path().join("feature"));
+        let mut one_clip = timeline(vec![clip(&picture, 2, 7, ClipSound::None)]);
+        one_clip.reel_starts = vec![3];
+
+        let TimelineShape::SingleClip(build) = shape(&one_clip).unwrap() else {
+            panic!("one clip is the one-picture build");
+        };
+        assert_eq!(
+            build,
+            SingleClipBuild {
+                picture,
+                trim_start_frames: 2,
+                trim_end_frames: CODESTREAM_FRAMES - 7,
+                audio: None,
+                silent: true,
+                subtitle: None,
+                subtitle_from_clip: false,
+                reel_split_frames: vec![3],
+            }
+        );
+    }
+
+    #[test]
+    fn one_clip_takes_the_override_or_its_own_sound_and_subtitle() {
+        let directory = tempfile::tempdir().unwrap();
+        let picture = codestream_directory(&directory.path().join("feature"));
+        let clip_wav = directory.path().join("clip.wav");
+        let mut with_clip_sound = clip(&picture, 0, 10, ClipSound::File(clip_wav.clone()));
+        with_clip_sound.subtitle = Some(directory.path().join("clip.srt"));
+        let mut one_clip = timeline(vec![with_clip_sound]);
+
+        let TimelineShape::SingleClip(build) = shape(&one_clip).unwrap() else {
+            panic!("one clip is the one-picture build");
+        };
+        assert_eq!(build.audio, Some(clip_wav));
+        assert!(!build.silent);
+        assert_eq!(build.subtitle, Some(directory.path().join("clip.srt")));
+        assert!(build.subtitle_from_clip);
+
+        let mix = directory.path().join("mix.wav");
+        one_clip.sound = SoundTrack::Override(mix.clone());
+        one_clip.clips[0].subtitle = None;
+        one_clip.subtitle = Some(directory.path().join("timeline.srt"));
+        let TimelineShape::SingleClip(build) = shape(&one_clip).unwrap() else {
+            panic!("one clip is the one-picture build");
+        };
+        assert_eq!(build.audio, Some(mix));
+        assert_eq!(build.subtitle, Some(directory.path().join("timeline.srt")));
+        assert!(!build.subtitle_from_clip);
+    }
+
+    #[test]
+    fn one_clip_refuses_two_subtitle_sources_and_its_own_colour() {
+        let directory = tempfile::tempdir().unwrap();
+        let picture = codestream_directory(&directory.path().join("feature"));
+        let mut with_subtitle = clip(&picture, 0, 10, ClipSound::None);
+        with_subtitle.subtitle = Some(directory.path().join("clip.srt"));
+        let mut one_clip = timeline(vec![with_subtitle]);
+        one_clip.subtitle = Some(directory.path().join("timeline.srt"));
+        let Err(refusal) = shape(&one_clip) else {
+            panic!("two subtitle sources have to be refused");
+        };
+        assert!(
+            refusal.contains("timeline.srt") && refusal.contains("clip 1"),
+            "{refusal}"
+        );
+
+        let mut coloured = clip(&picture, 0, 10, ClipSound::None);
+        coloured.source_colour = SourceColour::KeepRgb;
+        let Err(refusal) = shape(&timeline(vec![coloured])) else {
+            panic!("a clip colour has no single-picture field to go to");
+        };
+        assert!(refusal.contains("--source-colourspace"), "{refusal}");
+    }
+
+    #[test]
+    fn more_than_one_clip_is_the_multi_clip_build() {
+        let picture = Path::new("/media/a.mov");
+        let two_clips = timeline(vec![
+            clip(picture, 0, 1, ClipSound::None),
+            clip(picture, 0, 1, ClipSound::None),
+        ]);
+        assert!(matches!(shape(&two_clips), Ok(TimelineShape::MultiClip)));
     }
 
     #[test]

@@ -3,8 +3,8 @@ use crate::mxf_wrap::{
     EssenceType, MxfStandard, MxfWrapOptions, mxf_wrap, rec709_sdr_picture_colour,
 };
 use crate::packaging::{
-    App2eEdition, AssetMap, AssetMapAsset, ImfCpl, ImfEssenceDescriptor, ImfResource, ImfTrackKind,
-    PackingList, PklAsset, ns,
+    App2eEdition, AssetMap, AssetMapAsset, ImfCpl, ImfEssenceDescriptor, ImfSegment, ImfSequence,
+    ImfTrackKind, PackingList, PklAsset, ns,
 };
 use asdcplib::crypto::{AesEncContext, HmacContext};
 use asdcplib::jp2k::{CodestreamHeader, PictureDescriptor};
@@ -64,20 +64,17 @@ pub(crate) fn write_imp(directory: &Path, encrypted_picture: bool) -> PathBuf {
         title: TITLE.into(),
         fps_num: EDIT_RATE.0,
         fps_den: EDIT_RATE.1,
-        resources: vec![
-            ImfResource {
-                track_file_uuid: PICTURE_ID.into(),
-                duration: FRAMES,
-                kind: ImfTrackKind::Image,
-                source_encoding: Some(PICTURE_DESCRIPTOR_ID.into()),
-            },
-            ImfResource {
-                track_file_uuid: SOUND_ID.into(),
-                duration: FRAMES,
-                kind: ImfTrackKind::Audio,
-                source_encoding: None,
-            },
-        ],
+        segments: vec![ImfSegment {
+            sequences: vec![
+                ImfSequence::whole_track_file(
+                    ImfTrackKind::Image,
+                    PICTURE_ID.into(),
+                    FRAMES,
+                    Some(PICTURE_DESCRIPTOR_ID.into()),
+                ),
+                ImfSequence::whole_track_file(ImfTrackKind::Audio, SOUND_ID.into(), FRAMES, None),
+            ],
+        }],
         essence_descriptors: vec![ImfEssenceDescriptor {
             id: PICTURE_DESCRIPTOR_ID.into(),
             body: PICTURE_DESCRIPTOR.into(),
