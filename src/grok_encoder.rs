@@ -152,6 +152,7 @@ pub struct CompressParams {
     /// Encoder threads the pipeline runs, 0 for one per available CPU
     pub encode_threads: u32,
     pub detect_picture_findings: bool,
+    pub first_output_frame: u64,
 }
 
 /// Bits a sample carries in the packed rgb48 layout the burns read.
@@ -196,7 +197,12 @@ impl SourcePreparation {
     /// Burn the subtitles in, then the watermark, then convert the colour. A
     /// packed 16-bit rgb48 frame takes all three, in either byte order; planar
     /// components take the burns alone.
-    fn apply(&self, frame: &mut RawFrame, compressor_transform: bool) -> Result<(), String> {
+    fn apply(
+        &self,
+        frame: &mut RawFrame,
+        first_output_frame: u64,
+        compressor_transform: bool,
+    ) -> Result<(), String> {
         if self.is_empty() {
             return Ok(());
         }
@@ -207,7 +213,7 @@ impl SourcePreparation {
                     .to_string(),
             );
         }
-        let index = frame.index();
+        let index = first_output_frame + frame.index();
         match frame {
             RawFrame::Packed {
                 data,
@@ -343,6 +349,7 @@ impl Default for CompressParams {
             threads_per_codec: 1,
             encode_threads: 0,
             detect_picture_findings: false,
+            first_output_frame: 0,
         }
     }
 }
@@ -662,9 +669,11 @@ where
     let writer_first_error = first_error.clone();
     let writer_phase_clocks = phase_clocks.clone();
     let writer_input_queue = input_queue.clone();
+    let first_output_frame = params.first_output_frame;
     let writer_handle = std::thread::spawn(move || {
         for frame in writer_rx {
-            let path = writer_output_dir.join(format!("frame_{:08}.j2c", frame.index));
+            let path = writer_output_dir
+                .join(format!("frame_{:08}.j2c", first_output_frame + frame.index));
             let write_start = std::time::Instant::now();
             let written = std::fs::write(&path, &frame.data);
             writer_phase_clocks.add(EncodePhase::CodestreamWrite, write_start.elapsed());
@@ -936,9 +945,11 @@ fn encoder_thread_fn(
         };
 
         let prepare_start = std::time::Instant::now();
-        let prepared = params
-            .source_preparation
-            .apply(&mut frame, params.apply_xyz_transform);
+        let prepared = params.source_preparation.apply(
+            &mut frame,
+            params.first_output_frame,
+            params.apply_xyz_transform,
+        );
         phase_clocks.add(EncodePhase::Preparation, prepare_start.elapsed());
 
         if let Err(e) = prepared {
@@ -2578,7 +2589,7 @@ mod tests {
             ..SourcePreparation::default()
         };
         let mut packed = one_red_packed_frame();
-        prep.apply(&mut packed, false).unwrap();
+        prep.apply(&mut packed, 0, false).unwrap();
         let RawFrame::Packed { data, .. } = &packed else {
             panic!("frame changed shape");
         };
@@ -2586,7 +2597,7 @@ mod tests {
         assert_eq!(u16::from_be_bytes([data[0], data[1]]), want[0]);
 
         // converting twice would be silently wrong colour, so it fails instead
-        assert!(prep.apply(&mut packed, true).is_err());
+        assert!(prep.apply(&mut packed, 0, true).is_err());
 
         let mut planar = RawFrame::Planar {
             components: [vec![0i32], vec![0], vec![0]],
@@ -2595,14 +2606,14 @@ mod tests {
             precision: 16,
             index: 0,
         };
-        assert!(prep.apply(&mut planar, false).is_err());
+        assert!(prep.apply(&mut planar, 0, false).is_err());
     }
 
     #[test]
     fn empty_source_preparation_leaves_the_frame_alone() {
         let prep = SourcePreparation::default();
         let mut packed = one_red_packed_frame();
-        prep.apply(&mut packed, true).unwrap();
+        prep.apply(&mut packed, 0, true).unwrap();
         let RawFrame::Packed { data, .. } = &packed else {
             panic!("frame changed shape");
         };
@@ -2642,7 +2653,7 @@ mod tests {
             precision: 16,
             index: 0,
         };
-        prep.apply(&mut frame, false).unwrap();
+        prep.apply(&mut frame, 0, false).unwrap();
         let RawFrame::Packed { data, .. } = &frame else {
             panic!("frame changed shape");
         };
@@ -2672,11 +2683,54 @@ mod tests {
             precision: 16,
             index: 0,
         };
-        burn_only.apply(&mut frame, true).unwrap();
+        burn_only.apply(&mut frame, 0, true).unwrap();
         let RawFrame::Packed { data, .. } = &frame else {
             panic!("frame changed shape");
         };
         assert_eq!(u16::from_be_bytes([data[0], data[1]]), 65535);
+    }
+
+    #[test]
+    fn a_burn_is_timed_from_the_first_output_frame() {
+        use crate::subtitle_formats::{StyledCue, StyledRun, VAlign};
+        use crate::subtitle_raster::{BurnStyle, SubtitleBurn};
+
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("cue.png");
+        write_solid_png(&png, [255, 0, 0, 255]);
+        // on screen from frame 24 at 24 fps
+        let mut cue = StyledCue::text(1000, 2000, vec![StyledRun::plain("")]);
+        cue.runs.clear();
+        cue.image = Some(png);
+        cue.valign = Some(VAlign::Top);
+        cue.vposition = Some(0.0);
+        let prep = SourcePreparation {
+            subtitle_burn: Some(Arc::new(
+                SubtitleBurn::new(vec![cue], None, BurnStyle::default(), 24.0).unwrap(),
+            )),
+            ..SourcePreparation::default()
+        };
+        let red_after = |first_output_frame: u64| {
+            let mut frame = RawFrame::Packed {
+                data: vec![0u8; 6],
+                order: SampleOrder::Big,
+                width: 1,
+                height: 1,
+                precision: 16,
+                index: 4,
+            };
+            prep.apply(&mut frame, first_output_frame, true).unwrap();
+            let RawFrame::Packed { data, .. } = frame else {
+                panic!("frame changed shape");
+            };
+            u16::from_be_bytes([data[0], data[1]])
+        };
+        assert_eq!(red_after(0), 0, "frame 4 is before the cue");
+        assert_eq!(
+            red_after(20),
+            65535,
+            "frame 4 of a clip placed at 20 is frame 24"
+        );
     }
 
     fn write_solid_png(path: &Path, colour: [u8; 4]) {
@@ -2745,7 +2799,7 @@ mod tests {
             ..SourcePreparation::default()
         };
         let mut frame = one_pixel_black_frame();
-        prep.apply(&mut frame, false).unwrap();
+        prep.apply(&mut frame, 0, false).unwrap();
         assert_eq!(
             packed_pixel(&frame),
             [0, 65535, 0],
@@ -2760,7 +2814,7 @@ mod tests {
             ..SourcePreparation::default()
         };
         let mut frame = one_pixel_black_frame();
-        reversed.apply(&mut frame, false).unwrap();
+        reversed.apply(&mut frame, 0, false).unwrap();
         assert_eq!(packed_pixel(&frame), [65535, 0, 0]);
     }
 
@@ -2830,7 +2884,7 @@ mod tests {
             precision: PRECISION,
             index: 0,
         };
-        prep.apply(&mut frame, true).unwrap();
+        prep.apply(&mut frame, 0, true).unwrap();
         let RawFrame::Planar { components, .. } = &frame else {
             panic!("frame changed shape");
         };
@@ -2845,7 +2899,7 @@ mod tests {
             precision: PRECISION,
             index: 0,
         };
-        let refused = prep.apply(&mut packed_12_bit, true).unwrap_err();
+        let refused = prep.apply(&mut packed_12_bit, 0, true).unwrap_err();
         assert!(refused.contains("packed 16-bit"), "got: {refused}");
 
         for component in components {

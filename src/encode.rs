@@ -171,6 +171,16 @@ pub fn find_source_frames(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(frames)
 }
 
+/// The directory holding an image sequence, whether the input names the
+/// directory itself or one frame in it.
+pub(crate) fn sequence_directory(input: &Path) -> PathBuf {
+    if input.is_dir() {
+        input.to_path_buf()
+    } else {
+        input.parent().unwrap_or(input).to_path_buf()
+    }
+}
+
 /// The first still of an image sequence, the frame that decides its format and
 /// its raster.
 pub(crate) fn first_source_frame(directory: &Path) -> Result<PathBuf, String> {
@@ -728,6 +738,8 @@ pub struct StreamEncodeOptions {
     pub encode_threads: u32,
     #[serde(default)]
     pub detect_picture_findings: bool,
+    #[serde(default)]
+    pub first_output_frame: u64,
 }
 
 /// The cinema profile a DCP picture declares, written as 2K or 4K by each
@@ -760,6 +772,7 @@ impl Default for StreamEncodeOptions {
             codestream_byte_cap: None,
             encode_threads: 0,
             detect_picture_findings: false,
+            first_output_frame: 0,
         }
     }
 }
@@ -905,6 +918,7 @@ fn compress_params(
         apply_xyz_transform: opts.source_colour.applies_xyz_transform(),
         encode_threads: opts.encode_threads,
         detect_picture_findings: opts.detect_picture_findings,
+        first_output_frame: opts.first_output_frame,
         source_preparation: crate::grok_encoder::SourcePreparation {
             subtitle_burn: opts.subtitle_burn.clone(),
             watermark: opts.watermark.clone(),

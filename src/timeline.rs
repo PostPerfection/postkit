@@ -1,0 +1,836 @@
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde::{Deserialize, Serialize};
+
+use crate::encode::{FrameRate, InputType, SourceColour};
+use crate::picture_processing::PictureProcessing;
+use crate::subtitle_retime::{SrtCue, format_srt, parse_srt};
+use crate::wav_io::{SampleFormat, WavReader, WavSpec, WavWriter};
+
+pub const TIMELINE_FORMAT_VERSION: u32 = 1;
+
+const SOUND_SAMPLE_RATE: u32 = 48_000;
+const SOUND_BITS_PER_SAMPLE: u16 = 24;
+const SOUND_BYTES_PER_SAMPLE: u64 = 3;
+const LARGEST_24_BIT_SAMPLE: i32 = (1 << 23) - 1;
+const SMALLEST_24_BIT_SAMPLE: i32 = -(1 << 23);
+const BITS_PER_BYTE: u16 = 8;
+const MILLISECONDS_PER_SECOND: u64 = 1000;
+const COPY_BUFFER_BYTES: usize = 1 << 20;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Timeline {
+    pub version: u32,
+    pub fps: FrameRate,
+    pub clips: Vec<Clip>,
+    pub sound: SoundTrack,
+    pub subtitle: Option<PathBuf>,
+    #[serde(default)]
+    pub reel_starts: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Clip {
+    pub picture: PathBuf,
+    pub in_frame: u64,
+    pub out_frame: u64,
+    pub sound: ClipSound,
+    pub subtitle: Option<PathBuf>,
+    #[serde(default)]
+    pub source_colour: SourceColour,
+    #[serde(default)]
+    pub picture_processing: PictureProcessing,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ClipSound {
+    Embedded,
+    File(PathBuf),
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SoundTrack {
+    PerClip,
+    Override(PathBuf),
+}
+
+impl Timeline {
+    pub fn read(path: &Path) -> Result<Timeline, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let value: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{} is not JSON: {e}", path.display()))?;
+        let version = value.get("version").and_then(serde_json::Value::as_u64);
+        if version != Some(u64::from(TIMELINE_FORMAT_VERSION)) {
+            let found = version.map_or("no version".to_string(), |v| format!("version {v}"));
+            return Err(format!(
+                "{} is a timeline file of {found}, and this build reads version \
+                 {TIMELINE_FORMAT_VERSION}",
+                path.display()
+            ));
+        }
+        serde_json::from_value(value)
+            .map_err(|e| format!("{} is not a timeline: {e}", path.display()))
+    }
+
+    pub fn write(&self, path: &Path) -> Result<(), String> {
+        if self.version != TIMELINE_FORMAT_VERSION {
+            return Err(format!(
+                "the timeline is version {}, and this build writes version \
+                 {TIMELINE_FORMAT_VERSION}",
+                self.version
+            ));
+        }
+        let text = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("cannot serialise the timeline: {e}"))?;
+        std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    }
+
+    pub fn total_frames(&self) -> u64 {
+        self.clips.iter().map(Clip::frame_count).sum()
+    }
+
+    pub fn clip_starts(&self) -> Vec<u64> {
+        self.clips
+            .iter()
+            .scan(0, |start, clip| {
+                let this_start = *start;
+                *start += clip.frame_count();
+                Some(this_start)
+            })
+            .collect()
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        if self.clips.is_empty() {
+            return Err("the timeline has no clips".to_string());
+        }
+        for (index, clip) in self.clips.iter().enumerate() {
+            let name = clip_name(index, clip);
+            if clip.out_frame <= clip.in_frame {
+                return Err(format!(
+                    "{name}: the out point {} is at or before the in point {}",
+                    clip.out_frame, clip.in_frame
+                ));
+            }
+            let source = probe_source(&clip.picture).map_err(|e| format!("{name}: {e}"))?;
+            if clip.in_frame >= source.frames {
+                return Err(format!(
+                    "{name}: the in point {} is past the source's {} frames",
+                    clip.in_frame, source.frames
+                ));
+            }
+            if clip.out_frame > source.frames {
+                return Err(format!(
+                    "{name}: the out point {} is past the source's {} frames",
+                    clip.out_frame, source.frames
+                ));
+            }
+            if let Some(rate) = source.rate
+                && rate_differs(rate, self.fps)
+            {
+                return Err(format!(
+                    "{name} runs at {}/{} fps and the timeline at {}/{} fps",
+                    rate.numerator, rate.denominator, self.fps.numerator, self.fps.denominator
+                ));
+            }
+        }
+        self.check_reel_starts()
+    }
+
+    fn check_reel_starts(&self) -> Result<(), String> {
+        let total = self.total_frames();
+        let mut previous = 0;
+        for &start in &self.reel_starts {
+            if start == 0 {
+                return Err(
+                    "reel start 0 is listed, but the first reel always starts there".to_string(),
+                );
+            }
+            if start == previous {
+                return Err(format!("reel start {start} is listed twice"));
+            }
+            if start < previous {
+                return Err(format!(
+                    "reel start {start} comes after {previous}: reel starts run in order"
+                ));
+            }
+            if start >= total {
+                return Err(format!(
+                    "reel start {start} is at or past the timeline's end at frame {total}"
+                ));
+            }
+            previous = start;
+        }
+        Ok(())
+    }
+}
+
+impl Clip {
+    fn frame_count(&self) -> u64 {
+        self.out_frame.saturating_sub(self.in_frame)
+    }
+}
+
+pub(crate) fn clip_name(index: usize, clip: &Clip) -> String {
+    format!("clip {} ({})", index + 1, clip.picture.display())
+}
+
+// 24000/1001 and 48000/2002 are one rate
+fn rate_differs(a: FrameRate, b: FrameRate) -> bool {
+    u64::from(a.numerator) * u64::from(b.denominator)
+        != u64::from(b.numerator) * u64::from(a.denominator)
+}
+
+pub(crate) struct SourceLength {
+    pub frames: u64,
+    // None for a sequence of stills, which runs at whatever rate it is given
+    pub rate: Option<FrameRate>,
+}
+
+pub(crate) fn probe_source(picture: &Path) -> Result<SourceLength, String> {
+    match crate::encode::detect_input_type(picture) {
+        InputType::Video => {
+            let info = crate::probe::probe_video(picture)
+                .ok_or_else(|| "ffprobe cannot read it".to_string())?;
+            if info.total_frames == 0 || info.fps_num == 0 || info.fps_den == 0 {
+                return Err(format!(
+                    "ffprobe reads {} frames at {}/{} fps from it",
+                    info.total_frames, info.fps_num, info.fps_den
+                ));
+            }
+            Ok(SourceLength {
+                frames: u64::from(info.total_frames),
+                rate: Some(FrameRate::new(info.fps_num, info.fps_den)),
+            })
+        }
+        InputType::ImageSequence => {
+            let directory = crate::encode::sequence_directory(picture);
+            let frames = crate::encode::find_source_frames(&directory)
+                .map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
+            Ok(SourceLength {
+                frames: frames.len() as u64,
+                rate: None,
+            })
+        }
+        InputType::J2kSequence => Ok(SourceLength {
+            frames: j2k_codestreams(&crate::encode::sequence_directory(picture))?.len() as u64,
+            rate: None,
+        }),
+        InputType::PictureMxf => {
+            let info = crate::mxf_unwrap::probe_picture_mxf(picture)?;
+            Ok(SourceLength {
+                frames: info.frames,
+                rate: Some(FrameRate::new(info.edit_rate_num, info.edit_rate_den)),
+            })
+        }
+        InputType::Unknown => Err("cannot tell what kind of picture it is".to_string()),
+    }
+}
+
+pub(crate) fn j2k_codestreams(directory: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
+    let mut codestreams: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .map(str::to_lowercase);
+            path.is_file() && matches!(extension.as_deref(), Some("j2c" | "j2k"))
+        })
+        .collect();
+    codestreams.sort();
+    Ok(codestreams)
+}
+
+fn sample_at(frame: u64, fps: FrameRate) -> u64 {
+    (u128::from(frame) * u128::from(SOUND_SAMPLE_RATE) * u128::from(fps.denominator)
+        / u128::from(fps.numerator)) as u64
+}
+
+fn milliseconds_at(frame: u64, fps: FrameRate) -> u64 {
+    let numerator = u128::from(fps.numerator);
+    ((u128::from(frame) * u128::from(MILLISECONDS_PER_SECOND) * u128::from(fps.denominator)
+        + numerator / 2)
+        / numerator) as u64
+}
+
+pub fn render_sound(timeline: &Timeline, output: &Path) -> Result<Option<PathBuf>, String> {
+    if let SoundTrack::Override(path) = &timeline.sound {
+        return Ok(Some(path.clone()));
+    }
+    let Some(channels) = shared_channel_count(timeline)? else {
+        return Ok(None);
+    };
+    let spec = WavSpec {
+        channels,
+        sample_rate: SOUND_SAMPLE_RATE,
+        bits_per_sample: SOUND_BITS_PER_SAMPLE,
+        sample_format: SampleFormat::Int,
+    };
+    let fps = timeline.fps;
+    let total_samples = sample_at(timeline.total_frames(), fps);
+    let mut writer = WavWriter::create(output, spec, total_samples)
+        .map_err(|e| format!("cannot create {}: {e}", output.display()))?;
+    let write_error = |e: std::io::Error| format!("cannot write {}: {e}", output.display());
+    for (index, (clip, start)) in timeline
+        .clips
+        .iter()
+        .zip(timeline.clip_starts())
+        .enumerate()
+    {
+        let length = sample_at(start + clip.frame_count(), fps) - sample_at(start, fps);
+        let first_sample = sample_at(clip.in_frame, fps);
+        let written = match &clip.sound {
+            ClipSound::None => Ok(0),
+            ClipSound::Embedded => {
+                copy_embedded_sound(&clip.picture, first_sample, length, &mut writer)
+            }
+            ClipSound::File(path) => copy_wav(path, first_sample, length, &mut writer),
+        }
+        .map_err(|e| format!("{}: {e}", clip_name(index, clip)))?;
+        write_silence(&mut writer, channels, length - written).map_err(write_error)?;
+    }
+    writer.finalize().map_err(write_error)?;
+    Ok(Some(output.to_path_buf()))
+}
+
+fn shared_channel_count(timeline: &Timeline) -> Result<Option<u16>, String> {
+    let mut first: Option<(usize, u16)> = None;
+    for (index, clip) in timeline.clips.iter().enumerate() {
+        let channels = match &clip.sound {
+            ClipSound::None => continue,
+            ClipSound::Embedded => embedded_channel_count(&clip.picture),
+            ClipSound::File(path) => wav_channel_count(path),
+        }
+        .map_err(|e| format!("{}: {e}", clip_name(index, clip)))?;
+        match first {
+            None => first = Some((index, channels)),
+            Some((first_index, first_channels)) if first_channels != channels => {
+                return Err(format!(
+                    "{} has {first_channels} sound channels and {} has {channels}: every \
+                     clip's sound needs the same channel count",
+                    clip_name(first_index, &timeline.clips[first_index]),
+                    clip_name(index, clip)
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(first.map(|(_, channels)| channels))
+}
+
+fn embedded_channel_count(picture: &Path) -> Result<u16, String> {
+    let output = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0"])
+        .args(["-show_entries", "stream=channels", "-of", "csv=p=0"])
+        .arg(picture)
+        .output()
+        .map_err(|e| format!("cannot run ffprobe: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "ffprobe cannot read it: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("it has no sound to take: give the clip a WAV or no sound".to_string());
+    }
+    text.parse()
+        .map_err(|_| format!("ffprobe reads the channel count {text:?}"))
+}
+
+fn open_wav(path: &Path) -> Result<WavReader, String> {
+    let reader =
+        WavReader::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let rate = reader.spec().sample_rate;
+    if rate != SOUND_SAMPLE_RATE {
+        return Err(format!(
+            "{} is at {rate} Hz and the timeline's sound at {SOUND_SAMPLE_RATE} Hz",
+            path.display()
+        ));
+    }
+    Ok(reader)
+}
+
+fn wav_channel_count(path: &Path) -> Result<u16, String> {
+    Ok(open_wav(path)?.spec().channels)
+}
+
+fn copy_embedded_sound(
+    picture: &Path,
+    first_sample: u64,
+    length: u64,
+    writer: &mut WavWriter,
+) -> Result<u64, String> {
+    let window = format!(
+        "aresample={SOUND_SAMPLE_RATE},atrim=start_sample={first_sample}:end_sample={}",
+        first_sample + length
+    );
+    let mut child = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-i"])
+        .arg(picture)
+        .args([
+            "-map",
+            "0:a:0",
+            "-af",
+            &window,
+            "-c:a",
+            "pcm_s24le",
+            "-f",
+            "s24le",
+            "-",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run ffmpeg: {e}"))?;
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let block_align = u64::from(writer.spec().channels) * SOUND_BYTES_PER_SAMPLE;
+    let mut bytes_left = length * block_align;
+    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
+    loop {
+        let read = stdout
+            .read(&mut buffer)
+            .map_err(|e| format!("cannot read ffmpeg's sound: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        let kept = (read as u64).min(bytes_left) as usize;
+        writer
+            .write_bytes(&buffer[..kept])
+            .map_err(|e| format!("cannot write the timeline's sound: {e}"))?;
+        bytes_left -= kept as u64;
+    }
+    let finished = child
+        .wait_with_output()
+        .map_err(|e| format!("ffmpeg did not finish: {e}"))?;
+    if !finished.status.success() {
+        return Err(format!(
+            "ffmpeg cannot take its sound: {}",
+            String::from_utf8_lossy(&finished.stderr).trim()
+        ));
+    }
+    let bytes_written = length * block_align - bytes_left;
+    if !bytes_written.is_multiple_of(block_align) {
+        return Err(format!(
+            "ffmpeg gave {bytes_written} bytes of sound, not whole {block_align}-byte frames"
+        ));
+    }
+    Ok(bytes_written / block_align)
+}
+
+fn copy_wav(
+    path: &Path,
+    first_sample: u64,
+    length: u64,
+    writer: &mut WavWriter,
+) -> Result<u64, String> {
+    let mut reader = open_wav(path)?;
+    let read_error = |e: std::io::Error| format!("cannot read {}: {e}", path.display());
+    let write_error = |e: std::io::Error| format!("cannot write the timeline's sound: {e}");
+    reader.skip_frames(first_sample).map_err(read_error)?;
+    let frames = reader.duration().saturating_sub(first_sample).min(length);
+    let samples = (frames * u64::from(reader.spec().channels)) as usize;
+    match reader.spec().sample_format {
+        SampleFormat::Int => {
+            let container_bits = reader.layout().bytes_per_sample * BITS_PER_BYTE;
+            for sample in reader.samples::<i32>().take(samples) {
+                let sample = sample.map_err(read_error)?;
+                let widened = if container_bits <= SOUND_BITS_PER_SAMPLE {
+                    sample << (SOUND_BITS_PER_SAMPLE - container_bits)
+                } else {
+                    sample >> (container_bits - SOUND_BITS_PER_SAMPLE)
+                };
+                writer.write_sample(widened).map_err(write_error)?;
+            }
+        }
+        SampleFormat::Float => {
+            for sample in reader.samples::<f32>().take(samples) {
+                let sample = sample.map_err(read_error)?;
+                let scaled = (f64::from(sample) * f64::from(LARGEST_24_BIT_SAMPLE)).round() as i32;
+                writer
+                    .write_sample(scaled.clamp(SMALLEST_24_BIT_SAMPLE, LARGEST_24_BIT_SAMPLE))
+                    .map_err(write_error)?;
+            }
+        }
+    }
+    Ok(frames)
+}
+
+fn write_silence(writer: &mut WavWriter, channels: u16, frames: u64) -> std::io::Result<()> {
+    let zeros = vec![0u8; COPY_BUFFER_BYTES];
+    let mut bytes_left = frames * u64::from(channels) * SOUND_BYTES_PER_SAMPLE;
+    while bytes_left > 0 {
+        let chunk = bytes_left.min(COPY_BUFFER_BYTES as u64) as usize;
+        writer.write_bytes(&zeros[..chunk])?;
+        bytes_left -= chunk as u64;
+    }
+    Ok(())
+}
+
+pub fn join_subtitles(timeline: &Timeline, output: &Path) -> Result<Option<PathBuf>, String> {
+    if timeline.clips.iter().all(|clip| clip.subtitle.is_none()) {
+        return Ok(None);
+    }
+    let fps = timeline.fps;
+    let mut joined: Vec<SrtCue> = Vec::new();
+    for (clip, start) in timeline.clips.iter().zip(timeline.clip_starts()) {
+        let Some(path) = &clip.subtitle else {
+            continue;
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        let in_point = milliseconds_at(clip.in_frame, fps);
+        let out_point = milliseconds_at(clip.out_frame, fps);
+        let place = milliseconds_at(start, fps);
+        for cue in parse_srt(&text) {
+            if cue.end_ms <= in_point || cue.start_ms >= out_point {
+                continue;
+            }
+            joined.push(SrtCue {
+                index: joined.len() as u32 + 1,
+                start_ms: cue.start_ms.max(in_point) - in_point + place,
+                end_ms: cue.end_ms.min(out_point) - in_point + place,
+                text: cue.text,
+            });
+        }
+    }
+    std::fs::write(output, format_srt(&joined))
+        .map_err(|e| format!("cannot write {}: {e}", output.display()))?;
+    Ok(Some(output.to_path_buf()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RATE: FrameRate = FrameRate {
+        numerator: 24,
+        denominator: 1,
+    };
+
+    fn clip(picture: &Path, in_frame: u64, out_frame: u64, sound: ClipSound) -> Clip {
+        Clip {
+            picture: picture.to_path_buf(),
+            in_frame,
+            out_frame,
+            sound,
+            subtitle: None,
+            source_colour: SourceColour::default(),
+            picture_processing: PictureProcessing::default(),
+        }
+    }
+
+    fn timeline(clips: Vec<Clip>) -> Timeline {
+        Timeline {
+            version: TIMELINE_FORMAT_VERSION,
+            fps: RATE,
+            clips,
+            sound: SoundTrack::PerClip,
+            subtitle: None,
+            reel_starts: Vec::new(),
+        }
+    }
+
+    fn still_sequence(directory: &Path, frames: usize) -> PathBuf {
+        std::fs::create_dir_all(directory).unwrap();
+        for frame in 0..frames {
+            std::fs::write(directory.join(format!("shot_{frame:04}.png")), b"png").unwrap();
+        }
+        directory.to_path_buf()
+    }
+
+    fn wav_of(path: &Path, spec: WavSpec, samples: &[i32]) {
+        let mut writer = WavWriter::create(path, spec, samples.len() as u64).unwrap();
+        for &sample in samples {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn stereo(bits_per_sample: u16) -> WavSpec {
+        WavSpec {
+            channels: 2,
+            sample_rate: SOUND_SAMPLE_RATE,
+            bits_per_sample,
+            sample_format: SampleFormat::Int,
+        }
+    }
+
+    fn read_samples(path: &Path) -> Vec<i32> {
+        WavReader::open(path)
+            .unwrap()
+            .samples::<i32>()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn the_clip_starts_add_up_the_trimmed_lengths() {
+        let picture = Path::new("/media/a.mov");
+        let timeline = timeline(vec![
+            clip(picture, 10, 34, ClipSound::None),
+            clip(picture, 0, 5, ClipSound::None),
+            clip(picture, 100, 148, ClipSound::None),
+        ]);
+        assert_eq!(timeline.clip_starts(), vec![0, 24, 29]);
+        assert_eq!(timeline.total_frames(), 77);
+    }
+
+    #[test]
+    fn a_timeline_file_reads_back_as_written_and_refuses_another_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cut.json");
+        let mut written = timeline(vec![clip(
+            Path::new("/media/a.mov"),
+            0,
+            24,
+            ClipSound::File(PathBuf::from("/media/a.wav")),
+        )]);
+        written.reel_starts = vec![12];
+        written.write(&path).unwrap();
+        assert_eq!(Timeline::read(&path).unwrap(), written);
+
+        let newer = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("\"version\": 1", "\"version\": 2");
+        std::fs::write(&path, newer).unwrap();
+        let refused = Timeline::read(&path).unwrap_err();
+        assert!(refused.contains("version 2"), "{refused}");
+        assert!(refused.contains("reads version 1"), "{refused}");
+
+        written.version = 2;
+        let refused = written.write(&path).unwrap_err();
+        assert!(refused.contains("version 2"), "{refused}");
+    }
+
+    #[test]
+    fn a_hand_written_clip_can_leave_out_the_colour_and_the_picture_processing() {
+        let text = r#"{
+            "version": 1,
+            "fps": {"numerator": 25, "denominator": 1},
+            "clips": [{"picture": "/media/a.mov", "in_frame": 0, "out_frame": 25,
+                       "sound": "Embedded", "subtitle": null}],
+            "sound": "PerClip",
+            "subtitle": null
+        }"#;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cut.json");
+        std::fs::write(&path, text).unwrap();
+        let read = Timeline::read(&path).unwrap();
+        assert_eq!(read.clips[0].source_colour, SourceColour::DisplayRgb);
+        assert!(read.clips[0].picture_processing.is_identity());
+        assert!(read.reel_starts.is_empty());
+    }
+
+    #[test]
+    fn the_check_refuses_a_bad_clip_by_number_and_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let stills = still_sequence(&directory.path().join("stills"), 10);
+        assert!(
+            timeline(Vec::new())
+                .check()
+                .unwrap_err()
+                .contains("no clips")
+        );
+        assert!(
+            timeline(vec![clip(&stills, 0, 10, ClipSound::None)])
+                .check()
+                .is_ok(),
+            "a still sequence takes the timeline's rate"
+        );
+        for (in_frame, out_frame, expected) in [
+            (4, 4, "at or before the in point 4"),
+            (10, 12, "the in point 10 is past the source's 10 frames"),
+            (2, 11, "the out point 11 is past the source's 10 frames"),
+        ] {
+            let refused = timeline(vec![
+                clip(&stills, 0, 10, ClipSound::None),
+                clip(&stills, in_frame, out_frame, ClipSound::None),
+            ])
+            .check()
+            .unwrap_err();
+            assert!(refused.contains(expected), "{refused}");
+            assert!(
+                refused.starts_with(&format!("clip 2 ({})", stills.display())),
+                "{refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_check_refuses_reel_starts_out_of_order_or_past_the_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let stills = still_sequence(&directory.path().join("stills"), 10);
+        let mut timeline = timeline(vec![clip(&stills, 0, 10, ClipSound::None)]);
+        for (reel_starts, expected) in [
+            (vec![0, 5], "reel start 0"),
+            (vec![5, 5], "listed twice"),
+            (vec![6, 3], "reel start 3 comes after 6"),
+            (vec![10], "at or past the timeline's end at frame 10"),
+        ] {
+            timeline.reel_starts = reel_starts;
+            let refused = timeline.check().unwrap_err();
+            assert!(refused.contains(expected), "{refused}");
+        }
+        timeline.reel_starts = vec![3, 9];
+        assert!(timeline.check().is_ok());
+    }
+
+    #[test]
+    fn rates_compare_as_fractions() {
+        assert!(!rate_differs(
+            FrameRate::new(24000, 1001),
+            FrameRate::new(48000, 2002)
+        ));
+        assert!(rate_differs(
+            FrameRate::new(24000, 1001),
+            FrameRate::whole(24)
+        ));
+    }
+
+    #[test]
+    fn clip_sound_is_cut_to_the_frames_and_padded_with_silence() {
+        let directory = tempfile::tempdir().unwrap();
+        let samples_per_frame = (SOUND_SAMPLE_RATE / RATE.numerator) as usize;
+        let first = directory.path().join("first.wav");
+        let numbered: Vec<i32> = (0..(4 * samples_per_frame) as i32)
+            .flat_map(|frame| [frame, -frame])
+            .collect();
+        wav_of(&first, stereo(24), &numbered);
+        let short = directory.path().join("short.wav");
+        wav_of(&short, stereo(16), &[100, -100, 200, -200]);
+
+        let picture = Path::new("/media/a.mov");
+        let timeline = timeline(vec![
+            clip(picture, 1, 3, ClipSound::File(first)),
+            clip(picture, 0, 1, ClipSound::None),
+            clip(picture, 0, 1, ClipSound::File(short)),
+        ]);
+        let output = directory.path().join("timeline.wav");
+        let rendered = render_sound(&timeline, &output).unwrap().unwrap();
+        assert_eq!(rendered, output);
+
+        let reader = WavReader::open(&output).unwrap();
+        assert_eq!(reader.spec(), stereo(24));
+        assert_eq!(reader.duration(), (4 * samples_per_frame) as u64);
+        let joined = read_samples(&output);
+        let first_clip = &joined[..4 * samples_per_frame];
+        assert_eq!(
+            first_clip[0], samples_per_frame as i32,
+            "starts at the in point"
+        );
+        assert_eq!(first_clip[1], -(samples_per_frame as i32));
+        assert_eq!(
+            first_clip[4 * samples_per_frame - 2],
+            (3 * samples_per_frame - 1) as i32
+        );
+        let silent_clip = &joined[4 * samples_per_frame..6 * samples_per_frame];
+        assert!(silent_clip.iter().all(|&sample| sample == 0));
+        let short_clip = &joined[6 * samples_per_frame..];
+        assert_eq!(
+            &short_clip[..4],
+            &[100 << 8, -100 << 8, 200 << 8, -200 << 8]
+        );
+        assert!(short_clip[4..].iter().all(|&sample| sample == 0));
+    }
+
+    #[test]
+    fn clip_sound_refuses_a_channel_count_that_differs() {
+        let directory = tempfile::tempdir().unwrap();
+        let stereo_wav = directory.path().join("stereo.wav");
+        wav_of(&stereo_wav, stereo(24), &[0, 0]);
+        let mono_wav = directory.path().join("mono.wav");
+        wav_of(
+            &mono_wav,
+            WavSpec {
+                channels: 1,
+                ..stereo(24)
+            },
+            &[0],
+        );
+        let timeline = timeline(vec![
+            clip(Path::new("/media/a.mov"), 0, 1, ClipSound::File(stereo_wav)),
+            clip(Path::new("/media/b.mov"), 0, 1, ClipSound::File(mono_wav)),
+        ]);
+        let refused = render_sound(&timeline, &directory.path().join("out.wav")).unwrap_err();
+        assert!(
+            refused.contains("clip 1 (/media/a.mov) has 2 sound channels"),
+            "{refused}"
+        );
+        assert!(refused.contains("clip 2 (/media/b.mov) has 1"), "{refused}");
+    }
+
+    #[test]
+    fn a_timeline_with_no_clip_sound_renders_none_and_an_override_is_returned_as_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("out.wav");
+        let mut timeline = timeline(vec![clip(Path::new("/a.mov"), 0, 1, ClipSound::None)]);
+        assert_eq!(render_sound(&timeline, &output).unwrap(), None);
+        assert!(!output.exists());
+
+        timeline.sound = SoundTrack::Override(PathBuf::from("/mix/full.wav"));
+        assert_eq!(
+            render_sound(&timeline, &output).unwrap(),
+            Some(PathBuf::from("/mix/full.wav"))
+        );
+    }
+
+    #[test]
+    fn clip_subtitles_are_shifted_to_the_clip_and_cut_to_its_range() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.srt");
+        std::fs::write(
+            &first,
+            "1\n00:00:00,000 --> 00:00:00,900\nbefore the in point\n\n\
+             2\n00:00:00,500 --> 00:00:01,500\nstraddles the in point\n\n\
+             3\n00:00:02,000 --> 00:00:04,000\nstraddles the out point\n\n\
+             4\n00:00:03,000 --> 00:00:03,500\nafter the out point\n",
+        )
+        .unwrap();
+        let second = directory.path().join("second.srt");
+        std::fs::write(&second, "1\n00:00:00,250 --> 00:00:00,750\nsecond clip\n").unwrap();
+
+        let picture = Path::new("/media/a.mov");
+        let mut clips = vec![
+            clip(picture, 24, 72, ClipSound::None),
+            clip(picture, 0, 12, ClipSound::None),
+            clip(picture, 0, 24, ClipSound::None),
+        ];
+        clips[0].subtitle = Some(first);
+        clips[2].subtitle = Some(second);
+        let output = directory.path().join("joined.srt");
+        join_subtitles(&timeline(clips), &output).unwrap().unwrap();
+
+        let cues = parse_srt(&std::fs::read_to_string(&output).unwrap());
+        let timings: Vec<(u32, u64, u64, &str)> = cues
+            .iter()
+            .map(|cue| (cue.index, cue.start_ms, cue.end_ms, cue.text.as_str()))
+            .collect();
+        assert_eq!(
+            timings,
+            vec![
+                (1, 0, 500, "straddles the in point"),
+                (2, 1000, 2000, "straddles the out point"),
+                (3, 2750, 3250, "second clip"),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_clip_subtitle_joins_to_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("joined.srt");
+        let timeline = timeline(vec![clip(Path::new("/a.mov"), 0, 1, ClipSound::None)]);
+        assert_eq!(join_subtitles(&timeline, &output).unwrap(), None);
+        assert!(!output.exists());
+    }
+}

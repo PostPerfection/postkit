@@ -184,6 +184,35 @@ pub fn parse_srt(content: &str) -> Vec<SrtCue> {
     cues
 }
 
+const WHOLE_MILLISECONDS_PER_SECOND: u64 = 1000;
+const MILLISECONDS_PER_MINUTE: u64 = 60 * WHOLE_MILLISECONDS_PER_SECOND;
+const MILLISECONDS_PER_HOUR: u64 = 60 * MILLISECONDS_PER_MINUTE;
+
+fn srt_timestamp(milliseconds: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02},{:03}",
+        milliseconds / MILLISECONDS_PER_HOUR,
+        milliseconds % MILLISECONDS_PER_HOUR / MILLISECONDS_PER_MINUTE,
+        milliseconds % MILLISECONDS_PER_MINUTE / WHOLE_MILLISECONDS_PER_SECOND,
+        milliseconds % WHOLE_MILLISECONDS_PER_SECOND
+    )
+}
+
+pub fn format_srt(cues: &[SrtCue]) -> String {
+    let mut text = String::new();
+    for cue in cues {
+        let _ = write!(
+            text,
+            "{}\n{} --> {}\n{}\n\n",
+            cue.index,
+            srt_timestamp(cue.start_ms),
+            srt_timestamp(cue.end_ms),
+            cue.text
+        );
+    }
+    text
+}
+
 /// Parse a "HH:MM:SS,mmm --> HH:MM:SS,mmm" line into (start_ms, end_ms).
 fn parse_srt_timecode_line(line: &str) -> Option<(u64, u64)> {
     let (a, b) = line.split_once("-->")?;
@@ -553,6 +582,30 @@ mod tests {
         assert_eq!(cues[1].start_ms, 5000);
         assert_eq!(cues[1].end_ms, 8500);
         assert_eq!(cues[1].text, "Second\nline");
+    }
+
+    #[test]
+    fn format_srt_writes_what_parse_srt_reads_back() {
+        let cues = vec![
+            SrtCue {
+                index: 1,
+                start_ms: 1_000,
+                end_ms: 4_250,
+                text: "Hello world".to_string(),
+            },
+            SrtCue {
+                index: 2,
+                start_ms: 3_725_042,
+                end_ms: 3_726_000,
+                text: "Second\nline".to_string(),
+            },
+        ];
+        let text = format_srt(&cues);
+        assert!(
+            text.contains("2\n01:02:05,042 --> 01:02:06,000\nSecond\nline\n"),
+            "{text}"
+        );
+        assert_eq!(parse_srt(&text), cues);
     }
 
     #[test]

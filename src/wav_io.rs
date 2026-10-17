@@ -397,6 +397,18 @@ impl WavReader {
         self.len() == 0
     }
 
+    pub fn skip_frames(&mut self, frames: u64) -> io::Result<()> {
+        let samples = frames
+            .saturating_mul(self.layout.spec.channels as u64)
+            .min(self.samples_left);
+        let bytes = samples * self.layout.bytes_per_sample as u64;
+        let bytes = i64::try_from(bytes)
+            .map_err(|_| invalid(format!("cannot skip {bytes} bytes of samples")))?;
+        self.source.seek_relative(bytes)?;
+        self.samples_left -= samples;
+        Ok(())
+    }
+
     pub fn samples<S: Sample>(&mut self) -> WavSamples<'_, S> {
         WavSamples {
             reader: self,

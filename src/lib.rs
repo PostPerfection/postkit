@@ -83,6 +83,7 @@ pub mod subtitle_raster;
 pub mod subtitle_retime;
 pub mod timecode;
 pub mod timed_text_descriptor;
+pub mod timeline;
 #[cfg(feature = "tms")]
 pub mod tms;
 pub mod trailer;

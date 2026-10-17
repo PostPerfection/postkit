@@ -14,6 +14,7 @@ use crate::encode::{
 };
 use crate::mxf_unwrap::CANCELLED;
 use crate::picture_processing::PictureProcessing;
+use crate::timeline::{Clip, Timeline};
 
 /// Progress information emitted during encode.
 ///
@@ -142,6 +143,7 @@ pub fn run_encode_with_ratio(
 }
 
 /// Encode settings for one pipeline run.
+#[derive(Clone)]
 pub struct EncodeRunOptions {
     /// J2K compression ratio (video input only), ignored under `target_codestream_bytes`.
     pub compression_ratio: f64,
@@ -226,6 +228,7 @@ pub fn run_encode_with_options(
         output_dir,
         options,
         None,
+        FIRST_FRAME,
         cancel,
         pause,
         on_progress,
@@ -263,6 +266,7 @@ pub fn run_encode_and_wrap_picture(
         output_dir,
         options,
         Some(wrap),
+        FIRST_FRAME,
         cancel,
         pause,
         on_progress,
@@ -271,12 +275,258 @@ pub fn run_encode_and_wrap_picture(
     Ok((encode, track.expect("a wrap was asked for")))
 }
 
+pub fn run_encode_timeline(
+    timeline: &Timeline,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    on_progress: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<EncodeResult, String> {
+    if options.frame_range.is_some() {
+        return Err(
+            "a timeline's clips carry their own in and out points, so a timeline encode takes \
+             no frame range"
+                .to_string(),
+        );
+    }
+    if let Some(filter) = &options.extra_picture_filter {
+        return Err(format!(
+            "the picture filter {filter} would start again on every clip, so a timeline encode \
+             takes none"
+        ));
+    }
+    timeline.check()?;
+    let start_time = std::time::Instant::now();
+    let total_frames = timeline.total_frames();
+    let j2k_dir = output_dir.join("j2k");
+    let mut picture_findings = crate::picture_findings::PictureFindings::default();
+    let mut finished_phases = PhaseSeconds::default();
+    for (index, (clip, first_output_frame)) in timeline
+        .clips
+        .iter()
+        .zip(timeline.clip_starts())
+        .enumerate()
+    {
+        if cancel.load(Ordering::Relaxed) {
+            on_log("=== CANCELLED ===");
+            return Err(CANCELLED.to_string());
+        }
+        let name = crate::timeline::clip_name(index, clip);
+        let frame_count = clip.out_frame - clip.in_frame;
+        on_log(&format!(
+            "[TIMELINE] {name}: frames {}..{} at timeline frame {first_output_frame}",
+            clip.in_frame, clip.out_frame
+        ));
+        let clip_phases = std::cell::Cell::new(PhaseSeconds::default());
+        let report = |progress: &PipelineProgress| {
+            clip_phases.set(PhaseSeconds::of(progress));
+            let phases = finished_phases.plus(clip_phases.get());
+            let frame = first_output_frame + progress.frame;
+            on_progress(&PipelineProgress {
+                stage: progress.stage.clone(),
+                message: format!("Frame {frame}/{total_frames}"),
+                frame,
+                total_frames,
+                fps: progress.fps,
+                elapsed_secs: start_time.elapsed().as_secs_f64(),
+                percent: (frame as f64 / total_frames as f64 * 100.0).min(99.0),
+                decode_wait_secs: phases.decode_wait,
+                prepare_secs: phases.prepare,
+                encode_secs: phases.encode,
+                write_secs: phases.write,
+            });
+        };
+        let clip_options = EncodeRunOptions {
+            source_colour: if clip.source_colour == SourceColour::default() {
+                options.source_colour.clone()
+            } else {
+                clip.source_colour.clone()
+            },
+            picture: if clip.picture_processing.is_identity() {
+                options.picture.clone()
+            } else {
+                clip.picture_processing.clone()
+            },
+            ..options.clone()
+        };
+        let input_type = crate::encode::detect_input_type(&clip.picture);
+        let mut findings = match input_type {
+            InputType::J2kSequence | InputType::PictureMxf => {
+                let scratch_dir = output_dir.join(format!("timeline_clip_{index}"));
+                place_compressed_clip(
+                    clip,
+                    input_type,
+                    &scratch_dir,
+                    &j2k_dir,
+                    first_output_frame,
+                    &clip_options,
+                    cancel,
+                    pause,
+                    report,
+                    &on_log,
+                )
+                .map_err(|error| name_the_clip(&name, error))?;
+                crate::picture_findings::PictureFindings::default()
+            }
+            _ => {
+                let windowed = EncodeRunOptions {
+                    frame_range: Some(FrameRange {
+                        first_frame: clip.in_frame,
+                        frame_count,
+                    }),
+                    ..clip_options
+                };
+                let (encode, _) = run_encode_and_maybe_wrap(
+                    &clip.picture,
+                    output_dir,
+                    &windowed,
+                    None,
+                    first_output_frame,
+                    cancel,
+                    pause,
+                    report,
+                    &on_log,
+                )
+                .map_err(|error| name_the_clip(&name, error))?;
+                encode.picture_findings
+            }
+        };
+        let phases = clip_phases.get();
+        let frames_done = first_output_frame + frame_count;
+        report(&PipelineProgress {
+            stage: "encode".to_string(),
+            message: String::new(),
+            frame: frame_count,
+            total_frames: frame_count,
+            fps: frames_done as f64 / start_time.elapsed().as_secs_f64(),
+            elapsed_secs: 0.0,
+            percent: 0.0,
+            decode_wait_secs: phases.decode_wait,
+            prepare_secs: phases.prepare,
+            encode_secs: phases.encode,
+            write_secs: phases.write,
+        });
+        for interval in findings.black.iter_mut().chain(findings.frozen.iter_mut()) {
+            interval.first_frame += first_output_frame;
+            interval.last_frame += first_output_frame;
+        }
+        picture_findings.black.append(&mut findings.black);
+        picture_findings.frozen.append(&mut findings.frozen);
+        finished_phases = finished_phases.plus(clip_phases.get());
+    }
+    on_log(&format!(
+        "[TIMELINE] Done: {total_frames} frames from {} clips",
+        timeline.clips.len()
+    ));
+    Ok(EncodeResult {
+        j2k_dir,
+        frames_encoded: total_frames,
+        elapsed_secs: start_time.elapsed().as_secs_f64(),
+        picture_findings,
+    })
+}
+
+fn name_the_clip(name: &str, error: String) -> String {
+    if error == CANCELLED {
+        return error;
+    }
+    format!("{name}: {error}")
+}
+
+#[derive(Clone, Copy, Default)]
+struct PhaseSeconds {
+    decode_wait: f64,
+    prepare: f64,
+    encode: f64,
+    write: f64,
+}
+
+impl PhaseSeconds {
+    fn of(progress: &PipelineProgress) -> Self {
+        Self {
+            decode_wait: progress.decode_wait_secs,
+            prepare: progress.prepare_secs,
+            encode: progress.encode_secs,
+            write: progress.write_secs,
+        }
+    }
+
+    fn plus(self, other: Self) -> Self {
+        Self {
+            decode_wait: self.decode_wait + other.decode_wait,
+            prepare: self.prepare + other.prepare,
+            encode: self.encode + other.encode,
+            write: self.write + other.write,
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn place_compressed_clip(
+    clip: &Clip,
+    input_type: InputType,
+    scratch_dir: &Path,
+    j2k_dir: &Path,
+    first_output_frame: u64,
+    options: &EncodeRunOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    on_progress: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<(), String> {
+    let source_frames = crate::timeline::probe_source(&clip.picture)?.frames;
+    if clip.in_frame != 0 || clip.out_frame != source_frames {
+        return Err(format!(
+            "it is already JPEG 2000 and cannot be trimmed: its in and out points have to be \
+             0 and {source_frames}, the whole source"
+        ));
+    }
+    let (encode, _) = run_encode_and_maybe_wrap(
+        &clip.picture,
+        scratch_dir,
+        options,
+        None,
+        FIRST_FRAME,
+        cancel,
+        pause,
+        on_progress,
+        on_log,
+    )?;
+    std::fs::create_dir_all(j2k_dir)
+        .map_err(|e| format!("cannot create {}: {e}", j2k_dir.display()))?;
+    let unwrapped = input_type == InputType::PictureMxf;
+    let source_dir = crate::encode::sequence_directory(&encode.j2k_dir);
+    for (offset, codestream) in crate::timeline::j2k_codestreams(&source_dir)?
+        .iter()
+        .enumerate()
+    {
+        let target = j2k_dir.join(format!(
+            "frame_{:08}.j2c",
+            first_output_frame + offset as u64
+        ));
+        let placed = if unwrapped {
+            std::fs::rename(codestream, &target)
+        } else {
+            std::fs::hard_link(codestream, &target)
+                .or_else(|_| std::fs::copy(codestream, &target).map(|_| ()))
+        };
+        placed.map_err(|e| format!("cannot place {}: {e}", target.display()))?;
+    }
+    std::fs::remove_dir_all(scratch_dir)
+        .map_err(|e| format!("cannot remove {}: {e}", scratch_dir.display()))
+}
+
+const FIRST_FRAME: u64 = 0;
+
 #[allow(clippy::too_many_arguments)]
 fn run_encode_and_maybe_wrap(
     video: &Path,
     output_dir: &Path,
     options: &EncodeRunOptions,
     wrap: Option<crate::mxf_wrap::IncrementalWrapOptions>,
+    first_output_frame: u64,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     on_progress: impl Fn(&PipelineProgress),
@@ -428,6 +678,7 @@ fn run_encode_and_maybe_wrap(
                     codestream_byte_cap: options.codestream_byte_cap,
                     encode_threads: options.encode_threads,
                     detect_picture_findings: options.detect_picture_findings,
+                    first_output_frame,
                     ..StreamEncodeOptions::default()
                 },
                 mxf_feed,
@@ -435,7 +686,7 @@ fn run_encode_and_maybe_wrap(
             on_log(&format!("[ENCODE] Done: {} frames", frames_encoded));
         }
         InputType::ImageSequence => {
-            let input_dir = sequence_directory(video);
+            let input_dir = crate::encode::sequence_directory(video);
             let frames = crate::encode::find_source_frames(&input_dir)
                 .map_err(|e| format!("cannot list {}: {e}", input_dir.display()))?;
             if frames.is_empty() {
@@ -463,6 +714,7 @@ fn run_encode_and_maybe_wrap(
                 codestream_byte_cap: options.codestream_byte_cap,
                 encode_threads: options.encode_threads,
                 detect_picture_findings: options.detect_picture_findings,
+                first_output_frame,
                 ..StreamEncodeOptions::default()
             };
             if sequence_needs_ffmpeg {
@@ -582,20 +834,10 @@ fn run_encode_and_maybe_wrap(
     ))
 }
 
-/// The directory holding an image sequence, whether the input names the
-/// directory itself or one frame in it.
-fn sequence_directory(input: &Path) -> PathBuf {
-    if input.is_dir() {
-        input.to_path_buf()
-    } else {
-        input.parent().unwrap_or(input).to_path_buf()
-    }
-}
-
 /// Format of the first frame of an image sequence, which decides whether
 /// postkit reads the stills itself or ffmpeg decodes them.
 fn first_frame_format(input: &Path) -> Result<ImageFormat, String> {
-    let first = crate::encode::first_source_frame(&sequence_directory(input))?;
+    let first = crate::encode::first_source_frame(&crate::encode::sequence_directory(input))?;
     Ok(crate::encode::detect_image_format(&first))
 }
 
