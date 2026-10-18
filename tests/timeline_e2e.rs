@@ -3,8 +3,13 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use postkit::encode::{FrameRate, SourceColour};
+use postkit::j2k::{ImfProfile, imf_levels, imf_rsiz};
+use postkit::mxf_wrap::{IncrementalWrapOptions, MxfStandard, rec709_sdr_picture_colour};
 use postkit::picture_processing::{Fit, PictureProcessing, Placement};
-use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_timeline};
+use postkit::pipeline::{
+    EncodeRunOptions, PipelineProgress, StretchBase, run_encode_timeline,
+    run_encode_timeline_stretch_and_wrap_picture, timeline_stretches,
+};
 use postkit::subtitle_retime::parse_srt;
 use postkit::timeline::{
     Clip, ClipSound, SoundTrack, TIMELINE_FORMAT_VERSION, Timeline, join_subtitles, render_sound,
@@ -380,13 +385,13 @@ fn close_to(found: [i32; 3], want: [i32; 3]) -> bool {
         .all(|(&found, want)| (found - want).abs() <= SAMPLE_TOLERANCE)
 }
 
-#[test]
-fn upper_layers_composite_over_layer_0_and_its_gaps_are_black() {
-    let directory = tempfile::tempdir().unwrap();
-    let blue = blue_video(directory.path(), 1);
-    let half_red = half_red_stills(directory.path(), 8);
-    let red_pillar = red_pillar_stills(directory.path(), 4);
-    let timeline = Timeline {
+// a black gap, a half red overlay running from it onto the blue base, a padded
+// opaque pillar, and the half red again at half opacity
+fn compositing_timeline(directory: &Path) -> Timeline {
+    let blue = blue_video(directory, 1);
+    let half_red = half_red_stills(directory, 8);
+    let red_pillar = red_pillar_stills(directory, 4);
+    Timeline {
         reel_starts: Vec::new(),
         ..timeline(vec![
             layered(&half_red, 20, 8, 2, 0.5),
@@ -394,18 +399,28 @@ fn upper_layers_composite_over_layer_0_and_its_gaps_are_black() {
             layered(&half_red, 4, 8, 1, 1.0),
             layered(&red_pillar, 14, 4, 1, 1.0),
         ])
-    };
+    }
+}
+
+fn compositing_options() -> EncodeRunOptions {
+    EncodeRunOptions {
+        source_colour: SourceColour::KeepRgb,
+        picture: fitted_to_the_raster(),
+        ..at_the_timeline_rate()
+    }
+}
+
+#[test]
+fn upper_layers_composite_over_layer_0_and_its_gaps_are_black() {
+    let directory = tempfile::tempdir().unwrap();
+    let timeline = compositing_timeline(directory.path());
     let total_frames = 30;
     assert_eq!(timeline.total_frames(), total_frames);
 
     let (result, frames_reported) = encode(
         &timeline,
         &directory.path().join("out"),
-        &EncodeRunOptions {
-            source_colour: SourceColour::KeepRgb,
-            picture: fitted_to_the_raster(),
-            ..at_the_timeline_rate()
-        },
+        &compositing_options(),
     );
     assert_eq!(result.frames_encoded, total_frames);
     let names = codestream_names(&result.j2k_dir);
@@ -543,4 +558,112 @@ fn an_overlay_over_jpeg_2000_or_jpeg_2000_above_layer_0_is_refused_by_name() {
             codestreams.display()
         )
     );
+}
+
+const IMF_BITS_PER_SECOND: u64 = 200_000_000;
+
+#[test]
+fn a_composite_stretch_and_a_black_one_wrap_into_track_files_of_their_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let timeline = compositing_timeline(directory.path());
+    let stretches = timeline_stretches(&timeline, &compositing_options()).unwrap();
+    let cuts: Vec<(u64, u64)> = stretches
+        .iter()
+        .map(|stretch| (stretch.frames.start, stretch.frames.end))
+        .collect();
+    assert_eq!(
+        cuts,
+        vec![
+            (0, 4),
+            (4, 6),
+            (6, 12),
+            (12, 14),
+            (14, 18),
+            (18, 20),
+            (20, 28),
+            (28, 30)
+        ]
+    );
+    let black = &stretches[0];
+    assert_eq!(
+        black.base,
+        StretchBase::Black {
+            width: WIDTH,
+            height: HEIGHT
+        }
+    );
+    assert!(black.overlays.is_empty());
+    let composite = &stretches[2];
+    assert_eq!(composite.base, StretchBase::Clip(1));
+    assert_eq!(composite.overlays, vec![2]);
+
+    // an IMF track file takes an IMF profile, as imfwizard encodes it
+    let levels = imf_levels(WIDTH, HEIGHT, f64::from(RATE), IMF_BITS_PER_SECOND).unwrap();
+    let options = EncodeRunOptions {
+        rsiz: imf_rsiz(ImfProfile::for_raster(WIDTH, HEIGHT).unwrap(), levels),
+        ..compositing_options()
+    };
+    for (stretch, want) in [
+        (black, [BLACK, BLACK, BLACK]),
+        (composite, [RED, RED, BLUE]),
+    ] {
+        let length = stretch.frames.end - stretch.frames.start;
+        let output = directory
+            .path()
+            .join(format!("stretch_{}", stretch.frames.start));
+        std::fs::create_dir_all(&output).unwrap();
+        let mxf = output.join("picture.mxf");
+        let frames_reported = Mutex::new(Vec::new());
+        let (encode, track) = run_encode_timeline_stretch_and_wrap_picture(
+            &timeline,
+            stretch,
+            &output,
+            &options,
+            IncrementalWrapOptions {
+                output: mxf.clone(),
+                standard: MxfStandard::As02,
+                fps_num: RATE,
+                fps_den: 1,
+                encryption: None,
+                hdr: Some(rec709_sdr_picture_colour()),
+                asset_uuid: None,
+            },
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            |progress: &PipelineProgress| frames_reported.lock().unwrap().push(progress.frame),
+            |_: &str| {},
+        )
+        .expect("the stretch encodes and wraps");
+        assert_eq!(encode.frames_encoded, length);
+        assert_eq!(track.path, mxf);
+        assert_eq!(
+            frames_reported.into_inner().unwrap().last(),
+            Some(&length),
+            "progress counts the stretch's own frames"
+        );
+
+        let unwrapped = output.join("unwrapped");
+        let info = postkit::mxf_unwrap::unwrap_picture_mxf(
+            &mxf,
+            &unwrapped,
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+        )
+        .expect("the track file reads back");
+        assert_eq!(info.frames, length);
+        assert_eq!((info.width, info.height), (WIDTH, HEIGHT));
+        let names = codestream_names(&unwrapped);
+        assert_eq!(names.len() as u64, length);
+        for name in names {
+            let found = sampled_pixels(&unwrapped.join(&name));
+            assert!(
+                found
+                    .iter()
+                    .zip(want)
+                    .all(|(&found, want)| close_to(found, want)),
+                "{name} of the track file for frames {:?} samples {found:?}, not {want:?}",
+                stretch.frames
+            );
+        }
+    }
 }

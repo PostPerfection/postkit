@@ -5,8 +5,8 @@ use crate::encode::stream_encode::{
     start_frame_decoder,
 };
 use crate::encode::{
-    DecodeSource, EncoderInputFormat, FrameRange, PACKED_RGB_BYTES_PER_PIXEL, PictureFilters,
-    StreamEncodeOptions, StreamProgress, compress_params, packed_rgb_sample_order,
+    DecodeSource, EncodeResult, EncoderInputFormat, FrameRange, PACKED_RGB_BYTES_PER_PIXEL,
+    PictureFilters, StreamEncodeOptions, StreamProgress, compress_params, packed_rgb_sample_order,
 };
 use crate::ffmpeg_decode::{
     FinishedDecode, FrameDecoder, FrameSource, NextFrame, PACKED_RGBA_BYTES_PER_PIXEL,
@@ -287,21 +287,30 @@ pub(crate) fn encode_composite<F>(
     composite: &Composite,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     pause: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
     on_progress: F,
     on_log: impl Fn(&str),
-) -> Result<PictureFindings, String>
+) -> EncodeResult
 where
     F: FnMut(StreamProgress),
 {
-    std::fs::create_dir_all(&opts.output_dir)
-        .map_err(|e| format!("cannot create {}: {e}", opts.output_dir.display()))?;
-    let params = compress_params(opts)?;
-    let frames = composite_frames(composite, opts, &params, &on_log)?;
-    let result = encode_frames(opts, &params, frames, cancel, pause, None, on_progress);
-    if !result.success {
-        return Err(result.error);
+    let opened = std::fs::create_dir_all(&opts.output_dir)
+        .map_err(|e| format!("cannot create {}: {e}", opts.output_dir.display()))
+        .and_then(|()| {
+            let params = compress_params(opts)?;
+            let frames = composite_frames(composite, opts, &params, &on_log)?;
+            Ok((params, frames))
+        });
+    match opened {
+        Ok((params, frames)) => {
+            encode_frames(opts, &params, frames, cancel, pause, mxf_feed, on_progress)
+        }
+        Err(error) => EncodeResult {
+            success: false,
+            error,
+            ..Default::default()
+        },
     }
-    Ok(result.picture_findings)
 }
 
 #[cfg(test)]

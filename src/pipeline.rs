@@ -287,20 +287,7 @@ pub fn run_encode_timeline(
     on_progress: impl Fn(&PipelineProgress),
     on_log: impl Fn(&str),
 ) -> Result<EncodeResult, String> {
-    if options.frame_range.is_some() {
-        return Err(
-            "a timeline's clips carry their own in and out points, so a timeline encode takes \
-             no frame range"
-                .to_string(),
-        );
-    }
-    if let Some(filter) = &options.extra_picture_filter {
-        return Err(format!(
-            "the picture filter {filter} would start again on every clip, so a timeline encode \
-             takes none"
-        ));
-    }
-    timeline.check()?;
+    refuse_timeline_options(options)?;
     let stretches = timeline_stretches(timeline, options)?;
     let start_time = std::time::Instant::now();
     let total_frames = timeline.total_frames();
@@ -333,22 +320,18 @@ pub fn run_encode_timeline(
                 write_secs: phases.write,
             });
         };
-        let mut findings = match (&stretch.base, stretch.overlays.is_empty()) {
-            (StretchBase::Clip(index), true) => encode_base_clip(
-                timeline,
-                *index,
-                &stretch.frames,
-                output_dir,
-                options,
-                cancel,
-                pause,
-                report,
-                &on_log,
-            )?,
-            _ => encode_composite_stretch(
-                timeline, stretch, output_dir, options, cancel, pause, report, &on_log,
-            )?,
-        };
+        let mut findings = encode_stretch(
+            timeline,
+            stretch,
+            output_dir,
+            options,
+            StretchOutput::TimelineCodestreams,
+            cancel,
+            pause,
+            report,
+            &on_log,
+        )?
+        .picture_findings;
         let phases = stretch_phases.get();
         let frames_done = first_output_frame + frame_count;
         report(&PipelineProgress {
@@ -384,17 +367,130 @@ pub fn run_encode_timeline(
     })
 }
 
-enum StretchBase {
+#[allow(clippy::too_many_arguments)]
+pub fn run_encode_timeline_stretch_and_wrap_picture(
+    timeline: &Timeline,
+    stretch: &TimelineStretch,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    wrap: crate::mxf_wrap::IncrementalWrapOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    on_progress: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<(EncodeResult, crate::mxf_wrap::MxfTrackFile), String> {
+    refuse_timeline_options(options)?;
+    let start_time = std::time::Instant::now();
+    let encoded = encode_stretch(
+        timeline,
+        stretch,
+        output_dir,
+        options,
+        StretchOutput::TrackFile(wrap),
+        cancel,
+        pause,
+        on_progress,
+        on_log,
+    )?;
+    let encode = EncodeResult {
+        j2k_dir: output_dir.join("j2k"),
+        frames_encoded: encoded.frames_encoded,
+        elapsed_secs: start_time.elapsed().as_secs_f64(),
+        picture_findings: encoded.picture_findings,
+    };
+    Ok((encode, encoded.track.expect("a wrap was asked for")))
+}
+
+fn refuse_timeline_options(options: &EncodeRunOptions) -> Result<(), String> {
+    if options.frame_range.is_some() {
+        return Err(
+            "a timeline's clips carry their own in and out points, so a timeline encode takes \
+             no frame range"
+                .to_string(),
+        );
+    }
+    if let Some(filter) = &options.extra_picture_filter {
+        return Err(format!(
+            "the picture filter {filter} would start again on every clip, so a timeline encode \
+             takes none"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StretchBase {
     Clip(usize),
     Black { width: u32, height: u32 },
 }
 
 // timeline frames whose clips stay the same throughout
-struct TimelineStretch {
-    frames: Range<u64>,
-    base: StretchBase,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineStretch {
+    pub frames: Range<u64>,
+    pub base: StretchBase,
     // clip indices on layers above 0, bottom to top
-    overlays: Vec<usize>,
+    pub overlays: Vec<usize>,
+}
+
+enum StretchOutput {
+    // into output_dir/j2k at the stretch's own timeline frames, beside the other stretches
+    TimelineCodestreams,
+    // into output_dir/j2k from frame 0, and into this track file as they are written
+    TrackFile(crate::mxf_wrap::IncrementalWrapOptions),
+}
+
+impl StretchOutput {
+    fn first_output_frame(&self, stretch_start: u64) -> u64 {
+        match self {
+            StretchOutput::TimelineCodestreams => stretch_start,
+            StretchOutput::TrackFile(_) => FIRST_FRAME,
+        }
+    }
+
+    fn wrap(self) -> Option<crate::mxf_wrap::IncrementalWrapOptions> {
+        match self {
+            StretchOutput::TimelineCodestreams => None,
+            StretchOutput::TrackFile(wrap) => Some(wrap),
+        }
+    }
+}
+
+struct StretchEncoded {
+    frames_encoded: u64,
+    picture_findings: crate::picture_findings::PictureFindings,
+    track: Option<crate::mxf_wrap::MxfTrackFile>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_stretch(
+    timeline: &Timeline,
+    stretch: &TimelineStretch,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    output: StretchOutput,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    report: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<StretchEncoded, String> {
+    match (&stretch.base, stretch.overlays.is_empty()) {
+        (StretchBase::Clip(index), true) => encode_base_clip(
+            timeline,
+            *index,
+            &stretch.frames,
+            output_dir,
+            options,
+            output,
+            cancel,
+            pause,
+            report,
+            &on_log,
+        ),
+        _ => encode_composite_stretch(
+            timeline, stretch, output_dir, options, output, cancel, pause, report, &on_log,
+        ),
+    }
 }
 
 fn is_compressed(clip: &Clip) -> bool {
@@ -419,10 +515,11 @@ fn effective_picture(clip: &Clip, options: &EncodeRunOptions) -> PictureProcessi
 }
 
 // cut at every clip's start and end on every layer
-fn timeline_stretches(
+pub fn timeline_stretches(
     timeline: &Timeline,
     options: &EncodeRunOptions,
 ) -> Result<Vec<TimelineStretch>, String> {
+    timeline.check()?;
     let clips = &timeline.clips;
     if let Some((index, clip)) = clips
         .iter()
@@ -539,11 +636,12 @@ fn encode_base_clip(
     frames: &Range<u64>,
     output_dir: &Path,
     options: &EncodeRunOptions,
+    output: StretchOutput,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     report: impl Fn(&PipelineProgress),
     on_log: impl Fn(&str),
-) -> Result<crate::picture_findings::PictureFindings, String> {
+) -> Result<StretchEncoded, String> {
     let clip = &timeline.clips[index];
     let name = crate::timeline::clip_name(index, clip);
     let window = clip_window(clip, frames);
@@ -559,44 +657,51 @@ fn encode_base_clip(
         ..options.clone()
     };
     let input_type = crate::encode::detect_input_type(&clip.picture);
-    match input_type {
-        InputType::J2kSequence | InputType::PictureMxf => {
-            let scratch_dir = output_dir.join(format!("timeline_clip_{index}"));
-            place_compressed_clip(
-                clip,
-                input_type,
-                &scratch_dir,
-                &output_dir.join("j2k"),
-                frames.start,
-                &clip_options,
-                cancel,
-                pause,
-                report,
-                &on_log,
-            )
-            .map_err(|error| name_the_clip(&name, error))?;
-            Ok(crate::picture_findings::PictureFindings::default())
-        }
-        _ => {
-            let windowed = EncodeRunOptions {
-                frame_range: Some(window),
-                ..clip_options
-            };
-            let (encode, _) = run_encode_and_maybe_wrap(
-                &clip.picture,
-                output_dir,
-                &windowed,
-                None,
-                frames.start,
-                cancel,
-                pause,
-                report,
-                &on_log,
-            )
-            .map_err(|error| name_the_clip(&name, error))?;
-            Ok(encode.picture_findings)
-        }
+    let compressed = matches!(input_type, InputType::J2kSequence | InputType::PictureMxf);
+    if compressed && let StretchOutput::TimelineCodestreams = output {
+        let scratch_dir = output_dir.join(format!("timeline_clip_{index}"));
+        place_compressed_clip(
+            clip,
+            input_type,
+            &scratch_dir,
+            &output_dir.join("j2k"),
+            frames.start,
+            &clip_options,
+            cancel,
+            pause,
+            report,
+            &on_log,
+        )
+        .map_err(|error| name_the_clip(&name, error))?;
+        return Ok(StretchEncoded {
+            frames_encoded: frames.end - frames.start,
+            picture_findings: crate::picture_findings::PictureFindings::default(),
+            track: None,
+        });
     }
+    // a compressed clip goes whole, as it would through run_encode_and_wrap_picture
+    let windowed = EncodeRunOptions {
+        frame_range: (!compressed).then_some(window),
+        ..clip_options
+    };
+    let first_output_frame = output.first_output_frame(frames.start);
+    let (encode, track) = run_encode_and_maybe_wrap(
+        &clip.picture,
+        output_dir,
+        &windowed,
+        output.wrap(),
+        first_output_frame,
+        cancel,
+        pause,
+        report,
+        &on_log,
+    )
+    .map_err(|error| name_the_clip(&name, error))?;
+    Ok(StretchEncoded {
+        frames_encoded: encode.frames_encoded,
+        picture_findings: encode.picture_findings,
+        track,
+    })
 }
 
 fn composite_layer(
@@ -651,11 +756,12 @@ fn encode_composite_stretch(
     stretch: &TimelineStretch,
     output_dir: &Path,
     options: &EncodeRunOptions,
+    output: StretchOutput,
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     report: impl Fn(&PipelineProgress),
     on_log: impl Fn(&str),
-) -> Result<crate::picture_findings::PictureFindings, String> {
+) -> Result<StretchEncoded, String> {
     let frames = &stretch.frames;
     let base = match stretch.base {
         StretchBase::Clip(index) => CompositeBase::Clip(composite_layer(
@@ -690,22 +796,34 @@ fn encode_composite_stretch(
     }
     let stream_options = StreamEncodeOptions {
         source_colour,
-        ..stream_encode_options(options, &output_dir.join("j2k"), frames.start)
+        ..stream_encode_options(
+            options,
+            &output_dir.join("j2k"),
+            output.first_output_frame(frames.start),
+        )
     };
     let composite = Composite {
         base,
         overlays,
         frame_count: frames.end - frames.start,
     };
-    let findings = crate::composite::encode_composite(
+    let mut overlapped_wrap = output
+        .wrap()
+        .map(crate::mxf_wrap::OverlappedJ2kWrap::start)
+        .transpose()?;
+    let result = crate::composite::encode_composite(
         &stream_options,
         &composite,
         cancel,
         pause,
+        overlapped_wrap.as_ref().map(|wrap| wrap.sender()),
         |progress| report_stream_frame(progress, &report, &on_log),
         &on_log,
-    )
-    .map_err(|error| name_the_clip(&stretch_name, error))?;
+    );
+    let (frames_encoded, picture_findings) =
+        wrapped_stream_result(result, overlapped_wrap.as_mut())
+            .map_err(|error| name_the_clip(&stretch_name, error))?;
+    let track = finish_overlapped_wrap(overlapped_wrap, frames_encoded, &on_log)?;
     let base_layer = match &composite.base {
         CompositeBase::Clip(layer) => Some(layer),
         CompositeBase::Black { .. } => None,
@@ -717,7 +835,11 @@ fn encode_composite_stretch(
         std::fs::remove_file(&layer.input)
             .map_err(|e| format!("cannot remove {}: {e}", layer.input.display()))?;
     }
-    Ok(findings)
+    Ok(StretchEncoded {
+        frames_encoded,
+        picture_findings,
+        track,
+    })
 }
 
 fn name_the_clip(name: &str, error: String) -> String {
@@ -898,21 +1020,8 @@ fn run_encode_and_maybe_wrap(
     };
     let report_frame = |p: StreamProgress| report_stream_frame(p, &on_progress, &on_log);
     let mxf_feed = overlapped_wrap.as_ref().map(|wrap| wrap.sender());
-    let mut finish = |result: crate::encode::EncodeResult| -> Result<
-        (u64, crate::picture_findings::PictureFindings),
-        String,
-    > {
-        if !result.success {
-            // the encoder only sees that the wrap stopped taking frames, so the
-            // wrap's own error is the one worth reporting
-            if let Some(wrap) = overlapped_wrap.as_mut()
-                && let Some(error) = wrap.abandon()
-            {
-                return Err(error);
-            }
-            return Err(result.error);
-        }
-        Ok((result.frames_encoded, result.picture_findings))
+    let mut finish = |result: crate::encode::EncodeResult| {
+        wrapped_stream_result(result, overlapped_wrap.as_mut())
     };
     // a cloned feed would keep the wrap waiting after the encoder returns
     let run_stream = |opts: &StreamEncodeOptions, mxf_feed| {
@@ -1036,19 +1145,7 @@ fn run_encode_and_maybe_wrap(
         check_codestream_dir(&final_j2k_dir, cap)?;
     }
 
-    // the wrap has every frame by now, so this only writes the footer and hashes
-    let track_file = match overlapped_wrap.take() {
-        Some(wrap) => {
-            let track = wrap.finish(frames_encoded)?;
-            on_log(&format!(
-                "[WRAP] {} frames into {}",
-                track.duration,
-                track.path.display()
-            ));
-            Some(track)
-        }
-        None => None,
-    };
+    let track_file = finish_overlapped_wrap(overlapped_wrap.take(), frames_encoded, &on_log)?;
 
     let elapsed_secs = start_time.elapsed().as_secs_f64();
 
@@ -1061,6 +1158,41 @@ fn run_encode_and_maybe_wrap(
         },
         track_file,
     ))
+}
+
+fn wrapped_stream_result(
+    result: crate::encode::EncodeResult,
+    overlapped_wrap: Option<&mut crate::mxf_wrap::OverlappedJ2kWrap>,
+) -> Result<(u64, crate::picture_findings::PictureFindings), String> {
+    if !result.success {
+        // the encoder only sees that the wrap stopped taking frames, so the
+        // wrap's own error is the one worth reporting
+        if let Some(wrap) = overlapped_wrap
+            && let Some(error) = wrap.abandon()
+        {
+            return Err(error);
+        }
+        return Err(result.error);
+    }
+    Ok((result.frames_encoded, result.picture_findings))
+}
+
+// the wrap has every frame by now, so this only writes the footer and hashes
+fn finish_overlapped_wrap(
+    overlapped_wrap: Option<crate::mxf_wrap::OverlappedJ2kWrap>,
+    frames_encoded: u64,
+    on_log: &impl Fn(&str),
+) -> Result<Option<crate::mxf_wrap::MxfTrackFile>, String> {
+    let Some(wrap) = overlapped_wrap else {
+        return Ok(None);
+    };
+    let track = wrap.finish(frames_encoded)?;
+    on_log(&format!(
+        "[WRAP] {} frames into {}",
+        track.duration,
+        track.path.display()
+    ));
+    Ok(Some(track))
 }
 
 fn stream_encode_options(
