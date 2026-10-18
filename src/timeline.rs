@@ -1072,4 +1072,46 @@ mod tests {
             "edl://%14%/media/a,b.mov,0.5,1;%12%/media/c.mov,0,2"
         );
     }
+
+    #[test]
+    fn a_remuxed_dolby_vision_source_probes_the_frames_it_decodes() {
+        use crate::dolby_vision::{
+            DOLBY_VISION_FIXTURE_FRAMES, DolbyVisionFixtureProfile, write_dolby_vision_fixture,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let annex_b = write_dolby_vision_fixture(
+            directory.path(),
+            "dv.hevc",
+            DolbyVisionFixtureProfile::Profile81,
+            None,
+            None,
+        )
+        .unwrap();
+        let mp4 = directory.path().join("dv.mp4");
+        let remux = Command::new("ffmpeg")
+            .args(["-y", "-v", "error", "-i"])
+            .arg(&annex_b)
+            .args(["-c", "copy"])
+            .arg(&mp4)
+            .output()
+            .unwrap();
+        assert!(
+            remux.status.success(),
+            "{}",
+            String::from_utf8_lossy(&remux.stderr)
+        );
+        let decoded = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "v:0", "-count_frames"])
+            .args(["-show_entries", "stream=nb_read_frames", "-of", "csv=p=0"])
+            .arg(&mp4)
+            .output()
+            .unwrap();
+        let decoded: u64 = String::from_utf8_lossy(&decoded.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+
+        assert_eq!(probe_source(&mp4).unwrap().frames, decoded);
+        assert_eq!(decoded, DOLBY_VISION_FIXTURE_FRAMES as u64);
+    }
 }

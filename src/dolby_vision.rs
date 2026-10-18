@@ -429,6 +429,8 @@ pub const DOLBY_VISION_FIXTURE_FRAMES: usize = 6;
 
 const FIXTURE_SOURCE_FILTER: &str = "color=c=gray:s=320x180:r=25";
 const FIXTURE_PIXEL_FORMAT: &str = "yuv420p10le";
+// B-frames lose their order when ffmpeg remuxes raw hevc to mp4
+const FIXTURE_X265_PARAMS: &str = "log-level=none:bframes=0";
 const FIXTURE_LEVEL_1_AVG_PQ: u16 = 1229;
 const NAL_START_CODE: &[u8] = &[0, 0, 0, 1];
 const NAL_START_CODE_PREFIX: &[u8] = &[0, 0, 1];
@@ -469,7 +471,7 @@ fn encode_plain_hevc(output: &Path) -> Result<(), String> {
             "-c:v",
             "libx265",
             "-x265-params",
-            "log-level=none",
+            FIXTURE_X265_PARAMS,
             "-f",
             "hevc",
         ])
