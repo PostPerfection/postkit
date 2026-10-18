@@ -2,6 +2,7 @@ use super::{
     CompressParams, EncodePhase, EncodeProgress, PhaseClocks, PipelineResult,
     contiguous_encoded_frames, encode_pipeline_with_mxf_feed, gpu_active,
 };
+use crate::ffmpeg_decode::FrameSource;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -182,6 +183,7 @@ where
             quality_psnr: params.quality_psnr,
             postkit_prepares_the_frame: !params.source_preparation.is_empty(),
             detect_picture_findings: params.detect_picture_findings,
+            alpha: crate::encode::stream_encode::AlphaChannel::Dropped,
         },
         width,
         height,

@@ -67,8 +67,6 @@
   the file as ffprobe does, so nothing refuses or warns. Check the first packets
   for pts equal to dts on a stream whose SPS allows reordering and refuse or warn
   by name. Which remux recipe repairs such a file is not known yet.
-- Timeline follow-ups. `pipeline::run_encode_timeline` only cuts, so there is no
-  alpha compositing of a clip over the one below it for title sequences.
 - DTS:X. Would ride the generic DCData (ST 429-14) aux path, but the correct
   DataEssenceCoding UL could not be confirmed from asdcplib sources or SMPTE docs, so
   no `wrap_dcdata` was added rather than emit a wrong UL. Revisit once a confirmed UL

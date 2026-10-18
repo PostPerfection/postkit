@@ -3,7 +3,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use postkit::encode::{FrameRate, SourceColour};
-use postkit::picture_processing::PictureProcessing;
+use postkit::picture_processing::{Fit, PictureProcessing, Placement};
 use postkit::pipeline::{EncodeRunOptions, PipelineProgress, run_encode_timeline};
 use postkit::subtitle_retime::parse_srt;
 use postkit::timeline::{
@@ -71,15 +71,23 @@ fn timeline(clips: Vec<Clip>) -> Timeline {
     }
 }
 
-fn encode(timeline: &Timeline, output: &Path) -> (postkit::pipeline::EncodeResult, Vec<u64>) {
+fn at_the_timeline_rate() -> EncodeRunOptions {
+    EncodeRunOptions {
+        fps: FrameRate::whole(RATE),
+        ..Default::default()
+    }
+}
+
+fn encode(
+    timeline: &Timeline,
+    output: &Path,
+    options: &EncodeRunOptions,
+) -> (postkit::pipeline::EncodeResult, Vec<u64>) {
     let frames_reported = Mutex::new(Vec::new());
     let result = run_encode_timeline(
         timeline,
         output,
-        &EncodeRunOptions {
-            fps: FrameRate::whole(RATE),
-            ..Default::default()
-        },
+        options,
         &Arc::new(AtomicBool::new(false)),
         &Arc::new(AtomicBool::new(false)),
         |progress: &PipelineProgress| {
@@ -177,7 +185,11 @@ fn two_trimmed_clips_build_one_picture_sound_and_subtitle_track() {
         ]
     );
 
-    let (result, frames_reported) = encode(&timeline, &directory.path().join("out"));
+    let (result, frames_reported) = encode(
+        &timeline,
+        &directory.path().join("out"),
+        &at_the_timeline_rate(),
+    );
     assert_eq!(result.frames_encoded, total_frames);
     assert_eq!(
         codestream_names(&result.j2k_dir),
@@ -199,7 +211,11 @@ fn two_trimmed_clips_build_one_picture_sound_and_subtitle_track() {
     followed_by_codestreams
         .check()
         .expect("a codestream directory takes the timeline's rate");
-    let (linked, _) = encode(&followed_by_codestreams, &directory.path().join("linked"));
+    let (linked, _) = encode(
+        &followed_by_codestreams,
+        &directory.path().join("linked"),
+        &at_the_timeline_rate(),
+    );
     assert_eq!(
         codestream_names(&linked.j2k_dir),
         numbered_codestreams(24 + total_frames)
@@ -240,5 +256,291 @@ fn a_clip_at_another_rate_is_refused_by_name() {
     assert!(
         refused.starts_with(&format!("clip 2 ({}) runs at 25/1 fps", other.display())),
         "{refused}"
+    );
+}
+
+const WIDTH: u32 = 320;
+const HEIGHT: u32 = 180;
+
+fn run_ffmpeg(arguments: &[&str]) {
+    let made = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-y"])
+        .args(arguments)
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+}
+
+// rgb all the way, so the blue reaches the encode exactly
+fn blue_video(directory: &Path, seconds: u32) -> PathBuf {
+    let clip = directory.join("blue.mkv");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=blue:s={WIDTH}x{HEIGHT}:rate={RATE}:duration={seconds}"),
+        "-pix_fmt",
+        "gbrp",
+        "-c:v",
+        "ffv1",
+        &clip.to_string_lossy(),
+    ]);
+    clip
+}
+
+// red over the left half, transparent over the right
+fn half_red_stills(directory: &Path, frames: u32) -> PathBuf {
+    let stills = directory.join("half_red");
+    std::fs::create_dir_all(&stills).unwrap();
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=red:s={}x{HEIGHT}:rate={RATE}", WIDTH / 2),
+        "-vf",
+        &format!("format=rgba,pad={WIDTH}:{HEIGHT}:0:0:color=black@0"),
+        "-frames:v",
+        &frames.to_string(),
+        "-pix_fmt",
+        "rgba",
+        &stills.join("frame_%04d.png").to_string_lossy(),
+    ]);
+    stills
+}
+
+// opaque with no alpha, half the raster's width, so the fit pads it on both sides
+fn red_pillar_stills(directory: &Path, frames: u32) -> PathBuf {
+    let stills = directory.join("red_pillar");
+    std::fs::create_dir_all(&stills).unwrap();
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=red:s={}x{HEIGHT}:rate={RATE}", WIDTH / 2),
+        "-frames:v",
+        &frames.to_string(),
+        "-pix_fmt",
+        "rgb24",
+        &stills.join("frame_%04d.png").to_string_lossy(),
+    ]);
+    stills
+}
+
+fn layered(picture: &Path, start: u64, frames: u64, layer: u32, opacity: f64) -> Clip {
+    Clip {
+        layer,
+        opacity,
+        sound: ClipSound::None,
+        source_colour: SourceColour::KeepRgb,
+        ..clip(picture, start, 0, frames, None)
+    }
+}
+
+fn fitted_to_the_raster() -> PictureProcessing {
+    PictureProcessing {
+        fit: Some(Fit {
+            box_width: WIDTH,
+            box_height: HEIGHT,
+            raster_width: WIDTH,
+            raster_height: HEIGHT,
+            placement: Placement::default(),
+        }),
+        ..PictureProcessing::default()
+    }
+}
+
+// inside the pillar and left of the half red edge, and outside both
+fn sampled_pixels(codestream: &Path) -> [[i32; 3]; 3] {
+    let frame = postkit::grok_decoder::decode(std::fs::read(codestream).unwrap(), 0)
+        .expect("the codestream decodes");
+    assert_eq!((frame.width, frame.height), (WIDTH, HEIGHT));
+    let to_sixteen_bits = 16 - i32::from(frame.precision);
+    [WIDTH / 8, WIDTH * 3 / 8, WIDTH * 7 / 8].map(|x| {
+        let at = (HEIGHT / 2 * WIDTH + x) as usize;
+        [0, 1, 2].map(|component| frame.components[component][at] << to_sixteen_bits)
+    })
+}
+
+const FULL: i32 = 65535;
+const BLACK: [i32; 3] = [0, 0, 0];
+const BLUE: [i32; 3] = [0, 0, FULL];
+const RED: [i32; 3] = [FULL, 0, 0];
+const RED_AT_HALF_OPACITY_OVER_BLUE: [i32; 3] = [32768, 0, 32767];
+// compression at 10:1 takes a flat patch about one percent off, composited or not
+const SAMPLE_TOLERANCE: i32 = 1 << 10;
+
+fn close_to(found: [i32; 3], want: [i32; 3]) -> bool {
+    found
+        .iter()
+        .zip(want)
+        .all(|(&found, want)| (found - want).abs() <= SAMPLE_TOLERANCE)
+}
+
+#[test]
+fn upper_layers_composite_over_layer_0_and_its_gaps_are_black() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 1);
+    let half_red = half_red_stills(directory.path(), 8);
+    let red_pillar = red_pillar_stills(directory.path(), 4);
+    let timeline = Timeline {
+        reel_starts: Vec::new(),
+        ..timeline(vec![
+            layered(&half_red, 20, 8, 2, 0.5),
+            layered(&blue, 6, 24, 0, 1.0),
+            layered(&half_red, 4, 8, 1, 1.0),
+            layered(&red_pillar, 14, 4, 1, 1.0),
+        ])
+    };
+    let total_frames = 30;
+    assert_eq!(timeline.total_frames(), total_frames);
+
+    let (result, frames_reported) = encode(
+        &timeline,
+        &directory.path().join("out"),
+        &EncodeRunOptions {
+            source_colour: SourceColour::KeepRgb,
+            picture: fitted_to_the_raster(),
+            ..at_the_timeline_rate()
+        },
+    );
+    assert_eq!(result.frames_encoded, total_frames);
+    let names = codestream_names(&result.j2k_dir);
+    assert_eq!(names, numbered_codestreams(total_frames));
+    assert_eq!(frames_reported.last(), Some(&total_frames));
+
+    let expected = |frame: u64| match frame {
+        0..4 => [BLACK, BLACK, BLACK],
+        4..6 => [RED, RED, BLACK],
+        6..12 => [RED, RED, BLUE],
+        14..18 => [BLUE, RED, BLUE],
+        20..28 => [
+            RED_AT_HALF_OPACITY_OVER_BLUE,
+            RED_AT_HALF_OPACITY_OVER_BLUE,
+            BLUE,
+        ],
+        _ => [BLUE, BLUE, BLUE],
+    };
+    for (frame, name) in names.iter().enumerate() {
+        let found = sampled_pixels(&result.j2k_dir.join(name));
+        let want = expected(frame as u64);
+        assert!(
+            found
+                .iter()
+                .zip(want)
+                .all(|(&found, want)| close_to(found, want)),
+            "timeline frame {frame} samples {found:?}, not {want:?}"
+        );
+    }
+}
+
+fn refusal(clips: Vec<Clip>, output: &Path, options: &EncodeRunOptions) -> String {
+    let timeline = Timeline {
+        reel_starts: Vec::new(),
+        ..timeline(clips)
+    };
+    run_encode_timeline(
+        &timeline,
+        output,
+        options,
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(AtomicBool::new(false)),
+        |_: &PipelineProgress| {},
+        |_: &str| {},
+    )
+    .err()
+    .expect("the timeline has to be refused")
+}
+
+#[test]
+fn an_overlay_in_another_source_colour_or_a_gap_with_no_raster_is_refused_by_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 1);
+    let half_red = half_red_stills(directory.path(), 8);
+    let mut display_rgb_overlay = layered(&half_red, 4, 8, 1, 1.0);
+    display_rgb_overlay.source_colour = SourceColour::default();
+    let options = EncodeRunOptions {
+        picture: fitted_to_the_raster(),
+        ..at_the_timeline_rate()
+    };
+    let refused = refusal(
+        vec![layered(&blue, 0, 24, 0, 1.0), display_rgb_overlay],
+        &directory.path().join("colour"),
+        &options,
+    );
+    assert_eq!(
+        refused,
+        format!(
+            "clip 2 ({}) has the source colour DisplayRgb and clip 1 ({}) under it has \
+             KeepRgb: a composite takes one source colour",
+            half_red.display(),
+            blue.display()
+        )
+    );
+
+    let refused = refusal(
+        vec![layered(&blue, 6, 24, 0, 1.0)],
+        &directory.path().join("gap"),
+        &at_the_timeline_rate(),
+    );
+    assert_eq!(
+        refused,
+        "layer 0 is empty from frame 0 to frame 6, and the black there has no raster: the \
+         picture options need a fit"
+    );
+    assert!(
+        !directory.path().join("colour").exists() && !directory.path().join("gap").exists(),
+        "a refusal comes before anything is encoded"
+    );
+}
+
+#[test]
+fn an_overlay_over_jpeg_2000_or_jpeg_2000_above_layer_0_is_refused_by_name() {
+    let directory = tempfile::tempdir().unwrap();
+    let codestreams = directory.path().join("codestreams");
+    std::fs::create_dir_all(&codestreams).unwrap();
+    for frame in numbered_codestreams(8) {
+        std::fs::write(codestreams.join(frame), [0u8]).unwrap();
+    }
+    let half_red = half_red_stills(directory.path(), 8);
+    let options = EncodeRunOptions {
+        picture: fitted_to_the_raster(),
+        ..at_the_timeline_rate()
+    };
+    let refused = refusal(
+        vec![
+            layered(&codestreams, 0, 8, 0, 1.0),
+            layered(&half_red, 2, 4, 1, 1.0),
+        ],
+        &directory.path().join("over"),
+        &options,
+    );
+    assert_eq!(
+        refused,
+        format!(
+            "clip 2 ({}) lies over clip 1 ({}), which is already JPEG 2000 and cannot be \
+             composited",
+            half_red.display(),
+            codestreams.display()
+        )
+    );
+
+    let refused = refusal(
+        vec![
+            layered(&half_red, 0, 8, 0, 1.0),
+            layered(&codestreams, 0, 8, 3, 1.0),
+        ],
+        &directory.path().join("above"),
+        &options,
+    );
+    assert_eq!(
+        refused,
+        format!(
+            "clip 2 ({}) is on layer 3 and is already JPEG 2000, so it cannot be composited",
+            codestreams.display()
+        )
     );
 }

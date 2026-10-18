@@ -3,6 +3,7 @@ use super::{
     PictureFilters, PlanarYuvPixelFormat, SourceColour, StreamEncodeOptions, StreamProgress,
     YuvFrameFormat, YuvMatrix, compress_params, packed_rgb_sample_order,
 };
+use crate::ffmpeg_decode::{FrameSource, NextFrame};
 use crate::grok_encoder::SampleOrder;
 use std::path::Path;
 use std::sync::Arc;
@@ -109,6 +110,22 @@ fn planned_filters(
 /// runs at 8 bits and leaves every sample about two codes of 255 off the exact
 /// value.
 const SIXTEEN_BIT_RGB_FILTER: &str = "format=gbrp16le";
+const SIXTEEN_BIT_RGBA_FILTER: &str = "format=gbrap16le";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlphaChannel {
+    Dropped,
+    Kept,
+}
+
+impl AlphaChannel {
+    fn sixteen_bit_filter(self) -> &'static str {
+        match self {
+            AlphaChannel::Dropped => SIXTEEN_BIT_RGB_FILTER,
+            AlphaChannel::Kept => SIXTEEN_BIT_RGBA_FILTER,
+        }
+    }
+}
 
 /// ffmpeg filters that change the pixel format or the colour, so the decoded
 /// picture is no longer the source's own planes. `format=` is how a caller's
@@ -281,11 +298,12 @@ pub(crate) fn encoder_input_format_for_run(
 fn decode_filter_chain(
     picture: &DecodeFilters,
     input_format: EncoderInputFormat,
+    alpha: AlphaChannel,
     source: &crate::probe::PixelFormatInfo,
     source_colour: &SourceColour,
 ) -> String {
-    let hdr = hdr_yuv_to_rgb_filter(source, source_colour);
-    let filter = hdr.as_deref().unwrap_or(SIXTEEN_BIT_RGB_FILTER);
+    let hdr = hdr_yuv_to_rgb_filter(source, source_colour, alpha);
+    let filter = hdr.as_deref().unwrap_or(alpha.sixteen_bit_filter());
     match input_format {
         EncoderInputFormat::PlanarYuv(_) => picture.joined(),
         EncoderInputFormat::PackedRgb(_)
@@ -353,6 +371,7 @@ const ZSCALE_RGB_MATRIX: &str = "gbr";
 fn hdr_yuv_to_rgb_filter(
     source: &crate::probe::PixelFormatInfo,
     source_colour: &SourceColour,
+    alpha: AlphaChannel,
 ) -> Option<String> {
     let hdr_source = source_colour.hdr_source()?;
     if !is_yuv_pixel_format(&source.pix_fmt) {
@@ -365,8 +384,8 @@ fn hdr_yuv_to_rgb_filter(
     };
     let matrix = zscale_matrix_name(hdr_yuv_matrix(hdr_source, &source.color_space));
     Some(format!(
-        "zscale=matrixin={matrix}:rangein={range}:matrix={ZSCALE_RGB_MATRIX}:range=full,\
-         {SIXTEEN_BIT_RGB_FILTER}"
+        "zscale=matrixin={matrix}:rangein={range}:matrix={ZSCALE_RGB_MATRIX}:range=full,{}",
+        alpha.sixteen_bit_filter()
     ))
 }
 
@@ -400,11 +419,13 @@ pub(crate) struct DecodeChainInputs<'a> {
     /// and both need samples it can read
     pub postkit_prepares_the_frame: bool,
     pub detect_picture_findings: bool,
+    pub alpha: AlphaChannel,
 }
 
 /// What one decode runs.
 pub(crate) struct DecodeChain {
     pub input_format: EncoderInputFormat,
+    pub alpha: AlphaChannel,
     // the chain without the detection branch, which the graph adds itself
     pub picture_filters: String,
     pub decode_source: DecodeSource,
@@ -439,7 +460,9 @@ pub(crate) fn decode_chain(
         &FormatChoiceInputs {
             accelerator_active: inputs.accelerator_active,
             quality_psnr: inputs.quality_psnr,
-            postkit_prepares_the_frame: inputs.postkit_prepares_the_frame,
+            // a composite reads every layer's samples, so a layer with alpha is never planar YUV
+            postkit_prepares_the_frame: inputs.postkit_prepares_the_frame
+                || inputs.alpha == AlphaChannel::Kept,
             source_colour: inputs.source_colour,
             filters: &with_optional_detection_branch(
                 picture.joined(),
@@ -464,11 +487,13 @@ pub(crate) fn decode_chain(
     let picture_filters = passthrough_if_empty(decode_filter_chain(
         &picture,
         input_format,
+        inputs.alpha,
         inputs.source,
         inputs.source_colour,
     ));
     Ok(DecodeChain {
         input_format,
+        alpha: inputs.alpha,
         picture_filters,
         decode_source: inputs.decode_source,
         read_source_at: inputs.read_source_at,
@@ -503,80 +528,63 @@ pub fn stream_encode_inprocess_with_mxf_feed<F>(
     cancel: &Arc<AtomicBool>,
     pause: &Arc<AtomicBool>,
     mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
-    mut on_progress: F,
+    on_progress: F,
     on_log: impl Fn(&str),
 ) -> EncodeResult
 where
     F: FnMut(StreamProgress),
 {
-    use crate::grok_encoder;
-
-    let probed = match crate::ffmpeg_decode::probe(&opts.input, opts.decode_source) {
-        Ok(probed) => probed,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: e,
-                ..Default::default()
-            };
+    match decoded_frames(opts, &on_log) {
+        Ok((params, frames)) => {
+            encode_frames(opts, &params, frames, cancel, pause, mxf_feed, on_progress)
         }
-    };
+        Err(error) => EncodeResult {
+            success: false,
+            error,
+            ..Default::default()
+        },
+    }
+}
+
+pub(crate) struct FramesToEncode<S> {
+    pub source: S,
+    pub input_format: EncoderInputFormat,
+    pub width: u32,
+    pub height: u32,
+    pub total_frames: u64,
+}
+
+fn decoded_frames(
+    opts: &StreamEncodeOptions,
+    on_log: &dyn Fn(&str),
+) -> Result<
+    (
+        crate::grok_encoder::CompressParams,
+        FramesToEncode<crate::ffmpeg_decode::FrameDecoder>,
+    ),
+    String,
+> {
+    let probed = crate::ffmpeg_decode::probe(&opts.input, opts.decode_source)?;
     let (source_width, source_height, source_frames) =
         (probed.width, probed.height, probed.frame_count);
     if source_width == 0 || source_height == 0 {
-        return EncodeResult {
-            success: false,
-            error: "Could not determine video dimensions".to_string(),
-            ..Default::default()
-        };
+        return Err("Could not determine video dimensions".to_string());
     }
-    if let Some(range) = opts.frame_range
-        && let Err(e) = range.check_against_probe(source_frames)
-    {
-        return EncodeResult {
-            success: false,
-            error: e,
-            ..Default::default()
-        };
+    if let Some(range) = opts.frame_range {
+        range.check_against_probe(source_frames)?;
     }
     let total_frames = opts
         .frame_range
         .map_or(source_frames, |range| range.frame_count);
-    let plan = match opts.picture.plan(source_width, source_height) {
-        Ok(plan) => plan,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: e,
-                ..Default::default()
-            };
-        }
-    };
+    let plan = opts.picture.plan(source_width, source_height)?;
     tracing::info!("picture: {}", plan.describe());
     let (width, height) = (plan.output_width, plan.output_height);
 
-    if let Err(e) = std::fs::create_dir_all(&opts.output_dir) {
-        return EncodeResult {
-            success: false,
-            error: format!("Failed to create output directory: {e}"),
-            ..Default::default()
-        };
-    }
+    std::fs::create_dir_all(&opts.output_dir)
+        .map_err(|e| format!("Failed to create output directory: {e}"))?;
 
-    let params = match compress_params(opts) {
-        Ok(params) => params,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: e,
-                ..Default::default()
-            };
-        }
-    };
-
-    let source = probed.pixel_format;
-    let accelerator_active = grok_encoder::gpu_active();
-    let chain = match decode_chain(
+    let params = compress_params(opts)?;
+    let chain = decode_chain(
         &DecodeChainInputs {
             decode_source: opts.decode_source,
             read_source_at: opts.read_source_at,
@@ -587,39 +595,54 @@ where
                 extra_filter: opts.extra_picture_filter.as_deref(),
             },
             source_colour: &opts.source_colour,
-            source: &source,
-            accelerator_active,
+            source: &probed.pixel_format,
+            accelerator_active: crate::grok_encoder::gpu_active(),
             quality_psnr: opts.quality_psnr,
             postkit_prepares_the_frame: opts.subtitle_burn.is_some() || opts.watermark.is_some(),
             detect_picture_findings: opts.detect_picture_findings,
+            alpha: AlphaChannel::Dropped,
         },
         width,
         height,
         &params,
-        &on_log,
-    ) {
-        Ok(chain) => chain,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: e,
-                ..Default::default()
-            };
-        }
-    };
-    let input_format = chain.input_format;
+        on_log,
+    )?;
+    let source = start_frame_decoder(&chain, &opts.input, opts.frame_range, width, height)?;
+    Ok((
+        params,
+        FramesToEncode {
+            source,
+            input_format: chain.input_format,
+            width,
+            height,
+            total_frames,
+        },
+    ))
+}
+
+pub(crate) fn encode_frames<S, F>(
+    opts: &StreamEncodeOptions,
+    params: &crate::grok_encoder::CompressParams,
+    frames: FramesToEncode<S>,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    mxf_feed: Option<crate::mxf_wrap::J2kFrameSender>,
+    mut on_progress: F,
+) -> EncodeResult
+where
+    S: FrameSource,
+    F: FnMut(StreamProgress),
+{
+    use crate::grok_encoder;
+
+    let FramesToEncode {
+        mut source,
+        input_format,
+        width,
+        height,
+        total_frames,
+    } = frames;
     let frame_size = input_format.frame_bytes(width, height);
-    let mut reader = match start_frame_decoder(&chain, &opts.input, opts.frame_range, width, height)
-    {
-        Ok(reader) => reader,
-        Err(e) => {
-            return EncodeResult {
-                success: false,
-                error: e,
-                ..Default::default()
-            };
-        }
-    };
 
     grok_encoder::initialize(0);
 
@@ -629,7 +652,7 @@ where
 
     let result = grok_encoder::encode_pipeline_with_mxf_feed(
         &opts.output_dir,
-        &params,
+        params,
         total_frames,
         cancel,
         &phase_clocks,
@@ -647,9 +670,9 @@ where
             }
             let mut frame_buf = buffer_pool.take(frame_size);
             let read_start = std::time::Instant::now();
-            let read = reader.read_into(&mut frame_buf);
+            let read = source.read_into(&mut frame_buf);
             phase_clocks.add(grok_encoder::EncodePhase::DecoderWait, read_start.elapsed());
-            if let crate::ffmpeg_decode::NextFrame::Ended = read {
+            if let NextFrame::Ended = read {
                 return None;
             }
             let index = frame_index;
@@ -671,7 +694,7 @@ where
         },
     );
 
-    let decode = reader.finish(opts.fps.as_f64(), result.frames_encoded);
+    let decode = source.finish(opts.fps.as_f64(), result.frames_encoded);
 
     let mut success = result.success;
     let mut error = result.error;
@@ -705,12 +728,27 @@ pub(crate) fn start_frame_decoder(
         read_source_at: chain.read_source_at,
         hardware_decode: chain.hardware_decode,
         picture_filters: &chain.picture_filters,
-        input_format: chain.input_format,
+        pixels: chain.decoded_pixels(),
         width,
         height,
         frame_limit: frame_range.map(|range| range.frame_count),
         detect_picture_findings: chain.detect_picture_findings,
     })
+}
+
+impl DecodeChain {
+    fn decoded_pixels(&self) -> crate::ffmpeg_decode::DecodedPixels {
+        use crate::ffmpeg_decode::DecodedPixels;
+        match (self.alpha, self.input_format) {
+            (AlphaChannel::Dropped, format) => DecodedPixels::ForEncoder(format),
+            (AlphaChannel::Kept, EncoderInputFormat::PackedRgb(order)) => {
+                DecodedPixels::PackedRgba(order)
+            }
+            (AlphaChannel::Kept, EncoderInputFormat::PlanarYuv(_)) => {
+                unreachable!("decode_chain keeps a layer with alpha on packed RGB")
+            }
+        }
+    }
 }
 
 pub(crate) fn decode_failure(
@@ -987,7 +1025,7 @@ mod tests {
         let packed_rgb = EncoderInputFormat::PackedRgb(SampleOrder::Big);
         let hdr = hdr10_source();
         let chain = |source: &crate::probe::PixelFormatInfo| {
-            decode_filter_chain(&picture, packed_rgb, source, &hdr)
+            decode_filter_chain(&picture, packed_rgb, AlphaChannel::Dropped, source, &hdr)
         };
 
         let studio = chain(&hdr10_pixel_format("yuv420p10le", "tv"));
@@ -1019,6 +1057,7 @@ mod tests {
             !decode_filter_chain(
                 &picture,
                 packed_rgb,
+                AlphaChannel::Dropped,
                 &hdr10_pixel_format("yuv420p10le", "tv"),
                 &SourceColour::DisplayRgb
             )
@@ -1292,6 +1331,7 @@ mod tests {
             decode_filter_chain(
                 &picture,
                 planar_yuv,
+                AlphaChannel::Dropped,
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
@@ -1302,6 +1342,7 @@ mod tests {
             decode_filter_chain(
                 &picture,
                 EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                AlphaChannel::Dropped,
                 &source_pixel_format("yuv420p10le"),
                 &SourceColour::DisplayRgb
             ),
@@ -1312,6 +1353,7 @@ mod tests {
             decode_filter_chain(
                 &picture,
                 EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                AlphaChannel::Dropped,
                 &source_pixel_format("gbrp"),
                 &SourceColour::DisplayRgb
             ),
@@ -1322,6 +1364,7 @@ mod tests {
             decode_filter_chain(
                 &decode_filters(&PictureFilters::Given(""), &SourceColour::DisplayRgb),
                 EncoderInputFormat::PackedRgb(SampleOrder::Little),
+                AlphaChannel::Dropped,
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
@@ -1367,6 +1410,39 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn a_layer_with_alpha_keeps_it_through_the_conversion_and_pads_see_through() {
+        let plan = crate::picture_processing::PictureProcessing {
+            fit: Some(crate::picture_processing::Fit {
+                box_width: 2048,
+                box_height: 858,
+                raster_width: 2048,
+                raster_height: 1080,
+                placement: crate::picture_processing::Placement::default(),
+            }),
+            ..crate::picture_processing::PictureProcessing::default()
+        }
+        .plan_with_transparent_pad(1920, 1080)
+        .unwrap();
+        let picture = planned(FrameRate::whole(24), &SourceColour::DisplayRgb, &plan, None);
+        let fit = "scale=w=1524:h=858:flags=lanczos,pad=w=2048:h=1080:x=262:y=110:color=black@0";
+        for (pix_fmt, chain) in [
+            ("yuva420p", format!("format=gbrap16le,fps=24,{fit}")),
+            ("rgba", format!("fps=24,format=gbrap16le,{fit}")),
+        ] {
+            assert_eq!(
+                decode_filter_chain(
+                    &picture,
+                    EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                    AlphaChannel::Kept,
+                    &source_pixel_format(pix_fmt),
+                    &SourceColour::DisplayRgb
+                ),
+                chain
+            );
+        }
+    }
+
     /// One `format=gbrp16le` in each chain: the head conversion an 8-bit YUV
     /// source gets covers its geometry as well.
     #[test]
@@ -1382,6 +1458,7 @@ mod tests {
             decode_filter_chain(
                 &picture,
                 EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                AlphaChannel::Dropped,
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
@@ -1392,6 +1469,7 @@ mod tests {
             decode_filter_chain(
                 &picture,
                 EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                AlphaChannel::Dropped,
                 &source_pixel_format("rgb24"),
                 &SourceColour::DisplayRgb
             ),
@@ -1414,6 +1492,7 @@ mod tests {
             decode_filter_chain(
                 &picture,
                 EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                AlphaChannel::Dropped,
                 &source_pixel_format("yuv420p"),
                 &SourceColour::DisplayRgb
             ),
@@ -1425,6 +1504,7 @@ mod tests {
             decode_filter_chain(
                 &picture,
                 EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                AlphaChannel::Dropped,
                 &source_pixel_format("rgb24"),
                 &SourceColour::DisplayRgb
             ),
@@ -1441,6 +1521,7 @@ mod tests {
         let on_the_planes = decode_filter_chain(
             &picture,
             planar_yuv,
+            AlphaChannel::Dropped,
             &source_pixel_format("yuv420p"),
             &SourceColour::DisplayRgb,
         );
@@ -1560,7 +1641,7 @@ mod tests {
                 read_source_at: None,
                 hardware_decode: false,
                 picture_filters: filters,
-                input_format,
+                pixels: crate::ffmpeg_decode::DecodedPixels::ForEncoder(input_format),
                 width: SOLID_COLOUR_SIZE,
                 height: SOLID_COLOUR_SIZE,
                 frame_limit: None,
@@ -1650,6 +1731,7 @@ mod tests {
             let filters = decode_filter_chain(
                 &picture_filters,
                 packed_rgb,
+                AlphaChannel::Dropped,
                 &source,
                 &SourceColour::DisplayRgb,
             );

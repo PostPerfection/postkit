@@ -6,6 +6,8 @@ pub mod burnin;
 pub mod certificate;
 pub mod colour;
 pub mod component_versions;
+#[cfg(feature = "ffmpeg")]
+mod composite;
 pub mod composition_timeline;
 pub mod conform;
 pub mod content_keys;

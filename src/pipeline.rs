@@ -3,14 +3,17 @@
 //! Provides the shared encode workflow that both dcpwizard and imfwizard use.
 //! The caller provides progress/log callbacks and handles packaging themselves.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::composite::{Composite, CompositeBase, CompositeLayer, CompositeOverlay};
 pub use crate::encode::FrameRange;
 use crate::encode::{
-    FrameRate, ImageFormat, InputType, SourceColour, StreamEncodeOptions, StreamProgress,
-    check_codestream_size, encode_tiff_sequence_inprocess, stream_encode_inprocess_with_mxf_feed,
+    DecodeSource, FrameRate, ImageFormat, InputType, SourceColour, StreamEncodeOptions,
+    StreamProgress, check_codestream_size, encode_tiff_sequence_inprocess,
+    stream_encode_inprocess_with_mxf_feed,
 };
 use crate::mxf_unwrap::CANCELLED;
 use crate::picture_processing::PictureProcessing;
@@ -298,46 +301,23 @@ pub fn run_encode_timeline(
         ));
     }
     timeline.check()?;
-    if let Some((index, clip)) = timeline
-        .clips
-        .iter()
-        .enumerate()
-        .find(|(_, clip)| clip.layer > 0)
-    {
-        return Err(format!(
-            "{} is on layer {}, and this build composites nothing yet",
-            crate::timeline::clip_name(index, clip),
-            clip.layer
-        ));
-    }
-    if let Some(gap) = timeline.base_gaps().first() {
-        return Err(format!(
-            "layer 0 has a gap of {} frames at frame {}, and this build fills none yet",
-            gap.end - gap.start,
-            gap.start
-        ));
-    }
+    let stretches = timeline_stretches(timeline, options)?;
     let start_time = std::time::Instant::now();
     let total_frames = timeline.total_frames();
     let j2k_dir = output_dir.join("j2k");
     let mut picture_findings = crate::picture_findings::PictureFindings::default();
     let mut finished_phases = PhaseSeconds::default();
-    for (index, clip) in timeline.base_clips() {
-        let first_output_frame = clip.start;
+    for stretch in &stretches {
+        let first_output_frame = stretch.frames.start;
+        let frame_count = stretch.frames.end - stretch.frames.start;
         if cancel.load(Ordering::Relaxed) {
             on_log("=== CANCELLED ===");
             return Err(CANCELLED.to_string());
         }
-        let name = crate::timeline::clip_name(index, clip);
-        let frame_count = clip.out_frame - clip.in_frame;
-        on_log(&format!(
-            "[TIMELINE] {name}: frames {}..{} at timeline frame {first_output_frame}",
-            clip.in_frame, clip.out_frame
-        ));
-        let clip_phases = std::cell::Cell::new(PhaseSeconds::default());
+        let stretch_phases = std::cell::Cell::new(PhaseSeconds::default());
         let report = |progress: &PipelineProgress| {
-            clip_phases.set(PhaseSeconds::of(progress));
-            let phases = finished_phases.plus(clip_phases.get());
+            stretch_phases.set(PhaseSeconds::of(progress));
+            let phases = finished_phases.plus(stretch_phases.get());
             let frame = first_output_frame + progress.frame;
             on_progress(&PipelineProgress {
                 stage: progress.stage.clone(),
@@ -353,62 +333,23 @@ pub fn run_encode_timeline(
                 write_secs: phases.write,
             });
         };
-        let clip_options = EncodeRunOptions {
-            source_colour: if clip.source_colour == SourceColour::default() {
-                options.source_colour.clone()
-            } else {
-                clip.source_colour.clone()
-            },
-            picture: if clip.picture_processing.is_identity() {
-                options.picture.clone()
-            } else {
-                clip.picture_processing.clone()
-            },
-            ..options.clone()
+        let mut findings = match (&stretch.base, stretch.overlays.is_empty()) {
+            (StretchBase::Clip(index), true) => encode_base_clip(
+                timeline,
+                *index,
+                &stretch.frames,
+                output_dir,
+                options,
+                cancel,
+                pause,
+                report,
+                &on_log,
+            )?,
+            _ => encode_composite_stretch(
+                timeline, stretch, output_dir, options, cancel, pause, report, &on_log,
+            )?,
         };
-        let input_type = crate::encode::detect_input_type(&clip.picture);
-        let mut findings = match input_type {
-            InputType::J2kSequence | InputType::PictureMxf => {
-                let scratch_dir = output_dir.join(format!("timeline_clip_{index}"));
-                place_compressed_clip(
-                    clip,
-                    input_type,
-                    &scratch_dir,
-                    &j2k_dir,
-                    first_output_frame,
-                    &clip_options,
-                    cancel,
-                    pause,
-                    report,
-                    &on_log,
-                )
-                .map_err(|error| name_the_clip(&name, error))?;
-                crate::picture_findings::PictureFindings::default()
-            }
-            _ => {
-                let windowed = EncodeRunOptions {
-                    frame_range: Some(FrameRange {
-                        first_frame: clip.in_frame,
-                        frame_count,
-                    }),
-                    ..clip_options
-                };
-                let (encode, _) = run_encode_and_maybe_wrap(
-                    &clip.picture,
-                    output_dir,
-                    &windowed,
-                    None,
-                    first_output_frame,
-                    cancel,
-                    pause,
-                    report,
-                    &on_log,
-                )
-                .map_err(|error| name_the_clip(&name, error))?;
-                encode.picture_findings
-            }
-        };
-        let phases = clip_phases.get();
+        let phases = stretch_phases.get();
         let frames_done = first_output_frame + frame_count;
         report(&PipelineProgress {
             stage: "encode".to_string(),
@@ -429,7 +370,7 @@ pub fn run_encode_timeline(
         }
         picture_findings.black.append(&mut findings.black);
         picture_findings.frozen.append(&mut findings.frozen);
-        finished_phases = finished_phases.plus(clip_phases.get());
+        finished_phases = finished_phases.plus(stretch_phases.get());
     }
     on_log(&format!(
         "[TIMELINE] Done: {total_frames} frames from {} clips",
@@ -441,6 +382,342 @@ pub fn run_encode_timeline(
         elapsed_secs: start_time.elapsed().as_secs_f64(),
         picture_findings,
     })
+}
+
+enum StretchBase {
+    Clip(usize),
+    Black { width: u32, height: u32 },
+}
+
+// timeline frames whose clips stay the same throughout
+struct TimelineStretch {
+    frames: Range<u64>,
+    base: StretchBase,
+    // clip indices on layers above 0, bottom to top
+    overlays: Vec<usize>,
+}
+
+fn is_compressed(clip: &Clip) -> bool {
+    matches!(
+        crate::encode::detect_input_type(&clip.picture),
+        InputType::J2kSequence | InputType::PictureMxf
+    )
+}
+
+fn effective_source_colour(clip: &Clip, options: &EncodeRunOptions) -> SourceColour {
+    if clip.source_colour == SourceColour::default() {
+        return options.source_colour.clone();
+    }
+    clip.source_colour.clone()
+}
+
+fn effective_picture(clip: &Clip, options: &EncodeRunOptions) -> PictureProcessing {
+    if clip.picture_processing.is_identity() {
+        return options.picture.clone();
+    }
+    clip.picture_processing.clone()
+}
+
+// cut at every clip's start and end on every layer
+fn timeline_stretches(
+    timeline: &Timeline,
+    options: &EncodeRunOptions,
+) -> Result<Vec<TimelineStretch>, String> {
+    let clips = &timeline.clips;
+    if let Some((index, clip)) = clips
+        .iter()
+        .enumerate()
+        .find(|(_, clip)| clip.layer > 0 && is_compressed(clip))
+    {
+        return Err(format!(
+            "{} is on layer {} and is already JPEG 2000, so it cannot be composited",
+            crate::timeline::clip_name(index, clip),
+            clip.layer
+        ));
+    }
+    let mut cuts: Vec<u64> = clips
+        .iter()
+        .flat_map(|clip| [clip.start, clip.end()])
+        .chain([0])
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts.windows(2)
+        .map(|pair| {
+            let frames = pair[0]..pair[1];
+            let covers = |clip: &Clip| clip.start <= frames.start && frames.end <= clip.end();
+            let mut overlays: Vec<usize> = (0..clips.len())
+                .filter(|&index| clips[index].layer > 0 && covers(&clips[index]))
+                .collect();
+            overlays.sort_by_key(|&index| clips[index].layer);
+            let base = match clips
+                .iter()
+                .position(|clip| clip.layer == 0 && covers(clip))
+            {
+                Some(index) => StretchBase::Clip(index),
+                None => black_base(&frames, options)?,
+            };
+            let stretch = TimelineStretch {
+                frames,
+                base,
+                overlays,
+            };
+            check_composite(timeline, &stretch, options)?;
+            Ok(stretch)
+        })
+        .collect()
+}
+
+fn black_base(frames: &Range<u64>, options: &EncodeRunOptions) -> Result<StretchBase, String> {
+    let Some(fit) = options.picture.fit else {
+        return Err(format!(
+            "layer 0 is empty from frame {} to frame {}, and the black there has no raster: \
+             the picture options need a fit",
+            frames.start, frames.end
+        ));
+    };
+    Ok(StretchBase::Black {
+        width: fit.raster_width,
+        height: fit.raster_height,
+    })
+}
+
+fn check_composite(
+    timeline: &Timeline,
+    stretch: &TimelineStretch,
+    options: &EncodeRunOptions,
+) -> Result<(), String> {
+    let clips = &timeline.clips;
+    let name = |index: usize| crate::timeline::clip_name(index, &clips[index]);
+    if let (StretchBase::Clip(base), Some(&first_overlay)) =
+        (&stretch.base, stretch.overlays.first())
+        && is_compressed(&clips[*base])
+    {
+        return Err(format!(
+            "{} lies over {}, which is already JPEG 2000 and cannot be composited",
+            name(first_overlay),
+            name(*base)
+        ));
+    }
+    let Some(reference) = colour_clip(stretch) else {
+        return Ok(());
+    };
+    let reference_colour = effective_source_colour(&clips[reference], options);
+    for &overlay in &stretch.overlays {
+        let colour = effective_source_colour(&clips[overlay], options);
+        if colour != reference_colour {
+            return Err(format!(
+                "{} has the source colour {colour:?} and {} under it has {reference_colour:?}: \
+                 a composite takes one source colour",
+                name(overlay),
+                name(reference)
+            ));
+        }
+    }
+    Ok(())
+}
+
+// the clip whose source colour a stretch takes, none for a gap with nothing over it
+fn colour_clip(stretch: &TimelineStretch) -> Option<usize> {
+    match stretch.base {
+        StretchBase::Clip(index) => Some(index),
+        StretchBase::Black { .. } => stretch.overlays.first().copied(),
+    }
+}
+
+fn clip_window(clip: &Clip, frames: &Range<u64>) -> FrameRange {
+    FrameRange {
+        first_frame: clip.in_frame + (frames.start - clip.start),
+        frame_count: frames.end - frames.start,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_base_clip(
+    timeline: &Timeline,
+    index: usize,
+    frames: &Range<u64>,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    report: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<crate::picture_findings::PictureFindings, String> {
+    let clip = &timeline.clips[index];
+    let name = crate::timeline::clip_name(index, clip);
+    let window = clip_window(clip, frames);
+    on_log(&format!(
+        "[TIMELINE] {name}: frames {}..{} at timeline frame {}",
+        window.first_frame,
+        window.end_frame(),
+        frames.start
+    ));
+    let clip_options = EncodeRunOptions {
+        source_colour: effective_source_colour(clip, options),
+        picture: effective_picture(clip, options),
+        ..options.clone()
+    };
+    let input_type = crate::encode::detect_input_type(&clip.picture);
+    match input_type {
+        InputType::J2kSequence | InputType::PictureMxf => {
+            let scratch_dir = output_dir.join(format!("timeline_clip_{index}"));
+            place_compressed_clip(
+                clip,
+                input_type,
+                &scratch_dir,
+                &output_dir.join("j2k"),
+                frames.start,
+                &clip_options,
+                cancel,
+                pause,
+                report,
+                &on_log,
+            )
+            .map_err(|error| name_the_clip(&name, error))?;
+            Ok(crate::picture_findings::PictureFindings::default())
+        }
+        _ => {
+            let windowed = EncodeRunOptions {
+                frame_range: Some(window),
+                ..clip_options
+            };
+            let (encode, _) = run_encode_and_maybe_wrap(
+                &clip.picture,
+                output_dir,
+                &windowed,
+                None,
+                frames.start,
+                cancel,
+                pause,
+                report,
+                &on_log,
+            )
+            .map_err(|error| name_the_clip(&name, error))?;
+            Ok(encode.picture_findings)
+        }
+    }
+}
+
+fn composite_layer(
+    timeline: &Timeline,
+    index: usize,
+    frames: &Range<u64>,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+) -> Result<CompositeLayer, String> {
+    let clip = &timeline.clips[index];
+    let name = crate::timeline::clip_name(index, clip);
+    let window = clip_window(clip, frames);
+    let picture = effective_picture(clip, options);
+    match crate::encode::detect_input_type(&clip.picture) {
+        InputType::Video => Ok(CompositeLayer {
+            name,
+            input: clip.picture.clone(),
+            decode_source: DecodeSource::Video,
+            frame_range: Some(window),
+            picture,
+        }),
+        InputType::ImageSequence => {
+            let directory = crate::encode::sequence_directory(&clip.picture);
+            let stills = crate::encode::find_source_frames(&directory)
+                .map_err(|e| format!("{name}: cannot list {}: {e}", directory.display()))?;
+            let list = output_dir.join(format!("timeline_clip_{index}.ffconcat"));
+            crate::encode::write_image_concat_list(
+                window
+                    .window_of(&stills)
+                    .map_err(|error| name_the_clip(&name, error))?,
+                timeline.fps,
+                &list,
+            )?;
+            Ok(CompositeLayer {
+                name,
+                input: list,
+                decode_source: DecodeSource::ImageList,
+                frame_range: None,
+                picture,
+            })
+        }
+        other => unreachable!(
+            "the timeline check refuses an unknown picture and the stretches a compressed \
+             one, so {name} cannot be {other:?}"
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_composite_stretch(
+    timeline: &Timeline,
+    stretch: &TimelineStretch,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    report: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<crate::picture_findings::PictureFindings, String> {
+    let frames = &stretch.frames;
+    let base = match stretch.base {
+        StretchBase::Clip(index) => CompositeBase::Clip(composite_layer(
+            timeline, index, frames, output_dir, options,
+        )?),
+        StretchBase::Black { width, height } => CompositeBase::Black { width, height },
+    };
+    let mut overlays = Vec::new();
+    for &index in &stretch.overlays {
+        overlays.push(CompositeOverlay {
+            layer: composite_layer(timeline, index, frames, output_dir, options)?,
+            opacity: timeline.clips[index].opacity,
+        });
+    }
+    let layer_names: Vec<&str> = std::iter::once(match &base {
+        CompositeBase::Clip(layer) => layer.name.as_str(),
+        CompositeBase::Black { .. } => "black",
+    })
+    .chain(overlays.iter().map(|overlay| overlay.layer.name.as_str()))
+    .collect();
+    let stretch_name = format!("timeline frames {}..{}", frames.start, frames.end);
+    on_log(&format!(
+        "[TIMELINE] {stretch_name}: {}, bottom to top",
+        layer_names.join(", ")
+    ));
+    let source_colour = colour_clip(stretch).map_or(options.source_colour.clone(), |index| {
+        effective_source_colour(&timeline.clips[index], options)
+    });
+    if options.subtitle_burn.is_some() {
+        // every layer decodes through ffmpeg the way a video does
+        reject_unsupported_burn(InputType::Video, &source_colour)?;
+    }
+    let stream_options = StreamEncodeOptions {
+        source_colour,
+        ..stream_encode_options(options, &output_dir.join("j2k"), frames.start)
+    };
+    let composite = Composite {
+        base,
+        overlays,
+        frame_count: frames.end - frames.start,
+    };
+    let findings = crate::composite::encode_composite(
+        &stream_options,
+        &composite,
+        cancel,
+        pause,
+        |progress| report_stream_frame(progress, &report, &on_log),
+        &on_log,
+    )
+    .map_err(|error| name_the_clip(&stretch_name, error))?;
+    let base_layer = match &composite.base {
+        CompositeBase::Clip(layer) => Some(layer),
+        CompositeBase::Black { .. } => None,
+    };
+    let layers = base_layer
+        .into_iter()
+        .chain(composite.overlays.iter().map(|overlay| &overlay.layer));
+    for layer in layers.filter(|layer| layer.decode_source == DecodeSource::ImageList) {
+        std::fs::remove_file(&layer.input)
+            .map_err(|e| format!("cannot remove {}: {e}", layer.input.display()))?;
+    }
+    Ok(findings)
 }
 
 fn name_the_clip(name: &str, error: String) -> String {
@@ -547,10 +824,6 @@ fn run_encode_and_maybe_wrap(
     on_progress: impl Fn(&PipelineProgress),
     on_log: impl Fn(&str),
 ) -> Result<(EncodeResult, Option<crate::mxf_wrap::MxfTrackFile>), String> {
-    let compression_ratio = options.compression_ratio;
-    let target_codestream_bytes = options.target_codestream_bytes;
-    let quality_psnr = options.quality_psnr;
-    let fps = options.fps;
     if !video.exists() {
         return Err(format!("Input not found: {}", video.display()));
     }
@@ -623,30 +896,7 @@ fn run_encode_and_maybe_wrap(
             write_secs: 0.0,
         });
     };
-    let report_frame = |p: StreamProgress| {
-        let percent = if p.total_frames > 0 {
-            (p.frame as f64 / p.total_frames as f64) * 100.0
-        } else {
-            0.0
-        };
-        on_progress(&PipelineProgress {
-            stage: "encode".to_string(),
-            message: format!("Frame {}/{}", p.frame, p.total_frames),
-            frame: p.frame,
-            total_frames: p.total_frames,
-            fps: p.fps,
-            elapsed_secs: p.elapsed_secs,
-            percent: percent.min(99.0),
-            decode_wait_secs: p.decode_wait_secs,
-            prepare_secs: p.prepare_secs,
-            encode_secs: p.encode_secs,
-            write_secs: p.write_secs,
-        });
-        on_log(&format!(
-            "[ENCODE] frame={}/{} fps={:.1}",
-            p.frame, p.total_frames, p.fps
-        ));
-    };
+    let report_frame = |p: StreamProgress| report_stream_frame(p, &on_progress, &on_log);
     let mxf_feed = overlapped_wrap.as_ref().map(|wrap| wrap.sender());
     let mut finish = |result: crate::encode::EncodeResult| -> Result<
         (u64, crate::picture_findings::PictureFindings),
@@ -675,26 +925,9 @@ fn run_encode_and_maybe_wrap(
             (frames_encoded, picture_findings) = finish(run_stream(
                 &StreamEncodeOptions {
                     input: video.to_path_buf(),
-                    output_dir: j2k_dir.clone(),
-                    compression_ratio,
-                    target_codestream_bytes,
-                    quality_psnr,
-                    num_resolutions: 6,
-                    codeblock_size: 32,
-                    progression: "CPRL".to_string(),
-                    fps,
                     read_source_at: options.read_source_at,
                     frame_range: options.frame_range,
-                    source_colour: options.source_colour.clone(),
-                    rsiz: options.rsiz,
-                    subtitle_burn: options.subtitle_burn.clone(),
-                    picture: options.picture.clone(),
-                    extra_picture_filter: options.extra_picture_filter.clone(),
-                    codestream_byte_cap: options.codestream_byte_cap,
-                    encode_threads: options.encode_threads,
-                    detect_picture_findings: options.detect_picture_findings,
-                    first_output_frame,
-                    ..StreamEncodeOptions::default()
+                    ..stream_encode_options(options, &j2k_dir, first_output_frame)
                 },
                 mxf_feed,
             ))?;
@@ -712,31 +945,12 @@ fn run_encode_and_maybe_wrap(
                 None => frames,
             };
 
-            let compress = StreamEncodeOptions {
-                output_dir: j2k_dir.clone(),
-                compression_ratio,
-                target_codestream_bytes,
-                quality_psnr,
-                num_resolutions: 6,
-                codeblock_size: 32,
-                progression: "CPRL".to_string(),
-                fps,
-                source_colour: options.source_colour.clone(),
-                rsiz: options.rsiz,
-                subtitle_burn: options.subtitle_burn.clone(),
-                picture: options.picture.clone(),
-                extra_picture_filter: options.extra_picture_filter.clone(),
-                codestream_byte_cap: options.codestream_byte_cap,
-                encode_threads: options.encode_threads,
-                detect_picture_findings: options.detect_picture_findings,
-                first_output_frame,
-                ..StreamEncodeOptions::default()
-            };
+            let compress = stream_encode_options(options, &j2k_dir, first_output_frame);
             if sequence_needs_ffmpeg {
                 // a concat list holding each still for one frame period decodes
                 // to the same rgb48be stream a video does
                 let list = output_dir.join("frames.ffconcat");
-                crate::encode::write_image_concat_list(&frames, fps, &list)?;
+                crate::encode::write_image_concat_list(&frames, options.fps, &list)?;
                 on_log(&format!(
                     "[ENCODE] Taking {} images through ffmpeg",
                     frames.len()
@@ -847,6 +1061,62 @@ fn run_encode_and_maybe_wrap(
         },
         track_file,
     ))
+}
+
+fn stream_encode_options(
+    options: &EncodeRunOptions,
+    j2k_dir: &Path,
+    first_output_frame: u64,
+) -> StreamEncodeOptions {
+    StreamEncodeOptions {
+        output_dir: j2k_dir.to_path_buf(),
+        compression_ratio: options.compression_ratio,
+        target_codestream_bytes: options.target_codestream_bytes,
+        quality_psnr: options.quality_psnr,
+        num_resolutions: 6,
+        codeblock_size: 32,
+        progression: "CPRL".to_string(),
+        fps: options.fps,
+        source_colour: options.source_colour.clone(),
+        rsiz: options.rsiz,
+        subtitle_burn: options.subtitle_burn.clone(),
+        picture: options.picture.clone(),
+        extra_picture_filter: options.extra_picture_filter.clone(),
+        codestream_byte_cap: options.codestream_byte_cap,
+        encode_threads: options.encode_threads,
+        detect_picture_findings: options.detect_picture_findings,
+        first_output_frame,
+        ..StreamEncodeOptions::default()
+    }
+}
+
+fn report_stream_frame(
+    p: StreamProgress,
+    on_progress: &impl Fn(&PipelineProgress),
+    on_log: &impl Fn(&str),
+) {
+    let percent = if p.total_frames > 0 {
+        (p.frame as f64 / p.total_frames as f64) * 100.0
+    } else {
+        0.0
+    };
+    on_progress(&PipelineProgress {
+        stage: "encode".to_string(),
+        message: format!("Frame {}/{}", p.frame, p.total_frames),
+        frame: p.frame,
+        total_frames: p.total_frames,
+        fps: p.fps,
+        elapsed_secs: p.elapsed_secs,
+        percent: percent.min(99.0),
+        decode_wait_secs: p.decode_wait_secs,
+        prepare_secs: p.prepare_secs,
+        encode_secs: p.encode_secs,
+        write_secs: p.write_secs,
+    });
+    on_log(&format!(
+        "[ENCODE] frame={}/{} fps={:.1}",
+        p.frame, p.total_frames, p.fps
+    ));
 }
 
 /// Format of the first frame of an image sequence, which decides whether

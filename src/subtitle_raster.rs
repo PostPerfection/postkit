@@ -367,6 +367,27 @@ impl PositionedBitmap {
     }
 }
 
+// straight alpha source over, where `opaque` is the alpha of a fully opaque pixel
+pub(crate) fn source_over(source: u32, destination: u32, alpha: u32, opaque: u32) -> u32 {
+    (source * alpha + destination * (opaque - alpha) + opaque / 2) / opaque
+}
+
+pub(crate) fn read_sample(frame: &[u8], at: usize, order: SampleOrder) -> u16 {
+    let bytes = [frame[at], frame[at + 1]];
+    match order {
+        SampleOrder::Big => u16::from_be_bytes(bytes),
+        SampleOrder::Little => u16::from_le_bytes(bytes),
+    }
+}
+
+pub(crate) fn write_sample(frame: &mut [u8], at: usize, order: SampleOrder, value: u16) {
+    let bytes = match order {
+        SampleOrder::Big => value.to_be_bytes(),
+        SampleOrder::Little => value.to_le_bytes(),
+    };
+    frame[at..at + 2].copy_from_slice(&bytes);
+}
+
 /// Alpha-blend `bitmaps` onto a packed rgb48 frame, in order, clipping each to
 /// the frame. `frame` is `width * height * 6` bytes of interleaved RGB with
 /// 16-bit samples in `order`.
@@ -400,25 +421,10 @@ pub fn composite_rgb48(
                 let at = frame_y as usize * stride + frame_x as usize * 6;
                 for channel in 0..3 {
                     let sample = at + channel * 2;
-                    let destination = match order {
-                        SampleOrder::Big => u16::from_be_bytes([frame[sample], frame[sample + 1]]),
-                        SampleOrder::Little => {
-                            u16::from_le_bytes([frame[sample], frame[sample + 1]])
-                        }
-                    } as u32;
+                    let destination = u32::from(read_sample(frame, sample, order));
                     let source_sample = bitmap.pixels[source + channel] as u32 * 257;
-                    let mixed = (source_sample * alpha + destination * (255 - alpha) + 127) / 255;
-                    let bytes = (mixed.min(u16::MAX as u32) as u16).to_be_bytes();
-                    match order {
-                        SampleOrder::Big => {
-                            frame[sample] = bytes[0];
-                            frame[sample + 1] = bytes[1];
-                        }
-                        SampleOrder::Little => {
-                            frame[sample] = bytes[1];
-                            frame[sample + 1] = bytes[0];
-                        }
-                    }
+                    let mixed = source_over(source_sample, destination, alpha, u32::from(u8::MAX));
+                    write_sample(frame, sample, order, mixed as u16);
                 }
             }
         }

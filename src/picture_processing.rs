@@ -22,6 +22,7 @@ const SCALE_ALGORITHM: &str = "lanczos";
 
 /// Colour of the padding around a fitted picture.
 const PAD_COLOUR: &str = "black";
+const TRANSPARENT_PAD_COLOUR: &str = "black@0";
 
 /// ffmpeg filter that turns fields into progressive frames.
 const DEINTERLACE_FILTER: &str = "yadif";
@@ -289,6 +290,23 @@ impl PictureProcessing {
     /// Work out every intermediate size and the ffmpeg filter chain for a source
     /// of the given size. Pure arithmetic: no ffmpeg is run.
     pub fn plan(&self, source_width: u32, source_height: u32) -> Result<PicturePlan, String> {
+        self.plan_with_pad(source_width, source_height, PAD_COLOUR)
+    }
+
+    pub fn plan_with_transparent_pad(
+        &self,
+        source_width: u32,
+        source_height: u32,
+    ) -> Result<PicturePlan, String> {
+        self.plan_with_pad(source_width, source_height, TRANSPARENT_PAD_COLOUR)
+    }
+
+    fn plan_with_pad(
+        &self,
+        source_width: u32,
+        source_height: u32,
+        pad_colour: &str,
+    ) -> Result<PicturePlan, String> {
         if source_width == 0 || source_height == 0 {
             return Err(format!(
                 "source raster is {source_width}x{source_height}, so there is no picture to process"
@@ -373,7 +391,7 @@ impl PictureProcessing {
         }
         if pads {
             filters.push(format!(
-                "pad=w={output_width}:h={output_height}:x={pad_left}:y={pad_top}:color={PAD_COLOUR}"
+                "pad=w={output_width}:h={output_height}:x={pad_left}:y={pad_top}:color={pad_colour}"
             ));
         }
 

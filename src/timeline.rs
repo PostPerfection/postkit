@@ -660,12 +660,17 @@ pub fn join_subtitles(timeline: &Timeline, output: &Path) -> Result<Option<PathB
                 continue;
             }
             joined.push(SrtCue {
-                index: joined.len() as u32 + 1,
+                index: 0,
                 start_ms: cue.start_ms.max(in_point) - in_point + place,
                 end_ms: cue.end_ms.min(out_point) - in_point + place,
                 text: cue.text,
             });
         }
+    }
+    // the clips are not listed in time order
+    joined.sort_by_key(|cue| cue.start_ms);
+    for (number, cue) in joined.iter_mut().enumerate() {
+        cue.index = number as u32 + 1;
     }
     std::fs::write(output, format_srt(&joined))
         .map_err(|e| format!("cannot write {}: {e}", output.display()))?;
@@ -1366,6 +1371,34 @@ mod tests {
                 (500, 750, "title".to_string()),
                 (2250, 2750, "late clip".to_string()),
             ]
+        );
+    }
+
+    #[test]
+    fn joined_subtitles_run_in_time_order_whatever_order_the_clips_are_listed_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let late = directory.path().join("late.srt");
+        std::fs::write(&late, "1\n00:00:00,000 --> 00:00:00,500\nlate\n").unwrap();
+        let early = directory.path().join("early.srt");
+        std::fs::write(&early, "1\n00:00:00,000 --> 00:00:00,500\nearly\n").unwrap();
+
+        let picture = Path::new("/media/a.mov");
+        let mut clips = vec![
+            clip(picture, 48, 0, 24, ClipSound::None),
+            on_layer(clip(picture, 0, 0, 24, ClipSound::None), 1),
+        ];
+        clips[0].subtitle = Some(late);
+        clips[1].subtitle = Some(early);
+        let output = directory.path().join("joined.srt");
+        join_subtitles(&timeline(clips), &output).unwrap().unwrap();
+
+        let cues: Vec<(u32, u64, String)> = parse_srt(&std::fs::read_to_string(&output).unwrap())
+            .into_iter()
+            .map(|cue| (cue.index, cue.start_ms, cue.text))
+            .collect();
+        assert_eq!(
+            cues,
+            vec![(1, 0, "early".to_string()), (2, 2000, "late".to_string())]
         );
     }
 

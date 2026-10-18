@@ -8,6 +8,7 @@ use ffmpeg::ffi;
 use ffmpeg_next as ffmpeg;
 
 use crate::encode::{DecodeSource, EncoderInputFormat, FrameRate};
+use crate::grok_encoder::SampleOrder;
 use crate::probe::PixelFormatInfo;
 
 // frames waiting between the source thread and the graph thread
@@ -53,6 +54,38 @@ const DEVICE: (ffi::AVHWDeviceType, ffi::AVPixelFormat, &str) = (
     "VideoToolbox",
 );
 
+const PACKED_RGBA_BIG_ENDIAN_PIXEL_FORMAT: &str = "rgba64be";
+const PACKED_RGBA_LITTLE_ENDIAN_PIXEL_FORMAT: &str = "rgba64le";
+pub(crate) const PACKED_RGBA_BYTES_PER_PIXEL: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodedPixels {
+    ForEncoder(EncoderInputFormat),
+    // straight alpha, not premultiplied
+    PackedRgba(SampleOrder),
+}
+
+impl DecodedPixels {
+    pub(crate) fn ffmpeg_pixel_format(&self) -> &'static str {
+        match self {
+            DecodedPixels::ForEncoder(format) => format.ffmpeg_pixel_format(),
+            DecodedPixels::PackedRgba(SampleOrder::Big) => PACKED_RGBA_BIG_ENDIAN_PIXEL_FORMAT,
+            DecodedPixels::PackedRgba(SampleOrder::Little) => {
+                PACKED_RGBA_LITTLE_ENDIAN_PIXEL_FORMAT
+            }
+        }
+    }
+
+    pub(crate) fn frame_bytes(&self, width: u32, height: u32) -> usize {
+        match self {
+            DecodedPixels::ForEncoder(format) => format.frame_bytes(width, height),
+            DecodedPixels::PackedRgba(_) => {
+                width as usize * height as usize * PACKED_RGBA_BYTES_PER_PIXEL
+            }
+        }
+    }
+}
+
 pub(crate) struct DecodeRequest<'a> {
     pub input: &'a Path,
     pub decode_source: DecodeSource,
@@ -60,7 +93,7 @@ pub(crate) struct DecodeRequest<'a> {
     pub hardware_decode: bool,
     // the whole picture chain, without the detection branch
     pub picture_filters: &'a str,
-    pub input_format: EncoderInputFormat,
+    pub pixels: DecodedPixels,
     pub width: u32,
     pub height: u32,
     pub frame_limit: Option<u64>,
@@ -70,6 +103,13 @@ pub(crate) struct DecodeRequest<'a> {
 pub(crate) enum NextFrame {
     Copied,
     Ended,
+}
+
+// where a stream encode takes its frames from
+pub(crate) trait FrameSource {
+    // copies the next frame into `buffer` in the layout the encode reads
+    fn read_into(&mut self, buffer: &mut [u8]) -> NextFrame;
+    fn finish(self, fps: f64, frame_count: u64) -> FinishedDecode;
 }
 
 // what both decode threads report back
@@ -1607,7 +1647,7 @@ impl FrameDecoder {
         let mut stage = GraphStage {
             settings: GraphSettings {
                 picture_filters,
-                pixel_format: request.input_format.ffmpeg_pixel_format(),
+                pixel_format: request.pixels.ffmpeg_pixel_format(),
                 detect_picture_findings: request.detect_picture_findings,
                 container_crop,
                 forced_rate: source.timing.forced_rate,
@@ -1663,9 +1703,7 @@ impl FrameDecoder {
             input: request.input.display().to_string(),
             width: request.width,
             height: request.height,
-            frame_bytes: request
-                .input_format
-                .frame_bytes(request.width, request.height),
+            frame_bytes: request.pixels.frame_bytes(request.width, request.height),
             frames_read: 0,
         })
     }
@@ -1676,8 +1714,38 @@ impl FrameDecoder {
         Some(frame)
     }
 
-    // copies the next frame into `buffer` in the encoder input format's layout
-    pub(crate) fn read_into(&mut self, buffer: &mut [u8]) -> NextFrame {
+    // decodes and filters `frames` frames without copying them
+    pub(crate) fn skip(&mut self, frames: u64) -> Result<(), String> {
+        for skipped in 0..frames {
+            if self.next().is_none() {
+                return Err(self
+                    .outcome
+                    .lock()
+                    .unwrap()
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{} ended after {skipped} frames, before the {frames} to skip",
+                            self.input
+                        )
+                    }));
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_threads(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.frames = None;
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl FrameSource for FrameDecoder {
+    fn read_into(&mut self, buffer: &mut [u8]) -> NextFrame {
         let Some(frame) = self.next() else {
             return NextFrame::Ended;
         };
@@ -1726,36 +1794,7 @@ impl FrameDecoder {
         NextFrame::Copied
     }
 
-    // decodes and filters `frames` frames without copying them
-    pub(crate) fn skip(&mut self, frames: u64) -> Result<(), String> {
-        for skipped in 0..frames {
-            if self.next().is_none() {
-                return Err(self
-                    .outcome
-                    .lock()
-                    .unwrap()
-                    .failure
-                    .clone()
-                    .unwrap_or_else(|| {
-                        format!(
-                            "{} ended after {skipped} frames, before the {frames} to skip",
-                            self.input
-                        )
-                    }));
-            }
-        }
-        Ok(())
-    }
-
-    fn stop_threads(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.frames = None;
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
-    }
-
-    pub(crate) fn finish(mut self, fps: f64, frame_count: u64) -> FinishedDecode {
+    fn finish(mut self, fps: f64, frame_count: u64) -> FinishedDecode {
         self.stop_threads();
         let mut outcome = self.outcome.lock().unwrap();
         FinishedDecode {
@@ -1808,7 +1847,7 @@ mod tests {
             read_source_at: None,
             hardware_decode: false,
             picture_filters: &filters,
-            input_format,
+            pixels: DecodedPixels::ForEncoder(input_format),
             width,
             height,
             frame_limit: None,

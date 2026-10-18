@@ -420,7 +420,7 @@ impl DecodeSource {
 /// grok's accelerator plugin as it arrives.
 const PACKED_RGB_BIG_ENDIAN_PIXEL_FORMAT: &str = "rgb48be";
 const PACKED_RGB_LITTLE_ENDIAN_PIXEL_FORMAT: &str = "rgb48le";
-const PACKED_RGB_BYTES_PER_PIXEL: usize = 6;
+pub(crate) const PACKED_RGB_BYTES_PER_PIXEL: usize = 6;
 pub(crate) const PACKED_RGB_PRECISION: u8 = 16;
 
 /// A planar YUV pixel format postkit passes to grok's accelerator plugin as it
@@ -901,7 +901,7 @@ pub(crate) fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> ReadR
 
 /// The compressor settings a stream encode asks for, with the source's frame
 /// transform built once for the whole run.
-fn compress_params(
+pub(crate) fn compress_params(
     opts: &StreamEncodeOptions,
 ) -> Result<crate::grok_encoder::CompressParams, String> {
     let colour_transform = opts.source_colour.frame_transform()?;
