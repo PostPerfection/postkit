@@ -298,17 +298,32 @@ pub fn run_encode_timeline(
         ));
     }
     timeline.check()?;
+    if let Some((index, clip)) = timeline
+        .clips
+        .iter()
+        .enumerate()
+        .find(|(_, clip)| clip.layer > 0)
+    {
+        return Err(format!(
+            "{} is on layer {}, and this build composites nothing yet",
+            crate::timeline::clip_name(index, clip),
+            clip.layer
+        ));
+    }
+    if let Some(gap) = timeline.base_gaps().first() {
+        return Err(format!(
+            "layer 0 has a gap of {} frames at frame {}, and this build fills none yet",
+            gap.end - gap.start,
+            gap.start
+        ));
+    }
     let start_time = std::time::Instant::now();
     let total_frames = timeline.total_frames();
     let j2k_dir = output_dir.join("j2k");
     let mut picture_findings = crate::picture_findings::PictureFindings::default();
     let mut finished_phases = PhaseSeconds::default();
-    for (index, (clip, first_output_frame)) in timeline
-        .clips
-        .iter()
-        .zip(timeline.clip_starts())
-        .enumerate()
-    {
+    for (index, clip) in timeline.base_clips() {
+        let first_output_frame = clip.start;
         if cancel.load(Ordering::Relaxed) {
             on_log("=== CANCELLED ===");
             return Err(CANCELLED.to_string());

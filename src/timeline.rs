@@ -1,4 +1,5 @@
 use std::io::Read;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -10,7 +11,7 @@ use crate::picture_processing::PictureProcessing;
 use crate::subtitle_retime::{SrtCue, format_srt, parse_srt};
 use crate::wav_io::{SampleFormat, WavReader, WavSpec, WavWriter};
 
-pub const TIMELINE_FORMAT_VERSION: u32 = 1;
+pub const TIMELINE_FORMAT_VERSION: u32 = 2;
 
 const SOUND_SAMPLE_RATE: u32 = 48_000;
 const SOUND_BITS_PER_SAMPLE: u16 = 24;
@@ -22,6 +23,7 @@ const MILLISECONDS_PER_SECOND: u64 = 1000;
 const COPY_BUFFER_BYTES: usize = 1 << 20;
 // the sound plays as a second stream beside the joined pictures, not as one more segment after them
 const EDL_SEPARATE_STREAM: &str = "!new_stream;!no_clip";
+pub const BLACK_GAP_SIZE: &str = "320x180";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Timeline {
@@ -37,6 +39,11 @@ pub struct Timeline {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub picture: PathBuf,
+    pub start: u64,
+    #[serde(default)]
+    pub layer: u32,
+    #[serde(default = "full_opacity")]
+    pub opacity: f64,
     pub in_frame: u64,
     pub out_frame: u64,
     pub sound: ClipSound,
@@ -45,6 +52,10 @@ pub struct Clip {
     pub source_colour: SourceColour,
     #[serde(default)]
     pub picture_processing: PictureProcessing,
+}
+
+fn full_opacity() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -93,18 +104,38 @@ impl Timeline {
     }
 
     pub fn total_frames(&self) -> u64 {
-        self.clips.iter().map(Clip::frame_count).sum()
+        self.clips.iter().map(Clip::end).max().unwrap_or(0)
     }
 
     pub fn clip_starts(&self) -> Vec<u64> {
-        self.clips
+        self.clips.iter().map(|clip| clip.start).collect()
+    }
+
+    pub fn base_clips(&self) -> Vec<(usize, &Clip)> {
+        let mut base: Vec<(usize, &Clip)> = self
+            .clips
             .iter()
-            .scan(0, |start, clip| {
-                let this_start = *start;
-                *start += clip.frame_count();
-                Some(this_start)
-            })
-            .collect()
+            .enumerate()
+            .filter(|(_, clip)| clip.layer == 0)
+            .collect();
+        base.sort_by_key(|(_, clip)| clip.start);
+        base
+    }
+
+    pub fn base_gaps(&self) -> Vec<Range<u64>> {
+        let mut gaps = Vec::new();
+        let mut covered_to = 0;
+        for (_, clip) in self.base_clips() {
+            if clip.start > covered_to {
+                gaps.push(covered_to..clip.start);
+            }
+            covered_to = clip.end();
+        }
+        let total = self.total_frames();
+        if total > covered_to {
+            gaps.push(covered_to..total);
+        }
+        gaps
     }
 
     pub fn check(&self) -> Result<(), String> {
@@ -140,8 +171,40 @@ impl Timeline {
                     rate.numerator, rate.denominator, self.fps.numerator, self.fps.denominator
                 ));
             }
+            if !(0.0..=1.0).contains(&clip.opacity) {
+                return Err(format!(
+                    "{name}: the opacity {} is outside 0 to 1",
+                    clip.opacity
+                ));
+            }
+            if clip.layer > 0 && clip.sound != ClipSound::None {
+                return Err(format!(
+                    "{name} is on layer {} and carries sound: only layer 0 clips sound",
+                    clip.layer
+                ));
+            }
         }
+        self.check_overlaps()?;
         self.check_reel_starts()
+    }
+
+    fn check_overlaps(&self) -> Result<(), String> {
+        let mut by_layer: Vec<(usize, &Clip)> = self.clips.iter().enumerate().collect();
+        by_layer.sort_by_key(|(_, clip)| (clip.layer, clip.start));
+        for ((index_a, a), (index_b, b)) in by_layer.iter().zip(by_layer.iter().skip(1)) {
+            if a.layer == b.layer && b.start < a.end() {
+                return Err(format!(
+                    "{} starts at frame {} while {} on layer {} runs to frame {}: clips on one \
+                     layer cannot overlap",
+                    clip_name(*index_b, b),
+                    b.start,
+                    clip_name(*index_a, a),
+                    a.layer,
+                    a.end()
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn check_reel_starts(&self) -> Result<(), String> {
@@ -176,6 +239,10 @@ impl Clip {
     fn frame_count(&self) -> u64 {
         self.out_frame.saturating_sub(self.in_frame)
     }
+
+    pub fn end(&self) -> u64 {
+        self.start + self.frame_count()
+    }
 }
 
 pub enum TimelineShape {
@@ -201,6 +268,9 @@ pub fn shape(timeline: &Timeline) -> Result<TimelineShape, String> {
     let [clip] = timeline.clips.as_slice() else {
         return Ok(TimelineShape::MultiClip);
     };
+    if clip.start != 0 || clip.layer != 0 || clip.opacity != 1.0 {
+        return Ok(TimelineShape::MultiClip);
+    }
     timeline.check()?;
     let name = clip_name(0, clip);
     if clip.source_colour != SourceColour::default() {
@@ -371,13 +441,13 @@ pub fn render_sound(timeline: &Timeline, output: &Path) -> Result<Option<PathBuf
     let mut writer = WavWriter::create(output, spec, total_samples)
         .map_err(|e| format!("cannot create {}: {e}", output.display()))?;
     let write_error = |e: std::io::Error| format!("cannot write {}: {e}", output.display());
-    for (index, (clip, start)) in timeline
-        .clips
-        .iter()
-        .zip(timeline.clip_starts())
-        .enumerate()
-    {
-        let length = sample_at(start + clip.frame_count(), fps) - sample_at(start, fps);
+    let mut written_to = 0;
+    for (index, clip) in timeline.base_clips() {
+        let clip_first_sample = sample_at(clip.start, fps);
+        write_silence(&mut writer, channels, clip_first_sample - written_to)
+            .map_err(write_error)?;
+        written_to = sample_at(clip.end(), fps);
+        let length = written_to - clip_first_sample;
         let first_sample = sample_at(clip.in_frame, fps);
         let written = match &clip.sound {
             ClipSound::None => Ok(0),
@@ -389,6 +459,7 @@ pub fn render_sound(timeline: &Timeline, output: &Path) -> Result<Option<PathBuf
         .map_err(|e| format!("{}: {e}", clip_name(index, clip)))?;
         write_silence(&mut writer, channels, length - written).map_err(write_error)?;
     }
+    write_silence(&mut writer, channels, total_samples - written_to).map_err(write_error)?;
     writer.finalize().map_err(write_error)?;
     Ok(Some(output.to_path_buf()))
 }
@@ -601,31 +672,90 @@ pub fn join_subtitles(timeline: &Timeline, output: &Path) -> Result<Option<PathB
     Ok(Some(output.to_path_buf()))
 }
 
-pub fn mpv_edl_uri(timeline: &Timeline, sound: Option<&Path>) -> String {
+pub fn render_black(timeline: &Timeline, output: &Path) -> Result<Option<PathBuf>, String> {
     let fps = timeline.fps;
-    let pictures: Vec<PictureSegment> = timeline
-        .clips
+    let Some(longest_gap) = timeline
+        .base_gaps()
         .iter()
-        .map(|clip| PictureSegment {
-            path: clip.picture.clone(),
-            trim: Some(SegmentTrim {
-                start_seconds: seconds_at(clip.in_frame, fps),
-                length_seconds: Some(seconds_at(clip.frame_count(), fps)),
-            }),
+        .map(|gap| gap.end - gap.start)
+        .max()
+    else {
+        return Ok(None);
+    };
+    let black = format!(
+        "color=c=black:s={BLACK_GAP_SIZE}:r={}/{}:d={}",
+        fps.numerator,
+        fps.denominator,
+        seconds_at(longest_gap, fps)
+    );
+    let finished = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", &black])
+        .args(["-c:v", "ffv1"])
+        .arg(output)
+        .output()
+        .map_err(|e| format!("cannot run ffmpeg: {e}"))?;
+    if !finished.status.success() {
+        return Err(format!(
+            "ffmpeg cannot write the black for the gaps to {}: {}",
+            output.display(),
+            String::from_utf8_lossy(&finished.stderr).trim()
+        ));
+    }
+    Ok(Some(output.to_path_buf()))
+}
+
+pub fn mpv_edl_uri(
+    timeline: &Timeline,
+    sound: Option<&Path>,
+    black: Option<&Path>,
+) -> Result<String, String> {
+    let fps = timeline.fps;
+    let mut placed: Vec<(u64, PictureSegment)> = timeline
+        .base_clips()
+        .into_iter()
+        .map(|(_, clip)| {
+            let segment = PictureSegment {
+                path: clip.picture.clone(),
+                trim: Some(SegmentTrim {
+                    start_seconds: seconds_at(clip.in_frame, fps),
+                    length_seconds: Some(seconds_at(clip.frame_count(), fps)),
+                }),
+            };
+            (clip.start, segment)
         })
         .collect();
+    for gap in timeline.base_gaps() {
+        let frames = gap.end - gap.start;
+        let Some(black) = black else {
+            return Err(format!(
+                "layer 0 has a gap of {frames} frames at frame {}, and no black source was \
+                 rendered for it",
+                gap.start
+            ));
+        };
+        let segment = PictureSegment {
+            path: black.to_path_buf(),
+            trim: Some(SegmentTrim {
+                start_seconds: 0.0,
+                length_seconds: Some(seconds_at(frames, fps)),
+            }),
+        };
+        placed.push((gap.start, segment));
+    }
+    placed.sort_by_key(|(start, _)| *start);
+    let pictures: Vec<PictureSegment> = placed.into_iter().map(|(_, segment)| segment).collect();
     let picture_uri = edl_uri(&pictures);
     let Some(sound) = sound else {
-        return picture_uri;
+        return Ok(picture_uri);
     };
     let whole_timeline = SegmentTrim {
         start_seconds: 0.0,
         length_seconds: Some(seconds_at(timeline.total_frames(), fps)),
     };
-    format!(
+    Ok(format!(
         "{picture_uri};{EDL_SEPARATE_STREAM};{}",
         edl_segment(sound, Some(&whole_timeline))
-    )
+    ))
 }
 
 fn seconds_at(frame: u64, fps: FrameRate) -> f64 {
@@ -641,9 +771,12 @@ mod tests {
         denominator: 1,
     };
 
-    fn clip(picture: &Path, in_frame: u64, out_frame: u64, sound: ClipSound) -> Clip {
+    fn clip(picture: &Path, start: u64, in_frame: u64, out_frame: u64, sound: ClipSound) -> Clip {
         Clip {
             picture: picture.to_path_buf(),
+            start,
+            layer: 0,
+            opacity: 1.0,
             in_frame,
             out_frame,
             sound,
@@ -651,6 +784,11 @@ mod tests {
             source_colour: SourceColour::default(),
             picture_processing: PictureProcessing::default(),
         }
+    }
+
+    fn on_layer(mut clip: Clip, layer: u32) -> Clip {
+        clip.layer = layer;
+        clip
     }
 
     fn timeline(clips: Vec<Clip>) -> Timeline {
@@ -711,7 +849,7 @@ mod tests {
     fn one_clip_maps_its_in_and_out_points_onto_the_trims() {
         let directory = tempfile::tempdir().unwrap();
         let picture = codestream_directory(&directory.path().join("feature"));
-        let mut one_clip = timeline(vec![clip(&picture, 2, 7, ClipSound::None)]);
+        let mut one_clip = timeline(vec![clip(&picture, 0, 2, 7, ClipSound::None)]);
         one_clip.reel_starts = vec![3];
 
         let TimelineShape::SingleClip(build) = shape(&one_clip).unwrap() else {
@@ -737,7 +875,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let picture = codestream_directory(&directory.path().join("feature"));
         let clip_wav = directory.path().join("clip.wav");
-        let mut with_clip_sound = clip(&picture, 0, 10, ClipSound::File(clip_wav.clone()));
+        let mut with_clip_sound = clip(&picture, 0, 0, 10, ClipSound::File(clip_wav.clone()));
         with_clip_sound.subtitle = Some(directory.path().join("clip.srt"));
         let mut one_clip = timeline(vec![with_clip_sound]);
 
@@ -765,7 +903,7 @@ mod tests {
     fn one_clip_refuses_two_subtitle_sources_and_its_own_colour() {
         let directory = tempfile::tempdir().unwrap();
         let picture = codestream_directory(&directory.path().join("feature"));
-        let mut with_subtitle = clip(&picture, 0, 10, ClipSound::None);
+        let mut with_subtitle = clip(&picture, 0, 0, 10, ClipSound::None);
         with_subtitle.subtitle = Some(directory.path().join("clip.srt"));
         let mut one_clip = timeline(vec![with_subtitle]);
         one_clip.subtitle = Some(directory.path().join("timeline.srt"));
@@ -777,7 +915,7 @@ mod tests {
             "{refusal}"
         );
 
-        let mut coloured = clip(&picture, 0, 10, ClipSound::None);
+        let mut coloured = clip(&picture, 0, 0, 10, ClipSound::None);
         coloured.source_colour = SourceColour::KeepRgb;
         let Err(refusal) = shape(&timeline(vec![coloured])) else {
             panic!("a clip colour has no single-picture field to go to");
@@ -789,19 +927,19 @@ mod tests {
     fn more_than_one_clip_is_the_multi_clip_build() {
         let picture = Path::new("/media/a.mov");
         let two_clips = timeline(vec![
-            clip(picture, 0, 1, ClipSound::None),
-            clip(picture, 0, 1, ClipSound::None),
+            clip(picture, 0, 0, 1, ClipSound::None),
+            clip(picture, 1, 0, 1, ClipSound::None),
         ]);
         assert!(matches!(shape(&two_clips), Ok(TimelineShape::MultiClip)));
     }
 
     #[test]
-    fn the_clip_starts_add_up_the_trimmed_lengths() {
+    fn the_clip_starts_are_the_start_frames_in_clip_order() {
         let picture = Path::new("/media/a.mov");
         let timeline = timeline(vec![
-            clip(picture, 10, 34, ClipSound::None),
-            clip(picture, 0, 5, ClipSound::None),
-            clip(picture, 100, 148, ClipSound::None),
+            clip(picture, 0, 10, 34, ClipSound::None),
+            clip(picture, 24, 0, 5, ClipSound::None),
+            clip(picture, 29, 100, 148, ClipSound::None),
         ]);
         assert_eq!(timeline.clip_starts(), vec![0, 24, 29]);
         assert_eq!(timeline.total_frames(), 77);
@@ -814,6 +952,7 @@ mod tests {
         let mut written = timeline(vec![clip(
             Path::new("/media/a.mov"),
             0,
+            0,
             24,
             ClipSound::File(PathBuf::from("/media/a.wav")),
         )]);
@@ -821,25 +960,25 @@ mod tests {
         written.write(&path).unwrap();
         assert_eq!(Timeline::read(&path).unwrap(), written);
 
-        let newer = std::fs::read_to_string(&path)
+        let older = std::fs::read_to_string(&path)
             .unwrap()
-            .replace("\"version\": 1", "\"version\": 2");
-        std::fs::write(&path, newer).unwrap();
+            .replace("\"version\": 2", "\"version\": 1");
+        std::fs::write(&path, older).unwrap();
         let refused = Timeline::read(&path).unwrap_err();
-        assert!(refused.contains("version 2"), "{refused}");
-        assert!(refused.contains("reads version 1"), "{refused}");
+        assert!(refused.contains("of version 1"), "{refused}");
+        assert!(refused.contains("reads version 2"), "{refused}");
 
-        written.version = 2;
+        written.version = 1;
         let refused = written.write(&path).unwrap_err();
-        assert!(refused.contains("version 2"), "{refused}");
+        assert!(refused.contains("version 1"), "{refused}");
     }
 
     #[test]
-    fn a_hand_written_clip_can_leave_out_the_colour_and_the_picture_processing() {
+    fn a_hand_written_clip_can_leave_out_the_layer_opacity_colour_and_picture_processing() {
         let text = r#"{
-            "version": 1,
+            "version": 2,
             "fps": {"numerator": 25, "denominator": 1},
-            "clips": [{"picture": "/media/a.mov", "in_frame": 0, "out_frame": 25,
+            "clips": [{"picture": "/media/a.mov", "start": 0, "in_frame": 0, "out_frame": 25,
                        "sound": "Embedded", "subtitle": null}],
             "sound": "PerClip",
             "subtitle": null
@@ -848,6 +987,8 @@ mod tests {
         let path = directory.path().join("cut.json");
         std::fs::write(&path, text).unwrap();
         let read = Timeline::read(&path).unwrap();
+        assert_eq!(read.clips[0].layer, 0);
+        assert_eq!(read.clips[0].opacity, 1.0);
         assert_eq!(read.clips[0].source_colour, SourceColour::DisplayRgb);
         assert!(read.clips[0].picture_processing.is_identity());
         assert!(read.reel_starts.is_empty());
@@ -864,7 +1005,7 @@ mod tests {
                 .contains("no clips")
         );
         assert!(
-            timeline(vec![clip(&stills, 0, 10, ClipSound::None)])
+            timeline(vec![clip(&stills, 0, 0, 10, ClipSound::None)])
                 .check()
                 .is_ok(),
             "a still sequence takes the timeline's rate"
@@ -875,8 +1016,8 @@ mod tests {
             (2, 11, "the out point 11 is past the source's 10 frames"),
         ] {
             let refused = timeline(vec![
-                clip(&stills, 0, 10, ClipSound::None),
-                clip(&stills, in_frame, out_frame, ClipSound::None),
+                clip(&stills, 0, 0, 10, ClipSound::None),
+                clip(&stills, 10, in_frame, out_frame, ClipSound::None),
             ])
             .check()
             .unwrap_err();
@@ -892,7 +1033,7 @@ mod tests {
     fn the_check_refuses_reel_starts_out_of_order_or_past_the_end() {
         let directory = tempfile::tempdir().unwrap();
         let stills = still_sequence(&directory.path().join("stills"), 10);
-        let mut timeline = timeline(vec![clip(&stills, 0, 10, ClipSound::None)]);
+        let mut timeline = timeline(vec![clip(&stills, 0, 0, 10, ClipSound::None)]);
         for (reel_starts, expected) in [
             (vec![0, 5], "reel start 0"),
             (vec![5, 5], "listed twice"),
@@ -933,9 +1074,9 @@ mod tests {
 
         let picture = Path::new("/media/a.mov");
         let timeline = timeline(vec![
-            clip(picture, 1, 3, ClipSound::File(first)),
-            clip(picture, 0, 1, ClipSound::None),
-            clip(picture, 0, 1, ClipSound::File(short)),
+            clip(picture, 0, 1, 3, ClipSound::File(first)),
+            clip(picture, 2, 0, 1, ClipSound::None),
+            clip(picture, 3, 0, 1, ClipSound::File(short)),
         ]);
         let output = directory.path().join("timeline.wav");
         let rendered = render_sound(&timeline, &output).unwrap().unwrap();
@@ -980,8 +1121,20 @@ mod tests {
             &[0],
         );
         let timeline = timeline(vec![
-            clip(Path::new("/media/a.mov"), 0, 1, ClipSound::File(stereo_wav)),
-            clip(Path::new("/media/b.mov"), 0, 1, ClipSound::File(mono_wav)),
+            clip(
+                Path::new("/media/a.mov"),
+                0,
+                0,
+                1,
+                ClipSound::File(stereo_wav),
+            ),
+            clip(
+                Path::new("/media/b.mov"),
+                1,
+                0,
+                1,
+                ClipSound::File(mono_wav),
+            ),
         ]);
         let refused = render_sound(&timeline, &directory.path().join("out.wav")).unwrap_err();
         assert!(
@@ -995,7 +1148,7 @@ mod tests {
     fn a_timeline_with_no_clip_sound_renders_none_and_an_override_is_returned_as_is() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("out.wav");
-        let mut timeline = timeline(vec![clip(Path::new("/a.mov"), 0, 1, ClipSound::None)]);
+        let mut timeline = timeline(vec![clip(Path::new("/a.mov"), 0, 0, 1, ClipSound::None)]);
         assert_eq!(render_sound(&timeline, &output).unwrap(), None);
         assert!(!output.exists());
 
@@ -1023,9 +1176,9 @@ mod tests {
 
         let picture = Path::new("/media/a.mov");
         let mut clips = vec![
-            clip(picture, 24, 72, ClipSound::None),
-            clip(picture, 0, 12, ClipSound::None),
-            clip(picture, 0, 24, ClipSound::None),
+            clip(picture, 0, 24, 72, ClipSound::None),
+            clip(picture, 48, 0, 12, ClipSound::None),
+            clip(picture, 60, 0, 24, ClipSound::None),
         ];
         clips[0].subtitle = Some(first);
         clips[2].subtitle = Some(second);
@@ -1051,7 +1204,7 @@ mod tests {
     fn no_clip_subtitle_joins_to_none() {
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("joined.srt");
-        let timeline = timeline(vec![clip(Path::new("/a.mov"), 0, 1, ClipSound::None)]);
+        let timeline = timeline(vec![clip(Path::new("/a.mov"), 0, 0, 1, ClipSound::None)]);
         assert_eq!(join_subtitles(&timeline, &output).unwrap(), None);
         assert!(!output.exists());
     }
@@ -1059,17 +1212,202 @@ mod tests {
     #[test]
     fn the_edl_trims_each_clip_and_plays_the_sound_beside_them() {
         let timeline = timeline(vec![
-            clip(Path::new("/media/a,b.mov"), 12, 36, ClipSound::None),
-            clip(Path::new("/media/c.mov"), 0, 48, ClipSound::None),
+            clip(Path::new("/media/a,b.mov"), 0, 12, 36, ClipSound::None),
+            clip(Path::new("/media/c.mov"), 24, 0, 48, ClipSound::None),
         ]);
         assert_eq!(
-            mpv_edl_uri(&timeline, Some(Path::new("/work/sound.wav"))),
+            mpv_edl_uri(&timeline, Some(Path::new("/work/sound.wav")), None).unwrap(),
             "edl://%14%/media/a,b.mov,0.5,1;%12%/media/c.mov,0,2;!new_stream;!no_clip;\
              %15%/work/sound.wav,0,3"
         );
         assert_eq!(
-            mpv_edl_uri(&timeline, None),
+            mpv_edl_uri(&timeline, None, None).unwrap(),
             "edl://%14%/media/a,b.mov,0.5,1;%12%/media/c.mov,0,2"
+        );
+    }
+
+    #[test]
+    fn total_frames_runs_to_the_furthest_end_on_any_layer() {
+        let picture = Path::new("/media/a.mov");
+        let past_the_base = timeline(vec![
+            clip(picture, 0, 0, 24, ClipSound::None),
+            on_layer(clip(picture, 12, 0, 36, ClipSound::None), 1),
+        ]);
+        assert_eq!(past_the_base.total_frames(), 48);
+        let with_a_gap = timeline(vec![
+            clip(picture, 0, 0, 24, ClipSound::None),
+            clip(picture, 36, 0, 12, ClipSound::None),
+        ]);
+        assert_eq!(with_a_gap.total_frames(), 48);
+        assert_eq!(timeline(Vec::new()).total_frames(), 0);
+    }
+
+    #[test]
+    fn the_check_refuses_a_bad_opacity_upper_layer_sound_and_overlap_on_one_layer() {
+        let directory = tempfile::tempdir().unwrap();
+        let stills = still_sequence(&directory.path().join("stills"), 10);
+        let first = format!("clip 1 ({})", stills.display());
+        let second = format!("clip 2 ({})", stills.display());
+        for opacity in [1.5, -0.1] {
+            let mut faded = clip(&stills, 0, 0, 10, ClipSound::None);
+            faded.opacity = opacity;
+            assert_eq!(
+                timeline(vec![faded]).check().unwrap_err(),
+                format!("{first}: the opacity {opacity} is outside 0 to 1")
+            );
+        }
+        let mut not_a_number = clip(&stills, 0, 0, 10, ClipSound::None);
+        not_a_number.opacity = f64::NAN;
+        let refused = timeline(vec![not_a_number]).check().unwrap_err();
+        assert!(refused.contains("is outside 0 to 1"), "{refused}");
+
+        let sounding = on_layer(clip(&stills, 0, 0, 10, ClipSound::Embedded), 2);
+        assert_eq!(
+            timeline(vec![sounding]).check().unwrap_err(),
+            format!("{first} is on layer 2 and carries sound: only layer 0 clips sound")
+        );
+
+        let overlapping = timeline(vec![
+            clip(&stills, 4, 0, 10, ClipSound::None),
+            clip(&stills, 0, 0, 6, ClipSound::None),
+        ]);
+        assert_eq!(
+            overlapping.check().unwrap_err(),
+            format!(
+                "{first} starts at frame 4 while {second} on layer 0 runs to frame 6: clips on \
+                 one layer cannot overlap"
+            )
+        );
+
+        let layered_with_a_gap = timeline(vec![
+            clip(&stills, 0, 0, 10, ClipSound::None),
+            clip(&stills, 20, 0, 10, ClipSound::None),
+            on_layer(clip(&stills, 5, 0, 10, ClipSound::None), 1),
+            on_layer(clip(&stills, 0, 0, 10, ClipSound::None), 3),
+        ]);
+        assert!(layered_with_a_gap.check().is_ok());
+    }
+
+    #[test]
+    fn one_clip_off_frame_0_above_layer_0_or_faded_is_the_multi_clip_build() {
+        let picture = Path::new("/media/a.mov");
+        let late = clip(picture, 24, 0, 1, ClipSound::None);
+        let upper = on_layer(clip(picture, 0, 0, 1, ClipSound::None), 1);
+        let mut faded = clip(picture, 0, 0, 1, ClipSound::None);
+        faded.opacity = 0.5;
+        for one_clip in [late, upper, faded] {
+            assert!(matches!(
+                shape(&timeline(vec![one_clip])),
+                Ok(TimelineShape::MultiClip)
+            ));
+        }
+    }
+
+    #[test]
+    fn clip_sound_lands_at_the_clip_start_with_silence_in_the_gaps() {
+        let directory = tempfile::tempdir().unwrap();
+        let samples_per_frame = (SOUND_SAMPLE_RATE / RATE.numerator) as usize;
+        let numbered_wav = directory.path().join("numbered.wav");
+        let numbered: Vec<i32> = (0..(4 * samples_per_frame) as i32)
+            .flat_map(|frame| [frame, -frame])
+            .collect();
+        wav_of(&numbered_wav, stereo(24), &numbered);
+
+        let picture = Path::new("/media/a.mov");
+        let timeline = timeline(vec![
+            on_layer(clip(picture, 0, 0, 5, ClipSound::None), 1),
+            clip(picture, 2, 1, 3, ClipSound::File(numbered_wav)),
+        ]);
+        let output = directory.path().join("timeline.wav");
+        render_sound(&timeline, &output).unwrap().unwrap();
+
+        let joined = read_samples(&output);
+        assert_eq!(joined.len(), 2 * 5 * samples_per_frame);
+        let gap_before = &joined[..4 * samples_per_frame];
+        assert!(gap_before.iter().all(|&sample| sample == 0));
+        let clip_sound = &joined[4 * samples_per_frame..8 * samples_per_frame];
+        assert_eq!(clip_sound[0], samples_per_frame as i32, "the in point");
+        assert_eq!(clip_sound[1], -(samples_per_frame as i32));
+        assert_eq!(
+            clip_sound[4 * samples_per_frame - 2],
+            (3 * samples_per_frame - 1) as i32
+        );
+        let gap_after = &joined[8 * samples_per_frame..];
+        assert!(gap_after.iter().all(|&sample| sample == 0));
+    }
+
+    #[test]
+    fn clip_subtitles_shift_by_the_clip_start_across_a_gap_on_any_layer() {
+        let directory = tempfile::tempdir().unwrap();
+        let title = directory.path().join("title.srt");
+        std::fs::write(&title, "1\n00:00:00,000 --> 00:00:00,250\ntitle\n").unwrap();
+        let late = directory.path().join("late.srt");
+        std::fs::write(&late, "1\n00:00:00,250 --> 00:00:00,750\nlate clip\n").unwrap();
+
+        let picture = Path::new("/media/a.mov");
+        let mut clips = vec![
+            clip(picture, 0, 0, 12, ClipSound::None),
+            on_layer(clip(picture, 12, 0, 12, ClipSound::None), 1),
+            clip(picture, 48, 0, 24, ClipSound::None),
+        ];
+        clips[1].subtitle = Some(title);
+        clips[2].subtitle = Some(late);
+        let output = directory.path().join("joined.srt");
+        join_subtitles(&timeline(clips), &output).unwrap().unwrap();
+
+        let timings: Vec<(u64, u64, String)> =
+            parse_srt(&std::fs::read_to_string(&output).unwrap())
+                .into_iter()
+                .map(|cue| (cue.start_ms, cue.end_ms, cue.text))
+                .collect();
+        assert_eq!(
+            timings,
+            vec![
+                (500, 750, "title".to_string()),
+                (2250, 2750, "late clip".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_black_for_the_gaps_is_as_long_as_the_longest_gap() {
+        let directory = tempfile::tempdir().unwrap();
+        let picture = Path::new("/media/a.mov");
+        let output = directory.path().join("black.mkv");
+        let no_gap = timeline(vec![
+            clip(picture, 0, 0, 24, ClipSound::None),
+            clip(picture, 24, 0, 24, ClipSound::None),
+        ]);
+        assert_eq!(render_black(&no_gap, &output).unwrap(), None);
+        assert!(!output.exists());
+
+        let gaps = timeline(vec![
+            clip(picture, 12, 0, 24, ClipSound::None),
+            clip(picture, 60, 0, 12, ClipSound::None),
+            on_layer(clip(picture, 0, 0, 90, ClipSound::None), 1),
+        ]);
+        assert_eq!(gaps.base_gaps(), vec![0..12, 36..60, 72..90]);
+        assert_eq!(render_black(&gaps, &output).unwrap(), Some(output.clone()));
+        assert_eq!(probe_source(&output).unwrap().frames, 24);
+    }
+
+    #[test]
+    fn the_edl_fills_a_base_gap_with_black_and_leaves_upper_layers_out() {
+        let timeline = timeline(vec![
+            clip(Path::new("/media/a.mov"), 0, 12, 36, ClipSound::None),
+            on_layer(
+                clip(Path::new("/media/title.mov"), 12, 0, 24, ClipSound::None),
+                1,
+            ),
+            clip(Path::new("/media/c.mov"), 48, 0, 24, ClipSound::None),
+        ]);
+        assert_eq!(
+            mpv_edl_uri(&timeline, None, Some(Path::new("/work/black.mkv"))).unwrap(),
+            "edl://%12%/media/a.mov,0.5,1;%15%/work/black.mkv,0,1;%12%/media/c.mov,0,1"
+        );
+        assert_eq!(
+            mpv_edl_uri(&timeline, None, None).unwrap_err(),
+            "layer 0 has a gap of 24 frames at frame 24, and no black source was rendered for it"
         );
     }
 

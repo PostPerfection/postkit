@@ -39,9 +39,18 @@ fn clip_with_sound(directory: &Path, name: &str, rate: u32, seconds: f64) -> Pat
     clip
 }
 
-fn clip(picture: &Path, in_frame: u64, out_frame: u64, subtitle: Option<PathBuf>) -> Clip {
+fn clip(
+    picture: &Path,
+    start: u64,
+    in_frame: u64,
+    out_frame: u64,
+    subtitle: Option<PathBuf>,
+) -> Clip {
     Clip {
         picture: picture.to_path_buf(),
+        start,
+        layer: 0,
+        opacity: 1.0,
         in_frame,
         out_frame,
         sound: ClipSound::Embedded,
@@ -118,8 +127,8 @@ fn two_trimmed_clips_build_one_picture_sound_and_subtitle_track() {
     .unwrap();
 
     let timeline = timeline(vec![
-        clip(&first, 6, 30, Some(first_subtitle)),
-        clip(&second, 4, 16, Some(second_subtitle)),
+        clip(&first, 0, 6, 30, Some(first_subtitle)),
+        clip(&second, 24, 4, 16, Some(second_subtitle)),
     ]);
     let total_frames = 36;
     assert_eq!(timeline.total_frames(), total_frames);
@@ -183,8 +192,8 @@ fn two_trimmed_clips_build_one_picture_sound_and_subtitle_track() {
     let followed_by_codestreams = Timeline {
         reel_starts: Vec::new(),
         ..self::timeline(vec![
-            clip(&second, 0, 24, None),
-            clip(&result.j2k_dir, 0, total_frames, None),
+            clip(&second, 0, 0, 24, None),
+            clip(&result.j2k_dir, 24, 0, total_frames, None),
         ])
     };
     followed_by_codestreams
@@ -201,7 +210,7 @@ fn two_trimmed_clips_build_one_picture_sound_and_subtitle_track() {
         "the codestreams follow on at the clip's place"
     );
 
-    let trimmed_codestreams = self::timeline(vec![clip(&result.j2k_dir, 1, total_frames, None)]);
+    let trimmed_codestreams = self::timeline(vec![clip(&result.j2k_dir, 0, 1, total_frames, None)]);
     let refused = run_encode_timeline(
         &trimmed_codestreams,
         &directory.path().join("trimmed"),
@@ -223,8 +232,8 @@ fn a_clip_at_another_rate_is_refused_by_name() {
     let matching = clip_with_sound(directory.path(), "matching.mov", RATE, 0.5);
     let other = clip_with_sound(directory.path(), "other.mov", 25, 0.5);
     let refused = timeline(vec![
-        clip(&matching, 0, 12, None),
-        clip(&other, 0, 12, None),
+        clip(&matching, 0, 0, 12, None),
+        clip(&other, 12, 0, 12, None),
     ])
     .check()
     .unwrap_err();
