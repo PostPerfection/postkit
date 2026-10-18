@@ -11,6 +11,15 @@
   - Padding on the device, as a measured optimisation. The pad filter runs in
     the in-process graph.
 
+- Timeline follow-ups, shared by both wizards (2026-10-18).
+  - A PNG sequence cannot be a GUI timeline clip. The import dialog picks files
+    only, and probing one PNG gives no duration. `timeline::probe_source` counts
+    a sequence but is `pub(crate)`. `create --timeline` takes one.
+  - A single still held for a number of frames as a timeline clip.
+  - A composited preview. Play timeline plays layer 0 with black in its gaps,
+    without the layers above it.
+  - A webdriver test for Space and double-click on the properties handle.
+
 - The mpv level meter reads 0.3 to 0.6 s ahead of what is heard. The `astats`
   filter sees each block when mpv decodes it, before the audio output buffer,
   and `af-metadata` carries no timestamp to hold a reading back by. The grok
