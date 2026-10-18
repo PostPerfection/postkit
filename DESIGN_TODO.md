@@ -53,6 +53,17 @@
   embed PCM from the sound MXF, reusing the preview decode + colour transform as the
   frame source. Needs genlock-accurate scheduling and the physical board to verify.
   Gates on GPU J2K decode.
+- SDI capture from a DeckLink input (Clipster 7 parity, surveyed 2026-10-17 in
+  dcpwizard's DESIGN_TODO). The same SDK shim as the output, recording to a
+  frame folder and WAV the wizards already take. Needs the board.
+- Atmos decode for playback. An IAB track is wrapped and copied but never rendered,
+  so the player gives an Atmos package its main sound only. A bed-only render of
+  the IAB (ST 2098-2) is the first useful step.
+- Timeline follow-ups. `pipeline::run_encode_timeline` only cuts, so there is no
+  alpha compositing of a clip over the one below it for title sequences. A timeline
+  of JPEG 2000 sources previews picture only: `GrokPlayer` hands off between clips
+  without the timeline's sound, and `SourceOptions` has no subtitle field for a
+  clip's own cues.
 - DTS:X. Would ride the generic DCData (ST 429-14) aux path, but the correct
   DataEssenceCoding UL could not be confirmed from asdcplib sources or SMPTE docs, so
   no `wrap_dcdata` was added rather than emit a wrong UL. Revisit once a confirmed UL
