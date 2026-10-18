@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use asdcplib::crypto::{AesDecContext, HmacContext};
 pub(super) use asdcplib::jp2k::StereoscopicPhase;
 
-use super::FrameRange;
 use super::audio::{self, KeyedSoundSegment, PlayedFrames};
 use super::subtitle_tracks::{self, CompositionSubtitles, Reels};
+use super::{FrameRange, SoundFile};
 use crate::composition_timeline::{self, SoundSegment, SubtitleSegment};
 use crate::content_keys::ContentKeys;
+use crate::encode::FrameRate;
 use crate::preview::{self, PictureReader, ResolvedPicture};
 use crate::preview_colour::PictureColour;
 
@@ -55,6 +56,8 @@ pub(super) struct Timeline {
     pub height: u32,
     pub title: String,
     pub sound: Vec<KeyedSoundSegment>,
+    // the sound file's frame under first_frame, None while the sound is the composition's
+    sound_first_frame: Option<u64>,
     // None for a source that is not a composition, which leaves the subtitle slots as they are
     pub subtitles: Option<CompositionSubtitles>,
 }
@@ -175,6 +178,7 @@ impl Timeline {
             title: title.unwrap_or_else(|| file_name(source)),
             frames: Frames::Essence(opened),
             sound,
+            sound_first_frame: None,
             subtitles,
         })
     }
@@ -207,6 +211,7 @@ impl Timeline {
             title: file_name(directory),
             frames: Frames::Codestreams { files, render },
             sound: Vec::new(),
+            sound_first_frame: None,
             subtitles: None,
         })
     }
@@ -226,10 +231,38 @@ impl Timeline {
         Ok(())
     }
 
+    pub fn play_sound_file(&mut self, sound: &SoundFile) -> Result<(), String> {
+        let rate = |part: u32| {
+            i32::try_from(part).map_err(|_| {
+                format!(
+                    "{} is cut at {}/{} fps, past what a sound edit rate holds",
+                    sound.path.display(),
+                    sound.fps.numerator,
+                    sound.fps.denominator
+                )
+            })
+        };
+        let segment = SoundSegment {
+            path: sound.path.clone(),
+            trim: None,
+            edit_rate: Some((rate(sound.fps.numerator)?, rate(sound.fps.denominator)?)),
+        };
+        self.sound = vec![KeyedSoundSegment { segment, key: None }];
+        self.sound_first_frame = Some(sound.first_frame);
+        Ok(())
+    }
+
+    pub fn play_codestreams_at(&mut self, fps: FrameRate) {
+        if matches!(self.frames, Frames::Codestreams { .. }) {
+            self.fps = fps.as_f64();
+        }
+    }
+
+    // the frames of the sound the picture plays over
     pub fn played_frames(&self) -> PlayedFrames {
         PlayedFrames {
             fps: self.fps,
-            first_frame: self.first_frame,
+            first_frame: self.sound_first_frame.unwrap_or(self.first_frame),
             frame_count: self.frame_count,
         }
     }

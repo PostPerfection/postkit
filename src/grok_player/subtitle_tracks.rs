@@ -34,6 +34,21 @@ pub(super) struct CompositionSubtitles {
     _images: Option<tempfile::TempDir>,
 }
 
+impl CompositionSubtitles {
+    // one subtitle track and no captions
+    pub(super) fn of_cues(cues: Vec<StyledCue>) -> Self {
+        CompositionSubtitles {
+            subtitles: vec![CompositionTrack {
+                cues,
+                language: None,
+            }],
+            captions: Vec::new(),
+            warnings: Vec::new(),
+            _images: None,
+        }
+    }
+}
+
 // in composition seconds
 pub(super) struct Reels {
     pub starts_seconds: Vec<f64>,

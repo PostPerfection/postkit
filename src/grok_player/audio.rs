@@ -1,11 +1,14 @@
 //! PCM from a composition's MainSound, and the clock the picture follows.
 //!
 //! Grok's player is picture-only. A DCP still names a sound MXF, so this reads
-//! it with asdcplib and feeds a stereo downmix or a 5.1 or 7.1 routing to the chosen output device.
+//! it with asdcplib, or reads the WAV a timeline preview renders, and feeds a
+//! stereo downmix or a 5.1 or 7.1 routing to the chosen output device.
 //! Missing sound, a missing device, or a failed stream leaves the picture
 //! running. Encrypted sound with no key for it is the one sound that fails load.
 
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -27,6 +30,7 @@ use super::levels::{ChannelMeasure, LevelHistory};
 use crate::audio_levels::{ChannelLevel, RMS_WINDOW_SECONDS, numbered_channel_label};
 use crate::composition_timeline::{SegmentTrim, SoundSegment};
 use crate::content_keys::ContentKeys;
+use crate::wav_io::{SampleFormat as WavSampleFormat, WavLayout};
 
 pub const MAXIMUM_SOUND_DELAY_MILLISECONDS: i64 = 10_000;
 
@@ -37,6 +41,9 @@ const QUEUED_SOUND_SECONDS: f64 = 0.5;
 const FEED_WAIT: Duration = Duration::from_millis(5);
 const FULL_SCALE_I32: f32 = 2147483648.0;
 const DEFAULT_SAMPLE_RATE: u32 = 48_000;
+// the sample sizes unpack_pcm reads
+const UNPACKED_SAMPLE_BITS: [u16; 3] = [16, 24, 32];
+const BITS_PER_BYTE: u16 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SoundOutputLayout {
@@ -781,7 +788,7 @@ struct Feeder {
 }
 
 struct SoundReader {
-    reader: PcmReader,
+    reader: EditUnitReader,
     layout: AudioLayout,
     decrypt: Option<AesDecContext>,
 }
@@ -1447,11 +1454,130 @@ impl PcmReader {
     }
 }
 
+// the timeline's sound reaches the player as a WAV
+enum EditUnitReader {
+    Mxf(PcmReader),
+    Wav(WavEditUnits),
+}
+
+impl EditUnitReader {
+    fn read_frame(
+        &mut self,
+        edit_unit: u32,
+        buffer: &mut [u8],
+        decrypt: Option<&mut AesDecContext>,
+    ) -> Result<usize, String> {
+        match self {
+            EditUnitReader::Mxf(reader) => reader
+                .read_frame(edit_unit, buffer, decrypt)
+                .map_err(|error| error.to_string()),
+            EditUnitReader::Wav(reader) => reader.read_frame(edit_unit, buffer),
+        }
+    }
+}
+
+// edit unit n starts on sample frame floor(n * sample rate / fps), exact at 30000/1001
+struct WavEditUnits {
+    path: PathBuf,
+    file: File,
+    data_offset: u64,
+    block_align: u64,
+    sample_frames: u64,
+    sample_rate: u64,
+    edit_rate: (u64, u64),
+}
+
+impl WavEditUnits {
+    fn sample_frame_at(&self, edit_unit: u64) -> u64 {
+        let (numerator, denominator) = self.edit_rate;
+        let frame = u128::from(edit_unit) * u128::from(self.sample_rate) * u128::from(denominator)
+            / u128::from(numerator);
+        (frame as u64).min(self.sample_frames)
+    }
+
+    fn edit_units(&self) -> u64 {
+        let (numerator, denominator) = self.edit_rate;
+        (u128::from(self.sample_frames) * u128::from(numerator))
+            .div_ceil(u128::from(self.sample_rate) * u128::from(denominator)) as u64
+    }
+
+    fn read_frame(&mut self, edit_unit: u32, buffer: &mut [u8]) -> Result<usize, String> {
+        let start = self.sample_frame_at(u64::from(edit_unit));
+        let end = self.sample_frame_at(u64::from(edit_unit) + 1);
+        let bytes = ((end - start) * self.block_align) as usize;
+        let read_error = |error: std::io::Error| format!("{}: {error}", self.path.display());
+        self.file
+            .seek(SeekFrom::Start(self.data_offset + start * self.block_align))
+            .map_err(read_error)?;
+        self.file
+            .read_exact(&mut buffer[..bytes])
+            .map_err(read_error)?;
+        Ok(bytes)
+    }
+}
+
+fn open_wav(path: &Path, edit_rate: Option<(i32, i32)>) -> Result<SoundReader, String> {
+    let (numerator, denominator) = edit_rate
+        .and_then(|(numerator, denominator)| {
+            Some((
+                u64::try_from(numerator).ok()?,
+                u64::try_from(denominator).ok()?,
+            ))
+        })
+        .filter(|(numerator, denominator)| *numerator > 0 && *denominator > 0)
+        .ok_or_else(|| {
+            format!(
+                "{} is a WAV with no frame rate to read it at",
+                path.display()
+            )
+        })?;
+    let layout = WavLayout::read(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let bits = layout.bytes_per_sample * BITS_PER_BYTE;
+    if layout.spec.sample_format != WavSampleFormat::Int || !UNPACKED_SAMPLE_BITS.contains(&bits) {
+        return Err(format!(
+            "{} holds {bits}-bit {:?} samples, and the player reads 16, 24 or 32-bit integer WAVs",
+            path.display(),
+            layout.spec.sample_format
+        ));
+    }
+    let channels = layout.spec.channels;
+    let reader = WavEditUnits {
+        path: path.to_path_buf(),
+        file: File::open(path).map_err(|error| format!("{}: {error}", path.display()))?,
+        data_offset: layout.data.body_offset(),
+        block_align: layout.block_align(),
+        sample_frames: layout.frames(),
+        sample_rate: u64::from(layout.spec.sample_rate),
+        edit_rate: (numerator, denominator),
+    };
+    let sample_frames_per_edit_unit = (reader.sample_rate * denominator).div_ceil(numerator);
+    let edit_units = u32::try_from(reader.edit_units())
+        .map_err(|_| format!("{} is longer than the player reads", path.display()))?;
+    let (speakers, lane_names) = unlabelled_speakers(usize::from(channels));
+    Ok(SoundReader {
+        layout: AudioLayout {
+            channels,
+            bits,
+            bytes_per_edit_unit: (sample_frames_per_edit_unit * reader.block_align) as usize,
+            edit_units,
+            sample_rate: layout.spec.sample_rate,
+            speakers,
+            lane_names: Arc::from(lane_names),
+        },
+        reader: EditUnitReader::Wav(reader),
+        decrypt: None,
+    })
+}
+
 fn open_reader(
     path: &Path,
     edit_rate: Option<(i32, i32)>,
     key: Option<&SoundContentKey>,
 ) -> Result<SoundReader, String> {
+    // an unreadable file is left for the MXF reader to name
+    if crate::wav_io::has_wave_form_type(path).unwrap_or(false) {
+        return open_wav(path, edit_rate);
+    }
     let mut reader = PcmReader::open(path, edit_rate)?;
     let descriptor = reader
         .audio_descriptor()
@@ -1472,7 +1598,7 @@ fn open_reader(
         None => None,
     };
     Ok(SoundReader {
-        reader,
+        reader: EditUnitReader::Mxf(reader),
         layout: AudioLayout {
             channels: descriptor.channel_count as u16,
             bits: descriptor.quantization_bits as u16,
@@ -1502,16 +1628,7 @@ fn source_speakers(reader: &mut PcmReader, channels: usize) -> (Vec<Option<Speak
         })
         .collect();
     if labelled.is_empty() {
-        let speakers = default_dcp_speakers(channels);
-        let names = speakers
-            .iter()
-            .enumerate()
-            .map(|(index, speaker)| match speaker {
-                Some(speaker) => speaker.lane_name().to_string(),
-                None => numbered_channel_label(index),
-            })
-            .collect();
-        return (speakers, names);
+        return unlabelled_speakers(channels);
     }
     let mut speakers = vec![None; channels];
     let mut names: Vec<String> = (0..channels).map(numbered_channel_label).collect();
@@ -1521,6 +1638,19 @@ fn source_speakers(reader: &mut PcmReader, channels: usize) -> (Vec<Option<Speak
             names[index] = mca_lane(&tag_symbol).to_string();
         }
     }
+    (speakers, names)
+}
+
+fn unlabelled_speakers(channels: usize) -> (Vec<Option<Speaker>>, Vec<String>) {
+    let speakers = default_dcp_speakers(channels);
+    let names = speakers
+        .iter()
+        .enumerate()
+        .map(|(index, speaker)| match speaker {
+            Some(speaker) => speaker.lane_name().to_string(),
+            None => numbered_channel_label(index),
+        })
+        .collect();
     (speakers, names)
 }
 
@@ -2761,6 +2891,125 @@ mod tests {
 
         assert!(meter.levels().is_none());
         assert!(shared.levels.lock().unwrap().read(0, 0, true).is_none());
+    }
+
+    // 1601.6 sample frames a frame at 48 kHz, so the edit units differ in length
+    const TIMELINE_RATE: (u32, u32) = (30_000, 1_001);
+    const CODESTREAM_FILES: usize = 8;
+    const FIRST_CLIP: (u64, u64) = (2, 6);
+    const SECOND_CLIP: (u64, u64) = (1, 6);
+
+    fn timeline_sample_frame(frame: u64) -> usize {
+        let (numerator, denominator) = TIMELINE_RATE;
+        (frame * u64::from(DEFAULT_SAMPLE_RATE) * u64::from(denominator) / u64::from(numerator))
+            as usize
+    }
+
+    // every sample holds its own index, as 24-bit pcm
+    fn numbered_timeline_wav(directory: &Path, frames: u64) -> (PathBuf, Vec<f32>) {
+        let path = directory.join("timeline-sound.wav");
+        let spec = hound::WavSpec {
+            channels: SOUND_CHANNELS,
+            sample_rate: DEFAULT_SAMPLE_RATE,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        let samples = timeline_sample_frame(frames) * usize::from(SOUND_CHANNELS);
+        for index in 0..samples {
+            writer.write_sample(index as i32).unwrap();
+        }
+        writer.finalize().unwrap();
+        let played = (0..samples)
+            .map(|index| index as f32 / TWENTY_FOUR_BIT_FULL_SCALE)
+            .collect();
+        (path, played)
+    }
+
+    fn codestream_directory(directory: &Path) -> PathBuf {
+        let codestreams = directory.join("codestreams");
+        std::fs::create_dir_all(&codestreams).unwrap();
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cinema2k_64x64.j2c");
+        for index in 0..CODESTREAM_FILES {
+            std::fs::copy(&fixture, codestreams.join(format!("frame_{index:04}.j2c"))).unwrap();
+        }
+        codestreams
+    }
+
+    fn clip_sound(
+        codestreams: &Path,
+        wav: &Path,
+        (in_frame, out_frame): (u64, u64),
+        timeline_start: u64,
+    ) -> SoundComposition {
+        let fps = crate::encode::FrameRate::new(TIMELINE_RATE.0, TIMELINE_RATE.1);
+        let mut timeline = Timeline::open(codestreams, None, &[]).unwrap();
+        timeline.play_codestreams_at(fps);
+        timeline
+            .play_range(
+                super::super::FrameRange {
+                    in_frame,
+                    out_frame: Some(out_frame),
+                },
+                codestreams,
+            )
+            .unwrap();
+        timeline
+            .play_sound_file(&super::super::SoundFile {
+                path: wav.to_path_buf(),
+                fps,
+                first_frame: timeline_start,
+            })
+            .unwrap();
+        assert_eq!(timeline.fps, fps.as_f64());
+        SoundComposition::of(
+            std::mem::take(&mut timeline.sound),
+            timeline.played_frames(),
+        )
+    }
+
+    #[test]
+    fn a_timeline_wav_plays_each_clip_from_its_place_on_the_timeline() {
+        let first_frames = FIRST_CLIP.1 - FIRST_CLIP.0;
+        let total_frames = first_frames + SECOND_CLIP.1 - SECOND_CLIP.0;
+        let directory = tempfile::tempdir().unwrap();
+        let codestreams = codestream_directory(directory.path());
+        let (wav, whole_timeline) = numbered_timeline_wav(directory.path(), total_frames);
+        let channels = usize::from(SOUND_CHANNELS);
+
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = clip_sound(&codestreams, &wav, FIRST_CLIP, 0);
+        feeder.queue(Some(clip_sound(
+            &codestreams,
+            &wav,
+            SECOND_CLIP,
+            first_frames,
+        )));
+        feeder.seek(0);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+
+        let hand_off = timeline_sample_frame(first_frames) * channels;
+        assert_eq!(
+            played[hand_off], whole_timeline[hand_off],
+            "the second clip's first sample is not the WAV's at its timeline frame"
+        );
+        assert_eq!(played.len(), whole_timeline.len());
+        assert!(
+            played == whole_timeline,
+            "the two clips do not play the WAV end to end"
+        );
+
+        const FRAMES_INTO_THE_SECOND_CLIP: u64 = 3;
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = clip_sound(&codestreams, &wav, SECOND_CLIP, first_frames);
+        feeder.seek(FRAMES_INTO_THE_SECOND_CLIP);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+        let sought = timeline_sample_frame(first_frames + FRAMES_INTO_THE_SECOND_CLIP) * channels;
+        assert!(
+            played == whole_timeline[sought..],
+            "a seek in the second clip does not play the WAV from its timeline frame"
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use crate::audio_levels::ChannelLevel;
 use crate::colour::RenderingIntent;
 use crate::content_keys::ContentKeys;
+use crate::encode::FrameRate;
 
 pub use audio::{MAXIMUM_SOUND_DELAY_MILLISECONDS, SoundOutputLayout, sound_output_device_names};
 pub use compositor::SubtitlePresentation;
@@ -41,12 +42,39 @@ pub struct FrameRange {
     pub out_frame: Option<u64>,
 }
 
+// a WAV played in place of the source's sound, its frame first_frame under the range's in frame
+pub struct SoundFile {
+    pub path: PathBuf,
+    // the rate the WAV is cut into frames at
+    pub fps: FrameRate,
+    pub first_frame: u64,
+}
+
+// a cue at the file's time zero shows on source frame source_frame_at_time_zero
+pub struct SubtitleFile {
+    pub path: PathBuf,
+    pub source_frame_at_time_zero: i64,
+}
+
+#[derive(Default)]
+pub enum SourceSubtitles {
+    // a source without tracks of its own leaves the slots as they are
+    #[default]
+    Composition,
+    Empty,
+    File(SubtitleFile),
+}
+
 #[derive(Default)]
 pub struct SourceOptions {
     pub keys: Option<ContentKeys>,
     // packages holding the assets a version file takes from its original version, searched after its own package
     pub other_packages: Vec<PathBuf>,
     pub range: Option<FrameRange>,
+    pub sound: Option<SoundFile>,
+    pub subtitles: SourceSubtitles,
+    // a directory of bare codestreams states no rate of its own
+    pub codestream_fps: Option<FrameRate>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,7 +618,7 @@ impl GrokPlayer {
             SourceOptions {
                 keys,
                 other_packages: other_packages.to_vec(),
-                range: None,
+                ..SourceOptions::default()
             },
         )
     }
@@ -625,7 +653,7 @@ impl GrokPlayer {
             SourceOptions {
                 keys,
                 other_packages: other_packages.to_vec(),
-                range: None,
+                ..SourceOptions::default()
             },
         )
     }

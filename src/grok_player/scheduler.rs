@@ -9,11 +9,11 @@ use super::audio;
 use super::compositor::{Compositor, Layers};
 use super::decode_pool::{DecodeJob, DecodePool};
 use super::stereo::{StereoHalf, StereoOutput, StereoPair};
-use super::subtitle_tracks::CompositionTrack;
+use super::subtitle_tracks::{CompositionSubtitles, CompositionTrack};
 use super::timeline::{StereoscopicPhase, Timeline};
 use super::{
     Command, DecodeScale, MILLISECONDS_PER_SECOND, OverlayRectangle, RgbaFrame, Shared,
-    SourceOptions, Status, SubtitleSlot, TrackStatus,
+    SourceOptions, SourceSubtitles, Status, SubtitleSlot, TrackStatus,
 };
 use crate::colour::XyzToSrgb;
 use crate::preview::Display;
@@ -114,10 +114,44 @@ fn eyes_to_decode(
 
 fn open_timeline(source: &Path, options: &SourceOptions) -> Result<Timeline, String> {
     let mut timeline = Timeline::open(source, options.keys.as_ref(), &options.other_packages)?;
+    if let Some(fps) = options.codestream_fps {
+        timeline.play_codestreams_at(fps);
+    }
     if let Some(range) = options.range {
         timeline.play_range(range, source)?;
     }
+    if let Some(sound) = &options.sound {
+        timeline.play_sound_file(sound)?;
+    }
+    match &options.subtitles {
+        SourceSubtitles::Composition => {}
+        SourceSubtitles::Empty => {
+            timeline.subtitles = Some(CompositionSubtitles::of_cues(Vec::new()));
+        }
+        SourceSubtitles::File(file) => {
+            let shift_milliseconds = (file.source_frame_at_time_zero as f64 / timeline.fps
+                * MILLISECONDS_PER_SECOND)
+                .round() as i64;
+            let cues = shifted_cues(parse_subtitles(&file.path)?, shift_milliseconds);
+            timeline.subtitles = Some(CompositionSubtitles::of_cues(cues));
+        }
+    }
     Ok(timeline)
+}
+
+// a cue that ends before the source's first frame is dropped
+fn shifted_cues(cues: Vec<StyledCue>, shift_milliseconds: i64) -> Vec<StyledCue> {
+    let shifted = |milliseconds: u64| (milliseconds as i64 + shift_milliseconds).max(0) as u64;
+    cues.into_iter()
+        .filter_map(|cue| {
+            let end_ms = shifted(cue.end_ms);
+            (end_ms > 0).then(|| StyledCue {
+                start_ms: shifted(cue.start_ms),
+                end_ms,
+                ..cue
+            })
+        })
+        .collect()
 }
 
 fn frames_to_request(
@@ -1111,6 +1145,24 @@ mod tests {
         let mono = eyes_to_decode(StereoOutput::SideBySide, false);
         assert_eq!(mono.len(), 1);
         assert_eq!(jobs_per_frame(mono[0].1.as_ref()), 1);
+    }
+
+    #[test]
+    fn a_shifted_subtitle_file_keeps_the_cues_that_reach_the_source() {
+        let cue = |start_ms, end_ms| StyledCue::text(start_ms, end_ms, Vec::new());
+        let cues = vec![cue(0, 900), cue(500, 1_500), cue(2_000, 3_000)];
+        let times = |cues: Vec<StyledCue>| -> Vec<(u64, u64)> {
+            cues.iter().map(|cue| (cue.start_ms, cue.end_ms)).collect()
+        };
+        // a timeline-wide file whose time zero is a second before the source's first frame
+        assert_eq!(
+            times(shifted_cues(cues.clone(), -1_000)),
+            vec![(0, 500), (1_000, 2_000)]
+        );
+        assert_eq!(
+            times(shifted_cues(cues, 250)),
+            vec![(250, 1_150), (750, 1_750), (2_250, 3_250)]
+        );
     }
 
     #[test]

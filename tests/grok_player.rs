@@ -7,7 +7,8 @@ use postkit::colour::XyzToSrgb;
 use postkit::composition_timeline;
 use postkit::grok_player::{
     DecodeScale, FrameRange, GrokPlayer, OverlayRectangle, PictureMasks, PictureScaling,
-    PresentationSettings, SourceOptions, SubtitlePresentation, SubtitleSlot,
+    PresentationSettings, SourceOptions, SourceSubtitles, SubtitleFile, SubtitlePresentation,
+    SubtitleSlot,
 };
 use postkit::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
 use std::path::{Path, PathBuf};
@@ -1549,6 +1550,73 @@ fn a_subtitle_keeps_its_composition_time_inside_a_range() {
         .is_empty(),
         "the cue drew past its end"
     );
+}
+
+#[test]
+fn each_queued_clip_shows_the_subtitle_file_it_names_and_a_clip_without_one_clears_it() {
+    const WIDTH: u32 = 320;
+    const HEIGHT: u32 = 180;
+    // the cue runs over frames 12 to 17
+    const CUE_FRAME: u64 = 12;
+    let directory = tempfile::tempdir().unwrap();
+    let mxf = directory.path().join("picture.mxf");
+    let frames = vec![flat_codestreams(WIDTH, HEIGHT, 1, CINEMA_2K_PROFILE).remove(0); 24];
+    write_mxf(&mxf, &frames, None, WIDTH, HEIGHT);
+    let srt = directory.path().join("cues.srt");
+    std::fs::write(&srt, "1\n00:00:00,500 --> 00:00:00,750\nHELLO THERE\n\n").unwrap();
+    let (width, height) = (WIDTH as usize, HEIGHT as usize);
+    let clip = |in_frame: u64, subtitles: SourceSubtitles| SourceOptions {
+        range: Some(FrameRange {
+            in_frame,
+            out_frame: Some(in_frame + 2),
+        }),
+        subtitles,
+        ..SourceOptions::default()
+    };
+    let subtitle_file = |source_frame_at_time_zero: i64| {
+        SourceSubtitles::File(SubtitleFile {
+            path: srt.clone(),
+            source_frame_at_time_zero,
+        })
+    };
+    let player = GrokPlayer::new();
+    player.init_software().unwrap();
+    player
+        .load_with_options(&mxf, clip(0, SourceSubtitles::Empty))
+        .expect("load the first clip");
+    wait_until("the first frame was composed", || {
+        player.frame_size().is_some()
+    });
+    let plain = software_frame(&player, width, height);
+    let play_queued = |options: SourceOptions| {
+        player
+            .queue_next_with_options(&mxf, options)
+            .expect("queue the clip");
+        player.set_paused(false);
+        wait_until("the queued clip played to its end", || player.eof_reached());
+        changed_rows(
+            &plain,
+            &software_frame(&player, width, height),
+            width,
+            height,
+        )
+    };
+
+    assert!(
+        !play_queued(clip(CUE_FRAME, subtitle_file(0))).is_empty(),
+        "a clip's own file did not draw its cue on source frame {CUE_FRAME}"
+    );
+    assert!(!metadata_field(&player, "subtitle_track").is_null());
+    // a timeline-wide file, its time zero twelve frames before this clip's source starts
+    assert!(
+        !play_queued(clip(0, subtitle_file(-(CUE_FRAME as i64)))).is_empty(),
+        "the shifted file did not draw its cue on the clip's first frames"
+    );
+    assert!(
+        play_queued(clip(0, SourceSubtitles::Empty)).is_empty(),
+        "a clip with no subtitle file still drew the cue"
+    );
+    assert!(metadata_field(&player, "subtitle_track").is_null());
 }
 
 #[test]
