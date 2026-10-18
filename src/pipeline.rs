@@ -651,13 +651,19 @@ fn encode_base_clip(
         window.end_frame(),
         frames.start
     ));
-    let clip_options = EncodeRunOptions {
-        source_colour: effective_source_colour(clip, options),
-        picture: effective_picture(clip, options),
-        ..options.clone()
-    };
     let input_type = crate::encode::detect_input_type(&clip.picture);
     let compressed = matches!(input_type, InputType::J2kSequence | InputType::PictureMxf);
+    // the options' fit only sizes the black of a gap, a compressed clip has no frames to fit
+    let picture = if compressed {
+        clip.picture_processing.clone()
+    } else {
+        effective_picture(clip, options)
+    };
+    let clip_options = EncodeRunOptions {
+        source_colour: effective_source_colour(clip, options),
+        picture,
+        ..options.clone()
+    };
     if compressed && let StretchOutput::TimelineCodestreams = output {
         let scratch_dir = output_dir.join(format!("timeline_clip_{index}"));
         place_compressed_clip(

@@ -231,6 +231,33 @@ fn two_trimmed_clips_build_one_picture_sound_and_subtitle_track() {
         "the codestreams follow on at the clip's place"
     );
 
+    let after_a_gap = Timeline {
+        reel_starts: Vec::new(),
+        ..self::timeline(vec![clip(&result.j2k_dir, 4, 0, total_frames, None)])
+    };
+    let (placed, _) = encode(
+        &after_a_gap,
+        &directory.path().join("after_a_gap"),
+        &EncodeRunOptions {
+            picture: fitted_to_the_raster(),
+            ..at_the_timeline_rate()
+        },
+    );
+    assert_eq!(
+        codestream_names(&placed.j2k_dir),
+        numbered_codestreams(4 + total_frames)
+    );
+    assert_eq!(
+        std::fs::read(placed.j2k_dir.join("frame_00000004.j2c")).unwrap(),
+        std::fs::read(result.j2k_dir.join("frame_00000000.j2c")).unwrap(),
+        "the fit that sizes the gap's black leaves the codestreams alone"
+    );
+    let gap_pixels = sampled_pixels(&placed.j2k_dir.join("frame_00000000.j2c"));
+    assert!(
+        gap_pixels.iter().all(|&pixel| close_to(pixel, [0; 3])),
+        "the gap is black: {gap_pixels:?}"
+    );
+
     let trimmed_codestreams = self::timeline(vec![clip(&result.j2k_dir, 0, 1, total_frames, None)]);
     let refused = run_encode_timeline(
         &trimmed_codestreams,
