@@ -59,6 +59,14 @@
 - Atmos decode for playback. An IAB track is wrapped and copied but never rendered,
   so the player gives an Atmos package its main sound only. A bed-only render of
   the IAB (ST 2098-2) is the first useful step.
+- Warn on a source whose B-frames carry no reorder. A raw HEVC stream has no
+  timestamps, so `ffmpeg -c copy` into MP4 writes pts equal to dts, two frames
+  back, hides the first two behind an edit list and presents the rest out of
+  order (postkit's own Dolby Vision fixture did this until b458c46, an x265 base
+  layer with dovi_tool RPUs remuxed the same way still does). `probe_video` reads
+  the file as ffprobe does, so nothing refuses or warns. Check the first packets
+  for pts equal to dts on a stream whose SPS allows reordering and refuse or warn
+  by name. Which remux recipe repairs such a file is not known yet.
 - Timeline follow-ups. `pipeline::run_encode_timeline` only cuts, so there is no
   alpha compositing of a clip over the one below it for title sequences. A timeline
   of JPEG 2000 sources previews picture only: `GrokPlayer` hands off between clips
