@@ -2,7 +2,7 @@ use std::path::Path;
 
 use asdcplib::crypto::{AesDecContext, HmacContext};
 
-use crate::content_keys::ContentKeys;
+use crate::content_keys::decrypt_and_hmac_contexts_from_key;
 
 // Kumu's RESULT_SMALLBUF
 const SMALL_BUFFER_RESULT: i32 = -7;
@@ -57,6 +57,49 @@ enum Track {
     },
 }
 
+impl Track {
+    fn open(path: &Path) -> Result<Track, String> {
+        let path_text = path.to_string_lossy();
+        let essence_type = asdcplib::essence_type(&path_text).map_err(|error| error.to_string())?;
+        match essence_type {
+            asdcplib::EssenceType::DcDataDolbyAtmos => {
+                let mut reader = asdcplib::atmos::MxfReader::new();
+                reader
+                    .open_read(&path_text)
+                    .map_err(|error| error.to_string())?;
+                Ok(Track::Dcp {
+                    reader,
+                    frame_buffer: Vec::new(),
+                    keys: None,
+                })
+            }
+            asdcplib::EssenceType::As02Iab => {
+                let mut reader = asdcplib::as02::iab::MxfReader::new();
+                reader
+                    .open_read(&path_text)
+                    .map_err(|error| error.to_string())?;
+                Ok(Track::Imf { reader })
+            }
+            other => Err(format!("{other:?} is not an Atmos track")),
+        }
+    }
+
+    fn writer_info(&mut self) -> asdcplib::Result<asdcplib::WriterInfo> {
+        match self {
+            Track::Dcp { reader, .. } => reader.writer_info(),
+            Track::Imf { reader } => reader.writer_info(),
+        }
+    }
+}
+
+pub fn atmos_writer_info(path: &Path) -> Result<asdcplib::WriterInfo, String> {
+    let named = |error: String| format!("{}: {error}", path.display());
+    Track::open(path)
+        .map_err(named)?
+        .writer_info()
+        .map_err(|error| named(error.to_string()))
+}
+
 pub struct AtmosReader {
     track: Track,
     frame_count: u32,
@@ -64,53 +107,33 @@ pub struct AtmosReader {
 }
 
 impl AtmosReader {
-    pub fn open(path: &Path, keys: Option<&ContentKeys>) -> Result<Self, String> {
-        let path_text = path.to_string_lossy();
+    pub fn open(path: &Path, content_key: Option<&[u8; 16]>) -> Result<Self, String> {
         let named = |error: String| format!("{}: {error}", path.display());
-        let essence_type =
-            asdcplib::essence_type(&path_text).map_err(|error| named(error.to_string()))?;
-        match essence_type {
-            asdcplib::EssenceType::DcDataDolbyAtmos => {
-                let mut reader = asdcplib::atmos::MxfReader::new();
-                reader
-                    .open_read(&path_text)
-                    .map_err(|error| named(error.to_string()))?;
+        let mut track = Track::open(path).map_err(named)?;
+        let info = track
+            .writer_info()
+            .map_err(|error| named(error.to_string()))?;
+        let (frame_count, edit_rate) = match &mut track {
+            Track::Dcp {
+                reader,
+                frame_buffer,
+                keys,
+            } => {
+                if info.encrypted_essence {
+                    let key = content_key.ok_or_else(|| {
+                        named("the Atmos track is encrypted and no content key was given".into())
+                    })?;
+                    *keys = Some(
+                        decrypt_and_hmac_contexts_from_key(key, info.label_set).map_err(named)?,
+                    );
+                }
                 let descriptor = reader
                     .atmos_descriptor()
                     .map_err(|error| named(error.to_string()))?;
-                let info = reader
-                    .writer_info()
-                    .map_err(|error| named(error.to_string()))?;
-                let keys = if info.encrypted_essence {
-                    let keys = keys.ok_or_else(|| {
-                        named("the Atmos track is encrypted and no content key was given".into())
-                    })?;
-                    Some(
-                        keys.decrypt_and_hmac_contexts(&info, "Atmos")
-                            .map_err(named)?,
-                    )
-                } else {
-                    None
-                };
-                let largest_frame = largest_frame_bytes(descriptor.edit_rate).map_err(named)?;
-                Ok(AtmosReader {
-                    track: Track::Dcp {
-                        reader,
-                        frame_buffer: vec![0; largest_frame],
-                        keys,
-                    },
-                    frame_count: descriptor.container_duration,
-                    edit_rate: descriptor.edit_rate,
-                })
+                *frame_buffer = vec![0; largest_frame_bytes(descriptor.edit_rate).map_err(named)?];
+                (descriptor.container_duration, descriptor.edit_rate)
             }
-            asdcplib::EssenceType::As02Iab => {
-                let mut reader = asdcplib::as02::iab::MxfReader::new();
-                reader
-                    .open_read(&path_text)
-                    .map_err(|error| named(error.to_string()))?;
-                let info = reader
-                    .writer_info()
-                    .map_err(|error| named(error.to_string()))?;
+            Track::Imf { reader } => {
                 check_imf_track_is_clear(&info).map_err(named)?;
                 let frame_count = reader
                     .frame_count()
@@ -118,14 +141,14 @@ impl AtmosReader {
                 let descriptor = reader
                     .iab_essence_descriptor()
                     .map_err(|error| named(error.to_string()))?;
-                Ok(AtmosReader {
-                    track: Track::Imf { reader },
-                    frame_count,
-                    edit_rate: descriptor.sample_rate,
-                })
+                (frame_count, descriptor.sample_rate)
             }
-            other => Err(named(format!("{other:?} is not an Atmos track"))),
-        }
+        };
+        Ok(AtmosReader {
+            track,
+            frame_count,
+            edit_rate,
+        })
     }
 
     pub fn frame_count(&self) -> u32 {
@@ -139,15 +162,12 @@ impl AtmosReader {
     // the IAB bytes of one frame, decrypted and checked against its HMAC when encrypted
     pub fn read_frame(&mut self, frame_number: u32) -> Result<&[u8], String> {
         if frame_number >= self.frame_count {
-            return Err(format!(
-                "Atmos frame {frame_number} is past the last of {} frames",
-                self.frame_count
-            ));
+            return Err(format!("the track holds only {} frames", self.frame_count));
         }
         match &mut self.track {
             Track::Imf { reader } => reader
                 .read_frame(frame_number)
-                .map_err(|error| format!("Atmos frame {frame_number}: {error}")),
+                .map_err(|error| error.to_string()),
             Track::Dcp {
                 reader,
                 frame_buffer,
@@ -161,10 +181,10 @@ impl AtmosReader {
                 match result {
                     Ok(size) => Ok(&frame_buffer[..size]),
                     Err(asdcplib::Error::AsdcpError(SMALL_BUFFER_RESULT)) => Err(format!(
-                        "Atmos frame {frame_number} is over the {} bytes ST 429-18 Table 1 allows at its edit rate",
+                        "the frame is over the {} bytes ST 429-18 Table 1 allows at its edit rate",
                         frame_buffer.len()
                     )),
-                    Err(error) => Err(format!("Atmos frame {frame_number}: {error}")),
+                    Err(error) => Err(error.to_string()),
                 }
             }
         }
@@ -174,78 +194,15 @@ impl AtmosReader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::iab::tests::{fixture_directory, read_zipped_stream};
-    use crate::mxf_wrap::{
-        EssenceType, McaConfig, MxfEncryption, MxfStandard, MxfWrapOptions, SoundfieldGroup,
-        mxf_wrap,
-    };
-    use std::path::PathBuf;
+    use crate::iab::tests::{validation_stream_frames, wrap_atmos_track};
+    use crate::mxf_wrap::{MxfEncryption, MxfStandard};
 
     const CONTENT_KEY: [u8; 16] = [0x5a; 16];
     const KEY_ID: [u8; 16] = [0x17; 16];
     const FRAME_COUNT: usize = 4;
 
     fn stream_1_frames() -> Vec<Vec<u8>> {
-        let bytes = read_zipped_stream(&fixture_directory().join("IABValidationStream_1.iab.zip"));
-        crate::iab::parse::split_frames(&bytes).unwrap()[..FRAME_COUNT]
-            .iter()
-            .map(|frame| frame.to_vec())
-            .collect()
-    }
-
-    fn wrap(
-        directory: &Path,
-        frames: &[Vec<u8>],
-        standard: MxfStandard,
-        encryption: Option<MxfEncryption>,
-    ) -> PathBuf {
-        let input_files: Vec<PathBuf> = frames
-            .iter()
-            .enumerate()
-            .map(|(index, frame)| {
-                let path = directory.join(format!("frame_{index:05}.iab"));
-                std::fs::write(&path, frame).unwrap();
-                path
-            })
-            .collect();
-        let output = directory.join("atmos.mxf");
-        let mca_config = (standard == MxfStandard::As02).then(|| McaConfig {
-            labels: String::new(),
-            spoken_language: Some("en-US".to_string()),
-            soundfield_group: Some(SoundfieldGroup {
-                title: "IAB".to_string(),
-                title_version: "1".to_string(),
-                audio_content_kind: "PRM".to_string(),
-                audio_element_kind: "FCMP".to_string(),
-            }),
-        });
-        let result = mxf_wrap(&MxfWrapOptions {
-            input_files,
-            output: output.clone(),
-            essence_type: EssenceType::Atmos,
-            standard,
-            fps_num: 24,
-            fps_den: 1,
-            partition_size: 1,
-            encryption,
-            mca_config,
-            resource_ids: vec![],
-            hdr: None,
-            asset_uuid: None,
-            timed_text_duration_frames: None,
-        });
-        assert!(result.success, "{}", result.error);
-        output
-    }
-
-    fn keys_with(directory: &Path, content_key: [u8; 16]) -> ContentKeys {
-        let path = directory.join("keys.json");
-        let json = serde_json::json!({ "keys": [{
-            "key_id": uuid::Uuid::from_bytes(KEY_ID).to_string(),
-            "content_key_hex": hex::encode(content_key),
-        }]});
-        std::fs::write(&path, json.to_string()).unwrap();
-        ContentKeys::from_keys_json(&path).unwrap()
+        validation_stream_frames(1)[..FRAME_COUNT].to_vec()
     }
 
     fn encryption() -> Option<MxfEncryption> {
@@ -272,7 +229,8 @@ mod tests {
     fn a_clear_dcp_atmos_track_reads_back_its_frames() {
         let directory = tempfile::tempdir().unwrap();
         let frames = stream_1_frames();
-        let path = wrap(directory.path(), &frames, MxfStandard::AsDcp, None);
+        let path = directory.path().join("atmos.mxf");
+        wrap_atmos_track(&frames, &path, MxfStandard::AsDcp, None);
         assert_reads_back(&mut AtmosReader::open(&path, None).unwrap(), &frames);
     }
 
@@ -280,7 +238,8 @@ mod tests {
     fn an_imf_iab_track_reads_back_its_frames() {
         let directory = tempfile::tempdir().unwrap();
         let frames = stream_1_frames();
-        let path = wrap(directory.path(), &frames, MxfStandard::As02, None);
+        let path = directory.path().join("atmos.mxf");
+        wrap_atmos_track(&frames, &path, MxfStandard::As02, None);
         assert_reads_back(&mut AtmosReader::open(&path, None).unwrap(), &frames);
     }
 
@@ -288,19 +247,26 @@ mod tests {
     fn an_encrypted_dcp_atmos_track_decrypts_with_its_key() {
         let directory = tempfile::tempdir().unwrap();
         let frames = stream_1_frames();
-        let path = wrap(directory.path(), &frames, MxfStandard::AsDcp, encryption());
-        let keys = keys_with(directory.path(), CONTENT_KEY);
-        assert_reads_back(&mut AtmosReader::open(&path, Some(&keys)).unwrap(), &frames);
+        let path = directory.path().join("atmos.mxf");
+        wrap_atmos_track(&frames, &path, MxfStandard::AsDcp, encryption());
+        assert_reads_back(
+            &mut AtmosReader::open(&path, Some(&CONTENT_KEY)).unwrap(),
+            &frames,
+        );
         assert!(AtmosReader::open(&path, None).is_err());
+        assert_eq!(
+            atmos_writer_info(&path).unwrap().cryptographic_key_id,
+            KEY_ID
+        );
     }
 
     #[test]
     fn a_wrong_key_fails_the_read() {
         let directory = tempfile::tempdir().unwrap();
         let frames = stream_1_frames();
-        let path = wrap(directory.path(), &frames, MxfStandard::AsDcp, encryption());
-        let keys = keys_with(directory.path(), [0xa5; 16]);
-        let mut reader = AtmosReader::open(&path, Some(&keys)).unwrap();
+        let path = directory.path().join("atmos.mxf");
+        wrap_atmos_track(&frames, &path, MxfStandard::AsDcp, encryption());
+        let mut reader = AtmosReader::open(&path, Some(&[0xa5; 16])).unwrap();
         assert!(reader.read_frame(0).is_err());
     }
 
@@ -310,7 +276,8 @@ mod tests {
         let mut frames = stream_1_frames();
         frames[2] = vec![0; 781_250];
         frames[3] = vec![0; 781_251];
-        let path = wrap(directory.path(), &frames, MxfStandard::AsDcp, None);
+        let path = directory.path().join("atmos.mxf");
+        wrap_atmos_track(&frames, &path, MxfStandard::AsDcp, None);
         let mut reader = AtmosReader::open(&path, None).unwrap();
         assert_eq!(reader.read_frame(2).unwrap(), frames[2].as_slice());
         let error = match reader.read_frame(3) {
@@ -340,7 +307,8 @@ mod tests {
         ];
         let directory = tempfile::tempdir().unwrap();
         let frames = stream_1_frames();
-        let path = wrap(directory.path(), &frames, MxfStandard::AsDcp, encryption());
+        let path = directory.path().join("atmos.mxf");
+        wrap_atmos_track(&frames, &path, MxfStandard::AsDcp, encryption());
         let mut bytes = std::fs::read(&path).unwrap();
         let first_frame = bytes
             .windows(16)
@@ -351,8 +319,7 @@ mod tests {
         bytes[tampered] ^= 0x01;
         std::fs::write(&path, bytes).unwrap();
 
-        let keys = keys_with(directory.path(), CONTENT_KEY);
-        let mut reader = AtmosReader::open(&path, Some(&keys)).unwrap();
+        let mut reader = AtmosReader::open(&path, Some(&CONTENT_KEY)).unwrap();
         assert!(reader.read_frame(0).is_err());
         assert_eq!(reader.read_frame(1).unwrap(), frames[1].as_slice());
     }

@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use parse::parse_frame;
-pub use reader::AtmosReader;
+pub use reader::{AtmosReader, atmos_writer_info};
 pub use render::{OutputLayout, Renderer, UnrenderedFeature};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -333,4 +333,4 @@ fn pcm_samples(sample_bytes: &[u8], bit_depth: BitDepth) -> Vec<i32> {
 #[cfg(test)]
 mod render_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

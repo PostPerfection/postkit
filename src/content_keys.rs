@@ -156,13 +156,23 @@ impl ContentKeys {
         info: &asdcplib::WriterInfo,
         what: &str,
     ) -> Result<(AesDecContext, HmacContext), String> {
-        let decrypt = self.decrypt_context(info, what)?;
         let key = self.covering_key(info, what)?;
-        let mut hmac = HmacContext::new();
-        hmac.init_key(key, info.label_set)
-            .map_err(|e| format!("HMAC key init failed: {e}"))?;
-        Ok((decrypt, hmac))
+        decrypt_and_hmac_contexts_from_key(key, info.label_set)
     }
+}
+
+pub(crate) fn decrypt_and_hmac_contexts_from_key(
+    key: &[u8; CONTENT_KEY_BYTES],
+    label_set: asdcplib::LabelSet,
+) -> Result<(AesDecContext, HmacContext), String> {
+    let mut decrypt = AesDecContext::new();
+    decrypt
+        .init_key(key)
+        .map_err(|e| format!("AES key init failed: {e}"))?;
+    let mut hmac = HmacContext::new();
+    hmac.init_key(key, label_set)
+        .map_err(|e| format!("HMAC key init failed: {e}"))?;
+    Ok((decrypt, hmac))
 }
 
 // serde_json type errors quote the value, which can be a content key

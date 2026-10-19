@@ -1,5 +1,8 @@
 use super::parse::split_frames;
 use super::*;
+use crate::mxf_wrap::{
+    EssenceType, McaConfig, MxfEncryption, MxfStandard, MxfWrapOptions, SoundfieldGroup, mxf_wrap,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -8,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 const VALIDATION_STREAM_COUNT: u32 = 148;
 
-pub(super) fn fixture_directory() -> PathBuf {
+pub(crate) fn fixture_directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/iab")
 }
 
@@ -16,7 +19,7 @@ fn stream_name(number: u32) -> String {
     format!("IABValidationStream_{number}")
 }
 
-pub(super) fn read_zipped_stream(path: &Path) -> Vec<u8> {
+pub(crate) fn read_zipped_stream(path: &Path) -> Vec<u8> {
     let file =
         std::fs::File::open(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut archive = zip::ZipArchive::new(file).unwrap();
@@ -24,6 +27,61 @@ pub(super) fn read_zipped_stream(path: &Path) -> Vec<u8> {
     let mut bytes = Vec::new();
     entry.read_to_end(&mut bytes).unwrap();
     bytes
+}
+
+pub(crate) fn validation_stream_frames(number: u32) -> Vec<Vec<u8>> {
+    let stream =
+        read_zipped_stream(&fixture_directory().join(format!("{}.iab.zip", stream_name(number))));
+    split_frames(&stream)
+        .unwrap()
+        .into_iter()
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+// one IAB frame a picture frame at 24 fps
+pub(crate) fn wrap_atmos_track(
+    frames: &[Vec<u8>],
+    output: &Path,
+    standard: MxfStandard,
+    encryption: Option<MxfEncryption>,
+) {
+    let scratch = tempfile::tempdir().unwrap();
+    let input_files: Vec<PathBuf> = frames
+        .iter()
+        .enumerate()
+        .map(|(index, frame)| {
+            let path = scratch.path().join(format!("frame_{index:05}.iab"));
+            std::fs::write(&path, frame).unwrap();
+            path
+        })
+        .collect();
+    let mca_config = (standard == MxfStandard::As02).then(|| McaConfig {
+        labels: String::new(),
+        spoken_language: Some("en-US".to_string()),
+        soundfield_group: Some(SoundfieldGroup {
+            title: "IAB".to_string(),
+            title_version: "1".to_string(),
+            audio_content_kind: "PRM".to_string(),
+            audio_element_kind: "FCMP".to_string(),
+        }),
+    });
+    let result = mxf_wrap(&MxfWrapOptions {
+        input_files,
+        output: output.to_path_buf(),
+        essence_type: EssenceType::Atmos,
+        standard,
+        fps_num: 24,
+        fps_den: 1,
+        partition_size: 1,
+        encryption,
+        mca_config,
+        resource_ids: vec![],
+        hdr: None,
+        asset_uuid: None,
+        timed_text_duration_frames: None,
+    });
+    assert!(result.success, "{}", result.error);
 }
 
 fn read_verdict(path: &Path) -> serde_json::Value {
@@ -313,9 +371,7 @@ fn truncated(element: &'static str, field: &'static str) -> IabError {
 }
 
 fn first_frame(number: u32) -> Vec<u8> {
-    let stream =
-        read_zipped_stream(&fixture_directory().join(format!("{}.iab.zip", stream_name(number))));
-    split_frames(&stream).unwrap()[0].to_vec()
+    validation_stream_frames(number).swap_remove(0)
 }
 
 #[test]
