@@ -39,6 +39,7 @@ pub mod grok_encoder;
 pub mod grok_player;
 pub mod hash;
 pub mod hints;
+pub mod iab;
 #[cfg(test)]
 mod imp_fixture;
 pub mod j2k;
