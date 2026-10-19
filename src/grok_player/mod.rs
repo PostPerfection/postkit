@@ -1,3 +1,6 @@
+mod atmos;
+#[cfg(test)]
+mod atmos_package;
 mod audio;
 mod compositor;
 mod decode_capacity;

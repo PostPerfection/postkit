@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use asdcplib::crypto::{AesDecContext, HmacContext};
 pub(super) use asdcplib::jp2k::StereoscopicPhase;
 
-use super::audio::{self, KeyedSoundSegment, PlayedFrames};
+use super::audio::{self, CompositionSound, KeyedSoundSegment, PlayedFrames, SoundEssence};
 use super::subtitle_tracks::{self, CompositionSubtitles, Reels};
 use super::{FrameRange, SoundFile};
 use crate::composition_timeline::{self, SoundSegment, SubtitleSegment};
@@ -55,7 +55,9 @@ pub(super) struct Timeline {
     pub width: u32,
     pub height: u32,
     pub title: String,
-    pub sound: Vec<KeyedSoundSegment>,
+    pub sound: CompositionSound,
+    // names the reels without Atmos when only some carry it
+    pub atmos_warning: Option<String>,
     // the sound file's frame under first_frame, None while the sound is the composition's
     sound_first_frame: Option<u64>,
     // None for a source that is not a composition, which leaves the subtitle slots as they are
@@ -79,7 +81,7 @@ impl Timeline {
         }
         match extension(source).as_deref() {
             Some(MXF_EXTENSION) => {
-                Self::from_composition(source, Vec::new(), None, Vec::new(), None, keys)
+                Self::from_composition(source, Vec::new(), None, ChosenSound::default(), None, keys)
             }
             Some(CPL_EXTENSION) => Self::from_resolved(source, other_packages, keys),
             _ => Err(format!(
@@ -99,7 +101,7 @@ impl Timeline {
             source,
             composition.pictures,
             composition.title,
-            composition.sound,
+            chosen_sound(composition.sound, composition.atmos_by_reel),
             Some((composition.subtitles, composition.captions)),
             keys,
         )
@@ -109,7 +111,7 @@ impl Timeline {
         source: &Path,
         segments: Vec<composition_timeline::PictureSegment>,
         title: Option<String>,
-        sound: Vec<SoundSegment>,
+        sound: ChosenSound,
         subtitles_and_captions: Option<(Vec<SubtitleSegment>, Vec<SubtitleSegment>)>,
         keys: Option<&ContentKeys>,
     ) -> Result<Self, String> {
@@ -141,13 +143,8 @@ impl Timeline {
         let Some(first) = opened.first() else {
             return Err(format!("{} holds no picture frames", source.display()));
         };
-        let sound = sound
-            .into_iter()
-            .map(|segment| {
-                let key = audio::sound_content_key(&segment, keys)?;
-                Ok(KeyedSoundSegment { segment, key })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
+        let atmos_warning = sound.atmos_warning;
+        let sound = audio::keyed_sound(sound.segments, sound.essence, keys)?;
         // a composition mixing frame rates plays at the first reel's
         let (fps, width, height) = (
             first.resolved.fps,
@@ -178,6 +175,7 @@ impl Timeline {
             title: title.unwrap_or_else(|| file_name(source)),
             frames: Frames::Essence(opened),
             sound,
+            atmos_warning,
             sound_first_frame: None,
             subtitles,
         })
@@ -210,7 +208,8 @@ impl Timeline {
             height: header.height,
             title: file_name(directory),
             frames: Frames::Codestreams { files, render },
-            sound: Vec::new(),
+            sound: CompositionSound::default(),
+            atmos_warning: None,
             sound_first_frame: None,
             subtitles: None,
         })
@@ -247,7 +246,11 @@ impl Timeline {
             trim: None,
             edit_rate: Some((rate(sound.fps.numerator)?, rate(sound.fps.denominator)?)),
         };
-        self.sound = vec![KeyedSoundSegment { segment, key: None }];
+        self.sound = CompositionSound {
+            segments: vec![KeyedSoundSegment { segment, key: None }],
+            essence: SoundEssence::Pcm,
+        };
+        self.atmos_warning = None;
         self.sound_first_frame = Some(sound.first_frame);
         Ok(())
     }
@@ -308,6 +311,47 @@ impl Drop for Timeline {
                 segment.reader.close();
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct ChosenSound {
+    segments: Vec<SoundSegment>,
+    essence: SoundEssence,
+    atmos_warning: Option<String>,
+}
+
+// Atmos plays when every reel carries it
+fn chosen_sound(
+    main_sound: Vec<SoundSegment>,
+    atmos_by_reel: Vec<Vec<SoundSegment>>,
+) -> ChosenSound {
+    let reels_without_atmos: Vec<String> = atmos_by_reel
+        .iter()
+        .enumerate()
+        .filter(|(_, atmos)| atmos.is_empty())
+        .map(|(index, _)| (index + 1).to_string())
+        .collect();
+    if reels_without_atmos.len() == atmos_by_reel.len() {
+        return ChosenSound {
+            segments: main_sound,
+            ..ChosenSound::default()
+        };
+    }
+    if reels_without_atmos.is_empty() {
+        return ChosenSound {
+            segments: atmos_by_reel.into_iter().flatten().collect(),
+            essence: SoundEssence::Atmos,
+            atmos_warning: None,
+        };
+    }
+    ChosenSound {
+        segments: main_sound,
+        essence: SoundEssence::Pcm,
+        atmos_warning: Some(format!(
+            "the main sound plays in place of Atmos, which these reels lack: {}",
+            reels_without_atmos.join(", ")
+        )),
     }
 }
 
@@ -470,6 +514,7 @@ fn file_name(path: &Path) -> String {
 
 #[cfg(test)]
 pub(super) mod tests {
+    use super::super::atmos_package::{AtmosDcpReel, write_atmos_dcp};
     use super::*;
     use crate::mxf_unwrap::tests::{wrap, write_frames};
     use crate::mxf_wrap::MxfEncryption;
@@ -702,5 +747,69 @@ pub(super) mod tests {
 
         // no trim at all plays every frame
         assert_eq!(trimmed_range(&resolved, None), (0, 96));
+    }
+
+    fn atmos_reels(with_atmos: &[bool]) -> Vec<AtmosDcpReel> {
+        let frames = crate::iab::tests::validation_stream_frames(1)[..4].to_vec();
+        with_atmos
+            .iter()
+            .map(|with_atmos| AtmosDcpReel {
+                picture_frames: frames.len(),
+                atmos_frames: with_atmos.then(|| frames.clone()),
+            })
+            .collect()
+    }
+
+    fn sound_paths(timeline: &Timeline) -> Vec<&Path> {
+        timeline
+            .sound
+            .segments
+            .iter()
+            .map(|keyed| keyed.segment.path.as_path())
+            .collect()
+    }
+
+    #[test]
+    fn atmos_in_every_reel_plays_in_place_of_the_main_sound() {
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &atmos_reels(&[true, true]), None);
+        let timeline = Timeline::open(&dcp.package, None, &[]).unwrap();
+        assert_eq!(timeline.sound.essence, SoundEssence::Atmos);
+        let atmos_tracks: Vec<&Path> = dcp
+            .atmos_tracks
+            .iter()
+            .flatten()
+            .map(PathBuf::as_path)
+            .collect();
+        assert_eq!(sound_paths(&timeline), atmos_tracks);
+        assert_eq!(timeline.atmos_warning, None);
+    }
+
+    #[test]
+    fn atmos_in_some_reels_plays_the_main_sound_and_names_the_reels_without() {
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(
+            directory.path(),
+            &atmos_reels(&[true, false, true, false]),
+            None,
+        );
+        let timeline = Timeline::open(&dcp.package, None, &[]).unwrap();
+        assert_eq!(timeline.sound.essence, SoundEssence::Pcm);
+        let main_sound: Vec<&Path> = dcp.main_sound_tracks.iter().map(PathBuf::as_path).collect();
+        assert_eq!(sound_paths(&timeline), main_sound);
+        assert_eq!(
+            timeline.atmos_warning.as_deref(),
+            Some("the main sound plays in place of Atmos, which these reels lack: 2, 4")
+        );
+    }
+
+    #[test]
+    fn a_package_without_atmos_plays_its_main_sound_with_no_warning() {
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &atmos_reels(&[false, false]), None);
+        let timeline = Timeline::open(&dcp.package, None, &[]).unwrap();
+        assert_eq!(timeline.sound.essence, SoundEssence::Pcm);
+        assert_eq!(sound_paths(&timeline).len(), 2);
+        assert_eq!(timeline.atmos_warning, None);
     }
 }

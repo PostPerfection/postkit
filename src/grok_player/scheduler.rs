@@ -997,6 +997,7 @@ impl Scheduler {
                 .sound
                 .warnings()
                 .into_iter()
+                .chain(timeline.and_then(|timeline| timeline.atmos_warning.clone()))
                 .chain(
                     timeline
                         .and_then(|timeline| timeline.subtitles.as_ref())

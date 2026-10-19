@@ -348,6 +348,34 @@ fn bed_definition_without_channels(sub_elements: &[Vec<u8>]) -> Vec<u8> {
     element(0x10, &payload)
 }
 
+// 48 kHz, 24 bit, 24 fps, one bed whose centre channel plays samples as PCM
+pub(crate) fn centre_bed_frame(samples: &[i32]) -> Vec<u8> {
+    const CENTRE_CHANNEL_ID: u32 = 0x2;
+    const AUDIO_DATA_ID: u32 = 1;
+    let bed = BitWriter::default()
+        .plex(1, 8)
+        .bits(0, 1)
+        .plex(1, 4)
+        .plex(CENTRE_CHANNEL_ID, 4)
+        .plex(AUDIO_DATA_ID, 8)
+        .bits(0, 2)
+        .bits(0, 1)
+        .bits(0x180, 10)
+        .align()
+        .bits(0, 8)
+        .plex(0, 8)
+        .finish();
+    let sample_bytes: Vec<u8> = samples
+        .iter()
+        .flat_map(|sample| sample.to_le_bytes()[..3].to_vec())
+        .collect();
+    let pcm = BitWriter::default()
+        .plex(AUDIO_DATA_ID, 8)
+        .bytes(&sample_bytes)
+        .finish();
+    frame_with_sub_elements(&[element(0x10, &bed), element(0x400, &pcm)])
+}
+
 fn nested_beds(depth: u32) -> Vec<u8> {
     let children = if depth == 0 {
         Vec::new()

@@ -2,9 +2,9 @@ use std::f64::consts::PI;
 
 use super::panner::Loudspeaker;
 
-pub(super) const FILTER_LENGTH: usize = 512;
+pub const FILTER_LENGTH: usize = 512;
 // BS.2127 7.4 delays the direct path to line up with the filters
-pub(super) const DIRECT_PATH_DELAY: usize = (FILTER_LENGTH - 1) / 2;
+pub const DIRECT_PATH_DELAY: usize = (FILTER_LENGTH - 1) / 2;
 
 // BS.2127 7.4, one random phase all-pass filter per output channel
 pub(super) fn decorrelation_filters(loudspeakers: &[Loudspeaker]) -> Vec<Vec<f32>> {

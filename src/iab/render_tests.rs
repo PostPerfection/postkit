@@ -923,3 +923,25 @@ fn iab_coded_spread_matches_the_ear_oracle() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+#[test]
+fn a_centre_bed_frame_renders_on_the_centre_loudspeaker_alone() {
+    const HALF_SCALE_24_BIT: i32 = 1 << 22;
+    const CENTRE: usize = 2;
+    let samples = vec![HALF_SCALE_24_BIT; FrameRate::Fps24.sample_count_48k()];
+    let frame = parse_frame(&super::tests::centre_bed_frame(&samples)).unwrap();
+    let layout = OutputLayout::FivePointOne;
+    let output = Renderer::new(layout)
+        .render(&frame, &decode_audio(&frame).unwrap())
+        .unwrap();
+    for (index, sample) in output.iter().enumerate() {
+        let channel = index % layout.channel_count();
+        let delayed = index / layout.channel_count() < DIRECT_PATH_DELAY;
+        let expected = if channel == CENTRE && !delayed {
+            0.5
+        } else {
+            0.0
+        };
+        assert_eq!(*sample, expected, "sample {index}");
+    }
+}

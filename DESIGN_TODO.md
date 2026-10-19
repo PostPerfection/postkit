@@ -54,9 +54,6 @@
 - SDI capture from a DeckLink input (Clipster 7 parity, surveyed 2026-10-17 in
   dcpwizard's DESIGN_TODO). A glass2glass DeckLink source on the same shim,
   recording to a frame folder and WAV the wizards already take. Needs the board.
-- Atmos decode for playback. An IAB track is wrapped and copied but never rendered,
-  so the player gives an Atmos package its main sound only. A bed-only render of
-  the IAB (ST 2098-2) is the first useful step.
 - Warn on a source whose B-frames carry no reorder. A raw HEVC stream has no
   timestamps, so `ffmpeg -c copy` into MP4 writes pts equal to dts, two frames
   back, hides the first two behind an edit list and presents the rest out of

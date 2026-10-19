@@ -26,10 +26,12 @@ use cpal::{
 use zeroize::Zeroize;
 
 use super::MILLISECONDS_PER_SECOND;
+use super::atmos::AtmosSound;
 use super::levels::{ChannelMeasure, LevelHistory};
 use crate::audio_levels::{ChannelLevel, RMS_WINDOW_SECONDS, numbered_channel_label};
 use crate::composition_timeline::{SegmentTrim, SoundSegment};
 use crate::content_keys::ContentKeys;
+use crate::iab::OutputLayout;
 use crate::wav_io::{SampleFormat as WavSampleFormat, WavLayout};
 
 pub const MAXIMUM_SOUND_DELAY_MILLISECONDS: i64 = 10_000;
@@ -142,6 +144,35 @@ const SEVEN_POINT_ONE_DEVICE_ORDER: [Speaker; 8] = [
     Speaker::RightSurround,
 ];
 
+// the channel orders of iab::OutputLayout
+const RENDERED_STEREO: [Speaker; 2] = [Speaker::Left, Speaker::Right];
+const RENDERED_FIVE_POINT_ONE: [Speaker; 6] = [
+    Speaker::Left,
+    Speaker::Right,
+    Speaker::Centre,
+    Speaker::LowFrequency,
+    Speaker::LeftSurround,
+    Speaker::RightSurround,
+];
+const RENDERED_SEVEN_POINT_ONE: [Speaker; 8] = [
+    Speaker::Left,
+    Speaker::Right,
+    Speaker::Centre,
+    Speaker::LowFrequency,
+    Speaker::LeftSurround,
+    Speaker::RightSurround,
+    Speaker::LeftRearSurround,
+    Speaker::RightRearSurround,
+];
+
+fn rendered_speakers(layout: OutputLayout) -> &'static [Speaker] {
+    match layout {
+        OutputLayout::Stereo => &RENDERED_STEREO,
+        OutputLayout::FivePointOne => &RENDERED_FIVE_POINT_ONE,
+        OutputLayout::SevenPointOne => &RENDERED_SEVEN_POINT_ONE,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputMix {
     StereoDownmix,
@@ -153,6 +184,19 @@ impl OutputMix {
         match self {
             OutputMix::StereoDownmix => downmix(source, speakers.len(), out),
             OutputMix::Routed(device_order) => route(source, speakers, device_order, out),
+        }
+    }
+
+    // the Atmos renderer renders to the layout the device took
+    fn rendered_layout(self) -> OutputLayout {
+        match self {
+            OutputMix::StereoDownmix => OutputLayout::Stereo,
+            OutputMix::Routed(device_order)
+                if device_order.len() == SEVEN_POINT_ONE_DEVICE_ORDER.len() =>
+            {
+                OutputLayout::SevenPointOne
+            }
+            OutputMix::Routed(_) => OutputLayout::FivePointOne,
         }
     }
 }
@@ -177,11 +221,12 @@ enum Command {
     Shutdown,
 }
 
-struct SoundComposition {
-    reels: Vec<SoundReel>,
-    fps: f64,
+pub(super) struct SoundComposition {
+    pub(super) reels: Vec<SoundReel>,
+    essence: SoundEssence,
+    pub(super) fps: f64,
     // the composition frame of sound frame 0, past a range's in frame
-    first_frame: u64,
+    pub(super) first_frame: u64,
     // the picture's length, the sound is cut or padded with silence to it
     frame_count: u64,
 }
@@ -195,9 +240,10 @@ pub(super) struct PlayedFrames {
 }
 
 impl SoundComposition {
-    fn of(segments: Vec<KeyedSoundSegment>, frames: PlayedFrames) -> Self {
+    fn of(sound: CompositionSound, frames: PlayedFrames) -> Self {
         SoundComposition {
-            reels: reels_within(reels_of(segments, frames.fps), frames),
+            reels: reels_within(reels_of(sound.segments, sound.essence, frames.fps), frames),
+            essence: sound.essence,
             fps: frames.fps,
             first_frame: frames.first_frame,
             frame_count: frames.frame_count,
@@ -207,6 +253,7 @@ impl SoundComposition {
     fn empty() -> Self {
         SoundComposition {
             reels: Vec::new(),
+            essence: SoundEssence::Pcm,
             fps: 0.0,
             first_frame: 0,
             frame_count: 0,
@@ -214,16 +261,22 @@ impl SoundComposition {
     }
 }
 
-struct SoundReel {
-    path: PathBuf,
+pub(super) struct SoundReel {
+    pub(super) path: PathBuf,
     edit_rate: Option<(i32, i32)>,
     first_frame: u64,
     frame_count: u64,
-    entry_edit_unit: u32,
-    key: Option<SoundContentKey>,
+    pub(super) entry_edit_unit: u32,
+    pub(super) key: Option<SoundContentKey>,
 }
 
 pub(super) struct SoundContentKey([u8; 16]);
+
+impl SoundContentKey {
+    pub(super) fn bytes(&self) -> &[u8; 16] {
+        &self.0
+    }
+}
 
 impl Drop for SoundContentKey {
     fn drop(&mut self) {
@@ -242,8 +295,39 @@ pub(super) struct KeyedSoundSegment {
     pub(super) key: Option<SoundContentKey>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum SoundEssence {
+    #[default]
+    Pcm,
+    Atmos,
+}
+
+#[derive(Default)]
+pub(super) struct CompositionSound {
+    pub(super) segments: Vec<KeyedSoundSegment>,
+    pub(super) essence: SoundEssence,
+}
+
+pub(super) fn keyed_sound(
+    segments: Vec<SoundSegment>,
+    essence: SoundEssence,
+    keys: Option<&ContentKeys>,
+) -> Result<CompositionSound, String> {
+    let segments = segments
+        .into_iter()
+        .map(|segment| {
+            let key = match essence {
+                SoundEssence::Pcm => sound_content_key(&segment, keys)?,
+                SoundEssence::Atmos => atmos_content_key(&segment, keys)?,
+            };
+            Ok(KeyedSoundSegment { segment, key })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(CompositionSound { segments, essence })
+}
+
 // an unreadable reel is left for reels_of to skip with a warning
-pub(super) fn sound_content_key(
+fn sound_content_key(
     segment: &SoundSegment,
     keys: Option<&ContentKeys>,
 ) -> Result<Option<SoundContentKey>, String> {
@@ -263,14 +347,36 @@ pub(super) fn sound_content_key(
             path.display()
         ));
     }
+    covering_sound_key(path, &info, keys).map(Some)
+}
+
+// an unreadable reel is left for reels_of to skip with a warning
+fn atmos_content_key(
+    segment: &SoundSegment,
+    keys: Option<&ContentKeys>,
+) -> Result<Option<SoundContentKey>, String> {
+    let Ok(info) = crate::iab::atmos_writer_info(&segment.path) else {
+        return Ok(None);
+    };
+    if !info.encrypted_essence {
+        return Ok(None);
+    }
+    covering_sound_key(&segment.path, &info, keys).map(Some)
+}
+
+fn covering_sound_key(
+    path: &Path,
+    info: &asdcplib::WriterInfo,
+    keys: Option<&ContentKeys>,
+) -> Result<SoundContentKey, String> {
     let Some(keys) = keys else {
         return Err(format!(
             "{} is encrypted sound and the preview holds no content key for it",
             path.display()
         ));
     };
-    let key = keys.covering_key(&info, "sound")?;
-    Ok(Some(SoundContentKey(*key)))
+    let key = keys.covering_key(info, "sound")?;
+    Ok(SoundContentKey(*key))
 }
 
 struct Shared {
@@ -284,6 +390,8 @@ struct Shared {
     buffer: Mutex<VecDeque<f32>>,
     // what the open stream fell back from
     warnings: Mutex<Vec<String>>,
+    // what the loaded sound could not play
+    track_warnings: Mutex<Vec<String>>,
     level_meter_on: AtomicBool,
     levels: Mutex<LevelHistory>,
 }
@@ -300,6 +408,7 @@ impl Shared {
             emitted_sample_frames: AtomicU64::new(0),
             buffer: Mutex::new(VecDeque::new()),
             warnings: Mutex::new(Vec::new()),
+            track_warnings: Mutex::new(Vec::new()),
             level_meter_on: AtomicBool::new(false),
             levels: Mutex::new(LevelHistory::default()),
         }
@@ -348,8 +457,8 @@ impl Output {
     }
 
     // false when the composition has no sound to play
-    pub(super) fn load(&self, segments: Vec<KeyedSoundSegment>, frames: PlayedFrames) -> bool {
-        let composition = SoundComposition::of(segments, frames);
+    pub(super) fn load(&self, sound: CompositionSound, frames: PlayedFrames) -> bool {
+        let composition = SoundComposition::of(sound, frames);
         if composition.reels.is_empty() {
             let _ = self.commands.send(Command::Stop);
             return false;
@@ -362,8 +471,8 @@ impl Output {
     }
 
     // the feeder plays it straight after the loaded composition, silent if it has no sound
-    pub(super) fn queue(&self, segments: Vec<KeyedSoundSegment>, frames: PlayedFrames) {
-        let composition = SoundComposition::of(segments, frames);
+    pub(super) fn queue(&self, sound: CompositionSound, frames: PlayedFrames) {
+        let composition = SoundComposition::of(sound, frames);
         let _ = self.commands.send(Command::Queue(Some(composition)));
     }
 
@@ -438,7 +547,9 @@ impl Output {
     }
 
     pub(super) fn warnings(&self) -> Vec<String> {
-        self.shared.warnings.lock().unwrap().clone()
+        let mut warnings = self.shared.warnings.lock().unwrap().clone();
+        warnings.extend(self.shared.track_warnings.lock().unwrap().iter().cloned());
+        warnings
     }
 
     // takes hold at the next seek
@@ -486,13 +597,23 @@ impl Drop for Output {
     }
 }
 
-fn reels_of(segments: Vec<KeyedSoundSegment>, fps: f64) -> Vec<SoundReel> {
+fn reels_of(segments: Vec<KeyedSoundSegment>, essence: SoundEssence, fps: f64) -> Vec<SoundReel> {
     let mut first_frame = 0u64;
     let mut reels = Vec::new();
     for KeyedSoundSegment { segment, key } in segments {
         let (entry, stated) = trim_in_frames(segment.trim.as_ref(), fps);
-        let duration = match open_layout(&segment.path, segment.edit_rate) {
-            Ok(layout) => layout.edit_units.saturating_sub(entry),
+        let edit_units = match essence {
+            SoundEssence::Pcm => {
+                open_layout(&segment.path, segment.edit_rate).map(|layout| layout.edit_units)
+            }
+            SoundEssence::Atmos => crate::iab::AtmosReader::open(
+                &segment.path,
+                key.as_ref().map(SoundContentKey::bytes),
+            )
+            .map(|reader| reader.frame_count()),
+        };
+        let duration = match edit_units {
+            Ok(edit_units) => edit_units.saturating_sub(entry),
             Err(error) => {
                 tracing::warn!("preview sound: {error}");
                 continue;
@@ -774,6 +895,8 @@ struct Feeder {
     // the composition the fill left while the picture still shows it
     finished: Option<SoundComposition>,
     reader: Option<(PathBuf, SoundReader)>,
+    // the current composition's renderer when its sound is Atmos
+    atmos: Option<AtmosSound>,
     next_frame: u64,
     // the frame of the current composition the device count starts from
     seek_position: Option<f64>,
@@ -785,6 +908,13 @@ struct Feeder {
     mix: OutputMix,
     delay_seconds: f64,
     skipped_source_sample_frames: usize,
+}
+
+// one edit unit of source channels, before the mix to the device
+struct SourceEditUnit {
+    interleaved: Vec<f32>,
+    speakers: Vec<Option<Speaker>>,
+    lane_names: Arc<[String]>,
 }
 
 struct SoundReader {
@@ -843,6 +973,7 @@ impl Feeder {
             queued: None,
             finished: None,
             reader: None,
+            atmos: None,
             next_frame: 0,
             seek_position: None,
             pcm_sample_rate: DEFAULT_SAMPLE_RATE,
@@ -861,22 +992,42 @@ impl Feeder {
         let Some(first) = composition.reels.first() else {
             return;
         };
-        let opened = match open_reader(&first.path, first.edit_rate, first.key.as_ref()) {
-            Ok(open) => open,
-            Err(error) => {
-                tracing::warn!("preview sound: {error}");
-                return;
+        match composition.essence {
+            SoundEssence::Pcm => {
+                let opened = match open_reader(&first.path, first.edit_rate, first.key.as_ref()) {
+                    Ok(open) => open,
+                    Err(error) => {
+                        tracing::warn!("preview sound: {error}");
+                        return;
+                    }
+                };
+                eprintln!(
+                    "[preview] sound: {}ch {}-bit {} Hz from {}",
+                    opened.layout.channels,
+                    opened.layout.bits,
+                    opened.layout.sample_rate,
+                    first.path.display()
+                );
+                self.pcm_sample_rate = opened.layout.sample_rate;
+                self.reader = Some((first.path.clone(), opened));
             }
-        };
-        eprintln!(
-            "[preview] sound: {}ch {}-bit {} Hz from {}",
-            opened.layout.channels,
-            opened.layout.bits,
-            opened.layout.sample_rate,
-            first.path.display()
-        );
-        self.pcm_sample_rate = opened.layout.sample_rate;
-        self.reader = Some((first.path.clone(), opened));
+            SoundEssence::Atmos => {
+                let atmos = match AtmosSound::open(&composition, self.mix.rendered_layout()) {
+                    Ok(atmos) => atmos,
+                    Err(error) => {
+                        self.warn_track(vec![error]);
+                        return;
+                    }
+                };
+                eprintln!(
+                    "[preview] sound: Atmos at {} Hz from {}",
+                    atmos.sample_rate(),
+                    first.path.display()
+                );
+                self.pcm_sample_rate = atmos.sample_rate();
+                self.atmos = Some(atmos);
+            }
+        }
         self.current = composition;
         self.shared.reels_loaded.store(true, Ordering::Release);
         if self.stream.is_none() {
@@ -912,6 +1063,7 @@ impl Feeder {
         };
         let next_fps = next.fps;
         let finished = std::mem::replace(&mut self.current, next);
+        self.atmos = None;
         let to_next_frames =
             |frames: f64| (frames - finished.frame_count as f64) * next_fps / finished.fps;
         self.seek_position = self.seek_position.map(to_next_frames);
@@ -927,6 +1079,7 @@ impl Feeder {
             return;
         };
         let next = std::mem::replace(&mut self.current, finished);
+        self.atmos = None;
         let next_fps = next.fps;
         let current = &self.current;
         self.seek_position = self
@@ -975,6 +1128,9 @@ impl Feeder {
             self.stream = Some(opened.stream);
             self.mix = opened.mix;
         }
+        if let Some(atmos) = self.atmos.as_mut() {
+            atmos.set_layout(self.mix.rendered_layout());
+        }
         self.reset_resampler();
     }
 
@@ -987,6 +1143,9 @@ impl Feeder {
 
     fn start_at(&mut self, picture_frames: f64) {
         self.reset_resampler();
+        if let Some(atmos) = self.atmos.as_mut() {
+            atmos.restart();
+        }
         let device_rate = self.shared.device_sample_rate.load(Ordering::Acquire);
         let start = sound_start(
             picture_frames,
@@ -1031,8 +1190,21 @@ impl Feeder {
         self.queued = None;
         self.finished = None;
         self.reader = None;
+        self.atmos = None;
+        self.shared.track_warnings.lock().unwrap().clear();
         self.next_frame = 0;
         self.seek_position = None;
+    }
+
+    fn warn_track(&self, warnings: Vec<String>) {
+        if warnings.is_empty() {
+            return;
+        }
+        let mut track_warnings = self.shared.track_warnings.lock().unwrap();
+        for warning in warnings {
+            tracing::warn!("preview sound: {warning}");
+            track_warnings.push(warning);
+        }
     }
 
     fn reset_resampler(&mut self) {
@@ -1097,19 +1269,28 @@ impl Feeder {
             self.push_silent_edit_unit();
             return true;
         };
-        if !self.ensure_reader(reel) {
-            return false;
-        }
-        let Some((_, open)) = self.reader.as_ref() else {
+        let source = match self.current.essence {
+            SoundEssence::Pcm => self.read_pcm_edit_unit(reel, entry),
+            SoundEssence::Atmos => self.render_atmos_edit_unit(),
+        };
+        let Some(source) = source else {
             return false;
         };
+        self.queue_source_edit_unit(source);
+        self.next_frame += 1;
+        true
+    }
+
+    fn read_pcm_edit_unit(&mut self, reel: usize, entry: u32) -> Option<SourceEditUnit> {
+        if !self.ensure_reader(reel) {
+            return None;
+        }
+        let (_, open) = self.reader.as_ref()?;
         if open.layout.sample_rate != self.pcm_sample_rate {
             self.pcm_sample_rate = open.layout.sample_rate;
             self.reset_resampler();
         }
-        let Some((_, open)) = self.reader.as_mut() else {
-            return false;
-        };
+        let (_, open) = self.reader.as_mut()?;
         let layout = &open.layout;
         let mut essence = vec![0u8; layout.bytes_per_edit_unit];
         let read = match open
@@ -1119,7 +1300,7 @@ impl Feeder {
             Ok(read) => read,
             Err(error) => {
                 tracing::warn!("preview sound: {error}");
-                return false;
+                return None;
             }
         };
         let mut interleaved = Vec::new();
@@ -1129,18 +1310,59 @@ impl Feeder {
             layout.bits,
             &mut interleaved,
         );
-        let skipped =
-            (self.skipped_source_sample_frames * layout.channels as usize).min(interleaved.len());
+        Some(SourceEditUnit {
+            interleaved,
+            speakers: layout.speakers.clone(),
+            lane_names: Arc::clone(&layout.lane_names),
+        })
+    }
+
+    fn render_atmos_edit_unit(&mut self) -> Option<SourceEditUnit> {
+        if self.atmos.is_none() {
+            match AtmosSound::open(&self.current, self.mix.rendered_layout()) {
+                Ok(atmos) => self.atmos = Some(atmos),
+                Err(error) => {
+                    self.warn_track(vec![error]);
+                    return None;
+                }
+            }
+        }
+        let atmos = self.atmos.as_mut()?;
+        let sample_rate = atmos.sample_rate();
+        let rendered = atmos.edit_unit(&self.current.reels, self.next_frame);
+        let speakers = rendered_speakers(atmos.layout());
+        self.warn_track(rendered.warnings);
+        if sample_rate != self.pcm_sample_rate {
+            self.pcm_sample_rate = sample_rate;
+            self.reset_resampler();
+        }
+        Some(SourceEditUnit {
+            interleaved: rendered.samples,
+            speakers: speakers.iter().copied().map(Some).collect(),
+            lane_names: speakers
+                .iter()
+                .map(|speaker| speaker.lane_name().to_string())
+                .collect(),
+        })
+    }
+
+    fn queue_source_edit_unit(&mut self, source: SourceEditUnit) {
+        let SourceEditUnit {
+            mut interleaved,
+            speakers,
+            lane_names,
+        } = source;
+        let channels = speakers.len();
+        let skipped = (self.skipped_source_sample_frames * channels).min(interleaved.len());
         interleaved.drain(..skipped);
         self.skipped_source_sample_frames = 0;
-        let measured = self.shared.level_meter_on.load(Ordering::Acquire).then(|| {
-            (
-                Arc::clone(&layout.lane_names),
-                ChannelMeasure::of(&interleaved, layout.channels as usize),
-            )
-        });
+        let measured = self
+            .shared
+            .level_meter_on
+            .load(Ordering::Acquire)
+            .then(|| ChannelMeasure::of(&interleaved, channels));
         let mut mixed = Vec::new();
-        self.mix.apply(&interleaved, &layout.speakers, &mut mixed);
+        self.mix.apply(&interleaved, &speakers, &mut mixed);
         let device_samples = match self.resampler.as_mut() {
             Some(resampler) => {
                 let mut resampled = Vec::new();
@@ -1150,7 +1372,7 @@ impl Feeder {
             None => mixed,
         };
         let (start, end) = self.queue_for_the_device(device_samples);
-        if let Some((lane_names, measure)) = measured {
+        if let Some(measure) = measured {
             let played = self.shared.emitted_sample_frames.load(Ordering::Acquire);
             let window = self.shared.level_window_sample_frames();
             self.shared.levels.lock().unwrap().push(
@@ -1162,8 +1384,6 @@ impl Feeder {
                 window,
             );
         }
-        self.next_frame += 1;
-        true
     }
 
     // where the samples will play, in sample frames past the seek the device count started from
@@ -1203,18 +1423,7 @@ impl Feeder {
     }
 
     fn location(&self, frame: u64) -> Option<(usize, u32)> {
-        for (index, reel) in self.current.reels.iter().enumerate() {
-            if frame < reel.first_frame {
-                continue;
-            }
-            let into = frame - reel.first_frame;
-            if reel.frame_count != u64::MAX && into >= reel.frame_count {
-                continue;
-            }
-            let entry = reel.entry_edit_unit.saturating_add(into as u32);
-            return Some((index, entry));
-        }
-        None
+        reel_location(&self.current.reels, frame)
     }
 
     fn ensure_reader(&mut self, reel: usize) -> bool {
@@ -1238,6 +1447,22 @@ impl Feeder {
             }
         }
     }
+}
+
+// the reel that plays sound frame and the edit unit of it
+pub(super) fn reel_location(reels: &[SoundReel], frame: u64) -> Option<(usize, u32)> {
+    for (index, reel) in reels.iter().enumerate() {
+        if frame < reel.first_frame {
+            continue;
+        }
+        let into = frame - reel.first_frame;
+        if reel.frame_count != u64::MAX && into >= reel.frame_count {
+            continue;
+        }
+        let entry = reel.entry_edit_unit.saturating_add(into as u32);
+        return Some((index, entry));
+    }
+    None
 }
 
 // the sound edit unit the device reaches once it has played sample_frames past the seek
@@ -1795,6 +2020,7 @@ mod tests {
     use crate::mxf_unwrap::tests::{FRAME_COUNT, wrap, write_frames};
     use crate::mxf_wrap::{EssenceType, MxfEncryption, MxfStandard, MxfWrapOptions, mxf_wrap};
     use crate::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
+    use std::collections::BTreeMap;
 
     const SOUND_KEY: [u8; 16] = [0x33; 16];
     const SOUND_KEY_ID: [u8; 16] = [0x44; 16];
@@ -1915,7 +2141,7 @@ mod tests {
         let keys = content_keys(directory.path(), &[(SOUND_KEY_ID, SOUND_KEY)]);
 
         let timeline = Timeline::open(&package, Some(&keys), &[]).unwrap();
-        let [sound] = timeline.sound.as_slice() else {
+        let [sound] = timeline.sound.segments.as_slice() else {
             panic!("the package names one sound reel");
         };
         let mut opened = open_reader(&sound.segment.path, None, sound.key.as_ref()).unwrap();
@@ -2016,7 +2242,11 @@ mod tests {
 
         let mut timeline = Timeline::open(&cpl, None, &[]).unwrap();
         let fps = timeline.fps;
-        let reels = reels_of(std::mem::take(&mut timeline.sound), fps);
+        let reels = reels_of(
+            std::mem::take(&mut timeline.sound.segments),
+            SoundEssence::Pcm,
+            fps,
+        );
 
         let [reel] = reels.as_slice() else {
             panic!("the IMP names one sound track file");
@@ -2639,7 +2869,8 @@ mod tests {
             .into_iter()
             .collect();
         SoundComposition {
-            reels: reels_of(segments, COMPOSITION_FPS),
+            reels: reels_of(segments, SoundEssence::Pcm, COMPOSITION_FPS),
+            essence: SoundEssence::Pcm,
             fps: COMPOSITION_FPS,
             first_frame: 0,
             frame_count,
@@ -2669,10 +2900,11 @@ mod tests {
             if drained.is_empty() {
                 return played;
             }
+            let channels = feeder.shared.output_channels();
             feeder
                 .shared
                 .emitted_sample_frames
-                .fetch_add((drained.len() / STEREO_CHANNELS) as u64, Ordering::AcqRel);
+                .fetch_add((drained.len() / channels) as u64, Ordering::AcqRel);
             played.extend(drained);
         }
     }
@@ -2734,7 +2966,10 @@ mod tests {
 
         let mut feeder = Feeder::new(Arc::new(Shared::new()));
         feeder.current = SoundComposition::of(
-            segments,
+            CompositionSound {
+                segments,
+                essence: SoundEssence::Pcm,
+            },
             PlayedFrames {
                 fps: COMPOSITION_FPS,
                 first_frame: FIRST_FRAME,
@@ -3028,6 +3263,270 @@ mod tests {
             0.0,
             3 * SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24 * STEREO_CHANNELS,
         ));
+        assert!(played == expected);
+    }
+
+    use super::super::atmos_package::{
+        AtmosDcpReel, SAMPLE_FRAMES_PER_FRAME as ATMOS_SAMPLE_FRAMES, write_atmos_dcp,
+    };
+    use crate::iab::tests::{centre_bed_frame, validation_stream_frames};
+    use crate::iab::{DIRECT_PATH_DELAY, Renderer};
+
+    fn one_atmos_reel(frames: &[Vec<u8>]) -> Vec<AtmosDcpReel> {
+        vec![AtmosDcpReel {
+            picture_frames: frames.len(),
+            atmos_frames: Some(frames.to_vec()),
+        }]
+    }
+
+    fn atmos_composition(package: &Path, keys: Option<&ContentKeys>) -> SoundComposition {
+        let mut timeline = Timeline::open(package, keys, &[]).unwrap();
+        assert_eq!(timeline.sound.essence, SoundEssence::Atmos);
+        SoundComposition::of(
+            std::mem::take(&mut timeline.sound),
+            timeline.played_frames(),
+        )
+    }
+
+    fn played_after_a_seek(composition: SoundComposition, frame: u64) -> (Vec<f32>, Feeder) {
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = composition;
+        feeder.seek(frame);
+        (drain_until_the_feeder_stops(&mut feeder), feeder)
+    }
+
+    // every frame rendered in order on stereo and a silent frame after, the frames at silenced as silent frames
+    fn rendered_continuously(frames: &[Vec<u8>], silenced: &[usize]) -> Vec<f32> {
+        let mut silent_frame = crate::iab::parse_frame(&frames[0]).unwrap();
+        silent_frame.beds.clear();
+        silent_frame.objects.clear();
+        let mut renderer = Renderer::new(OutputLayout::Stereo);
+        let mut rendered = Vec::new();
+        for (index, frame) in frames.iter().enumerate() {
+            let samples = if silenced.contains(&index) {
+                renderer.render(&silent_frame, &BTreeMap::new())
+            } else {
+                let frame = crate::iab::parse_frame(frame).unwrap();
+                renderer.render(&frame, &crate::iab::decode_audio(&frame).unwrap())
+            };
+            rendered.extend(samples.unwrap());
+        }
+        rendered.extend(renderer.render(&silent_frame, &BTreeMap::new()).unwrap());
+        rendered
+            .into_iter()
+            .map(|sample| sample.clamp(-1.0, 1.0))
+            .collect()
+    }
+
+    // what plays from frame on with the renderer's delay taken off
+    fn heard_from(rendered: &[f32], frame: usize, frame_count: usize) -> &[f32] {
+        let start = (frame * ATMOS_SAMPLE_FRAMES + DIRECT_PATH_DELAY) * STEREO_CHANNELS;
+        &rendered[start..start + (frame_count - frame) * ATMOS_SAMPLE_FRAMES * STEREO_CHANNELS]
+    }
+
+    // stream 35 decorrelates, so its output depends on the frames before
+    #[test]
+    fn atmos_frame_n_after_a_seek_to_n_plays_as_continuous_rendering_does() {
+        for stream in [1, 35] {
+            let frames = validation_stream_frames(stream);
+            let directory = tempfile::tempdir().unwrap();
+            let dcp = write_atmos_dcp(directory.path(), &one_atmos_reel(&frames), None);
+            let rendered = rendered_continuously(&frames, &[]);
+            for seek_frame in [0, 1, 20, frames.len() - 1] {
+                let composition = atmos_composition(&dcp.package, None);
+                let (played, feeder) = played_after_a_seek(composition, seek_frame as u64);
+                assert!(
+                    played == heard_from(&rendered, seek_frame, frames.len()),
+                    "a seek to frame {seek_frame} of stream {stream} plays other samples"
+                );
+                assert!(feeder.shared.track_warnings.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn atmos_reels_play_on_as_one_rendering() {
+        let frames = validation_stream_frames(1);
+        let (first, second) = frames.split_at(frames.len() / 2);
+        let reels = [first, second].map(|frames| AtmosDcpReel {
+            picture_frames: frames.len(),
+            atmos_frames: Some(frames.to_vec()),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &reels, None);
+        let (played, _) = played_after_a_seek(atmos_composition(&dcp.package, None), 0);
+        let rendered = rendered_continuously(&frames, &[]);
+        assert!(played == heard_from(&rendered, 0, frames.len()));
+    }
+
+    #[test]
+    fn a_sound_starting_in_frame_n_reaches_the_device_on_frame_ns_first_sample() {
+        const FRAMES: usize = 8;
+        const ONSET_FRAME: usize = 5;
+        const LEVEL: i32 = 1 << 22;
+        let frames: Vec<Vec<u8>> = (0..FRAMES)
+            .map(|frame| {
+                let level = if frame < ONSET_FRAME { 0 } else { LEVEL };
+                centre_bed_frame(&vec![level; ATMOS_SAMPLE_FRAMES])
+            })
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &one_atmos_reel(&frames), None);
+        for seek_frame in [0, 3, ONSET_FRAME] {
+            let composition = atmos_composition(&dcp.package, None);
+            let (played, _) = played_after_a_seek(composition, seek_frame as u64);
+            let onset = played.iter().position(|sample| *sample != 0.0).unwrap() / STEREO_CHANNELS;
+            let frame_start = (ONSET_FRAME - seek_frame) * ATMOS_SAMPLE_FRAMES;
+            assert!(
+                onset.abs_diff(frame_start) <= 1,
+                "after a seek to {seek_frame} the sound starts at sample {onset}, frame {ONSET_FRAME} at {frame_start}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_atmos_frame_plays_as_silence_with_one_warning_per_error() {
+        let mut frames = validation_stream_frames(1);
+        let outside_profile_1 = validation_stream_frames(41).swap_remove(0);
+        frames[10] = outside_profile_1.clone();
+        frames[11] = outside_profile_1;
+        frames[20] = b"not an IAB frame".to_vec();
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &one_atmos_reel(&frames), None);
+
+        let (played, feeder) = played_after_a_seek(atmos_composition(&dcp.package, None), 0);
+
+        let warnings = feeder.shared.track_warnings.lock().unwrap().clone();
+        let [outside, unreadable] = warnings.as_slice() else {
+            panic!("two distinct errors give two warnings: {warnings:?}");
+        };
+        assert!(
+            outside.starts_with("Atmos frame 10 plays as silence: IAB ObjectDefinition")
+                && outside.contains("IAB Application Profile 1"),
+            "{outside}"
+        );
+        assert!(
+            unreadable.starts_with("Atmos frame 20 plays as silence: IAB"),
+            "{unreadable}"
+        );
+        let rendered = rendered_continuously(&frames, &[10, 11, 20]);
+        assert!(played == heard_from(&rendered, 0, frames.len()));
+    }
+
+    #[test]
+    fn an_encrypted_atmos_dcp_plays_with_its_key_and_fails_as_main_sound_does_without() {
+        const ATMOS_KEY: [u8; 16] = [0x3c; 16];
+        const ATMOS_KEY_ID: [u8; 16] = [0x4d; 16];
+        let frames = validation_stream_frames(1)[..4].to_vec();
+        let directory = tempfile::tempdir().unwrap();
+        let encryption = MxfEncryption {
+            content_key: ATMOS_KEY,
+            key_id: ATMOS_KEY_ID,
+        };
+        let dcp = write_atmos_dcp(
+            directory.path(),
+            &one_atmos_reel(&frames),
+            Some(&encryption),
+        );
+        let keys = content_keys(directory.path(), &[(ATMOS_KEY_ID, ATMOS_KEY)]);
+
+        let (played, feeder) = played_after_a_seek(atmos_composition(&dcp.package, Some(&keys)), 0);
+        assert!(played == heard_from(&rendered_continuously(&frames, &[]), 0, frames.len()));
+        assert!(feeder.shared.track_warnings.lock().unwrap().is_empty());
+
+        let atmos_track = dcp.atmos_tracks[0].as_ref().unwrap();
+        let error = Timeline::open(&dcp.package, None, &[]).err().unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "{} is encrypted sound and the preview holds no content key for it",
+                atmos_track.display()
+            )
+        );
+        let unrelated = content_keys(directory.path(), &[([0x5e; 16], ATMOS_KEY)]);
+        let error = Timeline::open(&dcp.package, Some(&unrelated), &[])
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            format!(
+                "KDM/keys do not cover sound KeyId {}",
+                uuid::Uuid::from_bytes(ATMOS_KEY_ID)
+            )
+        );
+    }
+
+    #[test]
+    fn five_point_one_atmos_reaches_the_device_and_the_meter_in_its_channels() {
+        const LEVEL: i32 = 1 << 22;
+        const FIVE_POINT_ONE_CHANNELS: usize = 6;
+        let frames = vec![centre_bed_frame(&vec![LEVEL; ATMOS_SAMPLE_FRAMES]); 4];
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &one_atmos_reel(&frames), None);
+        let shared = Arc::new(Shared::new());
+        shared
+            .output_channels
+            .store(FIVE_POINT_ONE_CHANNELS, Ordering::Release);
+        shared.playing.store(true, Ordering::Release);
+        shared.stream_live.store(true, Ordering::Release);
+        shared.reels_loaded.store(true, Ordering::Release);
+        let meter = SoundLevelMeter(Arc::clone(&shared));
+        meter.set_enabled(true);
+        let mut feeder = Feeder::new(shared);
+        feeder.mix = OutputMix::Routed(&FIVE_POINT_ONE_DEVICE_ORDER);
+        feeder.current = atmos_composition(&dcp.package, None);
+        feeder.seek(0);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+
+        let centre = device_position(Speaker::Centre, &FIVE_POINT_ONE_DEVICE_ORDER).unwrap();
+        let level = LEVEL as f32 * 256.0 / FULL_SCALE_I32;
+        for (index, sample) in played.iter().enumerate() {
+            let expected = if index % FIVE_POINT_ONE_CHANNELS == centre {
+                level
+            } else {
+                0.0
+            };
+            assert_eq!(*sample, expected, "sample {index}");
+        }
+        let levels = meter.levels().unwrap();
+        let labels: Vec<&str> = levels.iter().map(|level| level.label.as_str()).collect();
+        assert_eq!(labels, ["L", "R", "C", "LFE", "Ls", "Rs"]);
+        assert!(levels[2].peak_dbfs > SILENCE_FLOOR_DBFS);
+        assert_eq!(levels[0].peak_dbfs, SILENCE_FLOOR_DBFS);
+    }
+
+    #[test]
+    fn ninety_six_kilohertz_atmos_reaches_a_48_kilohertz_device_through_the_resampler() {
+        let frames = validation_stream_frames(127);
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &one_atmos_reel(&frames), None);
+
+        let (played, feeder) = played_after_a_seek(atmos_composition(&dcp.package, None), 0);
+
+        assert!(feeder.shared.track_warnings.lock().unwrap().is_empty());
+        let mut rendered = Vec::new();
+        let mut renderer = Renderer::new(OutputLayout::Stereo);
+        let mut silent_frame = crate::iab::parse_frame(&frames[0]).unwrap();
+        assert_eq!(silent_frame.sample_rate, crate::iab::SampleRate::Hz96000);
+        for frame in &frames {
+            let frame = crate::iab::parse_frame(frame).unwrap();
+            rendered.extend(
+                renderer
+                    .render(&frame, &crate::iab::decode_audio(&frame).unwrap())
+                    .unwrap(),
+            );
+        }
+        silent_frame.beds.clear();
+        silent_frame.objects.clear();
+        rendered.extend(renderer.render(&silent_frame, &BTreeMap::new()).unwrap());
+        let heard: Vec<f32> = rendered[DIRECT_PATH_DELAY * STEREO_CHANNELS..]
+            [..frames.len() * 2 * ATMOS_SAMPLE_FRAMES * STEREO_CHANNELS]
+            .iter()
+            .map(|sample| sample.clamp(-1.0, 1.0))
+            .collect();
+        let mut expected = Vec::new();
+        Resampler::new(96_000, DEFAULT_SAMPLE_RATE, STEREO_CHANNELS).push(&heard, &mut expected);
+        assert_eq!(played.len(), expected.len());
         assert!(played == expected);
     }
 }
