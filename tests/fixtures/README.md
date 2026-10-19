@@ -23,16 +23,17 @@ than the synthetic SOC+SIZ stubs the older tests build.
 # IAB validation streams
 
 - `iab/IABValidationStream_N.iab.zip` and `iab/StreamN_cA.json`: streams 1, 16,
-  29, 38, 41, 43, 49, 50, 59, 62, 91, 126, 127, 128 and 129 of the 148 in DTS's
+  27, 29, 35, 38, 41, 43, 49, 50, 59, 62, 91, 126, 127, 128 and 129 of the 148 in DTS's
   [iab-validator](https://github.com/DTSProAudio/iab-validator) at commit
   694b378 (`test/bitstreams` and `test/reference/cA`), unchanged, under the MIT
   licence in `iab/LICENSE-iab-validator`. 1 has beds, objects and DLC, 16 a bed
-  remap, 29 the nine zone gains, 38 child objects, 41 ObjectZoneDefinition19, 50
+  remap, 27 snapped objects, 29 the nine zone gains, 35 maximum object decorrelation, 38 child objects, 41 ObjectZoneDefinition19, 50
   96 kHz DLC, 59 96 fps DLC, 91 48 kHz PCM, 126 an undefined sub-element, 127
   96 kHz PCM, 128 16-bit PCM and 129 PCM at 23.976 fps. The reference marks 43
   (96 kHz DLC in a 48 kHz frame) and 129 invalid and both still parse. 49
   (Version 2) and 62 (DLC at 23.976 fps) fail to parse at the first frame in
-  IABLib and in postkit.
+  IABLib and in postkit. 1, 27, 29 and 35 meet SMPTE RDD 57 IAB Application
+  Profile 1, the set the renderer tests play.
 - `iab/iablib_decoded_digests_sha256.txt`: for each of the 148 streams, the
   SHA-256 of what `iab/dump_decoded_digests.cpp` prints for it. The program
   prints one line per frame and AudioDataID with the sample count and the FNV-1a
@@ -53,4 +54,14 @@ than the synthetic SOC+SIZ stubs the older tests build.
     printf 'IABValidationStream_%s %s\n' $n \
       "$(./dump IABValidationStream_$n stream.iab | sha256sum | cut -d' ' -f1)"
   done > iablib_decoded_digests_sha256.txt
+  ```
+- `iab/ear_gains.json`: the gains EBU's
+  [ear](https://github.com/ebu/ebu_adm_renderer) 2.1.0 (BSD-3-Clause-Clear), the
+  ITU-R BS.2127 reference renderer, computes for the object, bed channel and
+  decorrelation filter cases in `iab/ear_gains.py`, made with:
+
+  ```bash
+  uv venv --python 3.12 ear-oracle
+  uv pip install --python ear-oracle/bin/python ear==2.1.0 'setuptools<81'
+  ear-oracle/bin/python -I -W ignore iab/ear_gains.py > iab/ear_gains.json
   ```

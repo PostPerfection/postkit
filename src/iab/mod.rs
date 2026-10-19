@@ -1,11 +1,16 @@
 mod bit_reader;
+mod decorrelation;
+mod direct_speakers;
 mod dlc;
+mod panner;
 mod parse;
+mod render;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use parse::parse_frame;
+pub use render::{ExcludedFeature, OutputLayout, Renderer};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IabError {
@@ -20,6 +25,14 @@ pub enum IabError {
         field: &'static str,
         value: u64,
         rule: &'static str,
+    },
+    #[error(
+        "IAB {element} {meta_id} uses {feature}, which IAB Application Profile 1 (SMPTE RDD 57) leaves out"
+    )]
+    OutsideProfile1 {
+        element: &'static str,
+        meta_id: u32,
+        feature: ExcludedFeature,
     },
 }
 
@@ -100,6 +113,22 @@ impl FrameRate {
             | FrameRate::Fps24000Over1001 => 8,
             FrameRate::Fps48 | FrameRate::Fps50 | FrameRate::Fps60 => 4,
             FrameRate::Fps96 | FrameRate::Fps100 | FrameRate::Fps120 => 2,
+        }
+    }
+
+    // ST 2098-2 Table 23, in bitstream order
+    pub fn pan_sub_block_lengths(self, sample_rate: SampleRate) -> Vec<usize> {
+        match (self, sample_rate) {
+            (FrameRate::Fps24000Over1001, SampleRate::Hz48000) => {
+                vec![251, 250, 250, 250, 251, 250, 250, 250]
+            }
+            (FrameRate::Fps24000Over1001, SampleRate::Hz96000) => {
+                vec![501, 500, 501, 500, 501, 500, 501, 500]
+            }
+            _ => {
+                let count = self.pan_sub_block_count();
+                vec![self.sample_count(sample_rate) / count; count]
+            }
         }
     }
 }
@@ -301,5 +330,7 @@ fn pcm_samples(sample_bytes: &[u8], bit_depth: BitDepth) -> Vec<i32> {
     }
 }
 
+#[cfg(test)]
+mod render_tests;
 #[cfg(test)]
 mod tests;

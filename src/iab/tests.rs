@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 const VALIDATION_STREAM_COUNT: u32 = 148;
 
-fn fixture_directory() -> PathBuf {
+pub(super) fn fixture_directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/iab")
 }
 
@@ -16,7 +16,7 @@ fn stream_name(number: u32) -> String {
     format!("IABValidationStream_{number}")
 }
 
-fn read_zipped_stream(path: &Path) -> Vec<u8> {
+pub(super) fn read_zipped_stream(path: &Path) -> Vec<u8> {
     let file =
         std::fs::File::open(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut archive = zip::ZipArchive::new(file).unwrap();
