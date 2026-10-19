@@ -134,6 +134,12 @@ jobs:
             pkg-config --modversion mpv
           fi
 
+      - name: Fetch IAB validation streams
+        shell: bash
+        run: |
+          scripts/fetch-iab-validation-streams.sh "$RUNNER_TEMP/iab-validation-streams"
+          echo "POSTKIT_IAB_VALIDATION_STREAMS=$RUNNER_TEMP/iab-validation-streams" >> "$GITHUB_ENV"
+
       - name: Build
         run: cargo build --features "async tms flm-exchange"
 

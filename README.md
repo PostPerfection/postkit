@@ -30,6 +30,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `grok` | Grok codec detection and configuration |
 | `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
 | `hash` | SHA-1 / SHA-256 file hashing |
+| `iab` | Immersive Audio Bitstream (ST 2098-2) frame parsing and DLC and PCM decode |
 | `j2k` | JPEG 2000 codestream parsing, DCI validation, MXF frame extraction and bitrate analysis |
 | `job_queue` | The job queue every wizard process runs, with its jobs file |
 | `kdm_distribution` | A distributor's cinemas, screens, titles, bookings and issued KDMs: FLM import (ST 430-16 and 430-7), ISDCF Doc 5 certificate checks, formulation per screen, windows in the cinema's time zone, KDM and ZIP naming, SMTP delivery and resend, sqlite store, per-screen reissue after an edit or a certificate change, certificate and DKDM expiry against each booking, bookings about to end |
@@ -112,6 +113,11 @@ for the `zscale` filter. Homebrew and conda-forge build without it. macOS CI
 `https://ffmpeg.martin-riedl.de/download/macos/arm64/1787073674_9.0.1`
 (`ffmpeg.zip` / `ffprobe.zip`); Linux and Windows CI use BtbN's n8.1 gpl
 builds. Put that `ffmpeg` first on `PATH`, `brew shellenv` otherwise wins.
+
+`POSTKIT_IAB_VALIDATION_STREAMS` names a directory holding DTS's 148 IAB
+validation streams and their reference verdicts, which
+`scripts/fetch-iab-validation-streams.sh <directory>` downloads. The `iab` test
+that checks all 148 fails when it is unset.
 
 `POSTKIT_DECODE_MEASURE_CLIP`, `POSTKIT_DECODE_MEASURE_FILTERS` and
 `POSTKIT_DECODE_MEASURE_SIZE` drive the ignored throughput test in
