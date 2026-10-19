@@ -79,3 +79,24 @@ fn software_render_produces_a_non_black_frame() {
         FRAME_TIMEOUT
     );
 }
+
+#[test]
+fn a_title_with_a_control_character_reads_back_as_json() {
+    let title = "reel\t1 \"a\" \\ b";
+    let directory = tempfile::tempdir().unwrap();
+    let clip = test_clip(directory.path());
+    let player = MpvRenderPlayer::new().expect("create mpv");
+    player.init_software().expect("software render context");
+    player.load_file(clip.to_str().unwrap()).expect("load clip");
+    player
+        .set_property("force-media-title", title)
+        .expect("force the title");
+
+    let deadline = Instant::now() + FRAME_TIMEOUT;
+    while player.get_property_string("media-title").is_err() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let metadata: serde_json::Value =
+        serde_json::from_str(&player.get_metadata().unwrap()).unwrap();
+    assert_eq!(metadata["filename"], title);
+}

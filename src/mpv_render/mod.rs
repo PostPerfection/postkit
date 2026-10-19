@@ -638,7 +638,7 @@ impl MpvRenderPlayer {
         // media-title is the forced composition title when there is one and the
         // filename when there is not
         let filename = match self.get_property_string("media-title") {
-            Ok(name) => format!("\"{}\"", name.replace('\\', "\\\\").replace('"', "\\\"")),
+            Ok(name) => serde_json::Value::from(name).to_string(),
             Err(_) => "null".to_string(),
         };
         Ok(format!(
