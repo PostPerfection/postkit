@@ -46,16 +46,14 @@
   markers (dom#2893), waveform (dom#3091), 3D view modes
   (dom#1974, dom#3165), A/V sync offset (dom#3083). They waited on real-time 4K
   decode, which the device backend now gives.
-- SDI output via Blackmagic DeckLink (easyDCP Player+ parity). A playback sink
-  pushing decoded, colour-managed frames to an SDI board for reference monitoring.
-  FFI to the DeckLink SDK (COM-style C++, likely a C shim) in a separate crate,
-  mirroring asdcplib-sys: open DeckLinkOutput, schedule frames at the board clock,
-  embed PCM from the sound MXF, reusing the preview decode + colour transform as the
-  frame source. Needs genlock-accurate scheduling and the physical board to verify.
-  Gates on GPU J2K decode.
+- SDI output via Blackmagic DeckLink (easyDCP Player+ parity) for reference
+  monitoring. The board is driven by glass2glass DeckLink sink elements, built on
+  the DeckLink SDK through a C shim, which schedule frames and embedded PCM on the
+  board clock. The player feeds them the decoded, colour-managed frames of the
+  preview and the PCM of the sound MXF. Needs the physical board to verify.
 - SDI capture from a DeckLink input (Clipster 7 parity, surveyed 2026-10-17 in
-  dcpwizard's DESIGN_TODO). The same SDK shim as the output, recording to a
-  frame folder and WAV the wizards already take. Needs the board.
+  dcpwizard's DESIGN_TODO). A glass2glass DeckLink source on the same shim,
+  recording to a frame folder and WAV the wizards already take. Needs the board.
 - Atmos decode for playback. An IAB track is wrapped and copied but never rendered,
   so the player gives an Atmos package its main sound only. A bed-only render of
   the IAB (ST 2098-2) is the first useful step.
