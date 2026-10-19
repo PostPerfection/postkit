@@ -690,7 +690,7 @@ impl ImfCpl {
     }
 }
 
-fn write_resource(xml: &mut String, r: &ImfResource, fps_num: u32, fps_den: u32) {
+pub(crate) fn write_resource(xml: &mut String, r: &ImfResource, fps_num: u32, fps_den: u32) {
     // BaseResourceType is abstract, so a track file resource names its type
     xml.push_str("            <Resource xsi:type=\"TrackFileResourceType\">\n");
     let _ = writeln!(

@@ -60,6 +60,8 @@ pub struct SubtitleSegment {
 pub struct Composition {
     pub pictures: Vec<PictureSegment>,
     pub sound: Vec<SoundSegment>,
+    // one entry a DCP reel or an IMF segment, empty where it carries no Atmos track
+    pub atmos_by_reel: Vec<Vec<SoundSegment>>,
     pub subtitles: Vec<SubtitleSegment>,
     pub captions: Vec<SubtitleSegment>,
     pub title: Option<String>,
@@ -148,17 +150,24 @@ pub fn resolve_composition(
     if pictures.is_empty() {
         return Err(format!("{} names no picture", source.display()));
     }
-    let sound = located(sound_references(&cpl), &paths_by_id)
-        .into_iter()
-        .map(|found| {
-            found.map(|(path, reference)| SoundSegment {
-                path,
-                trim: reference.trim,
-                edit_rate: reference.edit_rate,
+    let sound_segments = |references: Vec<TrackFileReference>| {
+        located(references, &paths_by_id)
+            .into_iter()
+            .map(|found| {
+                found.map(|(path, reference)| SoundSegment {
+                    path,
+                    trim: reference.trim,
+                    edit_rate: reference.edit_rate,
+                })
             })
-        })
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(missing_asset_error)?;
+            .collect::<Result<Vec<_>, String>>()
+            .map_err(missing_asset_error)
+    };
+    let sound = sound_segments(sound_references(&cpl))?;
+    let atmos_by_reel = atmos_references(&cpl)
+        .into_iter()
+        .map(sound_segments)
+        .collect::<Result<Vec<_>, String>>()?;
     let subtitle_segments = |references: Vec<SubtitleReference>| {
         references
             .into_iter()
@@ -180,6 +189,7 @@ pub fn resolve_composition(
     Ok(Composition {
         pictures,
         sound,
+        atmos_by_reel,
         subtitles: subtitle_segments(subtitle_references(&cpl))?,
         captions: subtitle_segments(reel_subtitle_references(
             &cpl,
@@ -285,6 +295,7 @@ pub fn find_original_version_packages(
     let mut missing: Vec<String> = picture_references(&cpl)
         .into_iter()
         .chain(sound_references(&cpl))
+        .chain(atmos_references(&cpl).into_iter().flatten())
         .chain(
             subtitle_references(&cpl)
                 .into_iter()
@@ -430,6 +441,48 @@ fn sound_references(cpl: &str) -> Vec<TrackFileReference> {
     reel_sound
 }
 
+// the Dolby Atmos data essence UL a DCP reel's AuxData names, as libdcp writes it
+const ATMOS_DATA_TYPE_UL: &str = "urn:smpte:ul:060e2b34.04010105.0e090604.00000000";
+const IMF_ATMOS_SEQUENCE_ELEMENT: &str = "IABSequence";
+
+// a DCP reel's AuxData of the Atmos data type (ST 429-18), or an IMF segment's
+// IABSequence resources (ST 2067-201)
+fn atmos_references(cpl: &str) -> Vec<Vec<TrackFileReference>> {
+    let reels = element_blocks(cpl, "Reel");
+    if !reels.is_empty() {
+        return reels
+            .into_iter()
+            .map(|reel| {
+                element_blocks(reel, "AuxData")
+                    .into_iter()
+                    .filter(|aux_data| {
+                        read_prefixed_tag(aux_data, "DataType").is_some_and(|data_type| {
+                            data_type.eq_ignore_ascii_case(ATMOS_DATA_TYPE_UL)
+                        })
+                    })
+                    .filter_map(reel_asset_reference)
+                    .collect()
+            })
+            .collect();
+    }
+    let composition_edit_rate = read_prefixed_tag(cpl, "EditRate");
+    let first_track = element_blocks(cpl, IMF_ATMOS_SEQUENCE_ELEMENT)
+        .first()
+        .and_then(|sequence| uuid_in(sequence, "TrackId"));
+    element_blocks(cpl, "Segment")
+        .into_iter()
+        .map(|segment| {
+            element_blocks(segment, IMF_ATMOS_SEQUENCE_ELEMENT)
+                .into_iter()
+                .filter(|sequence| uuid_in(sequence, "TrackId") == first_track)
+                .flat_map(|sequence| {
+                    resource_references(sequence, composition_edit_rate.as_deref())
+                })
+                .collect()
+        })
+        .collect()
+}
+
 /// One MainPicture per reel, so a single forward scan gives reel order.
 fn main_picture_references(cpl: &str) -> Vec<TrackFileReference> {
     reel_asset_references(cpl, crate::cpl_xml::MAIN_PICTURE_ELEMENT_PATTERN)
@@ -439,14 +492,16 @@ fn main_picture_references(cpl: &str) -> Vec<TrackFileReference> {
 fn reel_asset_references(cpl: &str, name: &str) -> Vec<TrackFileReference> {
     element_blocks(cpl, name)
         .into_iter()
-        .filter_map(|block| {
-            Some(TrackFileReference {
-                asset_id: uuid_in(block, "Id")?,
-                trim: segment_trim(block, "Duration", None),
-                edit_rate: None,
-            })
-        })
+        .filter_map(reel_asset_reference)
         .collect()
+}
+
+fn reel_asset_reference(block: &str) -> Option<TrackFileReference> {
+    Some(TrackFileReference {
+        asset_id: uuid_in(block, "Id")?,
+        trim: segment_trim(block, "Duration", None),
+        edit_rate: None,
+    })
 }
 
 /// A sequence may list several resources, so the sequence blocks come first
@@ -462,10 +517,19 @@ fn sequence_resource_references(cpl: &str, sequence_name: &str) -> Vec<TrackFile
     sequences
         .into_iter()
         .filter(|sequence| uuid_in(sequence, "TrackId") == first_track)
-        .flat_map(|sequence| element_blocks(sequence, "Resource"))
+        .flat_map(|sequence| resource_references(sequence, composition_edit_rate.as_deref()))
+        .collect()
+}
+
+fn resource_references(
+    sequence: &str,
+    composition_edit_rate: Option<&str>,
+) -> Vec<TrackFileReference> {
+    element_blocks(sequence, "Resource")
+        .into_iter()
         .filter_map(|resource| {
-            let edit_rate =
-                read_prefixed_tag(resource, "EditRate").or_else(|| composition_edit_rate.clone());
+            let edit_rate = read_prefixed_tag(resource, "EditRate")
+                .or_else(|| composition_edit_rate.map(str::to_string));
             let seconds_per_unit = edit_rate.as_deref().and_then(seconds_per_edit_unit);
             Some(TrackFileReference {
                 asset_id: uuid_in(resource, "TrackFileId")?,
@@ -1459,5 +1523,185 @@ mod tests {
         let error = find_original_version_packages(&version_file_dir, &[pictures]).unwrap_err();
         assert!(error.contains(SOUND_UUID), "{error}");
         assert!(!error.contains(REEL_UUIDS[1]), "{error}");
+    }
+
+    const ATMOS_UUIDS: [&str; 2] = [
+        "a7a70000-0000-4000-8000-000000000001",
+        "a7a70000-0000-4000-8000-000000000002",
+    ];
+    const ATMOS_FRAMES: u64 = 48;
+
+    // two 48 frame reels of picture and Atmos, the second reel's Atmos playing frames 12 to 36
+    fn write_dcp_with_atmos(dir: &Path, data_type_replacement: Option<&str>) {
+        use crate::atmos_fixture::{AtmosReelAsset, with_atmos_reels};
+        use crate::packaging::{DcpCpl, DcpCplReel, ns};
+        let reel = |index: usize| DcpCplReel {
+            reel_id: uuid::Uuid::new_v4().to_string(),
+            picture_id: REEL_UUIDS[index].into(),
+            picture_edit_rate_num: 24,
+            picture_edit_rate_den: 1,
+            picture_duration: ATMOS_FRAMES,
+            picture_width: 64,
+            picture_height: 64,
+            ..Default::default()
+        };
+        let cpl = DcpCpl {
+            uuid: uuid::Uuid::new_v4().to_string(),
+            namespace: ns::CPL_SMPTE.into(),
+            title: "Atmos".into(),
+            reels: vec![reel(0), reel(1)],
+            ..Default::default()
+        };
+        let atmos = |index: usize, entry_point: u64, duration: u64| {
+            Some(AtmosReelAsset {
+                id: ATMOS_UUIDS[index].into(),
+                intrinsic_duration: ATMOS_FRAMES,
+                entry_point,
+                duration,
+                key_id: None,
+            })
+        };
+        let mut xml = with_atmos_reels(
+            &cpl.to_xml(),
+            &[atmos(0, 0, ATMOS_FRAMES), atmos(1, 12, 24)],
+        );
+        if let Some(replacement) = data_type_replacement {
+            xml = xml.replace("060e2b34.04010105.0e090604.00000000", replacement);
+        }
+        std::fs::write(dir.join("CPL_a.xml"), xml).unwrap();
+        write_assetmap(
+            dir,
+            "CPL_a.xml",
+            &[
+                (REEL_UUIDS[0], "picture_0.mxf"),
+                (REEL_UUIDS[1], "picture_1.mxf"),
+                (ATMOS_UUIDS[0], "atmos_0.mxf"),
+                (ATMOS_UUIDS[1], "atmos_1.mxf"),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_dcp_reels_atmos_track_resolves_with_its_trim() {
+        let dir = tempfile::tempdir().unwrap();
+        write_dcp_with_atmos(dir.path(), None);
+
+        let composition = resolve_composition(dir.path(), &[]).unwrap();
+
+        assert_eq!(
+            composition.atmos_by_reel,
+            vec![
+                vec![SoundSegment {
+                    path: dir.path().join("atmos_0.mxf"),
+                    trim: None,
+                    edit_rate: None,
+                }],
+                vec![SoundSegment {
+                    path: dir.path().join("atmos_1.mxf"),
+                    trim: Some(SegmentTrim {
+                        start_seconds: 0.5,
+                        length_seconds: Some(1.0),
+                    }),
+                    edit_rate: None,
+                }],
+            ]
+        );
+    }
+
+    #[test]
+    fn an_imf_segments_iab_sequence_resolves_with_its_trim() {
+        use crate::atmos_fixture::with_iab_sequences;
+        use crate::packaging::{ImfCpl, ImfResource, ImfSegment, ImfSequence, ImfTrackKind};
+        const EDIT_RATE: (u32, u32) = (24000, 1001);
+        let dir = tempfile::tempdir().unwrap();
+        let segment = |index: usize| ImfSegment {
+            sequences: vec![ImfSequence::whole_track_file(
+                ImfTrackKind::Image,
+                REEL_UUIDS[index].into(),
+                ATMOS_FRAMES,
+                None,
+            )],
+        };
+        let cpl = ImfCpl {
+            uuid: uuid::Uuid::new_v4().to_string(),
+            title: "IAB".into(),
+            fps_num: EDIT_RATE.0,
+            fps_den: EDIT_RATE.1,
+            segments: vec![segment(0), segment(1)],
+            ..Default::default()
+        };
+        let iab = [
+            Some(ImfResource::whole_track_file(
+                ATMOS_UUIDS[0].into(),
+                ATMOS_FRAMES,
+                None,
+            )),
+            Some(ImfResource {
+                track_file_uuid: ATMOS_UUIDS[1].into(),
+                duration: ATMOS_FRAMES,
+                entry_point: 12,
+                source_duration: 24,
+                source_encoding: None,
+            }),
+        ];
+        std::fs::write(
+            dir.path().join("CPL_a.xml"),
+            with_iab_sequences(&cpl.to_xml(), &iab, EDIT_RATE),
+        )
+        .unwrap();
+        write_assetmap(
+            dir.path(),
+            "CPL_a.xml",
+            &[
+                (REEL_UUIDS[0], "VIDEO_0.mxf"),
+                (REEL_UUIDS[1], "VIDEO_1.mxf"),
+                (ATMOS_UUIDS[0], "IAB_0.mxf"),
+                (ATMOS_UUIDS[1], "IAB_1.mxf"),
+            ],
+        );
+
+        let composition = resolve_composition(dir.path(), &[]).unwrap();
+
+        let seconds_per_frame = f64::from(EDIT_RATE.1) / f64::from(EDIT_RATE.0);
+        let edit_rate = Some((EDIT_RATE.0 as i32, EDIT_RATE.1 as i32));
+        assert_eq!(
+            composition.atmos_by_reel,
+            vec![
+                vec![SoundSegment {
+                    path: dir.path().join("IAB_0.mxf"),
+                    trim: None,
+                    edit_rate,
+                }],
+                vec![SoundSegment {
+                    path: dir.path().join("IAB_1.mxf"),
+                    trim: Some(SegmentTrim {
+                        start_seconds: 12.0 * seconds_per_frame,
+                        length_seconds: Some(24.0 * seconds_per_frame),
+                    }),
+                    edit_rate,
+                }],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_composition_without_atmos_has_none_in_any_reel() {
+        let dir = tempfile::tempdir().unwrap();
+        write_assetmap(
+            dir.path(),
+            "CPL_a.xml",
+            &[(REEL_UUIDS[0], "a.mxf"), (REEL_UUIDS[1], "b.mxf")],
+        );
+        std::fs::write(dir.path().join("CPL_a.xml"), dcp_cpl(&REEL_UUIDS[..2])).unwrap();
+        let composition = resolve_composition(dir.path(), &[]).unwrap();
+        assert_eq!(composition.atmos_by_reel, [Vec::new(), Vec::new()]);
+
+        let other_data = tempfile::tempdir().unwrap();
+        write_dcp_with_atmos(
+            other_data.path(),
+            Some("060e2b34.04010105.0e090604.00000001"),
+        );
+        let composition = resolve_composition(other_data.path(), &[]).unwrap();
+        assert_eq!(composition.atmos_by_reel, [Vec::new(), Vec::new()]);
     }
 }
