@@ -8,6 +8,8 @@ pub mod colour;
 pub mod component_versions;
 #[cfg(feature = "ffmpeg")]
 mod composite;
+#[cfg(feature = "ffmpeg")]
+pub mod composited_preview;
 pub mod composition_timeline;
 pub mod conform;
 pub mod content_keys;

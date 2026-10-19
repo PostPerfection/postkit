@@ -401,7 +401,7 @@ pub fn run_encode_timeline_stretch_and_wrap_picture(
     Ok((encode, encoded.track.expect("a wrap was asked for")))
 }
 
-fn refuse_timeline_options(options: &EncodeRunOptions) -> Result<(), String> {
+pub(crate) fn refuse_timeline_options(options: &EncodeRunOptions) -> Result<(), String> {
     if options.frame_range.is_some() {
         return Err(
             "a timeline's clips carry their own in and out points, so a timeline encode takes \
@@ -500,14 +500,14 @@ fn is_compressed(clip: &Clip) -> bool {
     )
 }
 
-fn effective_source_colour(clip: &Clip, options: &EncodeRunOptions) -> SourceColour {
+pub(crate) fn effective_source_colour(clip: &Clip, options: &EncodeRunOptions) -> SourceColour {
     if clip.source_colour == SourceColour::default() {
         return options.source_colour.clone();
     }
     clip.source_colour.clone()
 }
 
-fn effective_picture(clip: &Clip, options: &EncodeRunOptions) -> PictureProcessing {
+pub(crate) fn effective_picture(clip: &Clip, options: &EncodeRunOptions) -> PictureProcessing {
     if clip.picture_processing.is_identity() {
         return options.picture.clone();
     }
@@ -622,7 +622,7 @@ fn colour_clip(stretch: &TimelineStretch) -> Option<usize> {
     }
 }
 
-fn clip_window(clip: &Clip, frames: &Range<u64>) -> FrameRange {
+pub(crate) fn clip_window(clip: &Clip, frames: &Range<u64>) -> FrameRange {
     FrameRange {
         first_frame: clip.in_frame + (frames.start - clip.start),
         frame_count: frames.end - frames.start,
@@ -918,33 +918,24 @@ fn encode_composite_stretch(
     on_log: impl Fn(&str),
 ) -> Result<StretchEncoded, String> {
     let frames = &stretch.frames;
-    let base = match stretch.base {
-        StretchBase::Clip(index) => CompositeBase::Clip(composite_layer(
-            timeline, index, frames, output_dir, options,
-        )?),
-        StretchBase::Black { width, height } => CompositeBase::Black { width, height },
-    };
-    let mut overlays = Vec::new();
-    for &index in &stretch.overlays {
-        overlays.push(CompositeOverlay {
-            layer: composite_layer(timeline, index, frames, output_dir, options)?,
-            opacity: timeline.clips[index].opacity,
-        });
-    }
-    let layer_names: Vec<&str> = std::iter::once(match &base {
+    let composite = stretch_composite(timeline, stretch, output_dir, options)?;
+    let layer_names: Vec<&str> = std::iter::once(match &composite.base {
         CompositeBase::Clip(layer) => layer.name.as_str(),
         CompositeBase::Black { .. } => "black",
     })
-    .chain(overlays.iter().map(|overlay| overlay.layer.name.as_str()))
+    .chain(
+        composite
+            .overlays
+            .iter()
+            .map(|overlay| overlay.layer.name.as_str()),
+    )
     .collect();
     let stretch_name = format!("timeline frames {}..{}", frames.start, frames.end);
     on_log(&format!(
         "[TIMELINE] {stretch_name}: {}, bottom to top",
         layer_names.join(", ")
     ));
-    let source_colour = colour_clip(stretch).map_or(options.source_colour.clone(), |index| {
-        effective_source_colour(&timeline.clips[index], options)
-    });
+    let source_colour = stretch_source_colour(timeline, stretch, options);
     if options.subtitle_burn.is_some() {
         // every layer decodes through ffmpeg the way a video does
         reject_unsupported_burn(InputType::Video, &source_colour)?;
@@ -956,11 +947,6 @@ fn encode_composite_stretch(
             &output_dir.join("j2k"),
             output.first_output_frame(frames.start),
         )
-    };
-    let composite = Composite {
-        base,
-        overlays,
-        frame_count: frames.end - frames.start,
     };
     let mut overlapped_wrap = output
         .wrap()
@@ -994,6 +980,43 @@ fn encode_composite_stretch(
         frames_encoded,
         picture_findings,
         track,
+    })
+}
+
+pub(crate) fn stretch_composite(
+    timeline: &Timeline,
+    stretch: &TimelineStretch,
+    list_dir: &Path,
+    options: &EncodeRunOptions,
+) -> Result<Composite, String> {
+    let frames = &stretch.frames;
+    let base = match stretch.base {
+        StretchBase::Clip(index) => {
+            CompositeBase::Clip(composite_layer(timeline, index, frames, list_dir, options)?)
+        }
+        StretchBase::Black { width, height } => CompositeBase::Black { width, height },
+    };
+    let mut overlays = Vec::new();
+    for &index in &stretch.overlays {
+        overlays.push(CompositeOverlay {
+            layer: composite_layer(timeline, index, frames, list_dir, options)?,
+            opacity: timeline.clips[index].opacity,
+        });
+    }
+    Ok(Composite {
+        base,
+        overlays,
+        frame_count: frames.end - frames.start,
+    })
+}
+
+pub(crate) fn stretch_source_colour(
+    timeline: &Timeline,
+    stretch: &TimelineStretch,
+    options: &EncodeRunOptions,
+) -> SourceColour {
+    colour_clip(stretch).map_or(options.source_colour.clone(), |index| {
+        effective_source_colour(&timeline.clips[index], options)
     })
 }
 
@@ -1355,7 +1378,7 @@ fn finish_overlapped_wrap(
     Ok(Some(track))
 }
 
-fn stream_encode_options(
+pub(crate) fn stream_encode_options(
     options: &EncodeRunOptions,
     j2k_dir: &Path,
     first_output_frame: u64,

@@ -257,7 +257,7 @@ fn named(name: &str) -> impl Fn(String) -> String + '_ {
     move |error| format!("{name}: {error}")
 }
 
-fn composite_frames(
+pub(crate) fn composite_frames(
     composite: &Composite,
     opts: &StreamEncodeOptions,
     params: &crate::grok_encoder::CompressParams,

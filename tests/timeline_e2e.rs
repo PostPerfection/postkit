@@ -2,6 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
+use postkit::composited_preview::{
+    PreviewRenderProgress, preview_fit, render_grok_preview_stretches, render_mpv_preview_stretches,
+};
 use postkit::encode::{FrameRate, SourceColour};
 use postkit::j2k::{ImfProfile, imf_levels, imf_rsiz};
 use postkit::mxf_wrap::{IncrementalWrapOptions, MxfStandard, rec709_sdr_picture_colour};
@@ -14,7 +17,8 @@ use postkit::pipeline::{
 use postkit::still::{StillHold, build_still_frames};
 use postkit::subtitle_retime::parse_srt;
 use postkit::timeline::{
-    Clip, ClipSound, SoundTrack, TIMELINE_FORMAT_VERSION, Timeline, join_subtitles, render_sound,
+    Clip, ClipSound, RenderedStretch, SoundTrack, SourceLength, TIMELINE_FORMAT_VERSION, Timeline,
+    join_subtitles, mpv_edl_uri, probe_source, render_sound,
 };
 use postkit::wav_io::WavReader;
 
@@ -1136,6 +1140,715 @@ fn layer_0_pictures_with_alpha_go_over_black_alone_and_under_an_overlay() {
         assert!(
             samples_close_to(found, want),
             "timeline frame {frame} samples {found:?}, not {want:?}"
+        );
+    }
+}
+
+fn preview_timeline(clips: Vec<Clip>) -> Timeline {
+    Timeline {
+        reel_starts: Vec::new(),
+        ..timeline(clips)
+    }
+}
+
+fn not_cancelled() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(false))
+}
+
+fn render_for_mpv(
+    timeline: &Timeline,
+    options: &EncodeRunOptions,
+    cache: &Path,
+) -> (Vec<RenderedStretch>, Vec<PreviewRenderProgress>) {
+    let progress = Mutex::new(Vec::new());
+    let rendered = render_mpv_preview_stretches(
+        timeline,
+        options,
+        cache,
+        &not_cancelled(),
+        |reported: PreviewRenderProgress| progress.lock().unwrap().push(reported),
+    )
+    .expect("the preview renders");
+    (rendered, progress.into_inner().unwrap())
+}
+
+const PREVIEW_SOUND: &str = "/work/sound.wav";
+const PREVIEW_BLACK: &str = "/work/black.mkv";
+const EDL_SOUND_STREAM: &str = "!new_stream;!no_clip;";
+
+// each picture segment as its path, first frame and frame count, then the sound segment
+fn edl_segments(uri: &str) -> (Vec<(PathBuf, u64, u64)>, String) {
+    let to_frames =
+        |seconds: &str| (seconds.parse::<f64>().unwrap() * f64::from(RATE)).round() as u64;
+    let mut rest = uri.strip_prefix("edl://").unwrap();
+    let mut pictures = Vec::new();
+    loop {
+        if let Some(sound) = rest.strip_prefix(EDL_SOUND_STREAM) {
+            return (pictures, sound.to_string());
+        }
+        let (length, after) = rest.strip_prefix('%').unwrap().split_once('%').unwrap();
+        let (path, after) = after.split_at(length.parse().unwrap());
+        let (trim, after) = after.split_once(';').unwrap();
+        let (start, frames) = trim.strip_prefix(',').unwrap().split_once(',').unwrap();
+        pictures.push((PathBuf::from(path), to_frames(start), to_frames(frames)));
+        rest = after;
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Played {
+    Blue,
+    Black,
+    Rendered,
+}
+
+fn rendered_frame_count(path: &Path) -> u64 {
+    match probe_source(path).unwrap() {
+        SourceLength::Counted { frames, .. } => frames,
+        SourceLength::Still => panic!("{} is a movie", path.display()),
+    }
+}
+
+// renders the timeline for mpv and checks its EDL against `expected`, one entry a picture segment
+fn assert_stretch_edl(directory: &Path, clips: Vec<Clip>, expected: &[(Played, u64, u64)]) {
+    let timeline = preview_timeline(clips);
+    let (rendered, _) = render_for_mpv(&timeline, &compositing_options(), &directory.join("cache"));
+    let uri = mpv_edl_uri(
+        &timeline,
+        Some(Path::new(PREVIEW_SOUND)),
+        Some(Path::new(PREVIEW_BLACK)),
+        &rendered,
+    )
+    .unwrap();
+    let (pictures, sound) = edl_segments(&uri);
+    let played: Vec<(Played, u64, u64)> = pictures
+        .iter()
+        .map(|(path, first_frame, frames)| {
+            let what = if path == Path::new(PREVIEW_BLACK) {
+                Played::Black
+            } else if let Some(stretch) = rendered.iter().find(|stretch| &stretch.path == path) {
+                assert_eq!(stretch.frames.end - stretch.frames.start, *frames);
+                assert_eq!(rendered_frame_count(path), *frames, "{}", path.display());
+                Played::Rendered
+            } else {
+                assert_eq!(path.file_name().unwrap(), "blue.mkv");
+                Played::Blue
+            };
+            (what, *first_frame, *frames)
+        })
+        .collect();
+    assert_eq!(played, expected, "{uri}");
+    let played_frames: u64 = pictures.iter().map(|(_, _, frames)| frames).sum();
+    assert_eq!(played_frames, timeline.total_frames());
+    let unrendered = mpv_edl_uri(
+        &timeline,
+        Some(Path::new(PREVIEW_SOUND)),
+        Some(Path::new(PREVIEW_BLACK)),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(sound, edl_segments(&unrendered).1, "the sound segment");
+}
+
+fn trimmed(picture: &Path, start: u64, in_frame: u64, frames: u64) -> Clip {
+    Clip {
+        in_frame,
+        out_frame: in_frame + frames,
+        ..layered(picture, start, frames, 0, 1.0)
+    }
+}
+
+#[test]
+fn an_overlay_inside_one_base_clip_splits_it_in_three() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let half_red = half_red_stills(directory.path(), 8);
+    assert_stretch_edl(
+        directory.path(),
+        vec![trimmed(&blue, 0, 5, 48), layered(&half_red, 12, 8, 1, 1.0)],
+        &[
+            (Played::Blue, 5, 12),
+            (Played::Rendered, 0, 8),
+            (Played::Blue, 25, 28),
+        ],
+    );
+}
+
+#[test]
+fn an_overlay_across_two_base_clips_renders_a_stretch_on_each_side_of_the_cut() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let half_red = half_red_stills(directory.path(), 16);
+    assert_stretch_edl(
+        directory.path(),
+        vec![
+            trimmed(&blue, 0, 0, 24),
+            trimmed(&blue, 24, 10, 24),
+            layered(&half_red, 16, 16, 1, 1.0),
+        ],
+        &[
+            (Played::Blue, 0, 16),
+            (Played::Rendered, 0, 8),
+            (Played::Rendered, 0, 8),
+            (Played::Blue, 18, 16),
+        ],
+    );
+}
+
+#[test]
+fn an_overlay_over_a_gap_leaves_black_on_both_sides_of_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let half_red = half_red_stills(directory.path(), 6);
+    assert_stretch_edl(
+        directory.path(),
+        vec![
+            trimmed(&blue, 0, 0, 12),
+            trimmed(&blue, 24, 30, 12),
+            layered(&half_red, 14, 6, 1, 1.0),
+        ],
+        &[
+            (Played::Blue, 0, 12),
+            (Played::Black, 0, 2),
+            (Played::Rendered, 0, 6),
+            (Played::Black, 0, 4),
+            (Played::Blue, 30, 12),
+        ],
+    );
+}
+
+#[test]
+fn an_overlay_at_frame_0_plays_first() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let half_red = half_red_stills(directory.path(), 8);
+    assert_stretch_edl(
+        directory.path(),
+        vec![trimmed(&blue, 0, 3, 24), layered(&half_red, 0, 8, 1, 1.0)],
+        &[(Played::Rendered, 0, 8), (Played::Blue, 11, 16)],
+    );
+}
+
+#[test]
+fn an_overlay_running_past_layer_0_ends_the_timeline_over_black() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let half_red = half_red_stills(directory.path(), 14);
+    assert_stretch_edl(
+        directory.path(),
+        vec![trimmed(&blue, 0, 0, 24), layered(&half_red, 16, 14, 1, 1.0)],
+        &[
+            (Played::Blue, 0, 16),
+            (Played::Rendered, 0, 8),
+            (Played::Rendered, 0, 6),
+        ],
+    );
+}
+
+#[test]
+fn staggered_overlays_on_layers_1_and_2_render_each_change_of_layers() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let half_red = half_red_stills(directory.path(), 12);
+    assert_stretch_edl(
+        directory.path(),
+        vec![
+            trimmed(&blue, 0, 0, 32),
+            layered(&half_red, 8, 12, 1, 1.0),
+            layered(&half_red, 12, 12, 2, 0.5),
+        ],
+        &[
+            (Played::Blue, 0, 8),
+            (Played::Rendered, 0, 4),
+            (Played::Rendered, 0, 8),
+            (Played::Rendered, 0, 4),
+            (Played::Blue, 24, 8),
+        ],
+    );
+}
+
+#[test]
+fn two_adjacent_overlays_on_one_layer_render_a_stretch_each() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let half_red = half_red_stills(directory.path(), 4);
+    let red_pillar = red_pillar_stills(directory.path(), 4);
+    assert_stretch_edl(
+        directory.path(),
+        vec![
+            trimmed(&blue, 0, 0, 24),
+            layered(&half_red, 8, 4, 1, 1.0),
+            layered(&red_pillar, 12, 4, 1, 1.0),
+        ],
+        &[
+            (Played::Blue, 0, 8),
+            (Played::Rendered, 0, 4),
+            (Played::Rendered, 0, 4),
+            (Played::Blue, 16, 8),
+        ],
+    );
+}
+
+#[test]
+fn a_held_still_overlay_renders_its_hold() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let card = alpha_card(directory.path());
+    assert_stretch_edl(
+        directory.path(),
+        vec![trimmed(&blue, 0, 0, 24), layered(&card, 4, 8, 1, 1.0)],
+        &[
+            (Played::Blue, 0, 4),
+            (Played::Rendered, 0, 8),
+            (Played::Blue, 12, 12),
+        ],
+    );
+}
+
+#[test]
+fn a_held_still_on_layer_0_renders_with_nothing_above_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let card = lime_card(directory.path());
+    assert_stretch_edl(
+        directory.path(),
+        vec![layered(&card, 0, 10, 0, 1.0), trimmed(&blue, 10, 0, 10)],
+        &[(Played::Rendered, 0, 10), (Played::Blue, 0, 10)],
+    );
+}
+
+#[test]
+fn an_image_sequence_on_layer_0_renders_with_nothing_above_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 4);
+    let red_pillar = red_pillar_stills(directory.path(), 8);
+    assert_stretch_edl(
+        directory.path(),
+        vec![
+            trimmed(&blue, 0, 0, 6),
+            layered(&red_pillar, 6, 8, 0, 1.0),
+            trimmed(&blue, 14, 20, 6),
+        ],
+        &[
+            (Played::Blue, 0, 6),
+            (Played::Rendered, 0, 8),
+            (Played::Blue, 20, 6),
+        ],
+    );
+}
+
+fn preview_refusals(timeline: &Timeline, options: &EncodeRunOptions, cache: &Path) -> String {
+    let mpv = render_mpv_preview_stretches(timeline, options, cache, &not_cancelled(), |_| {})
+        .expect_err("the mpv preview has to be refused");
+    let grok = render_grok_preview_stretches(timeline, options, cache, &not_cancelled(), |_| {})
+        .expect_err("the grok preview has to be refused");
+    assert_eq!(mpv, grok);
+    mpv
+}
+
+#[test]
+fn the_preview_refuses_what_the_build_refuses_with_its_message() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 1);
+    let half_red = half_red_stills(directory.path(), 8);
+    let codestreams = directory.path().join("codestreams");
+    std::fs::create_dir_all(&codestreams).unwrap();
+    for frame in numbered_codestreams(8) {
+        std::fs::write(codestreams.join(frame), [0u8]).unwrap();
+    }
+    let mut display_rgb_overlay = layered(&half_red, 4, 8, 1, 1.0);
+    display_rgb_overlay.source_colour = SourceColour::default();
+    let fitted = EncodeRunOptions {
+        picture: fitted_to_the_raster(),
+        ..at_the_timeline_rate()
+    };
+    let refusals = [
+        (
+            vec![
+                layered(&codestreams, 0, 8, 0, 1.0),
+                layered(&half_red, 2, 4, 1, 1.0),
+            ],
+            fitted.clone(),
+            format!(
+                "clip 2 ({}) lies over clip 1 ({}), which is already JPEG 2000 and cannot be \
+                 composited",
+                half_red.display(),
+                codestreams.display()
+            ),
+        ),
+        (
+            vec![
+                layered(&half_red, 0, 8, 0, 1.0),
+                layered(&codestreams, 0, 8, 3, 1.0),
+            ],
+            fitted.clone(),
+            format!(
+                "clip 2 ({}) is on layer 3 and is already JPEG 2000, so it cannot be composited",
+                codestreams.display()
+            ),
+        ),
+        (
+            vec![layered(&blue, 0, 24, 0, 1.0), display_rgb_overlay],
+            fitted,
+            format!(
+                "clip 2 ({}) has the source colour DisplayRgb and clip 1 ({}) under it has \
+                 KeepRgb: a composite takes one source colour",
+                half_red.display(),
+                blue.display()
+            ),
+        ),
+        (
+            vec![
+                layered(&blue, 6, 24, 0, 1.0),
+                layered(&half_red, 8, 4, 1, 1.0),
+            ],
+            at_the_timeline_rate(),
+            "layer 0 is empty from frame 0 to frame 6, and the black there has no raster: the \
+             picture options need a fit"
+                .to_string(),
+        ),
+    ];
+    let cache = directory.path().join("cache");
+    for (clips, options, message) in refusals {
+        let refused = preview_refusals(&preview_timeline(clips.clone()), &options, &cache);
+        assert_eq!(refused, message);
+        assert_eq!(
+            refusal(clips, &directory.path().join("build"), &options),
+            message
+        );
+    }
+    assert!(
+        !cache.exists(),
+        "a refusal comes before anything is rendered"
+    );
+}
+
+fn cache_entries(cache: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(cache)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+fn rendered_frames(progress: &[PreviewRenderProgress]) -> u64 {
+    let last = progress.last().expect("something was rendered");
+    assert_eq!(last.frames_rendered, last.total_frames);
+    last.total_frames
+}
+
+fn path_of(rendered: &[RenderedStretch], frames: std::ops::Range<u64>) -> PathBuf {
+    rendered
+        .iter()
+        .find(|stretch| stretch.frames == frames)
+        .unwrap_or_else(|| panic!("no stretch over {frames:?} in {rendered:?}"))
+        .path
+        .clone()
+}
+
+// a blue base with a card over frames 8 to 16 and the half red over 24 to 32
+fn two_overlay_clips(directory: &Path) -> Vec<Clip> {
+    let blue = blue_video(directory, 2);
+    let card = alpha_card(directory);
+    let half_red = half_red_stills(directory, 8);
+    vec![
+        trimmed(&blue, 0, 0, 40),
+        layered(&card, 8, 8, 1, 1.0),
+        layered(&half_red, 24, 8, 1, 1.0),
+    ]
+}
+
+#[test]
+fn a_second_render_of_the_same_timeline_renders_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let timeline = preview_timeline(two_overlay_clips(directory.path()));
+    let cache = directory.path().join("cache");
+    let (first, progress) = render_for_mpv(&timeline, &compositing_options(), &cache);
+    assert_eq!(rendered_frames(&progress), 16);
+    let (second, progress) = render_for_mpv(&timeline, &compositing_options(), &cache);
+    assert_eq!(second, first);
+    assert!(progress.is_empty(), "{progress:?}");
+    assert_eq!(cache_entries(&cache).len(), 2);
+}
+
+#[test]
+fn changing_one_overlay_renders_only_its_stretches_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let clips = two_overlay_clips(directory.path());
+    let cache = directory.path().join("cache");
+    let (first, _) = render_for_mpv(
+        &preview_timeline(clips.clone()),
+        &compositing_options(),
+        &cache,
+    );
+    let card_stretch = path_of(&first, 8..16);
+    let half_red_stretch = path_of(&first, 24..32);
+
+    let mut faded = clips.clone();
+    faded[1].opacity = 0.5;
+    let (rendered, progress) =
+        render_for_mpv(&preview_timeline(faded), &compositing_options(), &cache);
+    assert_eq!(rendered_frames(&progress), 8, "the opacity");
+    assert_ne!(path_of(&rendered, 8..16), card_stretch);
+    assert_eq!(path_of(&rendered, 24..32), half_red_stretch);
+
+    let mut moved = clips.clone();
+    moved[1].start = 4;
+    let (rendered, progress) =
+        render_for_mpv(&preview_timeline(moved), &compositing_options(), &cache);
+    assert_eq!(rendered_frames(&progress), 8, "the start");
+    assert_eq!(path_of(&rendered, 24..32), half_red_stretch);
+
+    let lime = lime_card(directory.path());
+    std::fs::copy(&lime, &clips[1].picture).unwrap();
+    let (rendered, progress) =
+        render_for_mpv(&preview_timeline(clips), &compositing_options(), &cache);
+    assert_eq!(rendered_frames(&progress), 8, "the file");
+    assert_ne!(path_of(&rendered, 8..16), card_stretch);
+    assert_eq!(path_of(&rendered, 24..32), half_red_stretch);
+}
+
+#[test]
+fn a_cancelled_render_keeps_the_stretches_it_finished_and_nothing_part_written() {
+    let directory = tempfile::tempdir().unwrap();
+    let timeline = preview_timeline(two_overlay_clips(directory.path()));
+    let cache = directory.path().join("cache");
+    let cancel = not_cancelled();
+    let cancelled = render_mpv_preview_stretches(
+        &timeline,
+        &compositing_options(),
+        &cache,
+        &cancel,
+        |progress: PreviewRenderProgress| {
+            if progress.frames_rendered == 10 {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        },
+    );
+    assert_eq!(cancelled, Err("Cancelled".to_string()));
+    let left = cache_entries(&cache);
+    assert_eq!(left.len(), 1, "{left:?}");
+
+    let (rendered, progress) = render_for_mpv(&timeline, &compositing_options(), &cache);
+    assert_eq!(rendered_frames(&progress), 8);
+    assert_eq!(
+        path_of(&rendered, 8..16)
+            .file_name()
+            .unwrap()
+            .to_string_lossy(),
+        left[0]
+    );
+    assert_eq!(rendered_frame_count(&path_of(&rendered, 24..32)), 8);
+}
+
+#[test]
+fn a_load_deletes_the_renders_the_timeline_no_longer_uses_and_keeps_the_rest() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut clips = two_overlay_clips(directory.path());
+    let cache = directory.path().join("cache");
+    let (first, _) = render_for_mpv(
+        &preview_timeline(clips.clone()),
+        &compositing_options(),
+        &cache,
+    );
+    std::fs::write(cache.join("notes.txt"), "not a render").unwrap();
+
+    clips.remove(1);
+    let (rendered, progress) =
+        render_for_mpv(&preview_timeline(clips), &compositing_options(), &cache);
+    assert!(progress.is_empty(), "{progress:?}");
+    assert_eq!(rendered, vec![first[1].clone()]);
+    assert!(!first[0].path.exists());
+    let mut kept = vec![
+        "notes.txt".to_string(),
+        first[1]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
+    ];
+    kept.sort();
+    assert_eq!(cache_entries(&cache), kept);
+}
+
+const DCP_4K_WIDTH: u32 = 4096;
+const DCP_4K_HEIGHT: u32 = 2160;
+const PREVIEW_WIDTH: u32 = 2048;
+const PREVIEW_HEIGHT: u32 = 1080;
+// the 16:9 picture inside the halved raster, padded on either side
+const PREVIEW_PICTURE_LEFT: u32 = 64;
+const PREVIEW_PICTURE_WIDTH: u32 = 1920;
+
+fn fitted_to_4k() -> PictureProcessing {
+    PictureProcessing {
+        fit: Some(Fit {
+            box_width: 3840,
+            box_height: DCP_4K_HEIGHT,
+            raster_width: DCP_4K_WIDTH,
+            raster_height: DCP_4K_HEIGHT,
+            placement: Placement::default(),
+        }),
+        ..PictureProcessing::default()
+    }
+}
+
+fn options_fitted_to_4k() -> EncodeRunOptions {
+    EncodeRunOptions {
+        picture: fitted_to_4k(),
+        ..compositing_options()
+    }
+}
+
+// the alpha card over a gap, over the blue base, and over it again at half opacity
+fn alpha_card_over_a_gap_and_blue(directory: &Path) -> Timeline {
+    let blue = blue_video(directory, 1);
+    let card = alpha_card(directory);
+    let faded = Clip {
+        opacity: 0.5,
+        ..layered(&card, 8, 4, 1, 1.0)
+    };
+    preview_timeline(vec![
+        layered(&card, 0, 4, 1, 1.0),
+        trimmed(&blue, 4, 0, 8),
+        layered(&card, 4, 4, 1, 1.0),
+        faded,
+    ])
+}
+
+fn decoded_rgb48(movie: &Path) -> Vec<u8> {
+    let decoded = std::process::Command::new("ffmpeg")
+        .args(["-v", "error", "-i"])
+        .arg(movie)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb48le", "-"])
+        .output()
+        .expect("ffmpeg");
+    assert!(
+        decoded.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decoded.stderr)
+    );
+    decoded.stdout
+}
+
+// the middle row at the centre of each quarter of the picture
+fn quarter_samples(frame: &[u8]) -> [[i32; 3]; 4] {
+    [1, 3, 5, 7].map(|eighth| {
+        let x = PREVIEW_PICTURE_LEFT + PREVIEW_PICTURE_WIDTH * eighth / 8;
+        let at = ((PREVIEW_HEIGHT / 2 * PREVIEW_WIDTH + x) * 6) as usize;
+        [0, 1, 2].map(|channel| {
+            let sample = at + channel * 2;
+            i32::from(u16::from_le_bytes([frame[sample], frame[sample + 1]]))
+        })
+    })
+}
+
+const HALF_WHITE_OVER_BLUE: [i32; 3] = [32768, 32768, FULL];
+const QUARTER_WHITE_OVER_BLUE: [i32; 3] = [16448, 16448, FULL];
+const LIME_AT_HALF_OPACITY_OVER_BLUE: [i32; 3] = [0, 32768, 32767];
+// a JPEG at quality 2 holds a flat patch within about one percent
+const JPEG_TOLERANCE: i32 = 1 << 11;
+
+#[test]
+fn an_mpv_preview_decodes_to_the_composite_at_half_a_4k_raster() {
+    let directory = tempfile::tempdir().unwrap();
+    let timeline = alpha_card_over_a_gap_and_blue(directory.path());
+    let (rendered, _) = render_for_mpv(
+        &timeline,
+        &options_fitted_to_4k(),
+        &directory.path().join("cache"),
+    );
+    let expected = [
+        (0..4, [BLACK, HALF_WHITE, LIME, LIME]),
+        (4..8, [BLUE, HALF_WHITE_OVER_BLUE, LIME, LIME]),
+        (
+            8..12,
+            [
+                BLUE,
+                QUARTER_WHITE_OVER_BLUE,
+                LIME_AT_HALF_OPACITY_OVER_BLUE,
+                LIME_AT_HALF_OPACITY_OVER_BLUE,
+            ],
+        ),
+    ];
+    let frame_bytes = (PREVIEW_WIDTH * PREVIEW_HEIGHT * 6) as usize;
+    for (frames, want) in expected {
+        let decoded = decoded_rgb48(&path_of(&rendered, frames.clone()));
+        assert_eq!(
+            decoded.len(),
+            frame_bytes * 4,
+            "{frames:?} at {PREVIEW_WIDTH}x{PREVIEW_HEIGHT}"
+        );
+        for frame in decoded.chunks(frame_bytes) {
+            let found = quarter_samples(frame);
+            let close = found.iter().zip(want).all(|(found, want)| {
+                found
+                    .iter()
+                    .zip(want)
+                    .all(|(&found, want)| (found - want).abs() <= JPEG_TOLERANCE)
+            });
+            assert!(close, "{frames:?} samples {found:?}, not {want:?}");
+        }
+    }
+}
+
+fn halved_to_the_preview(timeline: &Timeline) -> Timeline {
+    let mut halved = timeline.clone();
+    for clip in &mut halved.clips {
+        clip.picture_processing.fit = clip.picture_processing.fit.map(preview_fit);
+    }
+    halved
+}
+
+#[test]
+fn a_grok_preview_decodes_to_the_samples_the_build_encodes_for_the_stretch() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 1);
+    let card = alpha_card(directory.path());
+    let timeline = preview_timeline(vec![
+        trimmed(&blue, 0, 0, 4),
+        layered(&card, 4, 4, 1, 1.0),
+        trimmed(&blue, 8, 4, 4),
+    ]);
+    let options = options_fitted_to_4k();
+    let rendered = render_grok_preview_stretches(
+        &timeline,
+        &options,
+        &directory.path().join("cache"),
+        &not_cancelled(),
+        |_| {},
+    )
+    .expect("the grok preview renders");
+    let stretch = path_of(&rendered, 4..8);
+
+    let halved_options = EncodeRunOptions {
+        picture: PictureProcessing {
+            fit: options.picture.fit.map(preview_fit),
+            ..options.picture.clone()
+        },
+        ..options
+    };
+    let (built, _) = encode(
+        &halved_to_the_preview(&timeline),
+        &directory.path().join("build"),
+        &halved_options,
+    );
+    assert_eq!(codestream_names(&stretch), numbered_codestreams(4));
+    for frame in 0..4u64 {
+        let decode = |path: PathBuf| {
+            postkit::grok_decoder::decode(std::fs::read(&path).unwrap(), 0)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        };
+        let preview = decode(stretch.join(format!("frame_{frame:08}.j2c")));
+        let build = decode(built.j2k_dir.join(format!("frame_{:08}.j2c", frame + 4)));
+        assert_eq!(
+            (preview.width, preview.height),
+            (PREVIEW_WIDTH, PREVIEW_HEIGHT)
+        );
+        assert!(
+            preview.components == build.components,
+            "preview frame {frame} decodes to other samples than the build's"
         );
     }
 }
