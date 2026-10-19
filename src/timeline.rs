@@ -735,46 +735,127 @@ pub fn render_black(timeline: &Timeline, output: &Path) -> Result<Option<PathBuf
     Ok(Some(output.to_path_buf()))
 }
 
+pub fn preview_renders_clip(clip: &Clip) -> bool {
+    clip.layer > 0
+        || crate::still::is_still_image(&clip.picture)
+        || matches!(
+            crate::encode::detect_input_type(&clip.picture),
+            InputType::ImageSequence
+        )
+}
+
+pub fn preview_renders_any_stretch(timeline: &Timeline) -> bool {
+    timeline.clips.iter().any(preview_renders_clip)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedStretch {
+    pub frames: Range<u64>,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlayedPicture {
+    // `first_frame` counts in the clip's source
+    Clip { index: usize, first_frame: u64 },
+    Black,
+    // from the file's first frame
+    Rendered(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayedStretch {
+    pub frames: Range<u64>,
+    pub picture: PlayedPicture,
+}
+
+// the rendered stretches play in place of the layer 0 clips and gaps under them
+pub fn played_stretches(timeline: &Timeline, rendered: &[RenderedStretch]) -> Vec<PlayedStretch> {
+    let mut rendered = rendered.to_vec();
+    rendered.sort_by_key(|stretch| stretch.frames.start);
+    let mut played: Vec<PlayedStretch> = rendered
+        .iter()
+        .map(|stretch| PlayedStretch {
+            frames: stretch.frames.clone(),
+            picture: PlayedPicture::Rendered(stretch.path.clone()),
+        })
+        .collect();
+    for (index, clip) in timeline.base_clips() {
+        for frames in outside_rendered(clip.start..clip.end(), &rendered) {
+            let first_frame = clip.in_frame + (frames.start - clip.start);
+            played.push(PlayedStretch {
+                frames,
+                picture: PlayedPicture::Clip { index, first_frame },
+            });
+        }
+    }
+    for gap in timeline.base_gaps() {
+        for frames in outside_rendered(gap, &rendered) {
+            played.push(PlayedStretch {
+                frames,
+                picture: PlayedPicture::Black,
+            });
+        }
+    }
+    played.sort_by_key(|stretch| stretch.frames.start);
+    played
+}
+
+// `rendered` is in start order
+fn outside_rendered(frames: Range<u64>, rendered: &[RenderedStretch]) -> Vec<Range<u64>> {
+    let mut parts = Vec::new();
+    let mut from = frames.start;
+    for stretch in rendered {
+        if stretch.frames.end <= from || stretch.frames.start >= frames.end {
+            continue;
+        }
+        if stretch.frames.start > from {
+            parts.push(from..stretch.frames.start);
+        }
+        from = stretch.frames.end;
+    }
+    if from < frames.end {
+        parts.push(from..frames.end);
+    }
+    parts
+}
+
 pub fn mpv_edl_uri(
     timeline: &Timeline,
     sound: Option<&Path>,
     black: Option<&Path>,
+    rendered: &[RenderedStretch],
 ) -> Result<String, String> {
     let fps = timeline.fps;
-    let mut placed: Vec<(u64, PictureSegment)> = timeline
-        .base_clips()
+    let pictures: Vec<PictureSegment> = played_stretches(timeline, rendered)
         .into_iter()
-        .map(|(_, clip)| {
-            let segment = PictureSegment {
-                path: clip.picture.clone(),
-                trim: Some(SegmentTrim {
-                    start_seconds: seconds_at(clip.in_frame, fps),
-                    length_seconds: Some(seconds_at(clip.frame_count(), fps)),
-                }),
+        .map(|played| {
+            let frames = played.frames.end - played.frames.start;
+            let (path, first_frame) = match played.picture {
+                PlayedPicture::Clip { index, first_frame } => {
+                    (timeline.clips[index].picture.clone(), first_frame)
+                }
+                PlayedPicture::Rendered(path) => (path, 0),
+                PlayedPicture::Black => {
+                    let Some(black) = black else {
+                        return Err(format!(
+                            "layer 0 has a gap of {frames} frames at frame {}, and no black \
+                             source was rendered for it",
+                            played.frames.start
+                        ));
+                    };
+                    (black.to_path_buf(), 0)
+                }
             };
-            (clip.start, segment)
+            Ok(PictureSegment {
+                path,
+                trim: Some(SegmentTrim {
+                    start_seconds: seconds_at(first_frame, fps),
+                    length_seconds: Some(seconds_at(frames, fps)),
+                }),
+            })
         })
-        .collect();
-    for gap in timeline.base_gaps() {
-        let frames = gap.end - gap.start;
-        let Some(black) = black else {
-            return Err(format!(
-                "layer 0 has a gap of {frames} frames at frame {}, and no black source was \
-                 rendered for it",
-                gap.start
-            ));
-        };
-        let segment = PictureSegment {
-            path: black.to_path_buf(),
-            trim: Some(SegmentTrim {
-                start_seconds: 0.0,
-                length_seconds: Some(seconds_at(frames, fps)),
-            }),
-        };
-        placed.push((gap.start, segment));
-    }
-    placed.sort_by_key(|(start, _)| *start);
-    let pictures: Vec<PictureSegment> = placed.into_iter().map(|(_, segment)| segment).collect();
+        .collect::<Result<_, String>>()?;
     let picture_uri = edl_uri(&pictures);
     let Some(sound) = sound else {
         return Ok(picture_uri);
@@ -1304,12 +1385,12 @@ mod tests {
             clip(Path::new("/media/c.mov"), 24, 0, 48, ClipSound::None),
         ]);
         assert_eq!(
-            mpv_edl_uri(&timeline, Some(Path::new("/work/sound.wav")), None).unwrap(),
+            mpv_edl_uri(&timeline, Some(Path::new("/work/sound.wav")), None, &[]).unwrap(),
             "edl://%14%/media/a,b.mov,0.5,1;%12%/media/c.mov,0,2;!new_stream;!no_clip;\
              %15%/work/sound.wav,0,3"
         );
         assert_eq!(
-            mpv_edl_uri(&timeline, None, None).unwrap(),
+            mpv_edl_uri(&timeline, None, None, &[]).unwrap(),
             "edl://%14%/media/a,b.mov,0.5,1;%12%/media/c.mov,0,2"
         );
     }
@@ -1511,6 +1592,67 @@ mod tests {
     }
 
     #[test]
+    fn the_preview_renders_a_timeline_with_an_upper_layer_a_still_or_an_image_sequence() {
+        let directory = tempfile::tempdir().unwrap();
+        let video = Path::new("/media/a.mov");
+        let still = still_image(&directory.path().join("card.png"));
+        let sequence = still_sequence(&directory.path().join("shots"), 3);
+        let base = clip(video, 0, 0, 24, ClipSound::None);
+        let cases = [
+            (vec![base.clone()], false, "a plain video"),
+            (Vec::new(), false, "an empty timeline"),
+            (
+                vec![
+                    base.clone(),
+                    on_layer(clip(video, 4, 0, 8, ClipSound::None), 1),
+                ],
+                true,
+                "a clip on layer 1",
+            ),
+            (
+                vec![base.clone(), clip(&still, 24, 0, 8, ClipSound::None)],
+                true,
+                "a still on layer 0",
+            ),
+            (
+                vec![clip(&sequence, 0, 0, 3, ClipSound::None), base],
+                true,
+                "an image sequence on layer 0",
+            ),
+        ];
+        for (clips, renders, what) in cases {
+            assert_eq!(
+                preview_renders_any_stretch(&timeline(clips)),
+                renders,
+                "{what}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gap_a_rendered_stretch_covers_plays_it_and_needs_no_black() {
+        let timeline = timeline(vec![
+            clip(Path::new("/media/a.mov"), 0, 12, 36, ClipSound::None),
+            clip(Path::new("/media/c.mov"), 48, 0, 24, ClipSound::None),
+        ]);
+        let rendered = [
+            RenderedStretch {
+                frames: 12..24,
+                path: PathBuf::from("/cache/one.mkv"),
+            },
+            RenderedStretch {
+                frames: 24..48,
+                path: PathBuf::from("/cache/two.mkv"),
+            },
+        ];
+        assert_eq!(
+            mpv_edl_uri(&timeline, None, None, &rendered).unwrap(),
+            "edl://%12%/media/a.mov,0.5,0.5;%14%/cache/one.mkv,0,0.5;%14%/cache/two.mkv,0,1;\
+             %12%/media/c.mov,0,1"
+        );
+    }
+
+    #[test]
     fn the_edl_fills_a_base_gap_with_black_and_leaves_upper_layers_out() {
         let timeline = timeline(vec![
             clip(Path::new("/media/a.mov"), 0, 12, 36, ClipSound::None),
@@ -1521,11 +1663,11 @@ mod tests {
             clip(Path::new("/media/c.mov"), 48, 0, 24, ClipSound::None),
         ]);
         assert_eq!(
-            mpv_edl_uri(&timeline, None, Some(Path::new("/work/black.mkv"))).unwrap(),
+            mpv_edl_uri(&timeline, None, Some(Path::new("/work/black.mkv")), &[]).unwrap(),
             "edl://%12%/media/a.mov,0.5,1;%15%/work/black.mkv,0,1;%12%/media/c.mov,0,1"
         );
         assert_eq!(
-            mpv_edl_uri(&timeline, None, None).unwrap_err(),
+            mpv_edl_uri(&timeline, None, None, &[]).unwrap_err(),
             "layer 0 has a gap of 24 frames at frame 24, and no black source was rendered for it"
         );
     }
