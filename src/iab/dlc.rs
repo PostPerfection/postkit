@@ -121,14 +121,14 @@ fn direct_form_coefficients(lattice_coefficients: &[i32]) -> Vec<i32> {
     let mut coefficients = vec![0i32; order + 1];
     coefficients[0] = 1 << 20;
     let mut updated = vec![0i32; order + 1];
-    for j in 1..=order {
-        let reflection = (lattice_coefficients[j - 1] - 512) << 11;
-        coefficients[j] = 0;
-        for k in 1..=j {
-            let product = i64::from(reflection) * i64::from(coefficients[j - k]);
-            updated[k] = coefficients[k].wrapping_add((product >> 20) as i32);
+    for stage in 1..=order {
+        let reflection = (lattice_coefficients[stage - 1] - 512) << 11;
+        coefficients[stage] = 0;
+        for term in 1..=stage {
+            let product = i64::from(reflection) * i64::from(coefficients[stage - term]);
+            updated[term] = coefficients[term].wrapping_add((product >> 20) as i32);
         }
-        coefficients[1..=j].copy_from_slice(&updated[1..=j]);
+        coefficients[1..=stage].copy_from_slice(&updated[1..=stage]);
     }
     coefficients.split_off(1)
 }

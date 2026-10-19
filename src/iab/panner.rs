@@ -73,13 +73,7 @@ pub(super) const SEVEN_POINT_ONE_LOUDSPEAKERS: &[Loudspeaker] = &[
     loudspeaker("M-135", 1.0, -1.0, -135.0),
 ];
 
-// the nine zones of ST 2098-2 Table 24 as ADM boxes (min X, max X, min Y, max Y,
-// min Z, max Z) around the nominal positions on the unit circle. BS.2127 10.1
-// puts the room's front corners at azimuth 30 and its rear corners at 110, so
-// the screen spans 0 to 30, the side walls 30 to 110 and the rear wall 110 to
-// 180, the corners going to the screen and rear walls. Zones 1 to 7 hold the
-// main and lower layers and the overhead zones everything above, so the zones
-// partition the loudspeakers as ST 2098-1 7.12.1 asks.
+// ST 2098-2 Table 24 as boxes (min X, max X, min Y, max Y, min Z, max Z) on nominal positions, walls split at the BS.2127 10.1 room corners of azimuth 30 and 110
 const ZONE_EDGE: f64 = 0.01;
 const COSINE_30_DEGREES: f64 = 0.866_025_403_784_438_6;
 const COSINE_110_DEGREES: f64 = -0.342_020_143_325_668_7;
@@ -215,7 +209,7 @@ impl ObjectPanner {
                 excluded |= 1 << channel;
             }
         }
-        // follows ear's core.allocentric.get_excluded, which drops the whole row of an excluded side wall loudspeaker
+        // follows ear's core.allocentric.get_excluded
         let mut row_removed = 0u32;
         for (channel, loudspeaker) in self.loudspeakers.iter().enumerate() {
             let position = loudspeaker.position;
@@ -276,15 +270,17 @@ impl ReducedLayout {
         let distances: Vec<f64> = self
             .positions
             .iter()
-            .map(|p| weighted_distance(*p))
+            .map(|loudspeaker| weighted_distance(*loudspeaker))
             .collect();
         let closest = distances.iter().copied().fold(f64::INFINITY, f64::min);
         // ties go to the lowest (|elevation|, elevation, |azimuth|, azimuth), elevation is 0 here
         let chosen = (0..self.positions.len())
             .filter(|index| distances[*index] - closest < TOLERANCE)
-            .min_by(|a, b| {
+            .min_by(|first, second| {
                 let key = |index: usize| (self.azimuths[index].abs(), self.azimuths[index]);
-                key(*a).partial_cmp(&key(*b)).expect("azimuths are finite")
+                key(*first)
+                    .partial_cmp(&key(*second))
+                    .expect("azimuths are finite")
             })
             .expect("a reduced layout keeps at least one loudspeaker");
         self.positions[chosen]
@@ -344,7 +340,7 @@ impl ReducedLayout {
         for speaker in 0..speaker_count {
             let (x_gains, y_gains, z_gains) =
                 (&tables.x[speaker], &tables.y[speaker], &tables.z[speaker]);
-            let (f_x, f_y, f_z) = (
+            let (x_sum, y_sum, z_sum) = (
                 sum(x_gains, &x_weights),
                 sum(y_gains, &y_weights),
                 sum(z_gains, &z_weights),
@@ -357,10 +353,10 @@ impl ReducedLayout {
             let front = term(y_gains[last_x], y_weights[last_x]);
             let floor = term(z_gains[0], z_weights[0]);
             let ceiling = term(z_gains[last_z], z_weights[last_z]);
-            inside[speaker] = f_x * f_y * f_z;
-            bound[speaker] = (left + right) * f_y * f_z
-                + f_x * (front + back) * f_z
-                + f_x * f_y * (floor + ceiling);
+            inside[speaker] = x_sum * y_sum * z_sum;
+            bound[speaker] = (left + right) * y_sum * z_sum
+                + x_sum * (front + back) * z_sum
+                + x_sum * y_sum * (floor + ceiling);
         }
         normalise(&mut inside);
         let distance_to_boundary = match tables.dimension {
@@ -398,8 +394,7 @@ impl ReducedLayout {
 }
 
 const HORIZONTAL_GRID_POINTS: usize = 40;
-// every layout here has no loudspeaker below the main plane, so the virtual
-// sources span z from 0 to 1 with half as many points (BS.2127 7.3.11.2 note 1)
+// no layout here has a loudspeaker below the main plane (BS.2127 7.3.11.2 note 1)
 const VERTICAL_GRID_POINTS: usize = 20;
 const MAXIMUM_EXTENT: f64 = 2.8;
 const FADE_EXTENT: f64 = 0.2;
@@ -422,9 +417,11 @@ fn prescaled_extent(extent: f64) -> f64 {
     const POINTS: [(f64, f64); 5] = [(0.0, 0.0), (0.2, 0.3), (0.5, 1.0), (0.75, 1.8), (1.0, 2.8)];
     let extent = extent.clamp(0.0, 1.0);
     for pair in POINTS.windows(2) {
-        let ((x0, y0), (x1, y1)) = (pair[0], pair[1]);
-        if extent <= x1 {
-            return y0 + (extent - x0) * (y1 - y0) / (x1 - x0);
+        let ((start_extent, start_value), (end_extent, end_value)) = (pair[0], pair[1]);
+        if extent <= end_extent {
+            return start_value
+                + (extent - start_extent) * (end_value - start_value)
+                    / (end_extent - start_extent);
         }
     }
     MAXIMUM_EXTENT
@@ -466,8 +463,7 @@ enum ExtentDimension {
     Plane,
 }
 
-// the point source panner's gain of each loudspeaker along each axis for a
-// virtual source on each grid point, which BS.2127 7.3.11.3 shows are separable
+// per loudspeaker and axis, the point gain of a virtual source on each grid point (BS.2127 7.3.11.3)
 struct ExtentTables {
     dimension: ExtentDimension,
     x: Vec<[f64; HORIZONTAL_GRID_POINTS]>,
@@ -478,7 +474,9 @@ struct ExtentTables {
 impl ExtentTables {
     fn new(positions: &[Cartesian]) -> Self {
         // a row of loudspeakers varies in x only, a lone loudspeaker gets every gain either way
-        let single_row = positions.iter().all(|p| p.y == positions[0].y);
+        let single_row = positions
+            .iter()
+            .all(|position| position.y == positions[0].y);
         let dimension = if single_row {
             ExtentDimension::Row
         } else {
@@ -530,19 +528,23 @@ struct AxisGains {
 // BS.2127 7.3.10 for one loudspeaker, kept per axis
 fn axis_gains(positions: &[Cartesian], speaker: usize, object: Cartesian) -> AxisGains {
     const SAME_PLANE: f64 = 0.001;
-    let relative = |p: &Cartesian| Cartesian {
-        x: p.x - object.x,
-        y: p.y - object.y,
-        z: p.z - object.z,
+    let relative = |position: &Cartesian| Cartesian {
+        x: position.x - object.x,
+        y: position.y - object.y,
+        z: position.z - object.z,
     };
     let this = relative(&positions[speaker]);
     let all = positions.iter().map(relative);
-    let plane = all.clone().filter(|p| (p.z - this.z).abs() < SAME_PLANE);
-    let row = plane.clone().filter(|p| (p.y - this.y).abs() < SAME_PLANE);
+    let plane = all
+        .clone()
+        .filter(|other| (other.z - this.z).abs() < SAME_PLANE);
+    let row = plane
+        .clone()
+        .filter(|other| (other.y - this.y).abs() < SAME_PLANE);
     AxisGains {
-        z: axis_gain(this.z, all.map(|p| p.z)),
-        y: axis_gain(this.y, plane.map(|p| p.y)),
-        x: axis_gain(this.x, row.map(|p| p.x)),
+        z: axis_gain(this.z, all.map(|other| other.z)),
+        y: axis_gain(this.y, plane.map(|other| other.y)),
+        x: axis_gain(this.x, row.map(|other| other.x)),
     }
 }
 

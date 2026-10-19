@@ -11,8 +11,7 @@ use super::{
     ObjectSpread, ZoneGain,
 };
 
-// ITU-R BS.2051 layouts with the BS.2127 11.2 positions; the channel order is
-// L R for stereo, L R C LFE Ls Rs for 5.1 and L R C LFE Lss Rss Lrs Rrs for 7.1
+// output channel order: L R, L R C LFE Ls Rs, L R C LFE Lss Rss Lrs Rrs
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputLayout {
     Stereo,
@@ -33,8 +32,7 @@ impl OutputLayout {
         }
     }
 
-    // the ST 2098-2 Table 1 UseCase of the layout: stereo is BS.2051 sound
-    // system A (0+2+0), 5.1 and 7.1 are the ST 428-12 5.1 and 7.1DS
+    // ST 2098-2 Table 1, stereo is BS.2051 sound system A
     fn use_case(self) -> u8 {
         match self {
             OutputLayout::Stereo => 0x30,
@@ -130,8 +128,7 @@ impl Renderer {
         self.diffuse_history = vec![vec![0.0; FILTER_LENGTH - 1]; channel_count];
     }
 
-    // interleaved samples at the frame's sample rate, DIRECT_PATH_DELAY samples
-    // behind the frame's audio as BS.2127 7.4 delays every output
+    // the output lags the frame's audio by DIRECT_PATH_DELAY samples, as BS.2127 7.4 delays it
     pub fn render(
         &mut self,
         frame: &Frame,
@@ -356,9 +353,7 @@ fn gain_value(
     }
 }
 
-// SMPTE ST 2098-2 11.1 to ADM Cartesian: the cube's x runs left to right and y
-// front to back from 0 to 1, ADM X and Y run from -1 to 1 with Y = 1 at the
-// front, and both put z = 0 on the main loudspeaker plane
+// ST 2098-2 11.1 puts y = 0 at the front wall, ADM puts Y = 1 there
 pub(super) fn adm_position(x_code: u16, y_code: u16, z_code: u16) -> Cartesian {
     // ST 2098-2 5.4 DistanceXY and DistanceZ for 16 bit codes
     let distance_xy = |code: u16| (f64::from(code) - 32_767.0) / 32_768.0;
@@ -477,9 +472,7 @@ fn object_hierarchy() -> Hierarchy<ObjectDefinition> {
     }
 }
 
-// ST 2098-2 10.3.2 and 10.5.1: an element is activated when it is not conditional
-// or its UseCase is the target's or Always Use, and the rendered one is the
-// deepest activated element down a chain of activated ancestors
+// ST 2098-2 10.3.2 and 10.5.1: the rendered element is the deepest activated one under activated ancestors
 fn rendered_elements<'a, T>(
     elements: &'a [T],
     target: u8,

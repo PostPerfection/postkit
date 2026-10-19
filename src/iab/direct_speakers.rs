@@ -2,11 +2,7 @@ use super::panner::{Cartesian, Loudspeaker, point_gains};
 
 const HALF_POWER: f64 = std::f64::consts::FRAC_1_SQRT_2;
 
-// the ST 2098-2 Table 19 channels SMPTE RDD 57 Table 1 allows, with the ITU-R
-// BS.2051 label of the 0+7+0 loudspeaker the channel drives and the channel's ADM
-// position. Lts and Rts have no BS.2051 loudspeaker: ST 2098-5 Annex B puts them
-// on the ceiling between the centre and side screen loudspeakers, running front
-// to back, so they sit at IAB (0.25, 0.5, 1) and (0.75, 0.5, 1).
+// ST 2098-5 Annex B puts Lts and Rts, which have no BS.2051 label, on the ceiling at IAB (0.25, 0.5, 1) and (0.75, 0.5, 1)
 struct BedChannel {
     channel_id: u32,
     label: Option<&'static str>,
@@ -40,8 +36,7 @@ const PROFILE_1_BED_CHANNELS: [BedChannel; 10] = [
     bed_channel(0xD, Some("LFE1"), -1.0, 1.0, -1.0),
 ];
 
-// the BS.2127 Table 16 rules for the labels above, in table order, leaving out
-// the rows limited to a 9+10+3 input since the bed is taken as 0+7+0 input
+// BS.2127 Table 16 in table order, less the rows only a 9+10+3 input uses
 const MAPPING_RULES: &[(&str, &[(&str, f64)])] = &[
     ("M+000", &[("M+000", 1.0)]),
     ("M+000", &[("M+030", HALF_POWER), ("M-030", HALF_POWER)]),
@@ -59,7 +54,7 @@ const MAPPING_RULES: &[(&str, &[(&str, f64)])] = &[
     ("M-135", &[("M-030", HALF_POWER)]),
 ];
 
-// BS.2127 clause 8, one gain per output channel; None for a channel Profile 1 does not allow
+// BS.2127 clause 8, None for a ChannelID outside RDD 57 Table 1
 pub(super) fn bed_channel_gains(loudspeakers: &[Loudspeaker], channel_id: u32) -> Option<Vec<f64>> {
     let channel = PROFILE_1_BED_CHANNELS
         .iter()

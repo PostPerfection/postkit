@@ -31,17 +31,20 @@ impl AtmosReader {
     pub fn open(path: &Path, keys: Option<&ContentKeys>) -> Result<Self, String> {
         let path_text = path.to_string_lossy();
         let named = |error: String| format!("{}: {error}", path.display());
-        let essence_type = asdcplib::essence_type(&path_text).map_err(|e| named(e.to_string()))?;
+        let essence_type =
+            asdcplib::essence_type(&path_text).map_err(|error| named(error.to_string()))?;
         match essence_type {
             asdcplib::EssenceType::DcDataDolbyAtmos => {
                 let mut reader = asdcplib::atmos::MxfReader::new();
                 reader
                     .open_read(&path_text)
-                    .map_err(|e| named(e.to_string()))?;
+                    .map_err(|error| named(error.to_string()))?;
                 let descriptor = reader
                     .atmos_descriptor()
-                    .map_err(|e| named(e.to_string()))?;
-                let info = reader.writer_info().map_err(|e| named(e.to_string()))?;
+                    .map_err(|error| named(error.to_string()))?;
+                let info = reader
+                    .writer_info()
+                    .map_err(|error| named(error.to_string()))?;
                 let keys = if info.encrypted_essence {
                     let keys = keys.ok_or_else(|| {
                         named("the Atmos track is encrypted and no content key was given".into())
@@ -67,11 +70,13 @@ impl AtmosReader {
                 let mut reader = asdcplib::as02::iab::MxfReader::new();
                 reader
                     .open_read(&path_text)
-                    .map_err(|e| named(e.to_string()))?;
-                let frame_count = reader.frame_count().map_err(|e| named(e.to_string()))?;
+                    .map_err(|error| named(error.to_string()))?;
+                let frame_count = reader
+                    .frame_count()
+                    .map_err(|error| named(error.to_string()))?;
                 let descriptor = reader
                     .iab_essence_descriptor()
-                    .map_err(|e| named(e.to_string()))?;
+                    .map_err(|error| named(error.to_string()))?;
                 Ok(AtmosReader {
                     track: Track::Imf { reader },
                     frame_count,
@@ -101,7 +106,7 @@ impl AtmosReader {
         match &mut self.track {
             Track::Imf { reader } => reader
                 .read_frame(frame_number)
-                .map_err(|e| format!("Atmos frame {frame_number}: {e}")),
+                .map_err(|error| format!("Atmos frame {frame_number}: {error}")),
             Track::Dcp {
                 reader,
                 frame_buffer,

@@ -62,7 +62,7 @@ fn the_oracle_uses_the_renderer_zones_and_channel_orders() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|l| l.as_str().unwrap())
+            .map(|label| label.as_str().unwrap())
             .collect();
         assert_eq!(ours, labels, "{name}");
     }
@@ -223,9 +223,7 @@ fn each_zone_holds_the_loudspeakers_of_its_part_of_the_room() {
     );
 }
 
-// the committed streams that meet SMPTE RDD 57: 48 kHz at 24 fps, one 9.1OH bed,
-// valid under the validator's DbyCinema constraint, 29 with the Table 4 zone set
-// 1a, 27 with snapped objects and 35 with maximum decorrelation
+// 29 has RDD 57 Table 4 zone set 1a, 27 snapped objects and 35 maximum decorrelation
 const PROFILE_1_STREAMS: [u32; 4] = [1, 27, 29, 35];
 const LAYOUTS: [OutputLayout; 3] = [
     OutputLayout::Stereo,
@@ -294,8 +292,7 @@ fn maximum_decorrelation_reaches_the_output_through_the_filters() {
     assert!(energy > 0.0);
 }
 
-// the decoded audio of each frame with every bed channel and every object not
-// decorrelated in all its sub-blocks silenced
+// silences every bed channel and every object not decorrelated in all its sub-blocks
 fn audio_of_decorrelated_objects_only(frames: &[Frame]) -> Vec<BTreeMap<u32, Vec<i32>>> {
     frames
         .iter()
@@ -363,8 +360,7 @@ fn no_sample_step_across_a_sub_block_exceeds_the_interpolated_gain_change() {
     let channel_count = layout.channel_count();
     let mut renderer = Renderer::new(layout);
     let mut panner = ObjectPanner::new(layout.loudspeakers());
-    // no Profile 1 fixture moves an object, so the first object of stream 1
-    // sweeps from the left wall to the right wall and back to the front
+    // no Profile 1 fixture moves an object, so this sweeps one from the left wall to the right front
     let mut frames = frames;
     let meta_id = frames[0].objects[0].meta_id;
     let sweep_length = (frames.len() * 8) as f64;
