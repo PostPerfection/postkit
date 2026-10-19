@@ -1886,8 +1886,9 @@ mod tests {
     #[test]
     fn a_filter_missing_from_the_build_is_named() {
         ready().unwrap();
-        let error = check_filters_exist("fps=24,eq=contrast=2", Path::new("clip.mov")).unwrap_err();
-        assert!(error.contains("`eq`"), "{error}");
+        let error =
+            check_filters_exist("fps=24,nosuchfilter=2", Path::new("clip.mov")).unwrap_err();
+        assert!(error.contains("`nosuchfilter`"), "{error}");
     }
 
     #[test]
