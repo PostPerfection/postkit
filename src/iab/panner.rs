@@ -215,10 +215,7 @@ impl ObjectPanner {
                 excluded |= 1 << channel;
             }
         }
-        // an excluded loudspeaker on a side wall takes its row with it, which keeps
-        // two loudspeakers at x = -1 and 1 in every row the point source panner
-        // uses; BS.2127 7.3.5 words it as a row left with one loudspeaker, the
-        // reference code as here
+        // follows ear's core.allocentric.get_excluded, which drops the whole row of an excluded side wall loudspeaker
         let mut row_removed = 0u32;
         for (channel, loudspeaker) in self.loudspeakers.iter().enumerate() {
             let position = loudspeaker.position;
@@ -293,8 +290,7 @@ impl ReducedLayout {
         self.positions[chosen]
     }
 
-    // BS.2127 7.3.11 with its general sums over all three axes and all six
-    // boundaries, which the reference code keeps for one row or one plane too
+    // follows ear's core.objectbased.allo_extent.get_gains
     fn extent_gains(&self, position: Cartesian, extent: f64) -> Vec<f64> {
         let tables = &self.extent_tables;
         let point = point_gains(&self.positions, position);

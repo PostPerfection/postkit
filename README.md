@@ -205,3 +205,7 @@ postkit = { git = "https://github.com/PostPerfection/postkit.git", tag = "v0.5.0
 ## License
 
 AGPL-3.0-or-later. Copyright (C) 2026 Grok Image Compression Inc. See [LICENSE](LICENSE).
+
+The IAB renderer's Cartesian extent panner and side wall row exclusion in `src/iab/panner.rs`
+follow EBU's [ear](https://github.com/ebu/ebu_adm_renderer) 2.1.0, under the BSD-3-Clause-Clear
+licence in [src/iab/LICENSE-ear](src/iab/LICENSE-ear).
