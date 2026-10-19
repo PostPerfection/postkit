@@ -4,12 +4,14 @@ mod direct_speakers;
 mod dlc;
 mod panner;
 mod parse;
+mod reader;
 mod render;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use parse::parse_frame;
+pub use reader::AtmosReader;
 pub use render::{ExcludedFeature, OutputLayout, Renderer};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
