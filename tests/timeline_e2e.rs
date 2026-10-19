@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use postkit::encode::{FrameRate, SourceColour};
 use postkit::j2k::{ImfProfile, imf_levels, imf_rsiz};
 use postkit::mxf_wrap::{IncrementalWrapOptions, MxfStandard, rec709_sdr_picture_colour};
+use postkit::picture_findings::{FrameInterval, PictureFindings};
 use postkit::picture_processing::{Fit, PictureProcessing, Placement};
 use postkit::pipeline::{
     EncodeRunOptions, PipelineProgress, StretchBase, run_encode_timeline,
@@ -693,4 +694,263 @@ fn a_composite_stretch_and_a_black_one_wrap_into_track_files_of_their_own() {
             );
         }
     }
+}
+
+const LIME: [i32; 3] = [0, FULL, 0];
+
+fn lime_card(directory: &Path) -> PathBuf {
+    let card = directory.join("lime.png");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=lime:s={WIDTH}x{HEIGHT}"),
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "rgb24",
+        &card.to_string_lossy(),
+    ]);
+    card
+}
+
+const HELD_FRAMES: u64 = 10;
+const HOLD_START: u64 = 6;
+
+// blue, the lime card held, then the padded red pillar
+fn held_still_timeline(directory: &Path) -> Timeline {
+    let blue = blue_video(directory, 1);
+    let card = lime_card(directory);
+    let red_pillar = red_pillar_stills(directory, 4);
+    Timeline {
+        reel_starts: Vec::new(),
+        ..timeline(vec![
+            layered(&blue, 0, HOLD_START, 0, 1.0),
+            layered(&card, HOLD_START, HELD_FRAMES, 0, 1.0),
+            layered(&red_pillar, HOLD_START + HELD_FRAMES, 4, 0, 1.0),
+        ])
+    }
+}
+
+fn samples_close_to(found: [[i32; 3]; 3], want: [[i32; 3]; 3]) -> bool {
+    found
+        .iter()
+        .zip(want)
+        .all(|(&found, want)| close_to(found, want))
+}
+
+#[test]
+fn a_held_still_encodes_once_and_links_its_codestream_for_the_hold() {
+    let directory = tempfile::tempdir().unwrap();
+    let timeline = held_still_timeline(directory.path());
+    let total_frames = HOLD_START + HELD_FRAMES + 4;
+
+    let (result, frames_reported) = encode(
+        &timeline,
+        &directory.path().join("out"),
+        &compositing_options(),
+    );
+    assert_eq!(result.frames_encoded, total_frames);
+    let names = codestream_names(&result.j2k_dir);
+    assert_eq!(names, numbered_codestreams(total_frames));
+    assert_eq!(frames_reported.last(), Some(&total_frames));
+
+    let hold = HOLD_START..HOLD_START + HELD_FRAMES;
+    for (frame, name) in names.iter().enumerate() {
+        let frame = frame as u64;
+        let want = match frame {
+            _ if frame < hold.start => [BLUE, BLUE, BLUE],
+            _ if hold.contains(&frame) => [LIME, LIME, LIME],
+            _ => [BLACK, RED, BLACK],
+        };
+        let found = sampled_pixels(&result.j2k_dir.join(name));
+        assert!(
+            samples_close_to(found, want),
+            "timeline frame {frame} samples {found:?}, not {want:?}"
+        );
+    }
+
+    // emptying the first held codestream empties the rest of the hold only if they are one file
+    let codestream = |frame: u64| result.j2k_dir.join(format!("frame_{frame:08}.j2c"));
+    std::fs::File::create(codestream(hold.start)).unwrap();
+    for frame in hold.start + 1..hold.end {
+        assert!(
+            std::fs::read(codestream(frame)).unwrap().is_empty(),
+            "frame {frame} is a link to the first frame of the hold"
+        );
+    }
+    assert!(!std::fs::read(codestream(hold.end)).unwrap().is_empty());
+}
+
+#[test]
+fn a_held_still_stretch_wraps_into_a_track_file_of_its_hold() {
+    let directory = tempfile::tempdir().unwrap();
+    let timeline = held_still_timeline(directory.path());
+    let stretches = timeline_stretches(&timeline, &compositing_options()).unwrap();
+    let stretch = &stretches[1];
+    assert_eq!(stretch.frames, HOLD_START..HOLD_START + HELD_FRAMES);
+    assert_eq!(stretch.base, StretchBase::Clip(1));
+
+    let levels = imf_levels(WIDTH, HEIGHT, f64::from(RATE), IMF_BITS_PER_SECOND).unwrap();
+    let options = EncodeRunOptions {
+        rsiz: imf_rsiz(ImfProfile::for_raster(WIDTH, HEIGHT).unwrap(), levels),
+        ..compositing_options()
+    };
+    let output = directory.path().join("stretch");
+    std::fs::create_dir_all(&output).unwrap();
+    let mxf = output.join("picture.mxf");
+    let frames_reported = Mutex::new(Vec::new());
+    let (encode, track) = run_encode_timeline_stretch_and_wrap_picture(
+        &timeline,
+        stretch,
+        &output,
+        &options,
+        IncrementalWrapOptions {
+            output: mxf.clone(),
+            standard: MxfStandard::As02,
+            fps_num: RATE,
+            fps_den: 1,
+            encryption: None,
+            hdr: Some(rec709_sdr_picture_colour()),
+            asset_uuid: None,
+        },
+        &Arc::new(AtomicBool::new(false)),
+        &Arc::new(AtomicBool::new(false)),
+        |progress: &PipelineProgress| frames_reported.lock().unwrap().push(progress.frame),
+        |_: &str| {},
+    )
+    .expect("the held still encodes and wraps");
+    assert_eq!(encode.frames_encoded, HELD_FRAMES);
+    assert_eq!(
+        (track.path.clone(), track.duration),
+        (mxf.clone(), HELD_FRAMES)
+    );
+    assert_eq!(
+        frames_reported.into_inner().unwrap().last(),
+        Some(&HELD_FRAMES)
+    );
+
+    let unwrapped = output.join("unwrapped");
+    let info = postkit::mxf_unwrap::unwrap_picture_mxf(
+        &mxf,
+        &unwrapped,
+        &AtomicBool::new(false),
+        &mut |_, _| {},
+    )
+    .expect("the track file reads back");
+    assert_eq!(info.frames, HELD_FRAMES);
+    let names = codestream_names(&unwrapped);
+    assert_eq!(names.len() as u64, HELD_FRAMES);
+    for name in names {
+        let found = sampled_pixels(&unwrapped.join(&name));
+        assert!(
+            samples_close_to(found, [LIME, LIME, LIME]),
+            "{name} samples {found:?}"
+        );
+    }
+}
+
+#[test]
+fn a_still_composites_as_an_overlay_with_alpha_and_as_a_base() {
+    let directory = tempfile::tempdir().unwrap();
+    let blue = blue_video(directory.path(), 1);
+    let card = lime_card(directory.path());
+    let half_red = half_red_stills(directory.path(), 8);
+    let half_red_still = half_red.join("frame_0001.png");
+    let timeline = Timeline {
+        reel_starts: Vec::new(),
+        ..timeline(vec![
+            layered(&blue, 0, 8, 0, 1.0),
+            layered(&half_red_still, 2, 4, 1, 1.0),
+            layered(&card, 8, 8, 0, 1.0),
+            layered(&half_red, 10, 4, 1, 1.0),
+        ])
+    };
+
+    let (result, _) = encode(
+        &timeline,
+        &directory.path().join("out"),
+        &compositing_options(),
+    );
+    let names = codestream_names(&result.j2k_dir);
+    assert_eq!(names, numbered_codestreams(16));
+    let expected = |frame: u64| match frame {
+        2..6 => [RED, RED, BLUE],
+        0..8 => [BLUE, BLUE, BLUE],
+        10..14 => [RED, RED, LIME],
+        _ => [LIME, LIME, LIME],
+    };
+    for (frame, name) in names.iter().enumerate() {
+        let found = sampled_pixels(&result.j2k_dir.join(name));
+        let want = expected(frame as u64);
+        assert!(
+            samples_close_to(found, want),
+            "timeline frame {frame} samples {found:?}, not {want:?}"
+        );
+    }
+}
+
+fn black_card(directory: &Path) -> PathBuf {
+    let card = directory.join("black.png");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=black:s={WIDTH}x{HEIGHT}"),
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "rgb24",
+        &card.to_string_lossy(),
+    ]);
+    card
+}
+
+const THREE_SECONDS: u64 = 3 * RATE as u64;
+
+fn still_held_three_seconds(directory: &Path, still: &Path) -> Timeline {
+    let blue = blue_video(directory, 1);
+    let red_pillar = red_pillar_stills(directory, 4);
+    Timeline {
+        reel_starts: Vec::new(),
+        ..timeline(vec![
+            layered(&blue, 0, HOLD_START, 0, 1.0),
+            layered(still, HOLD_START, THREE_SECONDS, 0, 1.0),
+            layered(&red_pillar, HOLD_START + THREE_SECONDS, 4, 0, 1.0),
+        ])
+    }
+}
+
+#[test]
+fn a_black_held_still_reports_black_over_its_hold_and_a_lime_one_reports_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let detecting = EncodeRunOptions {
+        detect_picture_findings: true,
+        ..compositing_options()
+    };
+
+    let black = black_card(directory.path());
+    let (result, _) = encode(
+        &still_held_three_seconds(directory.path(), &black),
+        &directory.path().join("black_out"),
+        &detecting,
+    );
+    assert_eq!(
+        result.picture_findings,
+        PictureFindings {
+            black: vec![FrameInterval {
+                first_frame: HOLD_START,
+                last_frame: HOLD_START + THREE_SECONDS - 1,
+            }],
+            frozen: Vec::new(),
+        }
+    );
+
+    let lime = lime_card(directory.path());
+    let (result, _) = encode(
+        &still_held_three_seconds(directory.path(), &lime),
+        &directory.path().join("lime_out"),
+        &detecting,
+    );
+    assert_eq!(result.picture_findings, PictureFindings::default());
 }

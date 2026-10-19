@@ -5,6 +5,7 @@
 //! `split` branch of their own: put them in the main chain and ffmpeg quietly
 //! round trips every frame through yuv444p16le on the way to the compressor.
 
+use crate::encode::FrameRate;
 use crate::timecode::Timecode;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
@@ -98,9 +99,42 @@ pub fn detect_in_essence(
     fps: f64,
     frame_count: u64,
 ) -> Result<PictureFindings, String> {
-    let mut ffmpeg = std::process::Command::new("ffmpeg")
-        .args(["-hide_banner", "-nostats", "-i"])
-        .arg(essence)
+    let mut ffmpeg = std::process::Command::new("ffmpeg");
+    ffmpeg.args(["-hide_banner", "-nostats", "-i"]).arg(essence);
+    let detection = detection_lines(ffmpeg, essence)?;
+    Ok(parse_ffmpeg_stderr(&detection, fps, frame_count))
+}
+
+// a held image is frozen on purpose, so only its black runs count
+pub fn detect_black_in_held_image(
+    image: &Path,
+    fps: FrameRate,
+    hold_frames: u64,
+) -> Result<Vec<FrameInterval>, String> {
+    // every frame of a hold is the same, so one run just past the minimum answers for the whole hold
+    let measured_frames =
+        hold_frames.min((BLACK_MINIMUM_DURATION_SECONDS * fps.as_f64()).ceil() as u64 + 1);
+    let mut ffmpeg = std::process::Command::new("ffmpeg");
+    ffmpeg
+        .args(["-hide_banner", "-nostats", "-loop", "1", "-framerate"])
+        .arg(fps.ffmpeg_filter_value())
+        .arg("-i")
+        .arg(image)
+        .arg("-frames:v")
+        .arg(measured_frames.to_string());
+    let detection = detection_lines(ffmpeg, image)?;
+    let black = parse_ffmpeg_stderr(&detection, fps.as_f64(), measured_frames).black;
+    if black.is_empty() {
+        return Ok(Vec::new());
+    }
+    Ok(vec![FrameInterval {
+        first_frame: 0,
+        last_frame: hold_frames - 1,
+    }])
+}
+
+fn detection_lines(mut ffmpeg: std::process::Command, input: &Path) -> Result<Vec<String>, String> {
+    let mut ffmpeg = ffmpeg
         .arg("-vf")
         .arg(detection_filters())
         .args(["-f", "null", "-"])
@@ -124,11 +158,11 @@ pub fn detect_in_essence(
         .map_err(|e| format!("cannot wait for ffmpeg: {e}"))?;
     if !status.success() {
         return Err(match last_other.trim() {
-            "" => format!("ffmpeg could not decode {}", essence.display()),
+            "" => format!("ffmpeg could not decode {}", input.display()),
             reason => reason.to_string(),
         });
     }
-    Ok(parse_ffmpeg_stderr(&detection, fps, frame_count))
+    Ok(detection)
 }
 
 fn is_detection_line(line: &str) -> bool {
@@ -217,6 +251,56 @@ mod tests {
         assert!(
             findings.black[0].last_frame >= 47,
             "a three second run at 24 fps covers most of 72 frames: {findings:?}"
+        );
+    }
+
+    fn one_frame_png(directory: &Path, colour: &str) -> std::path::PathBuf {
+        let image = directory.join(format!("{colour}.png"));
+        let made = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-f", "lavfi", "-i"])
+            .arg(format!("color=c={colour}:size=320x240"))
+            .args(["-frames:v", "1", "-pix_fmt", "rgb24", "-y"])
+            .arg(&image)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "fixture encode failed: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        image
+    }
+
+    #[test]
+    fn a_black_image_held_past_the_minimum_reports_black_over_the_whole_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let black = one_frame_png(dir.path(), "black");
+        assert_eq!(
+            detect_black_in_held_image(&black, FrameRate::whole(24), 72).unwrap(),
+            vec![FrameInterval {
+                first_frame: 0,
+                last_frame: 71,
+            }]
+        );
+        assert_eq!(
+            detect_black_in_held_image(&black, FrameRate::whole(24), 14_400).unwrap(),
+            vec![FrameInterval {
+                first_frame: 0,
+                last_frame: 14_399,
+            }],
+            "a ten minute hold is measured past the minimum and reported whole"
+        );
+        assert!(
+            detect_black_in_held_image(&black, FrameRate::whole(24), 24)
+                .unwrap()
+                .is_empty(),
+            "one second is under blackdetect's minimum"
+        );
+        let white = one_frame_png(dir.path(), "white");
+        assert!(
+            detect_black_in_held_image(&white, FrameRate::whole(24), 72)
+                .unwrap()
+                .is_empty()
         );
     }
 

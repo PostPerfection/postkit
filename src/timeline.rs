@@ -150,26 +150,11 @@ impl Timeline {
                     clip.out_frame, clip.in_frame
                 ));
             }
-            let source = probe_source(&clip.picture).map_err(|e| format!("{name}: {e}"))?;
-            if clip.in_frame >= source.frames {
-                return Err(format!(
-                    "{name}: the in point {} is past the source's {} frames",
-                    clip.in_frame, source.frames
-                ));
-            }
-            if clip.out_frame > source.frames {
-                return Err(format!(
-                    "{name}: the out point {} is past the source's {} frames",
-                    clip.out_frame, source.frames
-                ));
-            }
-            if let Some(rate) = source.rate
-                && rate_differs(rate, self.fps)
-            {
-                return Err(format!(
-                    "{name} runs at {}/{} fps and the timeline at {}/{} fps",
-                    rate.numerator, rate.denominator, self.fps.numerator, self.fps.denominator
-                ));
+            match probe_source(&clip.picture).map_err(|e| format!("{name}: {e}"))? {
+                SourceLength::Still => check_still_in_point(&name, clip)?,
+                SourceLength::Counted { frames, rate } => {
+                    check_counted_source(&name, clip, frames, rate, self.fps)?
+                }
             }
             if !(0.0..=1.0).contains(&clip.opacity) {
                 return Err(format!(
@@ -235,6 +220,47 @@ impl Timeline {
     }
 }
 
+fn check_still_in_point(name: &str, clip: &Clip) -> Result<(), String> {
+    if clip.in_frame != 0 {
+        return Err(format!(
+            "{name}: the in point is {}, and a still is held from its first frame: its in point \
+             is 0 and its out point sets the hold",
+            clip.in_frame
+        ));
+    }
+    Ok(())
+}
+
+fn check_counted_source(
+    name: &str,
+    clip: &Clip,
+    source_frames: u64,
+    source_rate: Option<FrameRate>,
+    timeline_rate: FrameRate,
+) -> Result<(), String> {
+    if clip.in_frame >= source_frames {
+        return Err(format!(
+            "{name}: the in point {} is past the source's {source_frames} frames",
+            clip.in_frame
+        ));
+    }
+    if clip.out_frame > source_frames {
+        return Err(format!(
+            "{name}: the out point {} is past the source's {source_frames} frames",
+            clip.out_frame
+        ));
+    }
+    if let Some(rate) = source_rate
+        && rate_differs(rate, timeline_rate)
+    {
+        return Err(format!(
+            "{name} runs at {}/{} fps and the timeline at {}/{} fps",
+            rate.numerator, rate.denominator, timeline_rate.numerator, timeline_rate.denominator
+        ));
+    }
+    Ok(())
+}
+
 impl Clip {
     fn frame_count(&self) -> u64 {
         self.out_frame.saturating_sub(self.in_frame)
@@ -262,6 +288,7 @@ pub struct SingleClipBuild {
     // the subtitle is timed against the clip's source
     pub subtitle_from_clip: bool,
     pub reel_split_frames: Vec<u64>,
+    pub still_hold_frames: Option<u64>,
 }
 
 pub fn shape(timeline: &Timeline) -> Result<TimelineShape, String> {
@@ -286,8 +313,11 @@ pub fn shape(timeline: &Timeline) -> Result<TimelineShape, String> {
         ));
     }
     refuse_two_subtitle_sources(timeline)?;
-    let source_frames =
-        single_clip_frame_count(&clip.picture).map_err(|e| format!("{name}: {e}"))?;
+    let (trim_end_frames, still_hold_frames) =
+        match probe_source(&clip.picture).map_err(|e| format!("{name}: {e}"))? {
+            SourceLength::Still => (0, Some(clip.out_frame)),
+            SourceLength::Counted { frames, .. } => (frames - clip.out_frame, None),
+        };
     let audio = match (&timeline.sound, &clip.sound) {
         (SoundTrack::Override(path), _) | (SoundTrack::PerClip, ClipSound::File(path)) => {
             Some(path.clone())
@@ -297,12 +327,13 @@ pub fn shape(timeline: &Timeline) -> Result<TimelineShape, String> {
     Ok(TimelineShape::SingleClip(SingleClipBuild {
         picture: clip.picture.clone(),
         trim_start_frames: clip.in_frame,
-        trim_end_frames: source_frames - clip.out_frame,
+        trim_end_frames,
         audio,
         silent: timeline.sound == SoundTrack::PerClip && clip.sound == ClipSound::None,
         subtitle: clip.subtitle.clone().or_else(|| timeline.subtitle.clone()),
         subtitle_from_clip: clip.subtitle.is_some(),
         reel_split_frames: timeline.reel_starts.clone(),
+        still_hold_frames,
     }))
 }
 
@@ -326,18 +357,6 @@ pub fn refuse_two_subtitle_sources(timeline: &Timeline) -> Result<(), String> {
     }
 }
 
-// counted the way a create command counts the picture it trims
-fn single_clip_frame_count(picture: &Path) -> Result<u64, String> {
-    match crate::encode::detect_input_type(picture) {
-        InputType::ImageSequence if !picture.is_dir() => Err(SINGLE_CLIP_PICTURES.to_string()),
-        InputType::Unknown => Err(SINGLE_CLIP_PICTURES.to_string()),
-        _ => Ok(probe_source(picture)?.frames),
-    }
-}
-
-const SINGLE_CLIP_PICTURES: &str =
-    "a one-clip timeline takes a video, a picture MXF, or a directory of images or codestreams";
-
 pub fn clip_name(index: usize, clip: &Clip) -> String {
     format!("clip {} ({})", index + 1, clip.picture.display())
 }
@@ -348,13 +367,21 @@ fn rate_differs(a: FrameRate, b: FrameRate) -> bool {
         != u64::from(b.numerator) * u64::from(a.denominator)
 }
 
-pub(crate) struct SourceLength {
-    pub frames: u64,
-    // None for a sequence of stills, which runs at whatever rate it is given
-    pub rate: Option<FrameRate>,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SourceLength {
+    Counted {
+        frames: u64,
+        // None for an image sequence, which runs at whatever rate it is given
+        rate: Option<FrameRate>,
+    },
+    // one image file, held for as long as its clip runs
+    Still,
 }
 
-pub(crate) fn probe_source(picture: &Path) -> Result<SourceLength, String> {
+pub fn probe_source(picture: &Path) -> Result<SourceLength, String> {
+    if crate::still::is_still_image(picture) {
+        return Ok(SourceLength::Still);
+    }
     match crate::encode::detect_input_type(picture) {
         InputType::Video => {
             let info = crate::probe::probe_video(picture)
@@ -365,27 +392,26 @@ pub(crate) fn probe_source(picture: &Path) -> Result<SourceLength, String> {
                     info.total_frames, info.fps_num, info.fps_den
                 ));
             }
-            Ok(SourceLength {
+            Ok(SourceLength::Counted {
                 frames: u64::from(info.total_frames),
                 rate: Some(FrameRate::new(info.fps_num, info.fps_den)),
             })
         }
         InputType::ImageSequence => {
-            let directory = crate::encode::sequence_directory(picture);
-            let frames = crate::encode::find_source_frames(&directory)
-                .map_err(|e| format!("cannot list {}: {e}", directory.display()))?;
-            Ok(SourceLength {
+            let frames = crate::encode::find_source_frames(picture)
+                .map_err(|e| format!("cannot list {}: {e}", picture.display()))?;
+            Ok(SourceLength::Counted {
                 frames: frames.len() as u64,
                 rate: None,
             })
         }
-        InputType::J2kSequence => Ok(SourceLength {
+        InputType::J2kSequence => Ok(SourceLength::Counted {
             frames: j2k_codestreams(&crate::encode::sequence_directory(picture))?.len() as u64,
             rate: None,
         }),
         InputType::PictureMxf => {
             let info = crate::mxf_unwrap::probe_picture_mxf(picture)?;
-            Ok(SourceLength {
+            Ok(SourceLength::Counted {
                 frames: info.frames,
                 rate: Some(FrameRate::new(info.edit_rate_num, info.edit_rate_den)),
             })
@@ -464,7 +490,7 @@ pub fn render_sound(timeline: &Timeline, output: &Path) -> Result<Option<PathBuf
     Ok(Some(output.to_path_buf()))
 }
 
-fn shared_channel_count(timeline: &Timeline) -> Result<Option<u16>, String> {
+pub fn shared_channel_count(timeline: &Timeline) -> Result<Option<u16>, String> {
     let mut first: Option<(usize, u16)> = None;
     for (index, clip) in timeline.clips.iter().enumerate() {
         let channels = match &clip.sound {
@@ -871,6 +897,7 @@ mod tests {
                 subtitle: None,
                 subtitle_from_clip: false,
                 reel_split_frames: vec![3],
+                still_hold_frames: None,
             }
         );
     }
@@ -1032,6 +1059,62 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    fn still_image(path: &Path) -> PathBuf {
+        std::fs::write(path, b"png").unwrap();
+        path.to_path_buf()
+    }
+
+    #[test]
+    fn a_still_is_held_from_its_first_frame_and_a_sequence_counts_its_images() {
+        let directory = tempfile::tempdir().unwrap();
+        let stills = still_sequence(&directory.path().join("stills"), 10);
+        let card = still_image(&directory.path().join("card.png"));
+        assert_eq!(probe_source(&card).unwrap(), SourceLength::Still);
+        assert_eq!(
+            probe_source(&stills).unwrap(),
+            SourceLength::Counted {
+                frames: 10,
+                rate: None
+            }
+        );
+        assert!(
+            timeline(vec![
+                clip(&stills, 0, 0, 10, ClipSound::None),
+                clip(&card, 10, 0, 500, ClipSound::None),
+            ])
+            .check()
+            .is_ok(),
+            "a still has no frame count for its out point to run past"
+        );
+        assert_eq!(
+            timeline(vec![
+                clip(&stills, 0, 0, 10, ClipSound::None),
+                clip(&card, 10, 3, 10, ClipSound::None),
+            ])
+            .check()
+            .unwrap_err(),
+            format!(
+                "clip 2 ({}): the in point is 3, and a still is held from its first frame: its in \
+                 point is 0 and its out point sets the hold",
+                card.display()
+            )
+        );
+    }
+
+    #[test]
+    fn one_still_clip_is_held_for_its_out_point_with_no_trims() {
+        let directory = tempfile::tempdir().unwrap();
+        let card = still_image(&directory.path().join("card.png"));
+        let TimelineShape::SingleClip(build) =
+            shape(&timeline(vec![clip(&card, 0, 0, 120, ClipSound::None)])).unwrap()
+        else {
+            panic!("one clip is the one-picture build");
+        };
+        assert_eq!(build.picture, card);
+        assert_eq!(build.still_hold_frames, Some(120));
+        assert_eq!((build.trim_start_frames, build.trim_end_frames), (0, 0));
     }
 
     #[test]
@@ -1421,7 +1504,10 @@ mod tests {
         ]);
         assert_eq!(gaps.base_gaps(), vec![0..12, 36..60, 72..90]);
         assert_eq!(render_black(&gaps, &output).unwrap(), Some(output.clone()));
-        assert_eq!(probe_source(&output).unwrap().frames, 24);
+        assert!(matches!(
+            probe_source(&output).unwrap(),
+            SourceLength::Counted { frames: 24, .. }
+        ));
     }
 
     #[test]
@@ -1482,7 +1568,10 @@ mod tests {
             .parse()
             .unwrap();
 
-        assert_eq!(probe_source(&mp4).unwrap().frames, decoded);
+        let SourceLength::Counted { frames, .. } = probe_source(&mp4).unwrap() else {
+            panic!("a video is counted");
+        };
+        assert_eq!(frames, decoded);
         assert_eq!(decoded, DOLBY_VISION_FIXTURE_FRAMES as u64);
     }
 }

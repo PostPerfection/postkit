@@ -155,7 +155,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         },
         ..CompressParams::default()
     };
-    let encoded = distinct_frames(burn.as_deref(), frames);
+    let encoded = distinct_frames(burn.as_deref(), 0..frames);
     let cancel = Arc::new(AtomicBool::new(false));
     grok_encoder::initialize(*encode_threads);
     let mut next = encoded.iter().copied();
@@ -200,14 +200,17 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
 
 /// Frame indices that have to be encoded: the first frame, plus every frame
 /// where the burnt-in cues change. Without a burn every frame is identical, so
-/// that is frame 0 alone.
-fn distinct_frames(burn: Option<&crate::subtitle_raster::SubtitleBurn>, frames: u64) -> Vec<u64> {
+/// that is the first frame alone.
+pub(crate) fn distinct_frames(
+    burn: Option<&crate::subtitle_raster::SubtitleBurn>,
+    frames: std::ops::Range<u64>,
+) -> Vec<u64> {
     let Some(burn) = burn else {
-        return vec![0];
+        return vec![frames.start];
     };
-    let mut encoded = vec![0u64];
-    let mut current = burn.active_cues(0);
-    for index in 1..frames {
+    let mut encoded = vec![frames.start];
+    let mut current = burn.active_cues(frames.start);
+    for index in frames.start + 1..frames.end {
         let active = burn.active_cues(index);
         if active != current {
             encoded.push(index);
@@ -242,14 +245,15 @@ mod tests {
         use crate::subtitle_formats::{StyledCue, StyledRun};
         use crate::subtitle_raster::{BurnStyle, SubtitleBurn};
 
-        assert_eq!(distinct_frames(None, 100), vec![0]);
+        assert_eq!(distinct_frames(None, 0..100), vec![0]);
 
         // one cue over frames 24..48 at 24 fps: the picture changes when it
         // arrives and again when it leaves
         let cue = StyledCue::text(1000, 2000, vec![StyledRun::plain("hello")]);
         let burn =
             SubtitleBurn::new(vec![cue], None, BurnStyle::default(), 24.0).expect("build a burn");
-        assert_eq!(distinct_frames(Some(&burn), 100), vec![0, 24, 48]);
+        assert_eq!(distinct_frames(Some(&burn), 0..100), vec![0, 24, 48]);
+        assert_eq!(distinct_frames(Some(&burn), 30..60), vec![30, 48]);
     }
 
     #[test]

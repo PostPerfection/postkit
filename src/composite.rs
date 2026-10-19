@@ -24,8 +24,24 @@ pub(crate) struct CompositeLayer {
     pub name: String,
     pub input: PathBuf,
     pub decode_source: DecodeSource,
-    pub frame_range: Option<FrameRange>,
+    pub frames: LayerFrames,
     pub picture: PictureProcessing,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum LayerFrames {
+    Advancing { frame_range: Option<FrameRange> },
+    // a still, decoded once and repeated for every frame of the composite
+    Held,
+}
+
+impl LayerFrames {
+    fn frame_range(self) -> Option<FrameRange> {
+        match self {
+            LayerFrames::Advancing { frame_range } => frame_range,
+            LayerFrames::Held => None,
+        }
+    }
 }
 
 pub(crate) enum CompositeBase {
@@ -80,12 +96,14 @@ fn sixteen_bit_opacity(opacity: f64) -> u16 {
 
 enum BaseFrames {
     Decoded { name: String, decoder: FrameDecoder },
+    Held(Vec<u8>),
     Black,
 }
 
 struct OverlayFrames {
     name: String,
-    decoder: FrameDecoder,
+    // None for a held still, whose one frame stays in `frame`
+    decoder: Option<FrameDecoder>,
     opacity: u16,
     frame: Vec<u8>,
 }
@@ -115,10 +133,13 @@ impl FrameSource for CompositeFrames {
                     return NextFrame::Ended;
                 }
             }
+            BaseFrames::Held(frame) => buffer.copy_from_slice(frame),
             BaseFrames::Black => buffer.fill(0),
         }
         for overlay in &mut self.overlays {
-            if let NextFrame::Ended = overlay.decoder.read_into(&mut overlay.frame) {
+            if let Some(decoder) = &mut overlay.decoder
+                && let NextFrame::Ended = decoder.read_into(&mut overlay.frame)
+            {
                 self.failure = Some(ended_early(
                     &overlay.name,
                     self.frames_read,
@@ -135,7 +156,7 @@ impl FrameSource for CompositeFrames {
     fn finish(self, fps: f64, frame_count: u64) -> FinishedDecode {
         let base = match self.base {
             BaseFrames::Decoded { decoder, .. } => decoder.finish(fps, frame_count),
-            BaseFrames::Black => FinishedDecode {
+            BaseFrames::Held(_) | BaseFrames::Black => FinishedDecode {
                 findings: PictureFindings::default(),
                 failure: None,
             },
@@ -143,7 +164,7 @@ impl FrameSource for CompositeFrames {
         let overlay_failures: Vec<String> = self
             .overlays
             .into_iter()
-            .filter_map(|overlay| overlay.decoder.finish(fps, frame_count).failure)
+            .filter_map(|overlay| overlay.decoder?.finish(fps, frame_count).failure)
             .collect();
         // a decoder's own failure says why it ended early
         let failure = base
@@ -172,7 +193,8 @@ fn open_layer(
     on_log: &dyn Fn(&str),
 ) -> Result<OpenedLayer, String> {
     let probed = crate::ffmpeg_decode::probe(&layer.input, layer.decode_source)?;
-    if let Some(range) = layer.frame_range {
+    let frame_range = layer.frames.frame_range();
+    if let Some(range) = frame_range {
         range.check_against_probe(probed.frame_count)?;
     }
     let plan = match alpha {
@@ -189,7 +211,7 @@ fn open_layer(
             picture: PictureFilters::Planned {
                 plan: &plan,
                 fps: opts.fps,
-                frame_range: layer.frame_range,
+                frame_range,
                 extra_filter: None,
             },
             source_colour: &opts.source_colour,
@@ -209,13 +231,26 @@ fn open_layer(
     let EncoderInputFormat::PackedRgb(order) = chain.input_format else {
         unreachable!("postkit reads every composited sample, so no layer decodes to planar YUV")
     };
-    let decoder = start_frame_decoder(&chain, &layer.input, layer.frame_range, width, height)?;
+    let decoder = start_frame_decoder(&chain, &layer.input, frame_range, width, height)?;
     Ok(OpenedLayer {
         decoder,
         order,
         width,
         height,
     })
+}
+
+fn held_frame(opened: OpenedLayer, bytes_per_pixel: usize, fps: f64) -> Result<Vec<u8>, String> {
+    let mut frame = vec![0; opened.width as usize * opened.height as usize * bytes_per_pixel];
+    let mut decoder = opened.decoder;
+    let read = decoder.read_into(&mut frame);
+    if let Some(failure) = decoder.finish(fps, 1).failure {
+        return Err(failure);
+    }
+    match read {
+        NextFrame::Copied => Ok(frame),
+        NextFrame::Ended => Err("the still decoded to no frame".to_string()),
+    }
 }
 
 fn named(name: &str) -> impl Fn(String) -> String + '_ {
@@ -232,11 +267,18 @@ fn composite_frames(
         CompositeBase::Clip(layer) => {
             let opened = open_layer(layer, AlphaChannel::Dropped, opts, params, on_log)
                 .map_err(named(&layer.name))?;
-            let base = BaseFrames::Decoded {
-                name: layer.name.clone(),
-                decoder: opened.decoder,
+            let (order, width, height) = (opened.order, opened.width, opened.height);
+            let base = match layer.frames {
+                LayerFrames::Advancing { .. } => BaseFrames::Decoded {
+                    name: layer.name.clone(),
+                    decoder: opened.decoder,
+                },
+                LayerFrames::Held => BaseFrames::Held(
+                    held_frame(opened, PACKED_RGB_BYTES_PER_PIXEL, opts.fps.as_f64())
+                        .map_err(named(&layer.name))?,
+                ),
             };
-            (base, opened.order, opened.width, opened.height)
+            (base, order, width, height)
         }
         CompositeBase::Black { width, height } => {
             let order = packed_rgb_sample_order(*width, *height, params);
@@ -258,11 +300,22 @@ fn composite_frames(
             opened.order, order,
             "one raster and one set of compression parameters take one sample order"
         );
+        let (decoder, frame) = match layer.frames {
+            LayerFrames::Advancing { .. } => (
+                Some(opened.decoder),
+                vec![0; width as usize * height as usize * PACKED_RGBA_BYTES_PER_PIXEL],
+            ),
+            LayerFrames::Held => (
+                None,
+                held_frame(opened, PACKED_RGBA_BYTES_PER_PIXEL, opts.fps.as_f64())
+                    .map_err(named(&layer.name))?,
+            ),
+        };
         overlays.push(OverlayFrames {
             name: layer.name.clone(),
-            decoder: opened.decoder,
+            decoder,
             opacity: sixteen_bit_opacity(overlay.opacity),
-            frame: vec![0; width as usize * height as usize * PACKED_RGBA_BYTES_PER_PIXEL],
+            frame,
         });
     }
     Ok(FramesToEncode {

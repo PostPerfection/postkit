@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::composite::{Composite, CompositeBase, CompositeLayer, CompositeOverlay};
+use crate::composite::{Composite, CompositeBase, CompositeLayer, CompositeOverlay, LayerFrames};
 pub use crate::encode::FrameRange;
 use crate::encode::{
     DecodeSource, FrameRate, ImageFormat, InputType, SourceColour, StreamEncodeOptions,
@@ -664,6 +664,22 @@ fn encode_base_clip(
         picture,
         ..options.clone()
     };
+    if crate::still::is_still_image(&clip.picture) {
+        return encode_held_still(
+            index,
+            &clip.picture,
+            frames,
+            timeline.fps,
+            output_dir,
+            &clip_options,
+            output,
+            cancel,
+            pause,
+            report,
+            &on_log,
+        )
+        .map_err(|error| name_the_clip(&name, error));
+    }
     if compressed && let StretchOutput::TimelineCodestreams = output {
         let scratch_dir = output_dir.join(format!("timeline_clip_{index}"));
         place_compressed_clip(
@@ -710,6 +726,124 @@ fn encode_base_clip(
     })
 }
 
+// a directory of the one image takes the still through the encode an image sequence takes
+#[allow(clippy::too_many_arguments)]
+fn encode_held_still(
+    index: usize,
+    image: &Path,
+    frames: &Range<u64>,
+    fps: FrameRate,
+    output_dir: &Path,
+    options: &EncodeRunOptions,
+    output: StretchOutput,
+    cancel: &Arc<AtomicBool>,
+    pause: &Arc<AtomicBool>,
+    report: impl Fn(&PipelineProgress),
+    on_log: impl Fn(&str),
+) -> Result<StretchEncoded, String> {
+    let frame_count = frames.end - frames.start;
+    let first_output_frame = output.first_output_frame(frames.start);
+    let output_frames = first_output_frame..first_output_frame + frame_count;
+    let encoded =
+        crate::still::distinct_frames(options.subtitle_burn.as_deref(), output_frames.clone());
+    let image_dir = output_dir.join(format!("timeline_clip_{index}_image"));
+    if image_dir.exists() {
+        std::fs::remove_dir_all(&image_dir)
+            .map_err(|e| format!("cannot clear {}: {e}", image_dir.display()))?;
+    }
+    std::fs::create_dir_all(&image_dir)
+        .map_err(|e| format!("cannot create {}: {e}", image_dir.display()))?;
+    link_or_copy(
+        image,
+        &image_dir.join(image.file_name().expect("a still image has a file name")),
+    )?;
+    let j2k_dir = output_dir.join("j2k");
+    let mut wrap = output
+        .wrap()
+        .map(crate::mxf_wrap::IncrementalJ2kWrap::new)
+        .transpose()?;
+    let mut finished_phases = PhaseSeconds::default();
+    for (at, &start) in encoded.iter().enumerate() {
+        let end = encoded.get(at + 1).copied().unwrap_or(output_frames.end);
+        let run_offset = start - first_output_frame;
+        let run_length = end - start;
+        let run_phases = std::cell::Cell::new(PhaseSeconds::default());
+        run_encode_and_maybe_wrap(
+            &image_dir,
+            output_dir,
+            options,
+            None,
+            start,
+            cancel,
+            pause,
+            |progress: &PipelineProgress| {
+                run_phases.set(PhaseSeconds::of(progress));
+                let phases = finished_phases.plus(run_phases.get());
+                // the one encoded frame stands for every frame of its run
+                let frame = run_offset + progress.frame * run_length;
+                report(&PipelineProgress {
+                    message: format!("Frame {frame}/{frame_count}"),
+                    frame,
+                    total_frames: frame_count,
+                    percent: (frame as f64 / frame_count as f64 * 100.0).min(99.0),
+                    decode_wait_secs: phases.decode_wait,
+                    prepare_secs: phases.prepare,
+                    encode_secs: phases.encode,
+                    write_secs: phases.write,
+                    ..progress.clone()
+                });
+            },
+            &on_log,
+        )?;
+        finished_phases = finished_phases.plus(run_phases.get());
+        let codestream = j2k_dir.join(format!("frame_{start:08}.j2c"));
+        for frame in start + 1..end {
+            link_or_copy(&codestream, &j2k_dir.join(format!("frame_{frame:08}.j2c")))?;
+        }
+        if let Some(wrap) = wrap.as_mut() {
+            let data = std::fs::read(&codestream)
+                .map_err(|e| format!("cannot read {}: {e}", codestream.display()))?;
+            for _ in start..end {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(CANCELLED.to_string());
+                }
+                wrap.write_frame(&data)?;
+            }
+        }
+    }
+    std::fs::remove_dir_all(&image_dir)
+        .map_err(|e| format!("cannot remove {}: {e}", image_dir.display()))?;
+    let track = wrap
+        .map(crate::mxf_wrap::IncrementalJ2kWrap::finish)
+        .transpose()?;
+    if let Some(track) = &track {
+        on_log(&format!(
+            "[WRAP] {} frames into {}",
+            track.duration,
+            track.path.display()
+        ));
+    }
+    let black = if options.detect_picture_findings {
+        crate::picture_findings::detect_black_in_held_image(image, fps, frame_count)?
+    } else {
+        Vec::new()
+    };
+    Ok(StretchEncoded {
+        frames_encoded: frame_count,
+        picture_findings: crate::picture_findings::PictureFindings {
+            black,
+            frozen: Vec::new(),
+        },
+        track,
+    })
+}
+
+fn link_or_copy(source: &Path, target: &Path) -> Result<(), String> {
+    std::fs::hard_link(source, target)
+        .or_else(|_| std::fs::copy(source, target).map(|_| ()))
+        .map_err(|e| format!("cannot place {}: {e}", target.display()))
+}
+
 fn composite_layer(
     timeline: &Timeline,
     index: usize,
@@ -721,22 +855,37 @@ fn composite_layer(
     let name = crate::timeline::clip_name(index, clip);
     let window = clip_window(clip, frames);
     let picture = effective_picture(clip, options);
+    let list = output_dir.join(format!("timeline_clip_{index}.ffconcat"));
+    if crate::still::is_still_image(&clip.picture) {
+        crate::encode::write_image_concat_list(
+            std::slice::from_ref(&clip.picture),
+            timeline.fps,
+            &list,
+        )?;
+        return Ok(CompositeLayer {
+            name,
+            input: list,
+            decode_source: DecodeSource::ImageList,
+            frames: LayerFrames::Held,
+            picture,
+        });
+    }
     match crate::encode::detect_input_type(&clip.picture) {
         InputType::Video => Ok(CompositeLayer {
             name,
             input: clip.picture.clone(),
             decode_source: DecodeSource::Video,
-            frame_range: Some(window),
+            frames: LayerFrames::Advancing {
+                frame_range: Some(window),
+            },
             picture,
         }),
         InputType::ImageSequence => {
-            let directory = crate::encode::sequence_directory(&clip.picture);
-            let stills = crate::encode::find_source_frames(&directory)
-                .map_err(|e| format!("{name}: cannot list {}: {e}", directory.display()))?;
-            let list = output_dir.join(format!("timeline_clip_{index}.ffconcat"));
+            let images = crate::encode::find_source_frames(&clip.picture)
+                .map_err(|e| format!("{name}: cannot list {}: {e}", clip.picture.display()))?;
             crate::encode::write_image_concat_list(
                 window
-                    .window_of(&stills)
+                    .window_of(&images)
                     .map_err(|error| name_the_clip(&name, error))?,
                 timeline.fps,
                 &list,
@@ -745,7 +894,7 @@ fn composite_layer(
                 name,
                 input: list,
                 decode_source: DecodeSource::ImageList,
-                frame_range: None,
+                frames: LayerFrames::Advancing { frame_range: None },
                 picture,
             })
         }
@@ -896,7 +1045,13 @@ fn place_compressed_clip(
     on_progress: impl Fn(&PipelineProgress),
     on_log: impl Fn(&str),
 ) -> Result<(), String> {
-    let source_frames = crate::timeline::probe_source(&clip.picture)?.frames;
+    let crate::timeline::SourceLength::Counted {
+        frames: source_frames,
+        ..
+    } = crate::timeline::probe_source(&clip.picture)?
+    else {
+        unreachable!("a compressed clip is a codestream directory or a picture MXF, never a still")
+    };
     if clip.in_frame != 0 || clip.out_frame != source_frames {
         return Err(format!(
             "it is already JPEG 2000 and cannot be trimmed: its in and out points have to be \
@@ -926,13 +1081,12 @@ fn place_compressed_clip(
             "frame_{:08}.j2c",
             first_output_frame + offset as u64
         ));
-        let placed = if unwrapped {
+        if unwrapped {
             std::fs::rename(codestream, &target)
+                .map_err(|e| format!("cannot place {}: {e}", target.display()))?;
         } else {
-            std::fs::hard_link(codestream, &target)
-                .or_else(|_| std::fs::copy(codestream, &target).map(|_| ()))
-        };
-        placed.map_err(|e| format!("cannot place {}: {e}", target.display()))?;
+            link_or_copy(codestream, &target)?;
+        }
     }
     std::fs::remove_dir_all(scratch_dir)
         .map_err(|e| format!("cannot remove {}: {e}", scratch_dir.display()))
