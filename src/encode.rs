@@ -422,6 +422,8 @@ const PACKED_RGB_BIG_ENDIAN_PIXEL_FORMAT: &str = "rgb48be";
 const PACKED_RGB_LITTLE_ENDIAN_PIXEL_FORMAT: &str = "rgb48le";
 pub(crate) const PACKED_RGB_BYTES_PER_PIXEL: usize = 6;
 pub(crate) const PACKED_RGB_PRECISION: u8 = 16;
+// premultiplying by alpha is the picture composited over black
+pub const SIXTEEN_BIT_OVER_BLACK_FILTER: &str = "format=gbrap16le,premultiply=inplace=1";
 
 /// A planar YUV pixel format postkit passes to grok's accelerator plugin as it
 /// comes off the decode. The name is ffprobe's and `-pix_fmt`'s.

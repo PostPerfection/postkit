@@ -9,8 +9,9 @@ use postkit::picture_findings::{FrameInterval, PictureFindings};
 use postkit::picture_processing::{Fit, PictureProcessing, Placement};
 use postkit::pipeline::{
     EncodeRunOptions, PipelineProgress, StretchBase, run_encode_timeline,
-    run_encode_timeline_stretch_and_wrap_picture, timeline_stretches,
+    run_encode_timeline_stretch_and_wrap_picture, run_encode_with_options, timeline_stretches,
 };
+use postkit::still::{StillHold, build_still_frames};
 use postkit::subtitle_retime::parse_srt;
 use postkit::timeline::{
     Clip, ClipSound, SoundTrack, TIMELINE_FORMAT_VERSION, Timeline, join_subtitles, render_sound,
@@ -953,4 +954,188 @@ fn a_black_held_still_reports_black_over_its_hold_and_a_lime_one_reports_nothing
         &detecting,
     );
     assert_eq!(result.picture_findings, PictureFindings::default());
+}
+
+// transparent white over the left quarter, white at half alpha over the next and opaque lime over the right half
+const ALPHA_CARD_FILTER: &str = "format=rgba,geq=r='if(lt(X,W/2),255,0)':g=255:\
+    b='if(lt(X,W/2),255,0)':a='if(lt(X,W/4),0,if(lt(X,W/2),128,255))'";
+const HALF_WHITE: [i32; 3] = [32768, 32768, 32768];
+const ALPHA_CARD_OVER_BLACK: [[i32; 3]; 3] = [BLACK, HALF_WHITE, LIME];
+const ALPHA_FRAMES: u64 = 8;
+
+fn alpha_card(directory: &Path) -> PathBuf {
+    let card = directory.join("alpha_card.png");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=white:s={WIDTH}x{HEIGHT}"),
+        "-vf",
+        ALPHA_CARD_FILTER,
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "rgba",
+        &card.to_string_lossy(),
+    ]);
+    card
+}
+
+fn alpha_movie(directory: &Path) -> PathBuf {
+    let movie = directory.join("alpha_card.mov");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=white:s={WIDTH}x{HEIGHT}:rate={RATE}"),
+        "-vf",
+        ALPHA_CARD_FILTER,
+        "-frames:v",
+        &ALPHA_FRAMES.to_string(),
+        "-c:v",
+        "prores_ks",
+        "-profile:v",
+        "4444",
+        "-pix_fmt",
+        "yuva444p10le",
+        &movie.to_string_lossy(),
+    ]);
+    movie
+}
+
+fn alpha_tiffs(directory: &Path) -> PathBuf {
+    let stills = directory.join("alpha_tiffs");
+    std::fs::create_dir_all(&stills).unwrap();
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=white:s={WIDTH}x{HEIGHT}:rate={RATE}"),
+        "-vf",
+        ALPHA_CARD_FILTER,
+        "-frames:v",
+        "2",
+        "-pix_fmt",
+        "rgba",
+        &stills.join("frame_%04d.tif").to_string_lossy(),
+    ]);
+    stills
+}
+
+// red over the right quarter, transparent elsewhere
+fn red_quarter_card(directory: &Path) -> PathBuf {
+    let card = directory.join("red_quarter.png");
+    run_ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("color=c=red:s={}x{HEIGHT}", WIDTH / 4),
+        "-vf",
+        &format!(
+            "format=rgba,pad={WIDTH}:{HEIGHT}:{}:0:color=black@0",
+            WIDTH * 3 / 4
+        ),
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "rgba",
+        &card.to_string_lossy(),
+    ]);
+    card
+}
+
+fn assert_every_codestream_samples(directory: &Path, want: [[i32; 3]; 3], what: &str) {
+    let names = codestream_names(directory);
+    assert!(!names.is_empty(), "{what} encoded nothing");
+    for name in names {
+        let found = sampled_pixels(&directory.join(&name));
+        assert!(
+            samples_close_to(found, want),
+            "{what} {name} samples {found:?}, not {want:?}"
+        );
+    }
+}
+
+#[test]
+fn a_single_picture_with_alpha_encodes_over_black() {
+    let directory = tempfile::tempdir().unwrap();
+    let card = alpha_card(directory.path());
+    let held = directory.path().join("held");
+    build_still_frames(&StillHold {
+        image: &card,
+        frames: 2,
+        fps: FrameRate::whole(RATE),
+        width: WIDTH,
+        height: HEIGHT,
+        filters: &[],
+        apply_xyz_transform: false,
+        rsiz: postkit::encode::default_rsiz(),
+        encode_threads: 0,
+        colour_transform: None,
+        burn: None,
+        watermark: None,
+        out_dir: &held,
+    })
+    .expect("the card holds");
+    assert_every_codestream_samples(&held, ALPHA_CARD_OVER_BLACK, "the held card");
+
+    let options = EncodeRunOptions {
+        source_colour: SourceColour::KeepRgb,
+        ..at_the_timeline_rate()
+    };
+    for (picture, what) in [
+        (alpha_movie(directory.path()), "the ProRes 4444 movie"),
+        (alpha_tiffs(directory.path()), "the RGBA TIFF sequence"),
+    ] {
+        let result = run_encode_with_options(
+            &picture,
+            &picture.with_extension("out"),
+            &options,
+            &Arc::new(AtomicBool::new(false)),
+            &Arc::new(AtomicBool::new(false)),
+            |_: &PipelineProgress| {},
+            |_: &str| {},
+        )
+        .unwrap_or_else(|error| panic!("{what} encodes: {error}"));
+        assert_every_codestream_samples(&result.j2k_dir, ALPHA_CARD_OVER_BLACK, what);
+    }
+}
+
+#[test]
+fn layer_0_pictures_with_alpha_go_over_black_alone_and_under_an_overlay() {
+    let directory = tempfile::tempdir().unwrap();
+    let movie = alpha_movie(directory.path());
+    let card = alpha_card(directory.path());
+    let red_quarter = red_quarter_card(directory.path());
+    let timeline = Timeline {
+        reel_starts: Vec::new(),
+        ..timeline(vec![
+            layered(&movie, 0, ALPHA_FRAMES, 0, 1.0),
+            layered(&card, ALPHA_FRAMES, ALPHA_FRAMES, 0, 1.0),
+            layered(&movie, 2 * ALPHA_FRAMES, ALPHA_FRAMES, 0, 1.0),
+            layered(&card, 3 * ALPHA_FRAMES, ALPHA_FRAMES, 0, 1.0),
+            layered(&red_quarter, 2 * ALPHA_FRAMES, 2 * ALPHA_FRAMES, 1, 1.0),
+        ])
+    };
+
+    let (result, _) = encode(
+        &timeline,
+        &directory.path().join("out"),
+        &compositing_options(),
+    );
+    let names = codestream_names(&result.j2k_dir);
+    assert_eq!(names, numbered_codestreams(4 * ALPHA_FRAMES));
+    let under_the_overlay = [BLACK, HALF_WHITE, RED];
+    for (frame, name) in names.iter().enumerate() {
+        let want = if (frame as u64) < 2 * ALPHA_FRAMES {
+            ALPHA_CARD_OVER_BLACK
+        } else {
+            under_the_overlay
+        };
+        let found = sampled_pixels(&result.j2k_dir.join(name));
+        assert!(
+            samples_close_to(found, want),
+            "timeline frame {frame} samples {found:?}, not {want:?}"
+        );
+    }
 }

@@ -81,32 +81,19 @@ pub fn load_tiff(path: &Path) -> Result<TiffFrame, String> {
             .read_image()
             .map_err(|e| format!("TIFF read error for {}: {e}", path.display()))?;
 
-        let mut r = Vec::with_capacity(num_pixels);
-        let mut g = Vec::with_capacity(num_pixels);
-        let mut b = Vec::with_capacity(num_pixels);
-
-        match image {
+        let ch = samples_per_pixel as usize;
+        let components = match image {
             tiff::decoder::DecodingResult::U8(data) => {
-                let ch = samples_per_pixel as usize;
-                for i in 0..num_pixels {
-                    r.push(data[i * ch] as i32);
-                    g.push(data[i * ch + 1] as i32);
-                    b.push(data[i * ch + 2] as i32);
-                }
+                planar_over_black(&data, ch, num_pixels, bits_per_sample)
             }
             tiff::decoder::DecodingResult::U16(data) => {
-                let ch = samples_per_pixel as usize;
-                for i in 0..num_pixels {
-                    r.push(data[i * ch] as i32);
-                    g.push(data[i * ch + 1] as i32);
-                    b.push(data[i * ch + 2] as i32);
-                }
+                planar_over_black(&data, ch, num_pixels, bits_per_sample)
             }
             _ => return Err("Unsupported TIFF sample format".to_string()),
-        }
+        };
 
         return Ok(TiffFrame {
-            components: [r, g, b],
+            components,
             width,
             height,
             precision: bits_per_sample,
@@ -160,23 +147,40 @@ pub fn load_tiff(path: &Path) -> Result<TiffFrame, String> {
         unpack_12bit_row(row, width as usize * ch, &mut samples);
     }
 
-    // De-interleave into planar buffers
-    let mut r = Vec::with_capacity(num_pixels);
-    let mut g = Vec::with_capacity(num_pixels);
-    let mut b = Vec::with_capacity(num_pixels);
-    for i in 0..num_pixels {
-        r.push(samples[i * ch]);
-        g.push(samples[i * ch + 1]);
-        b.push(samples[i * ch + 2]);
-    }
-
     Ok(TiffFrame {
-        components: [r, g, b],
+        components: planar_over_black(&samples, ch, num_pixels, bits_per_sample),
         width,
         height,
         precision: bits_per_sample,
         path: path.to_path_buf(),
     })
+}
+
+const ALPHA_SAMPLE: usize = 3;
+
+// a fourth sample is straight alpha, as ffmpeg reads it
+fn planar_over_black<T: Copy + Into<i32>>(
+    samples: &[T],
+    samples_per_pixel: usize,
+    pixel_count: usize,
+    precision: u8,
+) -> [Vec<i32>; 3] {
+    let opaque = (1u32 << precision) - 1;
+    let mut planes: [Vec<i32>; 3] = std::array::from_fn(|_| Vec::with_capacity(pixel_count));
+    for index in 0..pixel_count {
+        let pixel = &samples[index * samples_per_pixel..(index + 1) * samples_per_pixel];
+        let alpha = pixel.get(ALPHA_SAMPLE).map(|&alpha| alpha.into() as u32);
+        for (plane, &sample) in planes.iter_mut().zip(pixel) {
+            let sample = sample.into();
+            plane.push(match alpha {
+                Some(alpha) => {
+                    crate::subtitle_raster::source_over(sample as u32, 0, alpha, opaque) as i32
+                }
+                None => sample,
+            });
+        }
+    }
+    planes
 }
 
 /// Bits a packed 12-bit sample takes.
@@ -316,6 +320,28 @@ pub fn write_tiff_rgb(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_fourth_sample_takes_the_picture_over_black_and_three_samples_stay_as_read() {
+        let rgba: [u16; 12] = [
+            65535, 65535, 65535, 0, //
+            60000, 30000, 1000, 32768, //
+            60000, 30000, 1000, 65535,
+        ];
+        assert_eq!(
+            planar_over_black(&rgba, 4, 3, 16),
+            [
+                vec![0, 30000, 60000],
+                vec![0, 15000, 30000],
+                vec![0, 500, 1000]
+            ]
+        );
+        let rgb: [u8; 6] = [255, 128, 0, 10, 20, 30];
+        assert_eq!(
+            planar_over_black(&rgb, 3, 2, 8),
+            [vec![255, 10], vec![128, 20], vec![0, 30]]
+        );
+    }
 
     fn ramp(width: u32, height: u32, full_scale: u16) -> Vec<u16> {
         (0..width * height * 3)

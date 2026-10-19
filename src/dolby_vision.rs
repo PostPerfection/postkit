@@ -286,6 +286,14 @@ pub fn convert_hdr(input: &Path, target_type: HdrType, output: &Path) -> i32 {
             return -1;
         }
     };
+    // the SDR chain ends in yuv420p, which carries no alpha
+    let over_black =
+        target_type == HdrType::Sdr && crate::probe::probe_pixel_format(input).has_alpha();
+    let filter = if over_black {
+        format!("{},{filter}", crate::encode::SIXTEEN_BIT_OVER_BLACK_FILTER)
+    } else {
+        filter.to_string()
+    };
 
     let result = std::process::Command::new("ffmpeg")
         .arg("-y")

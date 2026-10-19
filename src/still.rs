@@ -33,8 +33,17 @@ pub fn is_still_image(path: &Path) -> bool {
 
 /// The filter chain the still decodes through: the picture plan's filters plus
 /// the hold's rate, so 24000/1001 reaches ffmpeg as itself rather than as 24.
-fn decode_filters(filters: &[String], fps: FrameRate) -> String {
-    let mut chain = filters.to_vec();
+fn decode_filters(
+    source: &crate::probe::PixelFormatInfo,
+    filters: &[String],
+    fps: FrameRate,
+) -> String {
+    let mut chain = Vec::new();
+    // the held picture carries no alpha, so an image with alpha goes over black
+    if source.has_alpha() {
+        chain.push(crate::encode::SIXTEEN_BIT_OVER_BLACK_FILTER.to_string());
+    }
+    chain.extend_from_slice(filters);
     chain.push(format!("fps={}", fps.ffmpeg_filter_value()));
     chain.join(",")
 }
@@ -50,9 +59,12 @@ fn decode_rgb48(
     filters: &[String],
     fps: FrameRate,
 ) -> Result<Vec<u8>, String> {
+    let source = crate::probe::probe_pixel_format(image);
     let mut command = std::process::Command::new("ffmpeg");
     command.arg("-y").arg("-i").arg(image);
-    command.arg("-vf").arg(decode_filters(filters, fps));
+    command
+        .arg("-vf")
+        .arg(decode_filters(&source, filters, fps));
     let output = command
         .args(["-frames:v", "1", "-pix_fmt", "rgb48be", "-f", "rawvideo"])
         .arg("pipe:1")
@@ -256,15 +268,40 @@ mod tests {
         assert_eq!(distinct_frames(Some(&burn), 30..60), vec![30, 48]);
     }
 
+    fn source_pixel_format(pix_fmt: &str) -> crate::probe::PixelFormatInfo {
+        crate::probe::PixelFormatInfo {
+            pix_fmt: pix_fmt.to_string(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn a_hold_decodes_at_the_rate_it_was_given_rather_than_a_whole_one() {
+        let opaque = source_pixel_format("rgb24");
         assert_eq!(
-            decode_filters(&[], FrameRate::new(24000, 1001)),
+            decode_filters(&opaque, &[], FrameRate::new(24000, 1001)),
             "fps=24000/1001"
         );
         assert_eq!(
-            decode_filters(&["crop=1920:804:0:138".into()], FrameRate::whole(25)),
+            decode_filters(
+                &opaque,
+                &["crop=1920:804:0:138".into()],
+                FrameRate::whole(25)
+            ),
             "crop=1920:804:0:138,fps=25"
+        );
+    }
+
+    #[test]
+    fn an_image_with_alpha_goes_over_black_before_the_plan_and_an_opaque_one_does_not() {
+        let crop = ["crop=1920:804:0:138".to_string()];
+        assert_eq!(
+            decode_filters(&source_pixel_format("rgba"), &crop, FrameRate::whole(24)),
+            "format=gbrap16le,premultiply=inplace=1,crop=1920:804:0:138,fps=24"
+        );
+        assert_eq!(
+            decode_filters(&source_pixel_format("rgb48be"), &crop, FrameRate::whole(24)),
+            "crop=1920:804:0:138,fps=24"
         );
     }
 

@@ -101,7 +101,7 @@ pub fn detect_in_essence(
 ) -> Result<PictureFindings, String> {
     let mut ffmpeg = std::process::Command::new("ffmpeg");
     ffmpeg.args(["-hide_banner", "-nostats", "-i"]).arg(essence);
-    let detection = detection_lines(ffmpeg, essence)?;
+    let detection = detection_lines(ffmpeg, essence, &detection_filters())?;
     Ok(parse_ffmpeg_stderr(&detection, fps, frame_count))
 }
 
@@ -122,7 +122,17 @@ pub fn detect_black_in_held_image(
         .arg(image)
         .arg("-frames:v")
         .arg(measured_frames.to_string());
-    let detection = detection_lines(ffmpeg, image)?;
+    // the encode composites a held image with alpha over black, so its black is measured the same way
+    let filters = if crate::probe::probe_pixel_format(image).has_alpha() {
+        format!(
+            "{},{}",
+            crate::encode::SIXTEEN_BIT_OVER_BLACK_FILTER,
+            detection_filters()
+        )
+    } else {
+        detection_filters()
+    };
+    let detection = detection_lines(ffmpeg, image, &filters)?;
     let black = parse_ffmpeg_stderr(&detection, fps.as_f64(), measured_frames).black;
     if black.is_empty() {
         return Ok(Vec::new());
@@ -133,10 +143,14 @@ pub fn detect_black_in_held_image(
     }])
 }
 
-fn detection_lines(mut ffmpeg: std::process::Command, input: &Path) -> Result<Vec<String>, String> {
+fn detection_lines(
+    mut ffmpeg: std::process::Command,
+    input: &Path,
+    filters: &str,
+) -> Result<Vec<String>, String> {
     let mut ffmpeg = ffmpeg
         .arg("-vf")
-        .arg(detection_filters())
+        .arg(filters)
         .args(["-f", "null", "-"])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -295,6 +309,33 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "one second is under blackdetect's minimum"
+        );
+        let clear = dir.path().join("clear.png");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=white@0.0:size=320x240,format=rgba",
+            ])
+            .args(["-frames:v", "1", "-y"])
+            .arg(&clear)
+            .output()
+            .unwrap();
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        assert_eq!(
+            detect_black_in_held_image(&clear, FrameRate::whole(24), 72).unwrap(),
+            vec![FrameInterval {
+                first_frame: 0,
+                last_frame: 71,
+            }],
+            "a transparent card encodes black over black, so it reports black"
         );
         let white = one_frame_png(dir.path(), "white");
         assert!(

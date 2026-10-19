@@ -73,6 +73,19 @@ impl Default for PixelFormatInfo {
     }
 }
 
+const ALPHA_PIXEL_FORMAT_PREFIXES: [&str; 10] = [
+    "yuva", "gbrap", "rgba", "bgra", "argb", "abgr", "ya", "ayuv", "vuya", "uyva",
+];
+
+impl PixelFormatInfo {
+    pub fn has_alpha(&self) -> bool {
+        self.pix_fmt == "pal8"
+            || ALPHA_PIXEL_FORMAT_PREFIXES
+                .iter()
+                .any(|prefix| self.pix_fmt.starts_with(prefix))
+    }
+}
+
 /// Read the first video stream's pixel format and colour tags. A file ffprobe
 /// cannot read comes back with every field untagged.
 pub fn probe_pixel_format(path: &Path) -> PixelFormatInfo {
@@ -323,6 +336,32 @@ fn ffprobe_video_field(path: &Path, field: &str, extra_args: &[&str]) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ffmpeg")]
+    #[test]
+    fn the_alpha_test_agrees_with_every_pixel_format_ffmpeg_knows() {
+        use ffmpeg_next::ffi;
+        let mut descriptor = unsafe { ffi::av_pix_fmt_desc_next(std::ptr::null()) };
+        let mut checked = 0;
+        while !descriptor.is_null() {
+            let (name, flags) = unsafe {
+                let name = std::ffi::CStr::from_ptr((*descriptor).name);
+                (name.to_string_lossy().into_owned(), (*descriptor).flags)
+            };
+            let source = PixelFormatInfo {
+                pix_fmt: name.clone(),
+                ..PixelFormatInfo::default()
+            };
+            assert_eq!(
+                source.has_alpha(),
+                flags & ffi::AV_PIX_FMT_FLAG_ALPHA as u64 != 0,
+                "{name}"
+            );
+            checked += 1;
+            descriptor = unsafe { ffi::av_pix_fmt_desc_next(descriptor) };
+        }
+        assert!(checked > 100, "ffmpeg listed only {checked} pixel formats");
+    }
 
     /// A clip ffmpeg encodes at `pixel_format`, tagged with `colour_args`.
     fn clip(

@@ -1,7 +1,8 @@
 use super::{
     DecodeSource, EncodeResult, EncoderInputFormat, FrameRange, FrameRate, PACKED_RGB_PRECISION,
-    PictureFilters, PlanarYuvPixelFormat, SourceColour, StreamEncodeOptions, StreamProgress,
-    YuvFrameFormat, YuvMatrix, compress_params, packed_rgb_sample_order,
+    PictureFilters, PlanarYuvPixelFormat, SIXTEEN_BIT_OVER_BLACK_FILTER, SourceColour,
+    StreamEncodeOptions, StreamProgress, YuvFrameFormat, YuvMatrix, compress_params,
+    packed_rgb_sample_order,
 };
 use crate::ffmpeg_decode::{FrameSource, NextFrame};
 use crate::grok_encoder::SampleOrder;
@@ -119,7 +120,15 @@ pub(crate) enum AlphaChannel {
 }
 
 impl AlphaChannel {
-    fn sixteen_bit_filter(self) -> &'static str {
+    // the encoded picture carries no alpha, so a bottom picture with alpha goes over black
+    fn composites_over_black(self, source: &crate::probe::PixelFormatInfo) -> bool {
+        self == AlphaChannel::Dropped && source.has_alpha()
+    }
+
+    fn sixteen_bit_filter(self, source: &crate::probe::PixelFormatInfo) -> &'static str {
+        if self.composites_over_black(source) {
+            return SIXTEEN_BIT_OVER_BLACK_FILTER;
+        }
         match self {
             AlphaChannel::Dropped => SIXTEEN_BIT_RGB_FILTER,
             AlphaChannel::Kept => SIXTEEN_BIT_RGBA_FILTER,
@@ -303,11 +312,13 @@ fn decode_filter_chain(
     source_colour: &SourceColour,
 ) -> String {
     let hdr = hdr_yuv_to_rgb_filter(source, source_colour, alpha);
-    let filter = hdr.as_deref().unwrap_or(alpha.sixteen_bit_filter());
+    let filter = hdr.as_deref().unwrap_or(alpha.sixteen_bit_filter(source));
     match input_format {
         EncoderInputFormat::PlanarYuv(_) => picture.joined(),
         EncoderInputFormat::PackedRgb(_)
-            if hdr.is_some() || is_eight_bit_yuv_pixel_format(&source.pix_fmt) =>
+            if hdr.is_some()
+                || alpha.composites_over_black(source)
+                || is_eight_bit_yuv_pixel_format(&source.pix_fmt) =>
         {
             picture.with_format_filter_at(0, filter)
         }
@@ -385,7 +396,7 @@ fn hdr_yuv_to_rgb_filter(
     let matrix = zscale_matrix_name(hdr_yuv_matrix(hdr_source, &source.color_space));
     Some(format!(
         "zscale=matrixin={matrix}:rangein={range}:matrix={ZSCALE_RGB_MATRIX}:range=full,{}",
-        alpha.sixteen_bit_filter()
+        alpha.sixteen_bit_filter(source)
     ))
 }
 
@@ -1441,6 +1452,63 @@ mod tests {
                 chain
             );
         }
+    }
+
+    #[test]
+    fn a_bottom_picture_with_alpha_goes_over_black_at_the_head_and_an_opaque_one_does_not() {
+        let plan = geometry_plan(false);
+        let picture = planned(FrameRate::whole(24), &SourceColour::DisplayRgb, &plan, None);
+        let chain = |source: &crate::probe::PixelFormatInfo, alpha, colour: &SourceColour| {
+            decode_filter_chain(
+                &picture,
+                EncoderInputFormat::PackedRgb(SampleOrder::Big),
+                alpha,
+                source,
+                colour,
+            )
+        };
+        let display = SourceColour::DisplayRgb;
+        let geometry = "fps=24,crop=1920:804:0:138,scale=w=2048:h=856:flags=lanczos,\
+                        pad=w=2048:h=1080:x=0:y=112:color=black";
+        for pix_fmt in ["rgba", "rgba64be", "yuva444p12le", "yuva420p", "pal8"] {
+            assert_eq!(
+                chain(
+                    &source_pixel_format(pix_fmt),
+                    AlphaChannel::Dropped,
+                    &display
+                ),
+                format!("format=gbrap16le,premultiply=inplace=1,{geometry}"),
+                "{pix_fmt}"
+            );
+        }
+        assert!(
+            !chain(&source_pixel_format("rgba"), AlphaChannel::Kept, &display)
+                .contains("premultiply"),
+            "an overlay keeps straight alpha for its own composite"
+        );
+        for pix_fmt in ["rgb24", "gbrp12le", "yuv420p", "yuv422p10le"] {
+            assert!(
+                !chain(
+                    &source_pixel_format(pix_fmt),
+                    AlphaChannel::Dropped,
+                    &display
+                )
+                .contains("premultiply"),
+                "{pix_fmt}"
+            );
+        }
+        assert!(
+            chain(
+                &hdr10_pixel_format("yuva444p12le", "tv"),
+                AlphaChannel::Dropped,
+                &hdr10_source()
+            )
+            .starts_with(
+                "zscale=matrixin=2020_ncl:rangein=limited:matrix=gbr:range=full,\
+                 format=gbrap16le,premultiply=inplace=1,fps=24"
+            ),
+            "an hdr master leaves the matrix before it goes over black"
+        );
     }
 
     /// One `format=gbrp16le` in each chain: the head conversion an 8-bit YUV

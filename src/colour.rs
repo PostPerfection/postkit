@@ -71,6 +71,24 @@ pub fn convert_colour(opts: &ColourConvertOptions) -> std::io::Result<()> {
     )
 }
 
+pub fn convert_colour_over_black(opts: &ColourConvertOptions) -> std::io::Result<()> {
+    let filter = colour_filter(
+        opts.source_space,
+        opts.target_space,
+        opts.lut_path.as_deref(),
+    )?;
+    let filter = if crate::probe::probe_pixel_format(&opts.input).has_alpha() {
+        format!("{},{filter}", crate::encode::SIXTEEN_BIT_OVER_BLACK_FILTER)
+    } else {
+        filter
+    };
+    run_colour_conversion(
+        &FfmpegInput::File(opts.input.clone()),
+        &opts.output,
+        &filter,
+    )
+}
+
 pub fn convert_colour_input(
     input: &FfmpegInput,
     output: &Path,
@@ -78,26 +96,33 @@ pub fn convert_colour_input(
     target_space: ColourSpace,
     lut_path: Option<&Path>,
 ) -> std::io::Result<()> {
-    let mut cmd = std::process::Command::new("ffmpeg");
-    cmd.arg("-y").args(input.arguments());
+    let filter = colour_filter(source_space, target_space, lut_path)?;
+    run_colour_conversion(input, output, &filter)
+}
 
+fn colour_filter(
+    source_space: ColourSpace,
+    target_space: ColourSpace,
+    lut_path: Option<&Path>,
+) -> std::io::Result<String> {
     // If a custom LUT is provided, use it for any pair of spaces.
     if let Some(lut) = lut_path {
-        cmd.arg("-vf")
-            .arg(format!("lut3d={}", filter_option_path(lut)));
-    } else {
-        // No LUT: only spaces the colorspace filter models are honest here.
-        let (colorspace, primaries, trc) =
-            ffmpeg_color_params(target_space).ok_or_else(|| unsupported_err(target_space))?;
-        let (in_colorspace, in_primaries, in_trc) =
-            ffmpeg_color_params(source_space).ok_or_else(|| unsupported_err(source_space))?;
-
-        let filter = format!(
-            "colorspace=all={colorspace}:iall={in_colorspace}:iprimaries={in_primaries}:itrc={in_trc}:primaries={primaries}:trc={trc}"
-        );
-        cmd.arg("-vf").arg(filter);
+        return Ok(format!("lut3d={}", filter_option_path(lut)));
     }
+    // No LUT: only spaces the colorspace filter models are honest here.
+    let (colorspace, primaries, trc) =
+        ffmpeg_color_params(target_space).ok_or_else(|| unsupported_err(target_space))?;
+    let (in_colorspace, in_primaries, in_trc) =
+        ffmpeg_color_params(source_space).ok_or_else(|| unsupported_err(source_space))?;
+    Ok(format!(
+        "colorspace=all={colorspace}:iall={in_colorspace}:iprimaries={in_primaries}:itrc={in_trc}:primaries={primaries}:trc={trc}"
+    ))
+}
 
+fn run_colour_conversion(input: &FfmpegInput, output: &Path, filter: &str) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.arg("-y").args(input.arguments());
+    cmd.arg("-vf").arg(filter);
     cmd.arg(output);
 
     let converted = cmd.output()?;
