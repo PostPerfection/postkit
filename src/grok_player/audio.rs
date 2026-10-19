@@ -3386,28 +3386,32 @@ mod tests {
 
     #[test]
     fn a_failing_atmos_frame_plays_as_silence_with_one_warning_per_error() {
+        const UNREADABLE: &[u8] = b"not an IAB frame";
         let mut frames = validation_stream_frames(1);
-        let outside_profile_1 = validation_stream_frames(41).swap_remove(0);
-        frames[10] = outside_profile_1.clone();
-        frames[11] = outside_profile_1;
-        frames[20] = b"not an IAB frame".to_vec();
+        let unrendered = validation_stream_frames(41).swap_remove(0);
+        let unrendered_error = {
+            let frame = crate::iab::parse_frame(&unrendered).unwrap();
+            let audio = crate::iab::decode_audio(&frame).unwrap();
+            Renderer::new(OutputLayout::Stereo)
+                .render(&frame, &audio)
+                .unwrap_err()
+        };
+        let unreadable_error = crate::iab::parse_frame(UNREADABLE).unwrap_err();
+        frames[10] = unrendered.clone();
+        frames[11] = unrendered;
+        frames[20] = UNREADABLE.to_vec();
         let directory = tempfile::tempdir().unwrap();
         let dcp = write_atmos_dcp(directory.path(), &one_atmos_reel(&frames), None);
 
         let (played, feeder) = played_after_a_seek(atmos_composition(&dcp.package, None), 0);
 
         let warnings = feeder.shared.track_warnings.lock().unwrap().clone();
-        let [outside, unreadable] = warnings.as_slice() else {
-            panic!("two distinct errors give two warnings: {warnings:?}");
-        };
-        assert!(
-            outside.starts_with("Atmos frame 10 plays as silence: IAB ObjectDefinition")
-                && outside.contains("IAB Application Profile 1"),
-            "{outside}"
-        );
-        assert!(
-            unreadable.starts_with("Atmos frame 20 plays as silence: IAB"),
-            "{unreadable}"
+        assert_eq!(
+            warnings,
+            [
+                format!("Atmos frame 10 plays as silence: {unrendered_error}"),
+                format!("Atmos frame 20 plays as silence: {unreadable_error}"),
+            ]
         );
         let rendered = rendered_continuously(&frames, &[10, 11, 20]);
         assert!(played == heard_from(&rendered, 0, frames.len()));
