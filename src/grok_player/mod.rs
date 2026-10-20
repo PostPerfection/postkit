@@ -1029,6 +1029,102 @@ mod tests {
     }
 
     #[test]
+    fn the_sound_source_and_atmos_read_back_from_the_metadata() {
+        let read_back = |status: Status| -> serde_json::Value {
+            serde_json::from_str(&status_json(&status)).expect("metadata is JSON")
+        };
+        let main_sound = read_back(Status {
+            sound_source: Some(SoundSource::MainSound),
+            atmos_available: true,
+            ..Status::default()
+        });
+        assert_eq!(main_sound["sound_source"], "main");
+        assert_eq!(main_sound["atmos_available"], true);
+        let atmos = read_back(Status {
+            sound_source: Some(SoundSource::Atmos),
+            ..Status::default()
+        });
+        assert_eq!(atmos["sound_source"], "atmos");
+        assert_eq!(atmos["atmos_available"], false);
+        assert_eq!(
+            read_back(Status::default())["sound_source"],
+            serde_json::Value::Null
+        );
+    }
+
+    const METADATA_WAIT: Duration = Duration::from_secs(10);
+    const METADATA_POLL: Duration = Duration::from_millis(5);
+
+    fn metadata_once(
+        player: &GrokPlayer,
+        what: &str,
+        ready: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        let deadline = Instant::now() + METADATA_WAIT;
+        loop {
+            let metadata: serde_json::Value =
+                serde_json::from_str(&player.metadata_json()).expect("metadata is JSON");
+            if ready(&metadata) {
+                return metadata;
+            }
+            assert!(Instant::now() < deadline, "{what}: {metadata}");
+            std::thread::sleep(METADATA_POLL);
+        }
+    }
+
+    #[test]
+    fn the_metadata_follows_the_sound_source_across_a_switch_and_later_loads() {
+        use super::atmos_package::{AtmosDcpReel, write_atmos_dcp};
+        const FRAMES_PER_SECOND: f64 = 24.0;
+        const SWITCH_FRAME: f64 = 5.0;
+        let frames = crate::iab::tests::validation_stream_frames(1)[..4].to_vec();
+        let reels = |with_atmos: bool| {
+            [0, 1].map(|_| AtmosDcpReel {
+                picture_frames: frames.len(),
+                atmos_frames: with_atmos.then(|| frames.clone()),
+            })
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let with_atmos = write_atmos_dcp(&directory.path().join("atmos"), &reels(true), None);
+        let plain = write_atmos_dcp(&directory.path().join("plain"), &reels(false), None);
+        let player = GrokPlayer::new();
+
+        player.load(&with_atmos.package, None).unwrap();
+        let loaded = metadata_once(&player, "the Atmos package loads", |_| true);
+        assert_eq!(loaded["sound_source"], "atmos");
+        assert_eq!(loaded["atmos_available"], true);
+
+        // the JSON parse loses the last digit of a position
+        let frame_shown = |metadata: &serde_json::Value| {
+            metadata["position"]
+                .as_f64()
+                .map(|seconds| (seconds * FRAMES_PER_SECOND).round())
+        };
+        player.seek_absolute(SWITCH_FRAME / FRAMES_PER_SECOND);
+        metadata_once(&player, "the seek lands", |metadata| {
+            frame_shown(metadata) == Some(SWITCH_FRAME)
+        });
+        player.set_sound_source(SoundSource::MainSound);
+        let switched = metadata_once(&player, "the switch to the main sound", |metadata| {
+            metadata["sound_source"] == "main"
+        });
+        assert_eq!(frame_shown(&switched), Some(SWITCH_FRAME));
+        assert_eq!(switched["paused"], true);
+        assert_eq!(switched["atmos_available"], true);
+
+        player.load(&with_atmos.package, None).unwrap();
+        let reloaded = metadata_once(&player, "the Atmos package loads again", |_| true);
+        assert_eq!(reloaded["sound_source"], "main");
+
+        player.set_sound_source(SoundSource::Atmos);
+        player.load(&plain.package, None).unwrap();
+        let plain = metadata_once(&player, "the package without Atmos loads", |_| true);
+        assert_eq!(plain["sound_source"], "main");
+        assert_eq!(plain["atmos_available"], false);
+        assert_eq!(plain["warnings"], serde_json::json!([]));
+    }
+
+    #[test]
     fn the_metadata_names_the_current_and_the_queued_source() {
         let status = Status {
             source: Some("/packages/first".to_string()),
