@@ -801,3 +801,39 @@ fn two_objects_or_two_beds_with_one_meta_id_are_invalid() {
     frame.beds.push(repeated);
     assert!(is_meta_id_error(&frame, "BedDefinition", meta_id));
 }
+
+#[test]
+fn a_reserved_prefix_error_names_the_prefix_code() {
+    let is_reserved_prefix = |error: IabError, expected_field: &str| {
+        matches!(
+            error,
+            IabError::Invalid { field, value: 3, .. } if field == expected_field
+        )
+    };
+    let frame = stream_frames(1).swap_remove(0);
+    assert_ne!(frame.objects[0].meta_id, 3);
+    assert_ne!(frame.beds[0].meta_id, 3);
+    let pan_error = |change: &dyn Fn(&mut ObjectPan)| {
+        let mut frame = frame.clone();
+        change(&mut frame.objects[0].pan_sub_blocks[0]);
+        render_error(&frame)
+    };
+    assert!(is_reserved_prefix(
+        pan_error(&|pan| pan.gain = Gain::Reserved(7)),
+        "ObjectGainPrefix"
+    ));
+    assert!(is_reserved_prefix(
+        pan_error(&|pan| pan.zone_gains = Some([ZoneGain::Reserved(7); 9])),
+        "ZoneGainPrefix"
+    ));
+    assert!(is_reserved_prefix(
+        pan_error(&|pan| pan.decorrelation = Decorrelation::Reserved(7)),
+        "ObjectDecorCoefPrefix"
+    ));
+    let mut bed_frame = frame.clone();
+    bed_frame.beds[0].channels[0].gain = Gain::Reserved(7);
+    assert!(is_reserved_prefix(
+        render_error(&bed_frame),
+        "ChannelGainPrefix"
+    ));
+}

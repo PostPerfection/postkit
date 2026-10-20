@@ -259,12 +259,7 @@ impl Renderer {
                 sub_block_gains.push(repeated);
                 continue;
             }
-            let gain = gain_value(
-                pan.gain,
-                "ObjectDefinition",
-                object.meta_id,
-                "ObjectGainPrefix",
-            )?;
+            let gain = gain_value(pan.gain, "ObjectDefinition", "ObjectGainPrefix")?;
             let parameters = object_parameters(pan, object.meta_id)?;
             let gains = self.object_panner.gains(&parameters);
             sub_block_gains.push(
@@ -343,23 +338,23 @@ fn audio_samples<'a>(
 }
 
 // ST 2098-2 5.5
-fn gain_value(
-    gain: Gain,
-    element: &'static str,
-    meta_id: u32,
-    field: &'static str,
-) -> Result<f64, IabError> {
+fn gain_value(gain: Gain, element: &'static str, field: &'static str) -> Result<f64, IabError> {
     const MUTE_CODE: u16 = 0x3FF;
     match gain {
         Gain::Unity => Ok(1.0),
         Gain::Silent | Gain::Coded(MUTE_CODE) => Ok(0.0),
         Gain::Coded(code) => Ok(2f64.powf(-f64::from(code) / 64.0)),
-        Gain::Reserved(_) => Err(IabError::Invalid {
-            element,
-            field,
-            value: u64::from(meta_id),
-            rule: "prefix code 3 is reserved",
-        }),
+        Gain::Reserved(_) => Err(reserved_prefix(element, field)),
+    }
+}
+
+// ST 2098-2 Tables 20, 21, 25 and 27 all reserve prefix code 3
+fn reserved_prefix(element: &'static str, field: &'static str) -> IabError {
+    IabError::Invalid {
+        element,
+        field,
+        value: 3,
+        rule: "prefix code 3 is reserved",
     }
 }
 
@@ -380,12 +375,7 @@ pub(super) fn object_parameters(
 ) -> Result<ObjectParameters, IabError> {
     let element = "ObjectDefinition";
     let unrendered = |feature| not_rendered(element, meta_id, feature);
-    let reserved = |field| IabError::Invalid {
-        element,
-        field,
-        value: u64::from(meta_id),
-        rule: "prefix code 3 is reserved",
-    };
+    let reserved = |field| reserved_prefix(element, field);
     // ObjectSpread S spans S / 2 either side in the unit cube, which is S in ADM
     // units, and ADM Cartesian extent is that half size (BS.2127 10.2.1 wd2xyz)
     let extent = match pan.spread {
@@ -458,7 +448,7 @@ fn bed_mixes<'a>(
             None | Some(Decorrelation::Off) => {}
             Some(_) => return Err(unrendered(UnrenderedFeature::BedChannelDecorrelation)),
         }
-        let gain = gain_value(channel.gain, element, bed.meta_id, "ChannelGainPrefix")?;
+        let gain = gain_value(channel.gain, element, "ChannelGainPrefix")?;
         let gains = bed_channel_gains(loudspeakers, channel.channel_id)
             .ok_or_else(|| unrendered(UnrenderedFeature::ChannelId(channel.channel_id)))?;
         mixes.push(BedMix {
