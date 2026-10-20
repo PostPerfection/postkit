@@ -4,9 +4,45 @@ use asdcplib::crypto::{AesDecContext, HmacContext};
 
 use crate::content_keys::ContentKeys;
 
-// Kumu's RESULT_SMALLBUF, which comes back without the size the frame needs
+// Kumu's RESULT_SMALLBUF
 const SMALL_BUFFER_RESULT: i32 = -7;
-const FIRST_FRAME_BUFFER_BYTES: usize = 1 << 20;
+
+// ST 429-18:2023 7.2.4 Table 1, the largest frame in bytes for each edit rate in frames a second
+const LARGEST_FRAME_BYTES: [(i32, usize); 9] = [
+    (24, 781_250),
+    (25, 750_000),
+    (30, 625_000),
+    (48, 390_625),
+    (50, 375_000),
+    (60, 312_500),
+    (96, 195_313),
+    (100, 187_500),
+    (120, 156_250),
+];
+
+fn largest_frame_bytes(edit_rate: asdcplib::Rational) -> Result<usize, String> {
+    LARGEST_FRAME_BYTES
+        .iter()
+        .find(|(frames_per_second, _)| {
+            edit_rate.denominator == 1 && edit_rate.numerator == *frames_per_second
+        })
+        .map(|(_, bytes)| *bytes)
+        .ok_or_else(|| {
+            format!(
+                "ST 429-18 Table 1 sets no frame size for the edit rate {}/{}",
+                edit_rate.numerator, edit_rate.denominator
+            )
+        })
+}
+
+fn check_imf_track_is_clear(info: &asdcplib::WriterInfo) -> Result<(), String> {
+    if info.encrypted_essence {
+        return Err(
+            "the IMF IAB track is encrypted and asdcplib reads AS-02 IAB in the clear only".into(),
+        );
+    }
+    Ok(())
+}
 
 enum Track {
     // ST 429-18, the DCP wrap
@@ -56,10 +92,11 @@ impl AtmosReader {
                 } else {
                     None
                 };
+                let largest_frame = largest_frame_bytes(descriptor.edit_rate).map_err(named)?;
                 Ok(AtmosReader {
                     track: Track::Dcp {
                         reader,
-                        frame_buffer: vec![0; FIRST_FRAME_BUFFER_BYTES],
+                        frame_buffer: vec![0; largest_frame],
                         keys,
                     },
                     frame_count: descriptor.container_duration,
@@ -71,6 +108,10 @@ impl AtmosReader {
                 reader
                     .open_read(&path_text)
                     .map_err(|error| named(error.to_string()))?;
+                let info = reader
+                    .writer_info()
+                    .map_err(|error| named(error.to_string()))?;
+                check_imf_track_is_clear(&info).map_err(named)?;
                 let frame_count = reader
                     .frame_count()
                     .map_err(|error| named(error.to_string()))?;
@@ -116,23 +157,19 @@ impl AtmosReader {
                     Some((decrypt, hmac)) => (Some(decrypt), Some(hmac)),
                     None => (None, None),
                 };
-                loop {
-                    let result = reader.read_frame(
-                        frame_number,
-                        frame_buffer,
-                        decrypt.as_deref_mut(),
-                        hmac.as_deref_mut(),
-                    );
-                    match result {
-                        Ok(size) => return Ok(&frame_buffer[..size]),
-                        Err(asdcplib::Error::AsdcpError(SMALL_BUFFER_RESULT))
-                            if frame_buffer.len() < u32::MAX as usize =>
-                        {
-                            let grown = frame_buffer.len().saturating_mul(2).min(u32::MAX as usize);
-                            *frame_buffer = vec![0; grown];
-                        }
-                        Err(error) => return Err(format!("Atmos frame {frame_number}: {error}")),
-                    }
+                let result = reader.read_frame(
+                    frame_number,
+                    frame_buffer,
+                    decrypt.as_deref_mut(),
+                    hmac.as_deref_mut(),
+                );
+                match result {
+                    Ok(size) => Ok(&frame_buffer[..size]),
+                    Err(asdcplib::Error::AsdcpError(SMALL_BUFFER_RESULT)) => Err(format!(
+                        "Atmos frame {frame_number} is over the {} bytes ST 429-18 Table 1 allows at its edit rate",
+                        frame_buffer.len()
+                    )),
+                    Err(error) => Err(format!("Atmos frame {frame_number}: {error}")),
                 }
             }
         }
@@ -270,6 +307,33 @@ mod tests {
         let keys = keys_with(directory.path(), [0xa5; 16]);
         let mut reader = AtmosReader::open(&path, Some(&keys)).unwrap();
         assert!(reader.read_frame(0).is_err());
+    }
+
+    #[test]
+    fn a_frame_over_the_st_429_18_limit_fails_the_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut frames = stream_1_frames();
+        frames[2] = vec![0; 781_250];
+        frames[3] = vec![0; 781_251];
+        let path = wrap(directory.path(), &frames, MxfStandard::AsDcp, None);
+        let mut reader = AtmosReader::open(&path, None).unwrap();
+        assert_eq!(reader.read_frame(2).unwrap(), frames[2].as_slice());
+        let error = match reader.read_frame(3) {
+            Ok(frame) => panic!("read {} bytes", frame.len()),
+            Err(error) => error,
+        };
+        assert!(error.contains("781250"), "{error}");
+        assert_eq!(reader.read_frame(0).unwrap(), frames[0].as_slice());
+    }
+
+    #[test]
+    fn an_encrypted_imf_iab_track_is_refused() {
+        let encrypted = asdcplib::WriterInfo {
+            encrypted_essence: true,
+            ..Default::default()
+        };
+        assert!(check_imf_track_is_clear(&encrypted).is_err());
+        assert!(check_imf_track_is_clear(&asdcplib::WriterInfo::default()).is_ok());
     }
 
     #[test]
