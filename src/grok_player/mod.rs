@@ -26,7 +26,9 @@ use crate::colour::RenderingIntent;
 use crate::content_keys::ContentKeys;
 use crate::encode::FrameRate;
 
-pub use audio::{MAXIMUM_SOUND_DELAY_MILLISECONDS, SoundOutputLayout, sound_output_device_names};
+pub use audio::{
+    MAXIMUM_SOUND_DELAY_MILLISECONDS, SoundOutputLayout, SoundSource, sound_output_device_names,
+};
 pub use compositor::SubtitlePresentation;
 pub use presenter::{
     MAXIMUM_BRIGHTNESS, MINIMUM_BRIGHTNESS, PictureMasks, PictureRectangle, PictureScaling,
@@ -311,6 +313,10 @@ struct Status {
     queued_source: Option<String>,
     subtitle_track: Option<TrackStatus>,
     caption_track: Option<TrackStatus>,
+    // None when the composition has no sound
+    sound_source: Option<SoundSource>,
+    // the composition carries Atmos on every reel
+    atmos_available: bool,
 }
 
 // a slot holding cues, in the language its track names
@@ -344,6 +350,7 @@ enum Command {
     SetOverlay(Vec<OverlayRectangle>),
     SetSoundOutputDevice(Option<String>),
     SetSoundOutputLayout(SoundOutputLayout),
+    SetSoundSource(SoundSource),
     SetSoundDelay(i64),
     Redraw,
     DecodeFinished,
@@ -766,6 +773,11 @@ impl GrokPlayer {
         let _ = self.send(Command::SetSoundOutputLayout(layout));
     }
 
+    // a composition lacking the chosen track plays the other, and the choice holds for the compositions after
+    pub fn set_sound_source(&self, source: SoundSource) {
+        let _ = self.send(Command::SetSoundSource(source));
+    }
+
     // positive delays the sound behind the picture, clamped to MAXIMUM_SOUND_DELAY_MILLISECONDS either way
     pub fn set_sound_delay_milliseconds(&self, milliseconds: i64) {
         let clamped = milliseconds.clamp(
@@ -866,7 +878,7 @@ impl Drop for GrokPlayer {
 
 fn status_json(status: &Status) -> String {
     format!(
-        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "decode_capacity_fps": {}, "container_fps": {}, "eof": {}, "stereoscopic": {}, "warnings": [{}], "source": {}, "queued_source": {}, "subtitle_track": {}, "caption_track": {}}}"#,
+        r#"{{"position": {}, "duration": {}, "paused": {}, "filename": {}, "dropped_frames": {}, "dropped_frames_not_decoded": {}, "dropped_frames_scheduler_late": {}, "delayed_frames": {}, "cache_seconds": null, "decoder_fps": {}, "decode_capacity_fps": {}, "container_fps": {}, "eof": {}, "stereoscopic": {}, "warnings": [{}], "source": {}, "queued_source": {}, "subtitle_track": {}, "caption_track": {}, "sound_source": {}, "atmos_available": {}}}"#,
         json_number(status.position),
         json_number(status.duration),
         status.paused,
@@ -890,6 +902,11 @@ fn status_json(status: &Status) -> String {
         json_string(status.queued_source.as_deref()),
         track_json(status.subtitle_track.as_ref()),
         track_json(status.caption_track.as_ref()),
+        json_string(status.sound_source.map(|source| match source {
+            SoundSource::Atmos => "atmos",
+            SoundSource::MainSound => "main",
+        })),
+        status.atmos_available,
     )
 }
 
@@ -956,12 +973,17 @@ mod tests {
         );
         assert!(metadata.contains(r#""subtitle_track": null"#), "{metadata}");
         assert!(metadata.contains(r#""caption_track": null"#), "{metadata}");
+        assert!(metadata.contains(r#""sound_source": null"#), "{metadata}");
+        assert!(
+            metadata.contains(r#""atmos_available": false"#),
+            "{metadata}"
+        );
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&metadata)
                 .expect("metadata is JSON")
                 .as_object()
                 .map(|fields| fields.len()),
-            Some(19)
+            Some(21)
         );
     }
 

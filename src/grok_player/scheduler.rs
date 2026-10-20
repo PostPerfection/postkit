@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use super::audio;
+use super::audio::{self, SoundSource, chosen_sound};
 use super::compositor::{Compositor, Layers};
 use super::decode_pool::{DecodeJob, DecodePool};
 use super::stereo::{StereoHalf, StereoOutput, StereoPair};
@@ -261,6 +261,8 @@ struct Scheduler {
     sound_loaded: bool,
     // where the current composition starts on the sound device's clock
     sound_offset_seconds: f64,
+    // kept for every composition the session loads or queues after
+    sound_source: SoundSource,
     source: Option<PathBuf>,
     queued: Option<QueuedSource>,
 }
@@ -296,6 +298,7 @@ impl Scheduler {
             sound,
             sound_loaded: false,
             sound_offset_seconds: 0.0,
+            sound_source: SoundSource::default(),
             source: None,
             queued: None,
         }
@@ -432,7 +435,7 @@ impl Scheduler {
         self.in_flight.clear();
         self.pool.rebase(finished.frame_count, self.generation);
         self.pool.measure_capacity_from(self.generation);
-        self.hand_off_sound(&finished, &mut timeline);
+        self.hand_off_sound(&finished, &timeline);
         if let Err(error) = self.take_composition_subtitles(&mut timeline) {
             tracing::error!("subtitles of {}: {error}", source.display());
         }
@@ -449,7 +452,7 @@ impl Scheduler {
         }
     }
 
-    fn hand_off_sound(&mut self, finished: &Timeline, next: &mut Timeline) {
+    fn hand_off_sound(&mut self, finished: &Timeline, next: &Timeline) {
         if self.sound_loaded {
             self.sound_offset_seconds += finished.frame_count as f64 / finished.fps;
             self.sound.advance(next.fps);
@@ -458,7 +461,7 @@ impl Scheduler {
         self.sound_offset_seconds = 0.0;
         self.sound_loaded = self
             .sound
-            .load(std::mem::take(&mut next.sound), next.played_frames());
+            .load(&next.sound, self.sound_source, next.played_frames());
         if self.sound_loaded && self.playing {
             self.sound.set_playing(true);
         }
@@ -707,6 +710,10 @@ impl Scheduler {
                 self.sound.set_layout(layout);
                 self.restart_sound();
             }
+            Command::SetSoundSource(source) => {
+                self.sound_source = source;
+                self.sound.set_source(source);
+            }
             Command::SetSoundDelay(milliseconds) => {
                 self.sound.set_delay_milliseconds(milliseconds);
                 self.restart_sound();
@@ -724,7 +731,7 @@ impl Scheduler {
         self.shared
             .set_source_size(Some((timeline.width, timeline.height)));
         let played = timeline.played_frames();
-        self.sound_loaded = self.sound.load(std::mem::take(&mut timeline.sound), played);
+        self.sound_loaded = self.sound.load(&timeline.sound, self.sound_source, played);
         self.sound_offset_seconds = 0.0;
         self.source = Some(source.to_path_buf());
         self.timeline = Some(timeline);
@@ -738,12 +745,11 @@ impl Scheduler {
         if self.timeline.is_none() {
             return Err("nothing is loaded for a source to follow".to_string());
         }
-        let mut timeline = open_timeline(&source, &options)?;
+        let timeline = open_timeline(&source, &options)?;
         self.clear_queued();
         if self.sound_loaded {
             let played = timeline.played_frames();
-            self.sound
-                .queue(std::mem::take(&mut timeline.sound), played);
+            self.sound.queue(&timeline.sound, self.sound_source, played);
         }
         self.queued = Some(QueuedSource { source, timeline });
         Ok(())
@@ -1007,6 +1013,11 @@ impl Scheduler {
                 .collect(),
             subtitle_track: self.subtitle.status(),
             caption_track: self.caption.status(),
+            sound_source: timeline.and_then(|timeline| {
+                chosen_sound(self.sound_source, |source| timeline.sound.carries(source))
+            }),
+            atmos_available: timeline
+                .is_some_and(|timeline| timeline.sound.carries(SoundSource::Atmos)),
         });
         self.shared
             .set_cached_frames(self.pool.cached_frame_count());

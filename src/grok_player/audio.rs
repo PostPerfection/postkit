@@ -57,6 +57,25 @@ pub enum SoundOutputLayout {
     Automatic,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SoundSource {
+    #[default]
+    Atmos,
+    MainSound,
+}
+
+// the track the choice names, or the other one when the composition lacks it
+pub(super) fn chosen_sound(
+    choice: SoundSource,
+    carries: impl Fn(SoundSource) -> bool,
+) -> Option<SoundSource> {
+    let other = match choice {
+        SoundSource::Atmos => SoundSource::MainSound,
+        SoundSource::MainSound => SoundSource::Atmos,
+    };
+    [choice, other].into_iter().find(|source| carries(*source))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Speaker {
     Left,
@@ -216,14 +235,17 @@ enum Command {
     SetPlaying(bool),
     SetDevice(Option<String>, Sender<()>),
     SetLayout(SoundOutputLayout, Sender<()>),
+    SetSource(SoundSource),
     SetDelay(i64),
     Stop,
     Shutdown,
 }
 
 pub(super) struct SoundComposition {
-    pub(super) reels: Vec<SoundReel>,
-    essence: SoundEssence,
+    main_sound: Vec<SoundReel>,
+    pub(super) atmos: Vec<SoundReel>,
+    // None while neither track has a reel to play
+    playing: Option<SoundSource>,
     pub(super) fps: f64,
     // the composition frame of sound frame 0, past a range's in frame
     pub(super) first_frame: u64,
@@ -240,24 +262,46 @@ pub(super) struct PlayedFrames {
 }
 
 impl SoundComposition {
-    fn of(sound: CompositionSound, frames: PlayedFrames) -> Self {
-        SoundComposition {
-            reels: reels_within(reels_of(sound.segments, sound.essence, frames.fps), frames),
-            essence: sound.essence,
+    fn of(sound: &CompositionSounds, choice: SoundSource, frames: PlayedFrames) -> Self {
+        let reels = |sound: &CompositionSound| {
+            reels_within(reels_of(&sound.segments, sound.essence, frames.fps), frames)
+        };
+        let mut composition = SoundComposition {
+            main_sound: reels(&sound.main_sound),
+            atmos: sound.atmos.as_ref().map(reels).unwrap_or_default(),
+            playing: None,
             fps: frames.fps,
             first_frame: frames.first_frame,
             frame_count: frames.frame_count,
-        }
+        };
+        composition.choose(choice);
+        composition
     }
 
     fn empty() -> Self {
         SoundComposition {
-            reels: Vec::new(),
-            essence: SoundEssence::Pcm,
+            main_sound: Vec::new(),
+            atmos: Vec::new(),
+            playing: None,
             fps: 0.0,
             first_frame: 0,
             frame_count: 0,
         }
+    }
+
+    fn track(&self, source: SoundSource) -> &[SoundReel] {
+        match source {
+            SoundSource::MainSound => &self.main_sound,
+            SoundSource::Atmos => &self.atmos,
+        }
+    }
+
+    fn reels(&self) -> &[SoundReel] {
+        self.playing.map_or(&[], |source| self.track(source))
+    }
+
+    fn choose(&mut self, choice: SoundSource) {
+        self.playing = chosen_sound(choice, |source| !self.track(source).is_empty());
     }
 }
 
@@ -270,6 +314,7 @@ pub(super) struct SoundReel {
     pub(super) key: Option<SoundContentKey>,
 }
 
+#[derive(Clone)]
 pub(super) struct SoundContentKey([u8; 16]);
 
 impl SoundContentKey {
@@ -306,6 +351,22 @@ pub(super) enum SoundEssence {
 pub(super) struct CompositionSound {
     pub(super) segments: Vec<KeyedSoundSegment>,
     pub(super) essence: SoundEssence,
+}
+
+// Atmos is there only when every reel carries it
+#[derive(Default)]
+pub(super) struct CompositionSounds {
+    pub(super) main_sound: CompositionSound,
+    pub(super) atmos: Option<CompositionSound>,
+}
+
+impl CompositionSounds {
+    pub(super) fn carries(&self, source: SoundSource) -> bool {
+        match source {
+            SoundSource::MainSound => !self.main_sound.segments.is_empty(),
+            SoundSource::Atmos => self.atmos.is_some(),
+        }
+    }
 }
 
 pub(super) fn keyed_sound(
@@ -457,9 +518,14 @@ impl Output {
     }
 
     // false when the composition has no sound to play
-    pub(super) fn load(&self, sound: CompositionSound, frames: PlayedFrames) -> bool {
-        let composition = SoundComposition::of(sound, frames);
-        if composition.reels.is_empty() {
+    pub(super) fn load(
+        &self,
+        sound: &CompositionSounds,
+        choice: SoundSource,
+        frames: PlayedFrames,
+    ) -> bool {
+        let composition = SoundComposition::of(sound, choice, frames);
+        if composition.playing.is_none() {
             let _ = self.commands.send(Command::Stop);
             return false;
         }
@@ -471,8 +537,13 @@ impl Output {
     }
 
     // the feeder plays it straight after the loaded composition, silent if it has no sound
-    pub(super) fn queue(&self, sound: CompositionSound, frames: PlayedFrames) {
-        let composition = SoundComposition::of(sound, frames);
+    pub(super) fn queue(
+        &self,
+        sound: &CompositionSounds,
+        choice: SoundSource,
+        frames: PlayedFrames,
+    ) {
+        let composition = SoundComposition::of(sound, choice, frames);
         let _ = self.commands.send(Command::Queue(Some(composition)));
     }
 
@@ -546,6 +617,11 @@ impl Output {
         }
     }
 
+    // the device clock runs on through the switch
+    pub(super) fn set_source(&self, choice: SoundSource) {
+        let _ = self.commands.send(Command::SetSource(choice));
+    }
+
     pub(super) fn warnings(&self) -> Vec<String> {
         let mut warnings = self.shared.warnings.lock().unwrap().clone();
         warnings.extend(self.shared.track_warnings.lock().unwrap().iter().cloned());
@@ -597,7 +673,7 @@ impl Drop for Output {
     }
 }
 
-fn reels_of(segments: Vec<KeyedSoundSegment>, essence: SoundEssence, fps: f64) -> Vec<SoundReel> {
+fn reels_of(segments: &[KeyedSoundSegment], essence: SoundEssence, fps: f64) -> Vec<SoundReel> {
     let mut first_frame = 0u64;
     let mut reels = Vec::new();
     for KeyedSoundSegment { segment, key } in segments {
@@ -624,12 +700,12 @@ fn reels_of(segments: Vec<KeyedSoundSegment>, essence: SoundEssence, fps: f64) -
             continue;
         }
         reels.push(SoundReel {
-            path: segment.path,
+            path: segment.path.clone(),
             edit_rate: segment.edit_rate,
             first_frame,
             frame_count: frames,
             entry_edit_unit: entry,
-            key,
+            key: key.clone(),
         });
         first_frame += frames;
     }
@@ -956,6 +1032,7 @@ fn feed(shared: Arc<Shared>, commands: mpsc::Receiver<Command>) {
                 feeder.reopen();
                 let _ = reply.send(());
             }
+            Ok(Command::SetSource(choice)) => feeder.set_source(choice),
             Ok(Command::SetDelay(milliseconds)) => {
                 feeder.delay_seconds = milliseconds as f64 / MILLISECONDS_PER_SECOND;
             }
@@ -989,18 +1066,32 @@ impl Feeder {
 
     fn load(&mut self, composition: SoundComposition) {
         self.stop();
-        let Some(first) = composition.reels.first() else {
+        let Some(playing) = composition.playing else {
             return;
         };
-        match composition.essence {
-            SoundEssence::Pcm => {
-                let opened = match open_reader(&first.path, first.edit_rate, first.key.as_ref()) {
-                    Ok(open) => open,
-                    Err(error) => {
-                        tracing::warn!("preview sound: {error}");
-                        return;
-                    }
-                };
+        self.current = composition;
+        if let Err(error) = self.open_track(playing) {
+            self.warn_track(vec![error]);
+            self.current = SoundComposition::empty();
+            return;
+        }
+        self.shared.reels_loaded.store(true, Ordering::Release);
+        if self.stream.is_none() {
+            self.open_stream();
+        }
+        self.seek(0);
+    }
+
+    // opens the track's first reel, which sets the sample rate a start counts source samples in
+    fn open_track(&mut self, source: SoundSource) -> Result<(), String> {
+        match source {
+            SoundSource::MainSound => {
+                let first = self
+                    .current
+                    .main_sound
+                    .first()
+                    .ok_or("the composition has no main sound reel")?;
+                let opened = open_reader(&first.path, first.edit_rate, first.key.as_ref())?;
                 eprintln!(
                     "[preview] sound: {}ch {}-bit {} Hz from {}",
                     opened.layout.channels,
@@ -1010,30 +1101,50 @@ impl Feeder {
                 );
                 self.pcm_sample_rate = opened.layout.sample_rate;
                 self.reader = Some((first.path.clone(), opened));
+                self.atmos = None;
             }
-            SoundEssence::Atmos => {
-                let atmos = match AtmosSound::open(&composition, self.mix.rendered_layout()) {
-                    Ok(atmos) => atmos,
-                    Err(error) => {
-                        self.warn_track(vec![error]);
-                        return;
-                    }
-                };
+            SoundSource::Atmos => {
+                let atmos = AtmosSound::open(&self.current, self.mix.rendered_layout())?;
                 eprintln!(
                     "[preview] sound: Atmos at {} Hz from {}",
                     atmos.sample_rate(),
-                    first.path.display()
+                    self.current.atmos[0].path.display()
                 );
                 self.pcm_sample_rate = atmos.sample_rate();
                 self.atmos = Some(atmos);
+                self.reader = None;
             }
         }
-        self.current = composition;
-        self.shared.reels_loaded.store(true, Ordering::Release);
-        if self.stream.is_none() {
-            self.open_stream();
+        Ok(())
+    }
+
+    // the queued composition takes the choice too, and the sound picks up where the device is
+    fn set_source(&mut self, choice: SoundSource) {
+        let switched_early = self.finished.is_some();
+        self.undo_switch();
+        if let Some(queued) = self.queued.as_mut() {
+            queued.choose(choice);
         }
-        self.seek(0);
+        let playing = self.current.playing;
+        self.current.choose(choice);
+        let other_track = self
+            .current
+            .playing
+            .filter(|chosen| playing != Some(*chosen));
+        let mut reopened = false;
+        if let Some(chosen) = other_track {
+            match self.open_track(chosen) {
+                Ok(()) => reopened = true,
+                Err(error) => {
+                    self.warn_track(vec![error]);
+                    self.current.playing = playing;
+                }
+            }
+        }
+        // the buffer holds the other track, or the start of the composition queued before
+        if reopened || switched_early {
+            self.resume_where_the_device_is();
+        }
     }
 
     fn queue(&mut self, composition: Option<SoundComposition>) {
@@ -1102,7 +1213,7 @@ impl Feeder {
 
     // a device or layout change before the first load waits for that load
     fn reopen(&mut self) {
-        if self.stream.is_none() && self.current.reels.is_empty() {
+        if self.stream.is_none() && self.current.reels().is_empty() {
             return;
         }
         self.open_stream();
@@ -1265,13 +1376,14 @@ impl Feeder {
         if self.next_frame >= self.current.frame_count && !self.switch_to_queued() {
             return false;
         }
-        let Some((reel, entry)) = self.location(self.next_frame) else {
+        let location = self.location(self.next_frame);
+        let (Some(playing), Some((reel, entry))) = (self.current.playing, location) else {
             self.push_silent_edit_unit();
             return true;
         };
-        let source = match self.current.essence {
-            SoundEssence::Pcm => self.read_pcm_edit_unit(reel, entry),
-            SoundEssence::Atmos => self.render_atmos_edit_unit(),
+        let source = match playing {
+            SoundSource::MainSound => self.read_pcm_edit_unit(reel, entry),
+            SoundSource::Atmos => self.render_atmos_edit_unit(),
         };
         let Some(source) = source else {
             return false;
@@ -1329,7 +1441,7 @@ impl Feeder {
         }
         let atmos = self.atmos.as_mut()?;
         let sample_rate = atmos.sample_rate();
-        let rendered = atmos.edit_unit(&self.current.reels, self.next_frame);
+        let rendered = atmos.edit_unit(&self.current.atmos, self.next_frame);
         let speakers = rendered_speakers(atmos.layout());
         self.warn_track(rendered.warnings);
         if sample_rate != self.pcm_sample_rate {
@@ -1423,11 +1535,11 @@ impl Feeder {
     }
 
     fn location(&self, frame: u64) -> Option<(usize, u32)> {
-        reel_location(&self.current.reels, frame)
+        reel_location(self.current.reels(), frame)
     }
 
     fn ensure_reader(&mut self, reel: usize) -> bool {
-        let reel = &self.current.reels[reel];
+        let reel = &self.current.main_sound[reel];
         if self
             .reader
             .as_ref()
@@ -2141,7 +2253,7 @@ mod tests {
         let keys = content_keys(directory.path(), &[(SOUND_KEY_ID, SOUND_KEY)]);
 
         let timeline = Timeline::open(&package, Some(&keys), &[]).unwrap();
-        let [sound] = timeline.sound.segments.as_slice() else {
+        let [sound] = timeline.sound.main_sound.segments.as_slice() else {
             panic!("the package names one sound reel");
         };
         let mut opened = open_reader(&sound.segment.path, None, sound.key.as_ref()).unwrap();
@@ -2240,12 +2352,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let cpl = write_imp(&directory.path().join("imp"), false);
 
-        let mut timeline = Timeline::open(&cpl, None, &[]).unwrap();
-        let fps = timeline.fps;
+        let timeline = Timeline::open(&cpl, None, &[]).unwrap();
         let reels = reels_of(
-            std::mem::take(&mut timeline.sound.segments),
+            &timeline.sound.main_sound.segments,
             SoundEssence::Pcm,
-            fps,
+            timeline.fps,
         );
 
         let [reel] = reels.as_slice() else {
@@ -2857,7 +2968,7 @@ mod tests {
     const SAMPLE_FRAMES_PER_EDIT_UNIT_AT_24: usize = 2_000;
 
     fn composition_of(sound: Option<&Path>, frame_count: u64) -> SoundComposition {
-        let segments = sound
+        let segments: Vec<KeyedSoundSegment> = sound
             .map(|path| KeyedSoundSegment {
                 segment: SoundSegment {
                     path: path.to_path_buf(),
@@ -2868,9 +2979,11 @@ mod tests {
             })
             .into_iter()
             .collect();
+        let main_sound = reels_of(&segments, SoundEssence::Pcm, COMPOSITION_FPS);
         SoundComposition {
-            reels: reels_of(segments, SoundEssence::Pcm, COMPOSITION_FPS),
-            essence: SoundEssence::Pcm,
+            playing: (!main_sound.is_empty()).then_some(SoundSource::MainSound),
+            main_sound,
+            atmos: Vec::new(),
             fps: COMPOSITION_FPS,
             first_frame: 0,
             frame_count,
@@ -2966,10 +3079,14 @@ mod tests {
 
         let mut feeder = Feeder::new(Arc::new(Shared::new()));
         feeder.current = SoundComposition::of(
-            CompositionSound {
-                segments,
-                essence: SoundEssence::Pcm,
+            &CompositionSounds {
+                main_sound: CompositionSound {
+                    segments,
+                    essence: SoundEssence::Pcm,
+                },
+                atmos: None,
             },
+            SoundSource::Atmos,
             PlayedFrames {
                 fps: COMPOSITION_FPS,
                 first_frame: FIRST_FRAME,
@@ -3199,7 +3316,8 @@ mod tests {
             .unwrap();
         assert_eq!(timeline.fps, fps.as_f64());
         SoundComposition::of(
-            std::mem::take(&mut timeline.sound),
+            &timeline.sound,
+            SoundSource::Atmos,
             timeline.played_frames(),
         )
     }
@@ -3280,12 +3398,18 @@ mod tests {
     }
 
     fn atmos_composition(package: &Path, keys: Option<&ContentKeys>) -> SoundComposition {
-        let mut timeline = Timeline::open(package, keys, &[]).unwrap();
-        assert_eq!(timeline.sound.essence, SoundEssence::Atmos);
-        SoundComposition::of(
-            std::mem::take(&mut timeline.sound),
-            timeline.played_frames(),
-        )
+        let composition = composition_choosing(package, keys, SoundSource::Atmos);
+        assert_eq!(composition.playing, Some(SoundSource::Atmos));
+        composition
+    }
+
+    fn composition_choosing(
+        package: &Path,
+        keys: Option<&ContentKeys>,
+        choice: SoundSource,
+    ) -> SoundComposition {
+        let timeline = Timeline::open(package, keys, &[]).unwrap();
+        SoundComposition::of(&timeline.sound, choice, timeline.played_frames())
     }
 
     fn played_after_a_seek(composition: SoundComposition, frame: u64) -> (Vec<f32>, Feeder) {

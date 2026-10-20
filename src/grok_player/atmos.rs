@@ -32,7 +32,7 @@ impl AtmosSound {
         layout: OutputLayout,
     ) -> Result<Self, String> {
         let first = composition
-            .reels
+            .atmos
             .first()
             .ok_or("the composition has no Atmos reel")?;
         let mut reader = AtmosReader::open(&first.path, first.key.as_ref().map(|key| key.bytes()))?;
