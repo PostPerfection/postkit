@@ -76,6 +76,7 @@ pub(super) const SEVEN_POINT_ONE_LOUDSPEAKERS: &[Loudspeaker] = &[
 // ST 2098-2 Table 24 as boxes (min X, max X, min Y, max Y, min Z, max Z) on nominal positions, walls split at the BS.2127 10.1 room corners of azimuth 30 and 110
 const ZONE_EDGE: f64 = 0.01;
 const COSINE_30_DEGREES: f64 = 0.866_025_403_784_438_6;
+// the 5.1 surrounds at azimuth 110 fall in the rear wall zones 6 and 7, so the side wall zones hold none on 5.1
 const COSINE_110_DEGREES: f64 = -0.342_020_143_325_668_7;
 pub(super) const ZONE_BOXES: [[f64; 6]; 9] = [
     [-1.0, -ZONE_EDGE, COSINE_30_DEGREES, 1.0, -1.0, 0.0],
