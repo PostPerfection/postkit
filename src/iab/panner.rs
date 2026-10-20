@@ -124,8 +124,8 @@ fn zone_contains(zone: &[f64; 6], position: Cartesian) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ObjectParameters {
     pub position: Cartesian,
-    // ADM width, height and depth, which a one dimensional IAB spread sets alike
-    pub extent: f64,
+    // the BS.2127 7.3.11 size on each axis before the Fig. 14 prescale
+    pub extent: Cartesian,
     pub excluded_zones: [bool; 9],
     pub channel_lock: bool,
     pub diffuse: bool,
@@ -172,7 +172,9 @@ impl ObjectPanner {
         if parameters.channel_lock {
             position = reduced.channel_lock(position);
         }
-        let reduced_gains = if parameters.extent == 0.0 {
+        let point_source =
+            parameters.extent.x == 0.0 && parameters.extent.y == 0.0 && parameters.extent.z == 0.0;
+        let reduced_gains = if point_source {
             point_gains(&reduced.positions, position)
         } else {
             reduced.extent_gains(position, parameters.extent)
@@ -282,15 +284,14 @@ impl ReducedLayout {
     }
 
     // follows ear's core.objectbased.allo_extent.get_gains
-    fn extent_gains(&self, position: Cartesian, extent: f64) -> Vec<f64> {
+    fn extent_gains(&self, position: Cartesian, extent: Cartesian) -> Vec<f64> {
         let tables = &self.extent_tables;
         let point = point_gains(&self.positions, position);
         let centre_z = position.z.max(0.0);
         let minimum_size = |points: usize| 2.0 / (points as f64 - 1.0);
-        let scaled = prescaled_extent(extent);
-        let size_x = scaled.max(minimum_size(HORIZONTAL_GRID_POINTS));
-        let size_y = scaled.max(minimum_size(HORIZONTAL_GRID_POINTS));
-        let size_z = scaled.max(minimum_size(VERTICAL_GRID_POINTS));
+        let size_x = prescaled_extent(extent.x).max(minimum_size(HORIZONTAL_GRID_POINTS));
+        let size_y = prescaled_extent(extent.y).max(minimum_size(HORIZONTAL_GRID_POINTS));
+        let size_z = prescaled_extent(extent.z).max(minimum_size(VERTICAL_GRID_POINTS));
         let effective = if tables.single_row {
             size_x
         } else {

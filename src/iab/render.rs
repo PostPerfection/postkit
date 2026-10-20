@@ -387,11 +387,21 @@ pub(super) fn object_parameters(
     let element = "ObjectDefinition";
     let unrendered = |feature| not_rendered(element, meta_id, feature);
     let reserved = |field| reserved_prefix(element, field);
-    // ObjectSpread S spans S / 2 either side in the unit cube, which is S in ADM
-    // units, and ADM Cartesian extent is that half size (BS.2127 10.2.1 wd2xyz)
+    // ST 2098-2 10.5.16 spreads S / 2 either side in the cube, a BS.2127 half size of S in X and Y and S / 2 in Z
     let extent = match pan.spread {
-        ObjectSpread::PointSource => 0.0,
-        ObjectSpread::OneDimension(code) => f64::from(code) / 4_095.0,
+        ObjectSpread::PointSource => Cartesian {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        ObjectSpread::OneDimension(code) => {
+            let spread = f64::from(code) / 4_095.0;
+            Cartesian {
+                x: spread,
+                y: spread,
+                z: spread / 2.0,
+            }
+        }
         ObjectSpread::LowResolution(_) => {
             return Err(unrendered(UnrenderedFeature::LowResolutionSpread));
         }

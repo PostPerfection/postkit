@@ -95,7 +95,14 @@ fn object_gains_match_the_ear_oracle() {
                 y: position[1],
                 z: position[2],
             },
-            extent: case["extent"].as_f64().unwrap(),
+            extent: {
+                let extent = numbers(&case["extent"]);
+                Cartesian {
+                    x: extent[0],
+                    y: extent[1],
+                    z: extent[2],
+                }
+            },
             excluded_zones,
             channel_lock: case["snap"].as_bool().unwrap(),
             diffuse: case["diffuse"].as_f64().unwrap() == 1.0,
@@ -884,4 +891,35 @@ fn a_position_code_below_the_distance_xy_range_is_invalid() {
             ..
         }
     ));
+}
+
+#[test]
+fn iab_coded_spread_matches_the_ear_oracle() {
+    let reference = ear_reference();
+    let cases = reference["iab_objects"].as_array().unwrap();
+    assert_eq!(cases.len(), 90);
+    let mut failures = Vec::new();
+    for case in cases {
+        let layout = layout_named(case["layout"].as_str().unwrap());
+        let codes = numbers(&case["position_codes"]);
+        let pan = ObjectPan {
+            gain: Gain::Unity,
+            position: ObjectPosition {
+                x: codes[0] as u16,
+                y: codes[1] as u16,
+                z: codes[2] as u16,
+            },
+            snap: ObjectSnap::Off,
+            zone_gains: None,
+            spread: ObjectSpread::OneDimension(case["spread_code"].as_u64().unwrap() as u16),
+            decorrelation: Decorrelation::Off,
+        };
+        let parameters = object_parameters(&pan, 1).unwrap();
+        let gains = ObjectPanner::new(layout.loudspeakers()).gains(&parameters);
+        let difference = largest_difference(&gains.direct, &numbers(&case["direct_gains"]));
+        if difference > ORACLE_TOLERANCE {
+            failures.push(format!("{case} ours {:?}", gains.direct));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

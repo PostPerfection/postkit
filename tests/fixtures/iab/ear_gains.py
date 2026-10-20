@@ -109,13 +109,19 @@ ZONE_POINTS = [
 ]
 
 
-def object_case(layout_name, calculator, position, extent, excluded_zones, snap, diffuse):
+# the X, Y and Z half sizes of a one dimensional IAB spread S, which covers S / 2 either side in the cube
+def spread_sizes(spread):
+    return (spread, spread, spread / 2.0)
+
+
+def object_case(layout_name, calculator, position, sizes, excluded_zones, snap, diffuse):
     block_format = AudioBlockFormatObjects(
         position=ObjectCartesianPosition(X=position[0], Y=position[1], Z=position[2]),
         cartesian=True,
-        width=extent,
-        height=extent,
-        depth=extent,
+        # GainCalc hands width, height and depth to the extent panner as its X, Y and Z sizes
+        width=sizes[0],
+        height=sizes[1],
+        depth=sizes[2],
         diffuse=diffuse,
         channelLock=ChannelLock() if snap else None,
         zoneExclusion=[
@@ -127,7 +133,7 @@ def object_case(layout_name, calculator, position, extent, excluded_zones, snap,
     return {
         "layout": layout_name,
         "position": list(position),
-        "extent": extent,
+        "extent": list(sizes),
         "excluded_zones": list(excluded_zones),
         "snap": snap,
         "diffuse": diffuse,
@@ -140,34 +146,36 @@ def object_cases(layout_name):
     calculator = GainCalc(bs2051.get_layout(layout_name))
     cases = []
 
-    def add(position, extent=0.0, excluded_zones=(), snap=False, diffuse=0.0):
-        cases.append(object_case(layout_name, calculator, position, extent, excluded_zones, snap, diffuse))
+    def add(position, spread=0.0, sizes=None, excluded_zones=(), snap=False, diffuse=0.0):
+        sizes = spread_sizes(spread) if sizes is None else sizes
+        cases.append(object_case(layout_name, calculator, position, sizes, excluded_zones, snap, diffuse))
 
     for position in FLOOR_POINTS + CEILING_POINTS:
         add(position)
     for position in EXTENT_POINTS:
         for extent in EXTENTS:
-            add(position, extent=extent)
+            add(position, spread=extent)
+            add(position, sizes=(extent, extent, extent))
     for zone in range(len(ZONES)):
         for position in ZONE_POINTS:
             add(position, excluded_zones=[zone])
     for excluded in RDD57_TABLE4_EXCLUDED.values():
         for position in ZONE_POINTS:
             add(position, excluded_zones=excluded)
-        add((-0.5, 0.3, 0.0), extent=0.5, excluded_zones=excluded)
+        add((-0.5, 0.3, 0.0), spread=0.5, excluded_zones=excluded)
     for position in FLOOR_POINTS + CEILING_POINTS:
         add(position, snap=True)
     for zone in range(len(ZONES)):
         add((-0.6, 0.8, 0.0), snap=True, excluded_zones=[zone])
         add((0.0, 0.0, 0.0), snap=True, excluded_zones=[zone])
-    add((-0.5, 0.3, 0.0), extent=0.25, snap=True)
+    add((-0.5, 0.3, 0.0), spread=0.25, snap=True)
     for position in [(0.0, 0.0, 0.0), (-0.5, 0.3, 0.0), (1.0, -1.0, 0.0)]:
         add(position, diffuse=1.0)
-    add((-0.5, 0.3, 0.0), extent=0.5, diffuse=1.0, excluded_zones=[3])
+    add((-0.5, 0.3, 0.0), spread=0.5, diffuse=1.0, excluded_zones=[3])
     for excluded in REDUCED_LAYOUT_ZONES[layout_name]:
         for position in REDUCED_LAYOUT_POINTS:
             for extent in REDUCED_LAYOUT_EXTENTS:
-                add(position, extent=extent, excluded_zones=excluded)
+                add(position, spread=extent, excluded_zones=excluded)
     generator = random.Random(layout_name)
     for _ in range(RANDOM_CASE_COUNT):
         position = (
@@ -177,11 +185,48 @@ def object_cases(layout_name):
         )
         add(
             position,
-            extent=generator.choice([0.0, generator.uniform(0.0, 1.0)]),
+            spread=generator.choice([0.0, generator.uniform(0.0, 1.0)]),
             excluded_zones=[zone for zone in range(len(ZONES)) if generator.random() < 0.25],
             snap=generator.random() < 0.2,
             diffuse=1.0 if generator.random() < 0.15 else 0.0,
         )
+    return cases
+
+
+# ObjectPosX, ObjectPosY and ObjectPosZ codes and 12 bit ObjectSpread codes
+IAB_POSITION_CODES = [
+    (32767, 32767, 0),
+    (49151, 49151, 0),
+    (60000, 40000, 30000),
+    (65535, 65535, 65535),
+    (40000, 60000, 65535),
+]
+IAB_SPREAD_CODES = [41, 410, 1024, 2048, 3071, 4095]
+
+
+# ST 2098-2 5.4 DistanceXY and DistanceZ, then 11.1 to ADM with y = 0 at the front wall
+def adm_position(codes):
+    distance_x = (codes[0] - 32767) / 32768
+    distance_y = (codes[1] - 32767) / 32768
+    return (2.0 * distance_x - 1.0, 1.0 - 2.0 * distance_y, codes[2] / 65535)
+
+
+def iab_object_cases(layout_name):
+    calculator = GainCalc(bs2051.get_layout(layout_name))
+    cases = []
+    for codes in IAB_POSITION_CODES:
+        for spread_code in IAB_SPREAD_CODES:
+            case = object_case(
+                layout_name, calculator, adm_position(codes), spread_sizes(spread_code / 4095), (), False, 0.0
+            )
+            cases.append(
+                {
+                    "layout": layout_name,
+                    "position_codes": list(codes),
+                    "spread_code": spread_code,
+                    "direct_gains": case["direct_gains"],
+                }
+            )
     return cases
 
 
@@ -236,6 +281,7 @@ def main():
         "zones": [list(box) for box in ZONES],
         "layouts": {name: bs2051.get_layout(name).channel_names for name in LAYOUTS},
         "objects": [case for name in LAYOUTS for case in object_cases(name)],
+        "iab_objects": [case for name in LAYOUTS for case in iab_object_cases(name)],
         "direct_speakers": [case for name in LAYOUTS for case in direct_speakers_cases(name)],
         # one filter per 0+7+0 channel in layout order, transposed to filter by channel
         "decorrelation_channel_names": seven_one.channel_names,
