@@ -1118,7 +1118,7 @@ impl Feeder {
         Ok(())
     }
 
-    // the queued composition takes the choice too, and the sound picks up where the device is
+    // the queued composition takes the choice too
     fn set_source(&mut self, choice: SoundSource) {
         let switched_early = self.finished.is_some();
         self.undo_switch();
