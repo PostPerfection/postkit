@@ -1,4 +1,5 @@
 import json
+import random
 import sys
 
 import numpy as np
@@ -86,6 +87,15 @@ EXTENT_POINTS = [
     (0.7, -0.9, 0.0),
 ]
 EXTENTS = [0.02, 0.1, 0.25, 0.5, 0.75, 1.0]
+# zone sets that leave the loudspeakers varying along fewer axes, such as L and Ls alone on 0+5+0
+REDUCED_LAYOUT_ZONES = {
+    "0+2+0": [[0], [2]],
+    "0+5+0": [[1, 2, 4, 6], [0, 1, 3, 5], [0, 2]],
+    "0+7+0": [[1, 2, 4, 6], [0, 1, 3, 5]],
+}
+REDUCED_LAYOUT_POINTS = [(-0.4, 0.2, 1.0), (0.3, -0.7, 0.0), (-1.0, 0.5, 0.5), (0.9, 0.9, 0.0)]
+REDUCED_LAYOUT_EXTENTS = [0.1, 0.61, 1.0]
+RANDOM_CASE_COUNT = 60
 ZONE_POINTS = [
     (-1.0, 1.0, 0.0),
     (0.0, 1.0, 0.0),
@@ -154,6 +164,24 @@ def object_cases(layout_name):
     for position in [(0.0, 0.0, 0.0), (-0.5, 0.3, 0.0), (1.0, -1.0, 0.0)]:
         add(position, diffuse=1.0)
     add((-0.5, 0.3, 0.0), extent=0.5, diffuse=1.0, excluded_zones=[3])
+    for excluded in REDUCED_LAYOUT_ZONES[layout_name]:
+        for position in REDUCED_LAYOUT_POINTS:
+            for extent in REDUCED_LAYOUT_EXTENTS:
+                add(position, extent=extent, excluded_zones=excluded)
+    generator = random.Random(layout_name)
+    for _ in range(RANDOM_CASE_COUNT):
+        position = (
+            generator.uniform(-1.0, 1.0),
+            generator.uniform(-1.0, 1.0),
+            generator.choice([0.0, 1.0, generator.uniform(0.0, 1.0)]),
+        )
+        add(
+            position,
+            extent=generator.choice([0.0, generator.uniform(0.0, 1.0)]),
+            excluded_zones=[zone for zone in range(len(ZONES)) if generator.random() < 0.25],
+            snap=generator.random() < 0.2,
+            diffuse=1.0 if generator.random() < 0.15 else 0.0,
+        )
     return cases
 
 

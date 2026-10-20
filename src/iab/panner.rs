@@ -291,9 +291,10 @@ impl ReducedLayout {
         let size_x = scaled.max(minimum_size(HORIZONTAL_GRID_POINTS));
         let size_y = scaled.max(minimum_size(HORIZONTAL_GRID_POINTS));
         let size_z = scaled.max(minimum_size(VERTICAL_GRID_POINTS));
-        let effective = match tables.dimension {
-            ExtentDimension::Row => size_x,
-            ExtentDimension::Plane => 0.75 * size_x.max(size_y) + 0.25 * size_x.min(size_y),
+        let effective = if tables.single_row {
+            size_x
+        } else {
+            0.75 * size_x.max(size_y) + 0.25 * size_x.min(size_y)
         };
         let exponent = if effective <= 0.5 {
             6.0
@@ -354,17 +355,19 @@ impl ReducedLayout {
                 + x_sum * y_sum * (floor + ceiling);
         }
         normalise(&mut inside);
-        let distance_to_boundary = match tables.dimension {
-            ExtentDimension::Row => (position.x + 1.0).min(1.0 - position.x),
-            ExtentDimension::Plane => (position.x + 1.0)
-                .min(1.0 - position.x)
-                .min(position.y + 1.0)
-                .min(1.0 - position.y),
+        let distance_x = (position.x + 1.0).min(1.0 - position.x);
+        let distance_y = (position.y + 1.0).min(1.0 - position.y);
+        let distance_z = (centre_z + 1.0).min(1.0 - centre_z);
+        let distance_to_boundary = match tables.boundary_axes {
+            BoundaryAxes::X => distance_x,
+            BoundaryAxes::XAndY => distance_x.min(distance_y),
+            BoundaryAxes::All => distance_x.min(distance_y).min(distance_z),
         };
         let fade = |size: f64| fade_out(distance_to_boundary, size);
-        let inside_share = match tables.dimension {
-            ExtentDimension::Row => fade(size_x).powi(3),
-            ExtentDimension::Plane => (fade(size_x) * fade(size_y)).powf(1.5),
+        let inside_share = match tables.boundary_axes {
+            BoundaryAxes::X => fade(size_x).powi(3),
+            BoundaryAxes::XAndY => (fade(size_x) * fade(size_y)).powf(1.5),
+            BoundaryAxes::All => fade(size_x) * fade(size_y) * fade(size_z),
         };
         let mut extent_gains: Vec<f64> = bound
             .iter()
@@ -452,15 +455,18 @@ fn normalise(gains: &mut [f64]) {
     }
 }
 
+// ear's _dim counts the axes the loudspeakers vary along, and 0 or 3 of them take every axis
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExtentDimension {
-    Row,
-    Plane,
+enum BoundaryAxes {
+    X,
+    XAndY,
+    All,
 }
 
 // per loudspeaker and axis, the point gain of a virtual source on each grid point (BS.2127 7.3.11.3)
 struct ExtentTables {
-    dimension: ExtentDimension,
+    single_row: bool,
+    boundary_axes: BoundaryAxes,
     x: Vec<[f64; HORIZONTAL_GRID_POINTS]>,
     y: Vec<[f64; HORIZONTAL_GRID_POINTS]>,
     z: Vec<[f64; VERTICAL_GRID_POINTS]>,
@@ -468,14 +474,25 @@ struct ExtentTables {
 
 impl ExtentTables {
     fn new(positions: &[Cartesian]) -> Self {
-        // a row of loudspeakers varies in x only, a lone loudspeaker gets every gain either way
-        let single_row = positions
+        let varies = |coordinate: fn(&Cartesian) -> f64| {
+            positions
+                .iter()
+                .any(|position| coordinate(position) != coordinate(&positions[0]))
+        };
+        let (varies_x, varies_y, varies_z) = (
+            varies(|position| position.x),
+            varies(|position| position.y),
+            varies(|position| position.z),
+        );
+        let single_row = !varies_y && !varies_z;
+        let boundary_axes = match [varies_x, varies_y, varies_z]
             .iter()
-            .all(|position| position.y == positions[0].y);
-        let dimension = if single_row {
-            ExtentDimension::Row
-        } else {
-            ExtentDimension::Plane
+            .filter(|varying| **varying)
+            .count()
+        {
+            1 => BoundaryAxes::X,
+            2 => BoundaryAxes::XAndY,
+            _ => BoundaryAxes::All,
         };
         let along = |speaker: usize, source: Cartesian| axis_gains(positions, speaker, source);
         let origin = Cartesian {
@@ -510,7 +527,13 @@ impl ExtentTables {
                 gains
             })
             .collect();
-        ExtentTables { dimension, x, y, z }
+        ExtentTables {
+            single_row,
+            boundary_axes,
+            x,
+            y,
+            z,
+        }
     }
 }
 
