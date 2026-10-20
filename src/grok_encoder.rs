@@ -153,6 +153,7 @@ pub struct CompressParams {
     pub encode_threads: u32,
     pub detect_picture_findings: bool,
     pub first_output_frame: u64,
+    pub cpu_only: bool,
 }
 
 /// Bits a sample carries in the packed rgb48 layout the burns read.
@@ -350,6 +351,7 @@ impl Default for CompressParams {
             encode_threads: 0,
             detect_picture_findings: false,
             first_output_frame: 0,
+            cpu_only: false,
         }
     }
 }
@@ -722,7 +724,7 @@ where
     // which the batch has no way to do, so it stays on the CPU.
     let mut pending_first_frame = None;
     let mut batch = None;
-    if gpu_active()
+    if plugin_enabled_for(&params)
         && params.quality_psnr.is_none()
         && let Some(frame) = frame_producer(&buffer_pool)
     {
@@ -1001,7 +1003,7 @@ fn encoder_thread_fn(
 
 /// How grok sizes one codestream.
 #[cfg(feature = "grok-ffi")]
-enum Allocation {
+pub(crate) enum Allocation {
     /// grok's rate/distortion curve at this ratio, with a non-zero `max_bytes` a hard ceiling.
     Ratio { ratio: f64, max_bytes: u64 },
     /// grok's layer allocation at this PSNR target. `max_cs_size` does nothing
@@ -1510,7 +1512,7 @@ fn compressor_init_failure(params: &CompressParams) -> String {
 
 /// The compression settings one codestream is written with.
 #[cfg(feature = "grok-ffi")]
-fn build_cparameters(
+pub(crate) fn build_cparameters(
     params: &CompressParams,
     rsiz: u16,
     allocation: Allocation,
@@ -1554,6 +1556,7 @@ fn build_cparameters(
         cparams.framerate = params.grok_frame_rate();
         cparams.num_threads = params.threads_per_codec;
         cparams.apply_xyz_transform = params.apply_xyz_transform;
+        cparams.cpu_only = params.cpu_only;
         // Bv2.1 requires a TLM marker in every codestream (libdcp's
         // MISSING_JPEG2000_TLM_MARKER), and grok writes none unless asked
         cparams.write_tlm = true;
@@ -1901,7 +1904,7 @@ impl Batch {
 /// `false` unless the plugin is switched on: nothing else takes these sources.
 #[cfg(feature = "grok-ffi")]
 pub fn plugin_takes_frame(shape_only: &RawFrame, params: &CompressParams) -> bool {
-    if !gpu_active() {
+    if !plugin_enabled_for(params) {
         return false;
     }
     let (writer_tx, _writer_rx) = std::sync::mpsc::sync_channel(1);
@@ -2426,6 +2429,11 @@ pub fn gpu_active() -> bool {
     ACCELERATOR_ENABLED.load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "grok-ffi")]
+pub(crate) fn plugin_enabled_for(params: &CompressParams) -> bool {
+    gpu_active() && !params.cpu_only
+}
+
 /// How many compress and decompress calls the device has run since the process
 /// started. grok counts the calls it routed one at a time and postkit counts
 /// the frames its batches got a codestream back for.
@@ -2457,6 +2465,11 @@ pub fn use_cpu() {}
 /// Stub when grok-ffi is not enabled.
 #[cfg(not(feature = "grok-ffi"))]
 pub fn gpu_active() -> bool {
+    false
+}
+
+#[cfg(not(feature = "grok-ffi"))]
+pub(crate) fn plugin_enabled_for(_params: &CompressParams) -> bool {
     false
 }
 

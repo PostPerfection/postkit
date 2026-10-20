@@ -67,6 +67,7 @@ fn base_params(res: &Res) -> CompressParams {
         encode_threads: 0,
         detect_picture_findings: false,
         first_output_frame: 0,
+        cpu_only: false,
     }
 }
 

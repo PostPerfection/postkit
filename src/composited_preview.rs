@@ -8,13 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::composite::{Composite, composite_frames, encode_composite};
+use crate::composite::{Composite, composite_frames};
+use crate::encode::stream_encode::encode_frames;
 use crate::encode::{
     EncoderInputFormat, FrameRange, FrameRate, InputType, SourceColour, StreamEncodeOptions,
     StreamProgress, compress_params,
 };
 use crate::ffmpeg_decode::{FrameSource, NextFrame};
-use crate::grok_encoder::SampleOrder;
+use crate::grok_encoder::{CompressParams, SampleOrder};
 use crate::mxf_unwrap::CANCELLED;
 use crate::picture_processing::{Fit, PictureProcessing, Placement};
 use crate::pipeline::{
@@ -425,6 +426,14 @@ fn stretch_options(
     }
 }
 
+// a build holding the device never holds up a preview
+fn preview_compress_params(stream_options: &StreamEncodeOptions) -> Result<CompressParams, String> {
+    Ok(CompressParams {
+        cpu_only: true,
+        ..compress_params(stream_options)?
+    })
+}
+
 fn log_line(line: &str) {
     tracing::debug!("{line}");
 }
@@ -446,7 +455,7 @@ fn write_mjpeg(
 ) -> Result<PathBuf, String> {
     let composite = stretch_composite(timeline, stretch, work_dir, options)?;
     let stream_options = stretch_options(timeline, stretch, options, &work_dir.join("j2k"));
-    let params = compress_params(&stream_options)?;
+    let params = preview_compress_params(&stream_options)?;
     let frames = composite_frames(&composite, &stream_options, &params, &log_line)?;
     let EncoderInputFormat::PackedRgb(order) = frames.input_format else {
         unreachable!("a composite is always packed RGB")
@@ -556,15 +565,18 @@ fn encode_codestreams(
     let composite: Composite = stretch_composite(timeline, stretch, work_dir, options)?;
     let j2k_dir = work_dir.join("j2k");
     let stream_options = stretch_options(timeline, stretch, options, &j2k_dir);
+    let params = preview_compress_params(&stream_options)?;
+    let frames = composite_frames(&composite, &stream_options, &params, &log_line)
+        .map_err(|error| format!("{}: {error}", stretch_name(stretch)))?;
     let never_paused = Arc::new(AtomicBool::new(false));
-    let result = encode_composite(
+    let result = encode_frames(
         &stream_options,
-        &composite,
+        &params,
+        frames,
         cancel,
         &never_paused,
         None,
         |progress: StreamProgress| on_frame(progress.frame),
-        log_line,
     );
     if cancel.load(Ordering::Relaxed) {
         return Err(CANCELLED.to_string());
@@ -616,6 +628,21 @@ mod tests {
     fn an_odd_offset_halves_toward_the_centre() {
         assert_eq!(preview_fit(fit(4096, 1716, 3, -3)), fit(2048, 858, 1, -1));
         assert_eq!(preview_fit(fit(4096, 1716, 1, -1)), fit(2048, 858, 0, 0));
+    }
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn a_preview_compress_tells_grok_to_stay_on_the_cpu() {
+        let stream_options =
+            stream_encode_options(&EncodeRunOptions::default(), Path::new("j2k"), 0);
+        let params = preview_compress_params(&stream_options).unwrap();
+        let allocation = crate::grok_encoder::Allocation::Ratio {
+            ratio: params.compression_ratio,
+            max_bytes: 0,
+        };
+        let grok_parameters =
+            crate::grok_encoder::build_cparameters(&params, params.profile, allocation);
+        assert!(grok_parameters.cpu_only);
     }
 
     #[test]

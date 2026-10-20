@@ -216,7 +216,7 @@ fn open_layer(
             },
             source_colour: &opts.source_colour,
             source: &probed.pixel_format,
-            accelerator_active: crate::grok_encoder::gpu_active(),
+            accelerator_active: crate::grok_encoder::plugin_enabled_for(params),
             quality_psnr: opts.quality_psnr,
             postkit_prepares_the_frame: true,
             // the findings describe the base picture alone

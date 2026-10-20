@@ -158,6 +158,10 @@ name = "grok_gpu_rgb48le"
 required-features = ["grok-gpu", "ffmpeg"]
 
 [[test]]
+name = "grok_gpu_preview"
+required-features = ["grok-gpu", "ffmpeg"]
+
+[[test]]
 name = "hdr_dcdm"
 required-features = ["ffmpeg"]
 
