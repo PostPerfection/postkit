@@ -20,6 +20,9 @@ const LARGEST_FRAME_BYTES: [(i32, usize); 9] = [
     (120, 156_250),
 ];
 
+// ST 2067-201 sets no IAB frame size, 16 MiB is over twenty times the 128 uncoded 24-bit channels ST 2098-2 Annex C lets a frame render
+const LARGEST_IMF_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+
 fn largest_frame_bytes(edit_rate: asdcplib::Rational) -> Result<usize, String> {
     LARGEST_FRAME_BYTES
         .iter()
@@ -74,7 +77,7 @@ impl Track {
                 })
             }
             asdcplib::EssenceType::As02Iab => {
-                let mut reader = asdcplib::as02::iab::MxfReader::new();
+                let mut reader = asdcplib::as02::iab::MxfReader::new(LARGEST_IMF_FRAME_BYTES);
                 reader
                     .open_read(&path_text)
                     .map_err(|error| error.to_string())?;
@@ -285,6 +288,39 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("781250"), "{error}");
+        assert_eq!(reader.read_frame(0).unwrap(), frames[0].as_slice());
+    }
+
+    fn ia_bitstream_frame_of(frame_bytes: usize) -> Vec<u8> {
+        const PREAMBLE_TAG: u8 = 0x01;
+        const IA_FRAME_TAG: u8 = 0x02;
+        const ELEMENT_HEADER_BYTES: usize = 5;
+        let ia_frame_length = frame_bytes - 2 * ELEMENT_HEADER_BYTES;
+        let mut frame = vec![PREAMBLE_TAG, 0, 0, 0, 0, IA_FRAME_TAG];
+        frame.extend((ia_frame_length as u32).to_be_bytes());
+        frame.resize(frame_bytes, 0);
+        frame
+    }
+
+    #[test]
+    fn an_imf_iab_frame_over_the_limit_fails_the_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let largest = LARGEST_IMF_FRAME_BYTES as usize;
+        let mut frames = stream_1_frames();
+        frames[2] = ia_bitstream_frame_of(largest);
+        frames[3] = ia_bitstream_frame_of(largest + 1);
+        let path = directory.path().join("atmos.mxf");
+        wrap_atmos_track(&frames, &path, MxfStandard::As02, None);
+        let mut reader = AtmosReader::open(&path, None).unwrap();
+        assert_eq!(reader.read_frame(2).unwrap(), frames[2].as_slice());
+        let error = match reader.read_frame(3) {
+            Ok(frame) => panic!("read {} bytes", frame.len()),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains(&LARGEST_IMF_FRAME_BYTES.to_string()),
+            "{error}"
+        );
         assert_eq!(reader.read_frame(0).unwrap(), frames[0].as_slice());
     }
 

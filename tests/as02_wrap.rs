@@ -313,6 +313,7 @@ fn as02_timed_text_refuses_ancillary_resources() {
 const PREAMBLE_TAG: u8 = 0x01;
 const IA_FRAME_TAG: u8 = 0x02;
 const IAB_ASSET_UUID: [u8; 16] = [5; 16];
+const LARGEST_IAB_FRAME_BYTES: u32 = 64 * 1024;
 
 // element values are filler: no real IA bitstream is available
 fn synthetic_ia_bitstream_frame(
@@ -402,7 +403,7 @@ fn as02_atmos_wraps_a_frame_directory_as_iab() {
         asdcplib::essence_type(&output_string).unwrap(),
         asdcplib::EssenceType::As02Iab
     );
-    let mut reader = asdcplib::as02::iab::MxfReader::new();
+    let mut reader = asdcplib::as02::iab::MxfReader::new(LARGEST_IAB_FRAME_BYTES);
     reader.open_read(&output_string).unwrap();
     assert_eq!(reader.frame_count().unwrap(), frames.len() as u32);
     for (index, expected) in frames.iter().enumerate() {
