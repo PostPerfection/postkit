@@ -153,16 +153,11 @@ impl AtmosReader {
                 frame_buffer,
                 keys,
             } => {
-                let (mut decrypt, mut hmac) = match keys {
+                let (decrypt, hmac) = match keys {
                     Some((decrypt, hmac)) => (Some(decrypt), Some(hmac)),
                     None => (None, None),
                 };
-                let result = reader.read_frame(
-                    frame_number,
-                    frame_buffer,
-                    decrypt.as_deref_mut(),
-                    hmac.as_deref_mut(),
-                );
+                let result = reader.read_frame(frame_number, frame_buffer, decrypt, hmac);
                 match result {
                     Ok(size) => Ok(&frame_buffer[..size]),
                     Err(asdcplib::Error::AsdcpError(SMALL_BUFFER_RESULT)) => Err(format!(
