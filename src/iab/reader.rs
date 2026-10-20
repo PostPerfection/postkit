@@ -21,7 +21,7 @@ const LARGEST_FRAME_BYTES: [(i32, usize); 9] = [
 ];
 
 // ST 2067-201 sets no IAB frame size, 16 MiB is over twenty times the 128 uncoded 24-bit channels ST 2098-2 Annex C lets a frame render
-const LARGEST_IMF_FRAME_BYTES: u32 = 16 * 1024 * 1024;
+pub const LARGEST_IMF_FRAME_BYTES: u32 = 16 * 1024 * 1024;
 
 fn largest_frame_bytes(edit_rate: asdcplib::Rational) -> Result<usize, String> {
     LARGEST_FRAME_BYTES
