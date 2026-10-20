@@ -746,3 +746,29 @@ fn a_zone_set_outside_rdd_57_table_4_silences_its_loudspeakers() {
     assert_eq!(channel_energy(&output, layout, 0), 0.0);
     assert!(energy(&output) > 0.0);
 }
+
+fn render_error(frame: &Frame) -> IabError {
+    let audio = decode_audio(frame).unwrap();
+    Renderer::new(OutputLayout::FivePointOne)
+        .render(frame, &audio)
+        .unwrap_err()
+}
+
+#[test]
+fn an_object_without_one_pan_sub_block_per_table_23_sub_block_is_invalid() {
+    for count in [0, 3, 9] {
+        let mut frame = stream_frames(1).swap_remove(0);
+        let first = frame.objects[0].pan_sub_blocks[0].clone();
+        frame.objects[0].pan_sub_blocks = vec![first; count];
+        assert!(
+            matches!(
+                render_error(&frame),
+                IabError::Invalid {
+                    field: "NumPanSubBlocks",
+                    ..
+                }
+            ),
+            "{count} sub-blocks"
+        );
+    }
+}

@@ -7,8 +7,8 @@ use super::panner::{
     SEVEN_POINT_ONE_LOUDSPEAKERS, STEREO_LOUDSPEAKERS,
 };
 use super::{
-    BedDefinition, Decorrelation, Frame, Gain, IabError, ObjectDefinition, ObjectPan, ObjectSnap,
-    ObjectSpread, ZoneGain,
+    BedDefinition, Decorrelation, Frame, FrameRate, Gain, IabError, ObjectDefinition, ObjectPan,
+    ObjectSnap, ObjectSpread, ZoneGain,
 };
 
 // output channel order: L R, L R C LFE Ls Rs, L R C LFE Lss Rss Lrs Rrs
@@ -144,7 +144,7 @@ impl Renderer {
         }
         let mut objects = Vec::new();
         for object in rendered_elements(&frame.objects, target, &object_hierarchy())? {
-            objects.push(self.object_mix(object, audio, sample_count)?);
+            objects.push(self.object_mix(object, frame.frame_rate, audio, sample_count)?);
         }
 
         let channel_count = loudspeakers.len();
@@ -230,12 +230,21 @@ impl Renderer {
     fn object_mix<'a>(
         &mut self,
         object: &ObjectDefinition,
+        frame_rate: FrameRate,
         audio: &'a BTreeMap<u32, Vec<i32>>,
         sample_count: usize,
     ) -> Result<ObjectMix<'a>, IabError> {
         let unrendered = |feature| not_rendered("ObjectDefinition", object.meta_id, feature);
         if !object.zone_definitions_19.is_empty() {
             return Err(unrendered(UnrenderedFeature::ObjectZoneDefinition19));
+        }
+        if object.pan_sub_blocks.len() != frame_rate.pan_sub_block_count() {
+            return Err(IabError::Invalid {
+                element: "ObjectDefinition",
+                field: "NumPanSubBlocks",
+                value: object.pan_sub_blocks.len() as u64,
+                rule: "ST 2098-2 Table 23 sets one pan sub-block count for each frame rate",
+            });
         }
         let mut sub_block_gains: Vec<Vec<f32>> = Vec::new();
         let mut previous_pan: Option<&ObjectPan> = None;
