@@ -8,7 +8,7 @@ use super::panner::{
 };
 use super::{
     BedDefinition, Decorrelation, Frame, FrameRate, Gain, IabError, ObjectDefinition, ObjectPan,
-    ObjectSnap, ObjectSpread, ZoneGain,
+    ObjectPosition, ObjectSnap, ObjectSpread, ZoneGain,
 };
 
 // output channel order: L R, L R C LFE Ls Rs, L R C LFE Lss Rss Lrs Rrs
@@ -359,14 +359,25 @@ fn reserved_prefix(element: &'static str, field: &'static str) -> IabError {
 }
 
 // ST 2098-2 11.1 puts y = 0 at the front wall, ADM puts Y = 1 there
-pub(super) fn adm_position(x_code: u16, y_code: u16, z_code: u16) -> Cartesian {
-    // ST 2098-2 5.4 DistanceXY and DistanceZ for 16 bit codes
-    let distance_xy = |code: u16| (f64::from(code) - 32_767.0) / 32_768.0;
-    Cartesian {
-        x: 2.0 * distance_xy(x_code) - 1.0,
-        y: 1.0 - 2.0 * distance_xy(y_code),
-        z: f64::from(z_code) / 65_535.0,
-    }
+pub(super) fn adm_position(position: ObjectPosition) -> Result<Cartesian, IabError> {
+    // ST 2098-2 5.4 DistanceXY for 16 bit codes, defined from 32767 up
+    const DISTANCE_XY_OFFSET: u16 = 32_767;
+    let distance_xy = |code: u16, field: &'static str| {
+        if code < DISTANCE_XY_OFFSET {
+            return Err(IabError::Invalid {
+                element: "ObjectDefinition",
+                field,
+                value: u64::from(code),
+                rule: "ST 2098-2 5.4 DistanceXY codes run from 32767 to 65535",
+            });
+        }
+        Ok(f64::from(code - DISTANCE_XY_OFFSET) / 32_768.0)
+    };
+    Ok(Cartesian {
+        x: 2.0 * distance_xy(position.x, "ObjectPosX")? - 1.0,
+        y: 1.0 - 2.0 * distance_xy(position.y, "ObjectPosY")?,
+        z: f64::from(position.z) / 65_535.0,
+    })
 }
 
 pub(super) fn object_parameters(
@@ -418,7 +429,7 @@ pub(super) fn object_parameters(
         Decorrelation::Reserved(_) => return Err(reserved("ObjectDecorCoefPrefix")),
     };
     Ok(ObjectParameters {
-        position: adm_position(pan.position.x, pan.position.y, pan.position.z),
+        position: adm_position(pan.position)?,
         extent,
         excluded_zones,
         channel_lock,

@@ -152,7 +152,12 @@ fn decorrelation_filters_match_the_ear_oracle() {
 
 #[test]
 fn cube_codes_map_to_adm_coordinates() {
-    let front_left_floor = adm_position(32_767, 32_767, 0);
+    let front_left_floor = adm_position(ObjectPosition {
+        x: 32_767,
+        y: 32_767,
+        z: 0,
+    })
+    .unwrap();
     assert_eq!(
         front_left_floor,
         Cartesian {
@@ -161,7 +166,12 @@ fn cube_codes_map_to_adm_coordinates() {
             z: 0.0
         }
     );
-    let back_right_ceiling = adm_position(65_535, 65_535, 65_535);
+    let back_right_ceiling = adm_position(ObjectPosition {
+        x: 65_535,
+        y: 65_535,
+        z: 65_535,
+    })
+    .unwrap();
     assert_eq!(
         back_right_ceiling,
         Cartesian {
@@ -170,7 +180,12 @@ fn cube_codes_map_to_adm_coordinates() {
             z: 1.0
         }
     );
-    let middle = adm_position(49_151, 49_151, 0);
+    let middle = adm_position(ObjectPosition {
+        x: 49_151,
+        y: 49_151,
+        z: 0,
+    })
+    .unwrap();
     assert_eq!((middle.x, middle.y), (0.0, 0.0));
 }
 
@@ -835,5 +850,38 @@ fn a_reserved_prefix_error_names_the_prefix_code() {
     assert!(is_reserved_prefix(
         render_error(&bed_frame),
         "ChannelGainPrefix"
+    ));
+}
+
+#[test]
+fn a_position_code_below_the_distance_xy_range_is_invalid() {
+    let position_error = |position: ObjectPosition| {
+        let mut frame = stream_frames(1).swap_remove(0);
+        frame.objects[0].pan_sub_blocks[2].position = position;
+        render_error(&frame)
+    };
+    assert!(matches!(
+        position_error(ObjectPosition {
+            x: 32_766,
+            y: 40_000,
+            z: 0
+        }),
+        IabError::Invalid {
+            field: "ObjectPosX",
+            value: 32_766,
+            ..
+        }
+    ));
+    assert!(matches!(
+        position_error(ObjectPosition {
+            x: 40_000,
+            y: 0,
+            z: 0
+        }),
+        IabError::Invalid {
+            field: "ObjectPosY",
+            value: 0,
+            ..
+        }
     ));
 }

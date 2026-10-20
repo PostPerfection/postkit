@@ -160,14 +160,9 @@ impl ObjectPanner {
         }
     }
 
-    // BS.2127 7.3.1 for bf.cartesian, without screen handling or divergence
+    // BS.2127 7.3.1 for bf.cartesian, without screen handling, divergence or the 7.3.2 clip, as valid codes stay in the room
     pub fn gains(&mut self, parameters: &ObjectParameters) -> DirectDiffuseGains {
-        let clip = |value: f64| value.clamp(-1.0, 1.0);
-        let mut position = Cartesian {
-            x: clip(parameters.position.x),
-            y: clip(parameters.position.y),
-            z: clip(parameters.position.z),
-        };
+        let mut position = parameters.position;
         let excluded = self.excluded_mask(&parameters.excluded_zones);
         let loudspeakers = self.loudspeakers;
         let reduced = self
