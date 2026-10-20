@@ -8,6 +8,9 @@ use crate::packaging::{AssetMap, AssetMapAsset, DcpCpl, DcpCplReel, ns};
 
 pub(super) const SAMPLE_FRAMES_PER_FRAME: usize = 2_000;
 const SAMPLE_RATE: u32 = 48_000;
+const MAIN_SOUND_CHANNELS: usize = 2;
+const MAIN_SOUND_SAMPLE_CYCLE: usize = 30_000;
+const MAIN_SOUND_REEL_STEP: usize = 3_001;
 const PICTURE_SIZE: u32 = 64;
 const CPL_ID: &str = "a7000000-0000-4000-8000-00000000c000";
 
@@ -27,7 +30,14 @@ fn fixture_id(kind: u32, reel: usize) -> String {
     format!("a7000000-0000-4000-8000-{kind:04x}{reel:08x}")
 }
 
-// a 24 fps DCP whose reels each hold a picture, a silent stereo main sound and the Atmos frames given
+// stereo 16-bit, interleaved, numbered so that no two neighbouring frames hold the same samples
+pub(super) fn main_sound_samples(reel: usize, frames: usize) -> Vec<i16> {
+    (0..frames * SAMPLE_FRAMES_PER_FRAME * MAIN_SOUND_CHANNELS)
+        .map(|index| ((index + reel * MAIN_SOUND_REEL_STEP) % MAIN_SOUND_SAMPLE_CYCLE + 1) as i16)
+        .collect()
+}
+
+// a 24 fps DCP whose reels each hold a picture, the main sound main_sound_samples gives and the Atmos frames given
 pub(super) fn write_atmos_dcp(
     directory: &Path,
     reels: &[AtmosDcpReel],
@@ -60,10 +70,10 @@ pub(super) fn write_atmos_dcp(
         let picture_name = format!("picture_{index}.mxf");
         wrap_picture(picture_files, package.join(&picture_name), None);
         let sound_name = format!("sound_{index}.mxf");
-        write_silent_sound(
+        write_main_sound(
             scratch.path(),
             &package.join(&sound_name),
-            reel.picture_frames,
+            &main_sound_samples(index, reel.picture_frames),
         );
         main_sound_tracks.push(package.join(&sound_name));
         let (picture_id, sound_id, atmos_id) = (
@@ -153,17 +163,17 @@ pub(super) fn write_atmos_dcp(
     }
 }
 
-fn write_silent_sound(scratch: &Path, output: &Path, frames: usize) {
-    let wav = scratch.join("silence.wav");
+fn write_main_sound(scratch: &Path, output: &Path, samples: &[i16]) {
+    let wav = scratch.join("main_sound.wav");
     let spec = hound::WavSpec {
-        channels: 2,
+        channels: MAIN_SOUND_CHANNELS as u16,
         sample_rate: SAMPLE_RATE,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::create(&wav, spec).unwrap();
-    for _ in 0..frames * SAMPLE_FRAMES_PER_FRAME * 2 {
-        writer.write_sample(0i16).unwrap();
+    for sample in samples {
+        writer.write_sample(*sample).unwrap();
     }
     writer.finalize().unwrap();
     let track = mxf_wrap(&MxfWrapOptions {

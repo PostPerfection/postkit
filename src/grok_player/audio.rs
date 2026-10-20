@@ -3165,18 +3165,22 @@ mod tests {
     }
 
     // the device takes sample_frames from the buffer and the feeder tops it up
-    fn play(feeder: &mut Feeder, sample_frames: usize) {
-        feeder
+    fn play(feeder: &mut Feeder, sample_frames: usize) -> Vec<f32> {
+        feeder.fill();
+        let channels = feeder.shared.output_channels();
+        let played = feeder
             .shared
             .buffer
             .lock()
             .unwrap()
-            .drain(..sample_frames * STEREO_CHANNELS);
+            .drain(..sample_frames * channels)
+            .collect();
         feeder
             .shared
             .emitted_sample_frames
             .fetch_add(sample_frames as u64, Ordering::AcqRel);
         feeder.fill();
+        played
     }
 
     fn assert_level(actual: f64, expected: f64) {
@@ -3656,5 +3660,232 @@ mod tests {
         Resampler::new(96_000, DEFAULT_SAMPLE_RATE, STEREO_CHANNELS).push(&heard, &mut expected);
         assert_eq!(played.len(), expected.len());
         assert!(played == expected);
+    }
+
+    use super::super::atmos_package::main_sound_samples;
+
+    // what the stereo device plays of each reel's main sound, end to end
+    fn main_sound_played(reels: &[AtmosDcpReel]) -> Vec<f32> {
+        reels
+            .iter()
+            .enumerate()
+            .flat_map(|(index, reel)| as_played(&main_sound_samples(index, reel.picture_frames)))
+            .collect()
+    }
+
+    fn stereo_samples_before(frame: usize) -> usize {
+        frame * ATMOS_SAMPLE_FRAMES * STEREO_CHANNELS
+    }
+
+    fn play_frames(feeder: &mut Feeder, frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|_| play(feeder, ATMOS_SAMPLE_FRAMES))
+            .collect()
+    }
+
+    fn assert_the_device_clock_is_where_it_was(feeder: &Feeder, sample_frames: u64) {
+        assert_eq!(
+            feeder.shared.emitted_sample_frames.load(Ordering::Acquire),
+            sample_frames
+        );
+        assert_eq!(feeder.seek_position, Some(0.0));
+    }
+
+    #[test]
+    fn a_switch_plays_the_other_track_from_the_frame_the_device_is_at() {
+        const MAIN_SOUND_FROM: usize = 5;
+        let frames = validation_stream_frames(1);
+        let (first, second) = frames.split_at(frames.len() / 2);
+        let reels = [first, second].map(|frames| AtmosDcpReel {
+            picture_frames: frames.len(),
+            atmos_frames: Some(frames.to_vec()),
+        });
+        // past the reel boundary
+        let atmos_again_from = first.len() + 2;
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &reels, None);
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = atmos_composition(&dcp.package, None);
+        feeder.seek(0);
+        play_frames(&mut feeder, MAIN_SOUND_FROM);
+
+        feeder.set_source(SoundSource::MainSound);
+        let played_sample_frames = (MAIN_SOUND_FROM * ATMOS_SAMPLE_FRAMES) as u64;
+        assert_the_device_clock_is_where_it_was(&feeder, played_sample_frames);
+        let on_the_main_sound = play_frames(&mut feeder, atmos_again_from - MAIN_SOUND_FROM);
+        let main_sound = main_sound_played(&reels);
+        assert!(
+            on_the_main_sound
+                == main_sound[stereo_samples_before(MAIN_SOUND_FROM)
+                    ..stereo_samples_before(atmos_again_from)],
+            "the main sound does not play from frame {MAIN_SOUND_FROM}"
+        );
+
+        feeder.set_source(SoundSource::Atmos);
+        let played_sample_frames = (atmos_again_from * ATMOS_SAMPLE_FRAMES) as u64;
+        assert_the_device_clock_is_where_it_was(&feeder, played_sample_frames);
+        let on_atmos = drain_until_the_feeder_stops(&mut feeder);
+        let rendered = rendered_continuously(&frames, &[]);
+        assert!(
+            on_atmos == heard_from(&rendered, atmos_again_from, frames.len()),
+            "Atmos does not play from frame {atmos_again_from} as continuous rendering does"
+        );
+        assert!(feeder.shared.track_warnings.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn back_on_atmos_a_sound_starting_in_frame_n_reaches_the_device_on_its_first_sample() {
+        const FRAMES: usize = 8;
+        const ATMOS_FROM: usize = 3;
+        const ONSET_FRAME: usize = 5;
+        const LEVEL: i32 = 1 << 22;
+        let frames: Vec<Vec<u8>> = (0..FRAMES)
+            .map(|frame| {
+                let level = if frame < ONSET_FRAME { 0 } else { LEVEL };
+                centre_bed_frame(&vec![level; ATMOS_SAMPLE_FRAMES])
+            })
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &one_atmos_reel(&frames), None);
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = composition_choosing(&dcp.package, None, SoundSource::MainSound);
+        feeder.seek(0);
+        play_frames(&mut feeder, ATMOS_FROM);
+
+        feeder.set_source(SoundSource::Atmos);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+        let onset = played.iter().position(|sample| *sample != 0.0).unwrap() / STEREO_CHANNELS;
+        let frame_start = (ONSET_FRAME - ATMOS_FROM) * ATMOS_SAMPLE_FRAMES;
+        assert!(
+            onset.abs_diff(frame_start) <= 1,
+            "the sound starts at sample {onset}, frame {ONSET_FRAME} at {frame_start}"
+        );
+    }
+
+    #[test]
+    fn a_switch_from_96_kilohertz_atmos_lands_inside_the_main_sound_frame_the_device_is_in() {
+        const SWITCH_AT_SAMPLE_FRAME: usize = 2 * ATMOS_SAMPLE_FRAMES + ATMOS_SAMPLE_FRAMES / 2;
+        let frames = validation_stream_frames(127);
+        let reels = one_atmos_reel(&frames);
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &reels, None);
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = atmos_composition(&dcp.package, None);
+        feeder.seek(0);
+        play(&mut feeder, SWITCH_AT_SAMPLE_FRAME);
+
+        feeder.set_source(SoundSource::MainSound);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+        assert!(
+            played == main_sound_played(&reels)[SWITCH_AT_SAMPLE_FRAME * STEREO_CHANNELS..],
+            "the 48 kHz main sound does not pick up at the sample the device is at"
+        );
+    }
+
+    #[test]
+    fn the_choice_carries_to_the_queued_composition_both_ways() {
+        let frames = validation_stream_frames(1)[..6].to_vec();
+        let with_atmos = one_atmos_reel(&frames);
+        let without_atmos = [AtmosDcpReel {
+            picture_frames: frames.len(),
+            atmos_frames: None,
+        }];
+        let directory = tempfile::tempdir().unwrap();
+        let first = write_atmos_dcp(&directory.path().join("first"), &with_atmos, None);
+        let second = write_atmos_dcp(&directory.path().join("second"), &with_atmos, None);
+        let plain = write_atmos_dcp(&directory.path().join("plain"), &without_atmos, None);
+        let main_sound = main_sound_played(&with_atmos);
+        let both_main_sounds = [main_sound.clone(), main_sound].concat();
+
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = composition_choosing(&first.package, None, SoundSource::MainSound);
+        feeder.queue(Some(composition_choosing(
+            &second.package,
+            None,
+            SoundSource::MainSound,
+        )));
+        feeder.seek(0);
+        assert!(
+            drain_until_the_feeder_stops(&mut feeder) == both_main_sounds,
+            "the queued composition with Atmos does not play its main sound"
+        );
+
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = atmos_composition(&first.package, None);
+        feeder.queue(Some(composition_choosing(
+            &plain.package,
+            None,
+            SoundSource::Atmos,
+        )));
+        feeder.seek(0);
+        let played = drain_until_the_feeder_stops(&mut feeder);
+        let rendered = rendered_continuously(&frames, &[]);
+        let expected = [
+            heard_from(&rendered, 0, frames.len()).to_vec(),
+            main_sound_played(&without_atmos),
+        ]
+        .concat();
+        assert!(
+            played == expected,
+            "the queued composition without Atmos does not play its main sound"
+        );
+        assert!(feeder.shared.track_warnings.lock().unwrap().is_empty());
+        let plain_timeline = Timeline::open(&plain.package, None, &[]).unwrap();
+        assert_eq!(plain_timeline.atmos_warning, None);
+
+        // the fill reaches the queued composition before the switch
+        let mut feeder = Feeder::new(Arc::new(Shared::new()));
+        feeder.current = atmos_composition(&first.package, None);
+        feeder.queue(Some(atmos_composition(&second.package, None)));
+        feeder.seek(0);
+        feeder.fill();
+        assert!(feeder.finished.is_some());
+        feeder.set_source(SoundSource::MainSound);
+        assert!(
+            drain_until_the_feeder_stops(&mut feeder) == both_main_sounds,
+            "a switch does not reach the queued composition"
+        );
+    }
+
+    #[test]
+    fn the_meter_names_the_channels_of_the_track_that_plays() {
+        const LEVEL: i32 = 1 << 22;
+        const FIVE_POINT_ONE_CHANNELS: usize = 6;
+        let frames = vec![centre_bed_frame(&vec![LEVEL; ATMOS_SAMPLE_FRAMES]); 12];
+        let directory = tempfile::tempdir().unwrap();
+        let dcp = write_atmos_dcp(directory.path(), &one_atmos_reel(&frames), None);
+        let shared = Arc::new(Shared::new());
+        shared
+            .output_channels
+            .store(FIVE_POINT_ONE_CHANNELS, Ordering::Release);
+        shared.playing.store(true, Ordering::Release);
+        shared.stream_live.store(true, Ordering::Release);
+        shared.reels_loaded.store(true, Ordering::Release);
+        let meter = SoundLevelMeter(Arc::clone(&shared));
+        meter.set_enabled(true);
+        let mut feeder = Feeder::new(shared);
+        feeder.mix = OutputMix::Routed(&FIVE_POINT_ONE_DEVICE_ORDER);
+        feeder.current = atmos_composition(&dcp.package, None);
+        feeder.seek(0);
+        let labels = |meter: &SoundLevelMeter| -> Vec<String> {
+            meter
+                .levels()
+                .unwrap()
+                .into_iter()
+                .map(|level| level.label)
+                .collect()
+        };
+
+        play_frames(&mut feeder, 2);
+        assert_eq!(labels(&meter), ["L", "R", "C", "LFE", "Ls", "Rs"]);
+        feeder.set_source(SoundSource::MainSound);
+        feeder.fill();
+        assert_eq!(labels(&meter), ["L", "R"]);
+        play_frames(&mut feeder, 2);
+        let levels = meter.levels().unwrap();
+        assert!(levels[0].peak_dbfs > SILENCE_FLOOR_DBFS);
+        feeder.set_source(SoundSource::Atmos);
+        feeder.fill();
+        assert_eq!(labels(&meter), ["L", "R", "C", "LFE", "Ls", "Rs"]);
     }
 }
