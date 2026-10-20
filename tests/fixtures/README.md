@@ -58,10 +58,11 @@ than the synthetic SOC+SIZ stubs the older tests build.
 - `iab/ear_gains.json`: the gains EBU's
   [ear](https://github.com/ebu/ebu_adm_renderer) 2.1.0 (BSD-3-Clause-Clear), the
   ITU-R BS.2127 reference renderer, computes for the object, bed channel and
-  decorrelation filter cases in `iab/ear_gains.py`, made with:
+  decorrelation filter cases in `iab/ear_gains.py`, made from the repository root
+  with the venv outside the repository:
 
   ```bash
-  uv venv --python 3.12 ear-oracle
-  uv pip install --python ear-oracle/bin/python ear==2.1.0 'setuptools<81'
-  ear-oracle/bin/python -I -W ignore iab/ear_gains.py > iab/ear_gains.json
+  uv venv --python 3.12 ~/.cache/postperfection/ear-oracle/.venv
+  uv pip install --python ~/.cache/postperfection/ear-oracle/.venv/bin/python ear==2.1.0 'setuptools<81'
+  ~/.cache/postperfection/ear-oracle/.venv/bin/python -I -W ignore tests/fixtures/iab/ear_gains.py > tests/fixtures/iab/ear_gains.json
   ```
