@@ -772,3 +772,32 @@ fn an_object_without_one_pan_sub_block_per_table_23_sub_block_is_invalid() {
         );
     }
 }
+
+#[test]
+fn two_objects_or_two_beds_with_one_meta_id_are_invalid() {
+    let is_meta_id_error = |frame: &Frame, element: &str, meta_id: u32| {
+        matches!(
+            render_error(frame),
+            IabError::Invalid { element: found, field: "MetaID", value, .. }
+                if found == element && value == u64::from(meta_id)
+        )
+    };
+    let mut frame = stream_frames(1).swap_remove(0);
+    let repeated = frame.objects[0].clone();
+    let meta_id = repeated.meta_id;
+    frame.objects.push(repeated);
+    assert!(is_meta_id_error(&frame, "ObjectDefinition", meta_id));
+
+    let mut frame = stream_frames(1).swap_remove(0);
+    let mut child = frame.objects[1].clone();
+    child.meta_id = frame.objects[0].meta_id;
+    child.use_case = Some(0x01);
+    frame.objects[1].child_objects = vec![child];
+    assert!(is_meta_id_error(&frame, "ObjectDefinition", meta_id));
+
+    let mut frame = stream_frames(1).swap_remove(0);
+    let repeated = frame.beds[0].clone();
+    let meta_id = repeated.meta_id;
+    frame.beds.push(repeated);
+    assert!(is_meta_id_error(&frame, "BedDefinition", meta_id));
+}

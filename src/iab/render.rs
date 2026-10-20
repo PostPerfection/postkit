@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::decorrelation::{DIRECT_PATH_DELAY, FILTER_LENGTH, decorrelation_filters};
 use super::direct_speakers::bed_channel_gains;
@@ -138,6 +138,8 @@ impl Renderer {
         let target = self.layout.use_case();
         let loudspeakers = self.layout.loudspeakers();
 
+        check_unique_meta_ids(&frame.beds, &bed_hierarchy())?;
+        check_unique_meta_ids(&frame.objects, &object_hierarchy())?;
         let mut beds = Vec::new();
         for bed in rendered_elements(&frame.beds, target, &bed_hierarchy())? {
             beds.extend(bed_mixes(bed, target, loudspeakers, audio, sample_count)?);
@@ -469,6 +471,7 @@ fn bed_mixes<'a>(
 
 struct Hierarchy<T> {
     element: &'static str,
+    meta_id: fn(&T) -> u32,
     use_case: fn(&T) -> Option<u8>,
     children: fn(&T) -> &[T],
 }
@@ -476,6 +479,7 @@ struct Hierarchy<T> {
 fn bed_hierarchy() -> Hierarchy<BedDefinition> {
     Hierarchy {
         element: "BedDefinition",
+        meta_id: |bed| bed.meta_id,
         use_case: |bed| bed.use_case,
         children: |bed| &bed.child_beds,
     }
@@ -484,9 +488,29 @@ fn bed_hierarchy() -> Hierarchy<BedDefinition> {
 fn object_hierarchy() -> Hierarchy<ObjectDefinition> {
     Hierarchy {
         element: "ObjectDefinition",
+        meta_id: |object| object.meta_id,
         use_case: |object| object.use_case,
         children: |object| &object.child_objects,
     }
+}
+
+// ST 2098-2 10.3.1, children included
+fn check_unique_meta_ids<T>(elements: &[T], hierarchy: &Hierarchy<T>) -> Result<(), IabError> {
+    let mut seen = HashSet::new();
+    let mut pending: Vec<&T> = elements.iter().collect();
+    while let Some(element) = pending.pop() {
+        let meta_id = (hierarchy.meta_id)(element);
+        if !seen.insert(meta_id) {
+            return Err(IabError::Invalid {
+                element: hierarchy.element,
+                field: "MetaID",
+                value: u64::from(meta_id),
+                rule: "no two elements of one ElementID share a MetaID within an IAFrame",
+            });
+        }
+        pending.extend((hierarchy.children)(element));
+    }
+    Ok(())
 }
 
 fn is_activated(use_case: Option<u8>, target: u8) -> bool {
