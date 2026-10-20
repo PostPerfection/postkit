@@ -437,36 +437,36 @@ fn error_with_changed_pan(change: &dyn Fn(&mut ObjectPan)) -> IabError {
         .unwrap_err()
 }
 
-fn excluded_feature(error: IabError) -> ExcludedFeature {
+fn unrendered_feature(error: IabError) -> UnrenderedFeature {
     match error {
-        IabError::OutsideProfile1 { feature, .. } => feature,
-        other => panic!("{other} is not an excluded feature"),
+        IabError::NotRendered { feature, .. } => feature,
+        other => panic!("{other} is not an unrendered feature"),
     }
 }
 
 #[test]
-fn features_outside_profile_1_return_the_named_error() {
+fn features_the_renderer_lacks_return_the_named_error() {
     let pan_error =
-        |change: &dyn Fn(&mut ObjectPan)| excluded_feature(error_with_changed_pan(change));
+        |change: &dyn Fn(&mut ObjectPan)| unrendered_feature(error_with_changed_pan(change));
     assert_eq!(
         pan_error(&|pan| pan.spread = ObjectSpread::LowResolution(3)),
-        ExcludedFeature::LowResolutionSpread
+        UnrenderedFeature::LowResolutionSpread
     );
     assert_eq!(
         pan_error(&|pan| pan.spread = ObjectSpread::ThreeDimensions { x: 1, y: 2, z: 3 }),
-        ExcludedFeature::ThreeDimensionalSpread
+        UnrenderedFeature::ThreeDimensionalSpread
     );
     assert_eq!(
         pan_error(&|pan| pan.snap = ObjectSnap::Tolerance(100)),
-        ExcludedFeature::ObjectSnapTolerance
+        UnrenderedFeature::ObjectSnapTolerance
     );
     assert_eq!(
         pan_error(&|pan| pan.decorrelation = Decorrelation::Coded(128)),
-        ExcludedFeature::ObjectDecorrelationCoefficient
+        UnrenderedFeature::ObjectDecorrelationCoefficient
     );
     assert_eq!(
         pan_error(&|pan| pan.zone_gains = Some([ZoneGain::Coded(512); 9])),
-        ExcludedFeature::ZoneGainCoefficient
+        UnrenderedFeature::ZoneGainCoefficient
     );
 
     let render_changed = |change: &dyn Fn(&mut Frame)| {
@@ -476,39 +476,45 @@ fn features_outside_profile_1_return_the_named_error() {
         Renderer::new(OutputLayout::SevenPointOne).render(&frame, &audio)
     };
     let error = render_changed(&|frame| frame.beds[0].channels[1].channel_id = 0x1).unwrap_err();
-    assert_eq!(excluded_feature(error), ExcludedFeature::ChannelId(0x1));
+    assert_eq!(unrendered_feature(error), UnrenderedFeature::ChannelId(0x1));
     let error = render_changed(&|frame| {
         frame.beds[0].channels[0].decorrelation = Some(Decorrelation::Maximum)
     })
     .unwrap_err();
     assert_eq!(
-        excluded_feature(error),
-        ExcludedFeature::BedChannelDecorrelation
+        unrendered_feature(error),
+        UnrenderedFeature::BedChannelDecorrelation
     );
-    let error = render_changed(&|frame| {
-        frame.beds[0].remaps.push(BedRemap {
-            meta_id: 9,
-            use_case: 0x01,
-            source_channel_count: 10,
-            destination_channel_count: 6,
-            sub_blocks: Vec::new(),
-        })
-    })
-    .unwrap_err();
-    assert_eq!(excluded_feature(error), ExcludedFeature::BedRemap);
+    let with_remap = |use_case: u8| {
+        move |frame: &mut Frame| {
+            frame.beds[0].remaps.push(BedRemap {
+                meta_id: 9,
+                use_case,
+                source_channel_count: 10,
+                destination_channel_count: 6,
+                sub_blocks: Vec::new(),
+            })
+        }
+    };
+    let error = render_changed(&with_remap(0x02)).unwrap_err();
+    assert_eq!(unrendered_feature(error), UnrenderedFeature::BedRemap);
+    let error = render_changed(&with_remap(0xFF)).unwrap_err();
+    assert_eq!(unrendered_feature(error), UnrenderedFeature::BedRemap);
+    // ST 2098-2 10.3.2 applies a remap only when its UseCase activates it
+    assert!(render_changed(&with_remap(0x01)).is_ok());
 }
 
 #[test]
-fn a_stream_outside_profile_1_returns_the_named_error() {
+fn a_stream_with_19_zones_returns_the_named_error() {
     let frame = &stream_frames(41)[0];
     let error = Renderer::new(OutputLayout::SevenPointOne)
         .render(frame, &decode_audio(frame).unwrap())
         .unwrap_err();
     assert!(matches!(
         error,
-        IabError::OutsideProfile1 {
+        IabError::NotRendered {
             element: "ObjectDefinition",
-            feature: ExcludedFeature::ObjectZoneDefinition19,
+            feature: UnrenderedFeature::ObjectZoneDefinition19,
             ..
         }
     ));
@@ -554,4 +560,189 @@ fn a_conditional_object_renders_only_for_its_use_case() {
             );
         }
     }
+}
+
+fn energy(samples: &[f32]) -> f64 {
+    samples
+        .iter()
+        .map(|sample| f64::from(*sample).powi(2))
+        .sum()
+}
+
+fn render_alone(frame: &Frame, layout: OutputLayout) -> Vec<f32> {
+    let audio = decode_audio(frame).unwrap();
+    Renderer::new(layout).render(frame, &audio).unwrap()
+}
+
+fn channel_energy(output: &[f32], layout: OutputLayout, channel: usize) -> f64 {
+    let samples: Vec<f32> = output
+        .iter()
+        .skip(channel)
+        .step_by(layout.channel_count())
+        .copied()
+        .collect();
+    energy(&samples)
+}
+
+fn largest_sample_difference(ours: &[f32], expected: &[f32]) -> f32 {
+    assert_eq!(ours.len(), expected.len());
+    ours.iter()
+        .zip(expected)
+        .map(|(ours, expected)| (ours - expected).abs())
+        .fold(0.0, f32::max)
+}
+
+// the first frame of stream 1 with its first object alone, a point source at position
+fn one_object_frame(position: ObjectPosition) -> Frame {
+    let mut frame = stream_frames(1).swap_remove(0);
+    frame.beds.clear();
+    frame.objects.truncate(1);
+    frame.objects[0].child_objects.clear();
+    for pan in &mut frame.objects[0].pan_sub_blocks {
+        pan.position = position;
+        pan.spread = ObjectSpread::PointSource;
+        pan.zone_gains = None;
+        pan.snap = ObjectSnap::Off;
+        pan.decorrelation = Decorrelation::Off;
+    }
+    frame
+}
+
+const FRONT_LEFT: ObjectPosition = ObjectPosition {
+    x: 32_767,
+    y: 32_767,
+    z: 0,
+};
+const FRONT_RIGHT: ObjectPosition = ObjectPosition {
+    x: 65_535,
+    y: 32_767,
+    z: 0,
+};
+
+#[test]
+fn streams_outside_profile_1_render_every_frame_on_every_layout() {
+    // 38 has child objects, 50 and 127 run at 96 kHz, 59 at 96 fps and 91 carries PCM
+    for number in [38, 50, 59, 91, 127] {
+        let frames = stream_frames(number);
+        for layout in LAYOUTS {
+            let mut renderer = Renderer::new(layout);
+            let mut total_energy = 0.0;
+            for (index, frame) in frames.iter().enumerate() {
+                let output = renderer
+                    .render(frame, &decode_audio(frame).unwrap())
+                    .unwrap_or_else(|error| panic!("stream {number} frame {index}: {error}"));
+                let sample_count = frame.frame_rate.sample_count(frame.sample_rate);
+                assert_eq!(output.len(), sample_count * layout.channel_count());
+                assert!(output.iter().all(|sample| sample.is_finite()));
+                total_energy += energy(&output);
+            }
+            assert!(total_energy > 0.0, "stream {number} renders silence");
+        }
+    }
+}
+
+#[test]
+fn an_activated_child_object_renders_in_place_of_its_parent() {
+    let with_child = |use_case: u8| {
+        let mut frame = one_object_frame(FRONT_LEFT);
+        let mut child = frame.objects[0].clone();
+        child.meta_id = frame.objects[0].meta_id + 1;
+        child.use_case = Some(use_case);
+        for pan in &mut child.pan_sub_blocks {
+            pan.position = FRONT_RIGHT;
+        }
+        frame.objects[0].child_objects = vec![child];
+        render_alone(&frame, OutputLayout::Stereo)
+    };
+    // the point source panner leaves about 1e-17 of the gain on the far loudspeaker
+    let only_in = |output: &[f32], channel: usize| {
+        let wanted = channel_energy(output, OutputLayout::Stereo, channel);
+        let other = channel_energy(output, OutputLayout::Stereo, 1 - channel);
+        wanted > 0.0 && other < wanted * 1e-20
+    };
+    assert!(only_in(&with_child(0x30), 1));
+    assert!(only_in(&with_child(0x01), 0));
+}
+
+#[test]
+fn two_beds_both_render() {
+    let mut frame = stream_frames(1).swap_remove(0);
+    frame.objects.clear();
+    let one_bed = render_alone(&frame, OutputLayout::FivePointOne);
+    let mut second = frame.beds[0].clone();
+    second.meta_id = frame.beds[0].meta_id + 1;
+    frame.beds.push(second);
+    let two_beds = render_alone(&frame, OutputLayout::FivePointOne);
+    let doubled: Vec<f32> = one_bed.iter().map(|sample| 2.0 * sample).collect();
+    assert!(energy(&one_bed) > 0.0);
+    assert!(largest_sample_difference(&two_beds, &doubled) < 1e-6);
+}
+
+#[test]
+fn a_coded_gain_of_64_halves_the_element() {
+    let halved = |frame: &Frame, layout: OutputLayout| {
+        render_alone(frame, layout)
+            .iter()
+            .map(|sample| 0.5 * sample)
+            .collect::<Vec<f32>>()
+    };
+    let mut objects = stream_frames(1).swap_remove(0);
+    objects.beds.clear();
+    let set_object_gains = |frame: &mut Frame, gain: Gain| {
+        for pan in frame
+            .objects
+            .iter_mut()
+            .flat_map(|object| &mut object.pan_sub_blocks)
+        {
+            pan.gain = gain;
+        }
+    };
+    set_object_gains(&mut objects, Gain::Unity);
+    let unity = halved(&objects, OutputLayout::SevenPointOne);
+    set_object_gains(&mut objects, Gain::Coded(64));
+    let coded = render_alone(&objects, OutputLayout::SevenPointOne);
+    assert!(energy(&unity) > 0.0);
+    assert!(largest_sample_difference(&coded, &unity) < 1e-6);
+
+    let mut bed = stream_frames(1).swap_remove(0);
+    bed.objects.clear();
+    let set_channel_gains = |frame: &mut Frame, gain: Gain| {
+        for channel in &mut frame.beds[0].channels {
+            channel.gain = gain;
+        }
+    };
+    set_channel_gains(&mut bed, Gain::Unity);
+    let unity = halved(&bed, OutputLayout::SevenPointOne);
+    set_channel_gains(&mut bed, Gain::Coded(64));
+    let coded = render_alone(&bed, OutputLayout::SevenPointOne);
+    assert!(energy(&unity) > 0.0);
+    assert!(largest_sample_difference(&coded, &unity) < 1e-6);
+}
+
+#[test]
+fn a_conditional_bed_renders_only_for_its_use_case() {
+    let bed_energy = |use_case: u8| {
+        let mut frame = stream_frames(1).swap_remove(0);
+        frame.objects.clear();
+        frame.beds[0].use_case = Some(use_case);
+        energy(&render_alone(&frame, OutputLayout::FivePointOne))
+    };
+    assert!(bed_energy(0x01) > 0.0);
+    assert!(bed_energy(0xFF) > 0.0);
+    assert_eq!(bed_energy(0x02), 0.0);
+}
+
+#[test]
+fn a_zone_set_outside_rdd_57_table_4_silences_its_loudspeakers() {
+    let layout = OutputLayout::FivePointOne;
+    let mut frame = one_object_frame(FRONT_LEFT);
+    // Table 4 has no set that turns off the left screen zone alone
+    let mut zone_gains = [ZoneGain::Full; 9];
+    zone_gains[0] = ZoneGain::Silent;
+    for pan in &mut frame.objects[0].pan_sub_blocks {
+        pan.zone_gains = Some(zone_gains);
+    }
+    let output = render_alone(&frame, layout);
+    assert_eq!(channel_energy(&output, layout, 0), 0.0);
+    assert!(energy(&output) > 0.0);
 }

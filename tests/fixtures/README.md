@@ -33,7 +33,7 @@ than the synthetic SOC+SIZ stubs the older tests build.
   (96 kHz DLC in a 48 kHz frame) and 129 invalid and both still parse. 49
   (Version 2) and 62 (DLC at 23.976 fps) fail to parse at the first frame in
   IABLib and in postkit. 1, 27, 29 and 35 meet SMPTE RDD 57 IAB Application
-  Profile 1, the set the renderer tests play.
+  Profile 1. The renderer tests play those and 38, 50, 59, 91 and 127.
 - `iab/iablib_decoded_digests_sha256.txt`: for each of the 148 streams, the
   SHA-256 of what `iab/dump_decoded_digests.cpp` prints for it. The program
   prints one line per frame and AudioDataID with the sample count and the FNV-1a

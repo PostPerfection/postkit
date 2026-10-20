@@ -44,9 +44,8 @@ impl OutputLayout {
 
 const ALWAYS_USE: u8 = 0xFF;
 
-// what SMPTE RDD 57 IAB Application Profile 1 leaves out of a stream
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExcludedFeature {
+pub enum UnrenderedFeature {
     BedRemap,
     BedChannelDecorrelation,
     ChannelId(u32),
@@ -58,24 +57,24 @@ pub enum ExcludedFeature {
     ObjectDecorrelationCoefficient,
 }
 
-impl std::fmt::Display for ExcludedFeature {
+impl std::fmt::Display for UnrenderedFeature {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExcludedFeature::BedRemap => write!(formatter, "a BedRemap"),
-            ExcludedFeature::BedChannelDecorrelation => {
+            UnrenderedFeature::BedRemap => write!(formatter, "a BedRemap"),
+            UnrenderedFeature::BedChannelDecorrelation => {
                 write!(formatter, "channel decorrelation")
             }
-            ExcludedFeature::ChannelId(channel_id) => {
+            UnrenderedFeature::ChannelId(channel_id) => {
                 write!(formatter, "ChannelID {channel_id:#x}")
             }
-            ExcludedFeature::ObjectZoneDefinition19 => {
+            UnrenderedFeature::ObjectZoneDefinition19 => {
                 write!(formatter, "an ObjectZoneDefinition19")
             }
-            ExcludedFeature::LowResolutionSpread => write!(formatter, "low resolution spread"),
-            ExcludedFeature::ThreeDimensionalSpread => write!(formatter, "3D spread"),
-            ExcludedFeature::ObjectSnapTolerance => write!(formatter, "a coded snap tolerance"),
-            ExcludedFeature::ZoneGainCoefficient => write!(formatter, "a coded zone gain"),
-            ExcludedFeature::ObjectDecorrelationCoefficient => {
+            UnrenderedFeature::LowResolutionSpread => write!(formatter, "low resolution spread"),
+            UnrenderedFeature::ThreeDimensionalSpread => write!(formatter, "3D spread"),
+            UnrenderedFeature::ObjectSnapTolerance => write!(formatter, "a coded snap tolerance"),
+            UnrenderedFeature::ZoneGainCoefficient => write!(formatter, "a coded zone gain"),
+            UnrenderedFeature::ObjectDecorrelationCoefficient => {
                 write!(formatter, "a coded decorrelation coefficient")
             }
         }
@@ -141,7 +140,7 @@ impl Renderer {
 
         let mut beds = Vec::new();
         for bed in rendered_elements(&frame.beds, target, &bed_hierarchy())? {
-            beds.extend(bed_mixes(bed, loudspeakers, audio, sample_count)?);
+            beds.extend(bed_mixes(bed, target, loudspeakers, audio, sample_count)?);
         }
         let mut objects = Vec::new();
         for object in rendered_elements(&frame.objects, target, &object_hierarchy())? {
@@ -234,9 +233,9 @@ impl Renderer {
         audio: &'a BTreeMap<u32, Vec<i32>>,
         sample_count: usize,
     ) -> Result<ObjectMix<'a>, IabError> {
-        let excluded = |feature| outside_profile_1("ObjectDefinition", object.meta_id, feature);
+        let unrendered = |feature| not_rendered("ObjectDefinition", object.meta_id, feature);
         if !object.zone_definitions_19.is_empty() {
-            return Err(excluded(ExcludedFeature::ObjectZoneDefinition19));
+            return Err(unrendered(UnrenderedFeature::ObjectZoneDefinition19));
         }
         let mut sub_block_gains: Vec<Vec<f32>> = Vec::new();
         let mut previous_pan: Option<&ObjectPan> = None;
@@ -295,8 +294,8 @@ fn sample_value(sample: i32) -> f32 {
     sample as f32 / 2_147_483_648.0
 }
 
-fn outside_profile_1(element: &'static str, meta_id: u32, feature: ExcludedFeature) -> IabError {
-    IabError::OutsideProfile1 {
+fn not_rendered(element: &'static str, meta_id: u32, feature: UnrenderedFeature) -> IabError {
+    IabError::NotRendered {
         element,
         meta_id,
         feature,
@@ -369,7 +368,7 @@ pub(super) fn object_parameters(
     meta_id: u32,
 ) -> Result<ObjectParameters, IabError> {
     let element = "ObjectDefinition";
-    let excluded = |feature| outside_profile_1(element, meta_id, feature);
+    let unrendered = |feature| not_rendered(element, meta_id, feature);
     let reserved = |field| IabError::Invalid {
         element,
         field,
@@ -382,17 +381,17 @@ pub(super) fn object_parameters(
         ObjectSpread::PointSource => 0.0,
         ObjectSpread::OneDimension(code) => f64::from(code) / 4_095.0,
         ObjectSpread::LowResolution(_) => {
-            return Err(excluded(ExcludedFeature::LowResolutionSpread));
+            return Err(unrendered(UnrenderedFeature::LowResolutionSpread));
         }
         ObjectSpread::ThreeDimensions { .. } => {
-            return Err(excluded(ExcludedFeature::ThreeDimensionalSpread));
+            return Err(unrendered(UnrenderedFeature::ThreeDimensionalSpread));
         }
     };
     let channel_lock = match pan.snap {
         ObjectSnap::Off => false,
         // DEFAULT_OBJ_SNAP_TOL is 1.0, which snaps from anywhere, as a lock with no maxDistance does
         ObjectSnap::DefaultTolerance => true,
-        ObjectSnap::Tolerance(_) => return Err(excluded(ExcludedFeature::ObjectSnapTolerance)),
+        ObjectSnap::Tolerance(_) => return Err(unrendered(UnrenderedFeature::ObjectSnapTolerance)),
     };
     let mut excluded_zones = [false; 9];
     if let Some(zone_gains) = &pan.zone_gains {
@@ -400,7 +399,9 @@ pub(super) fn object_parameters(
             *excluded_zone = match zone_gain {
                 ZoneGain::Silent => true,
                 ZoneGain::Full => false,
-                ZoneGain::Coded(_) => return Err(excluded(ExcludedFeature::ZoneGainCoefficient)),
+                ZoneGain::Coded(_) => {
+                    return Err(unrendered(UnrenderedFeature::ZoneGainCoefficient));
+                }
                 ZoneGain::Reserved(_) => return Err(reserved("ZoneGainPrefix")),
             };
         }
@@ -409,7 +410,9 @@ pub(super) fn object_parameters(
         Decorrelation::Off => false,
         Decorrelation::Maximum => true,
         Decorrelation::Coded(_) => {
-            return Err(excluded(ExcludedFeature::ObjectDecorrelationCoefficient));
+            return Err(unrendered(
+                UnrenderedFeature::ObjectDecorrelationCoefficient,
+            ));
         }
         Decorrelation::Reserved(_) => return Err(reserved("ObjectDecorCoefPrefix")),
     };
@@ -424,24 +427,29 @@ pub(super) fn object_parameters(
 
 fn bed_mixes<'a>(
     bed: &BedDefinition,
+    target: u8,
     loudspeakers: &[Loudspeaker],
     audio: &'a BTreeMap<u32, Vec<i32>>,
     sample_count: usize,
 ) -> Result<Vec<BedMix<'a>>, IabError> {
     let element = "BedDefinition";
-    let excluded = |feature| outside_profile_1(element, bed.meta_id, feature);
-    if !bed.remaps.is_empty() {
-        return Err(excluded(ExcludedFeature::BedRemap));
+    let unrendered = |feature| not_rendered(element, bed.meta_id, feature);
+    if bed
+        .remaps
+        .iter()
+        .any(|remap| is_activated(Some(remap.use_case), target))
+    {
+        return Err(unrendered(UnrenderedFeature::BedRemap));
     }
     let mut mixes = Vec::with_capacity(bed.channels.len());
     for channel in &bed.channels {
         match channel.decorrelation {
             None | Some(Decorrelation::Off) => {}
-            Some(_) => return Err(excluded(ExcludedFeature::BedChannelDecorrelation)),
+            Some(_) => return Err(unrendered(UnrenderedFeature::BedChannelDecorrelation)),
         }
         let gain = gain_value(channel.gain, element, bed.meta_id, "ChannelGainPrefix")?;
         let gains = bed_channel_gains(loudspeakers, channel.channel_id)
-            .ok_or_else(|| excluded(ExcludedFeature::ChannelId(channel.channel_id)))?;
+            .ok_or_else(|| unrendered(UnrenderedFeature::ChannelId(channel.channel_id)))?;
         mixes.push(BedMix {
             samples: audio_samples(audio, element, channel.audio_data_id, sample_count)?,
             gains: gains.iter().map(|value| (value * gain) as f32).collect(),
@@ -472,16 +480,20 @@ fn object_hierarchy() -> Hierarchy<ObjectDefinition> {
     }
 }
 
+fn is_activated(use_case: Option<u8>, target: u8) -> bool {
+    match use_case {
+        None => true,
+        Some(code) => code == target || code == ALWAYS_USE,
+    }
+}
+
 // ST 2098-2 10.3.2 and 10.5.1: the rendered element is the deepest activated one under activated ancestors
 fn rendered_elements<'a, T>(
     elements: &'a [T],
     target: u8,
     hierarchy: &Hierarchy<T>,
 ) -> Result<Vec<&'a T>, IabError> {
-    let activated = |element: &T| match (hierarchy.use_case)(element) {
-        None => true,
-        Some(code) => code == target || code == ALWAYS_USE,
-    };
+    let activated = |element: &T| is_activated((hierarchy.use_case)(element), target);
     let mut rendered = Vec::new();
     for element in elements.iter().filter(|element| activated(element)) {
         let mut current = element;

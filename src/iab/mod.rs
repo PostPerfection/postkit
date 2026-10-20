@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 pub use parse::parse_frame;
 pub use reader::AtmosReader;
-pub use render::{ExcludedFeature, OutputLayout, Renderer};
+pub use render::{OutputLayout, Renderer, UnrenderedFeature};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IabError {
@@ -28,13 +28,11 @@ pub enum IabError {
         value: u64,
         rule: &'static str,
     },
-    #[error(
-        "IAB {element} {meta_id} uses {feature}, which IAB Application Profile 1 (SMPTE RDD 57) leaves out"
-    )]
-    OutsideProfile1 {
+    #[error("IAB {element} {meta_id} uses {feature}, which the renderer does not render")]
+    NotRendered {
         element: &'static str,
         meta_id: u32,
-        feature: ExcludedFeature,
+        feature: UnrenderedFeature,
     },
 }
 
