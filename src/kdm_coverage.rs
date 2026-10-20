@@ -536,7 +536,7 @@ mod tests {
         };
         let cpl = format!(
             r#"<?xml version="1.0"?>
-<cpl:CompositionPlaylist xmlns:cpl="{}" xmlns:msp-cpl="http://www.smpte-ra.org/schemas/429-10/2008/Main-Stereo-Picture-CPL" xmlns:axd="http://www.dolby.com/schemas/2012/AD">
+<cpl:CompositionPlaylist xmlns:cpl="{}" xmlns:msp-cpl="http://www.smpte-ra.org/schemas/429-10/2008/Main-Stereo-Picture-CPL" xmlns:axd="{}">
   <cpl:Id>urn:uuid:{CPL_ID}</cpl:Id>
   <cpl:ContentTitleText>{TITLE}</cpl:ContentTitleText>
   <cpl:ReelList><cpl:Reel><cpl:Id>urn:uuid:{}</cpl:Id><cpl:AssetList>
@@ -545,6 +545,7 @@ mod tests {
   </cpl:AssetList></cpl:Reel></cpl:ReelList>
 </cpl:CompositionPlaylist>"#,
             ns::CPL_SMPTE,
+            ns::AUX_DATA,
             Uuid::from_u128(0xa001),
             asset("msp-cpl:MainStereoscopicPicture", 0xb001, PICTURE_KEY_ID),
             asset("cpl:MainSound", 0xc001, SOUND_KEY_ID),

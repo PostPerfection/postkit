@@ -7,6 +7,7 @@
 //! segments of virtual-track sequences) are different documents, so each has its
 //! own writer. Writers return the XML string; the caller does the file I/O.
 
+use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 /// Standard namespace URIs, kept in one place so the apps don't re-hardcode them.
@@ -14,6 +15,8 @@ pub mod ns {
     // DCP CPL
     pub const CPL_SMPTE: &str = "http://www.smpte-ra.org/schemas/429-7/2006/CPL";
     pub const CPL_INTEROP: &str = "http://www.digicine.com/PROTO-ASDCP-CPL-20040511#";
+    // DCP CPL AuxData, the Dolby namespace real Atmos DCPs use
+    pub const AUX_DATA: &str = "http://www.dolby.com/schemas/2012/AD";
     // DCP PKL
     pub const PKL_SMPTE: &str = "http://www.smpte-ra.org/schemas/429-8/2007/PKL";
     pub const PKL_INTEROP: &str = "http://www.digicine.com/PROTO-ASDCP-PKL-20040311#";
@@ -28,6 +31,8 @@ pub mod ns {
     pub const PKL_IMF: &str = "http://www.smpte-ra.org/schemas/2067-2/2016/PKL";
     pub const APP2E: &str = "http://www.smpte-ra.org/schemas/2067-21/2016";
     pub const APP2E_2020: &str = "http://www.smpte-ra.org/ns/2067-21/2020";
+    // IMF IAB sequence (ST 2067-201)
+    pub const IAB: &str = "http://www.smpte-ra.org/ns/2067-201/2019";
 }
 
 /// Escape XML special characters in element text or attribute values.
@@ -204,7 +209,7 @@ pub fn volindex_xml(namespace: &str) -> String {
 
 // ─── DCP CPL (ST 429-7) ────────────────────────────────────────────────────
 
-/// One reel of a DCP CPL: a MainPicture and an optional MainSound.
+/// One reel of a DCP CPL: a MainPicture, an optional MainSound and an optional AuxData.
 #[derive(Debug, Clone, Default)]
 pub struct DcpCplReel {
     /// Bare UUIDs.
@@ -232,6 +237,22 @@ pub struct DcpCplReel {
     /// than the PKL's, so a CPL without them is trusted less than one with them.
     pub picture_hash: Option<String>,
     pub sound_hash: Option<String>,
+    pub aux_data: Option<DcpAuxData>,
+}
+
+// the DataType of an Atmos AuxData asset, the Atmos track file's data essence coding UL
+pub const ATMOS_DATA_TYPE_UL: &str = "urn:smpte:ul:060e2b34.04010105.0e090604.00000000";
+
+// an auxiliary data (ST 429-18) track of a reel, written as AuxData in the AUX_DATA namespace
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DcpAuxData {
+    pub id: String,
+    pub edit_rate_num: u32,
+    pub edit_rate_den: u32,
+    pub duration: u64,
+    pub entry_point: u64,
+    pub key_id: Option<String>,
+    pub data_type: String,
 }
 
 /// One CPL rating (ST 429-7).
@@ -413,6 +434,9 @@ impl DcpCpl {
                 }
                 xml.push_str("        </MainSound>\n");
             }
+            if let Some(ref aux_data) = reel.aux_data {
+                write_aux_data(&mut xml, aux_data);
+            }
             xml.push_str("      </AssetList>\n");
             xml.push_str("    </Reel>\n");
         }
@@ -420,6 +444,36 @@ impl DcpCpl {
         xml.push_str("</CompositionPlaylist>\n");
         xml
     }
+}
+
+fn write_aux_data(xml: &mut String, aux_data: &DcpAuxData) {
+    let _ = writeln!(xml, "        <axd:AuxData xmlns:axd=\"{}\">", ns::AUX_DATA);
+    let _ = writeln!(xml, "          <Id>urn:uuid:{}</Id>", aux_data.id);
+    let _ = writeln!(
+        xml,
+        "          <EditRate>{} {}</EditRate>",
+        aux_data.edit_rate_num, aux_data.edit_rate_den
+    );
+    let _ = writeln!(
+        xml,
+        "          <IntrinsicDuration>{}</IntrinsicDuration>",
+        aux_data.duration
+    );
+    let _ = writeln!(
+        xml,
+        "          <EntryPoint>{}</EntryPoint>",
+        aux_data.entry_point
+    );
+    let _ = writeln!(xml, "          <Duration>{}</Duration>", aux_data.duration);
+    if let Some(ref key_id) = aux_data.key_id {
+        let _ = writeln!(xml, "          <KeyId>urn:uuid:{key_id}</KeyId>");
+    }
+    let _ = writeln!(
+        xml,
+        "          <axd:DataType>{}</axd:DataType>",
+        escape_xml(&aux_data.data_type)
+    );
+    xml.push_str("        </axd:AuxData>\n");
 }
 
 // ─── IMF CPL (ST 2067-3) ───────────────────────────────────────────────────
@@ -430,6 +484,7 @@ pub enum ImfTrackKind {
     Image,
     Audio,
     Subtitle,
+    Iab,
 }
 
 impl ImfTrackKind {
@@ -438,6 +493,7 @@ impl ImfTrackKind {
             ImfTrackKind::Image => "MainImageSequence",
             ImfTrackKind::Audio => "MainAudioSequence",
             ImfTrackKind::Subtitle => "SubtitlesSequence",
+            ImfTrackKind::Iab => "IABSequence",
         }
     }
 }
@@ -654,6 +710,7 @@ impl ImfCpl {
                 ImfTrackKind::Image,
                 ImfTrackKind::Audio,
                 ImfTrackKind::Subtitle,
+                ImfTrackKind::Iab,
             ] {
                 for sequence in segment.sequences.iter().filter(|s| s.kind == kind) {
                     self.write_sequence(&mut xml, sequence, fps_num, fps_den);
@@ -669,10 +726,15 @@ impl ImfCpl {
 
     fn write_sequence(&self, xml: &mut String, sequence: &ImfSequence, fps_num: u32, fps_den: u32) {
         let el = sequence.kind.sequence_element();
+        let (prefix, namespace) = match sequence.kind {
+            ImfTrackKind::Image | ImfTrackKind::Audio | ImfTrackKind::Subtitle => {
+                ("cc", self.app2e_edition.core_constraints_namespace())
+            }
+            ImfTrackKind::Iab => ("iab", ns::IAB),
+        };
         let _ = writeln!(
             xml,
-            "        <cc:{el} xmlns:cc=\"{}\">",
-            self.app2e_edition.core_constraints_namespace()
+            "        <{prefix}:{el} xmlns:{prefix}=\"{namespace}\">"
         );
         let _ = writeln!(xml, "          <Id>urn:uuid:{}</Id>", uuid::Uuid::new_v4());
         let _ = writeln!(
@@ -686,7 +748,7 @@ impl ImfCpl {
             write_resource(xml, r, fps_num, fps_den);
         }
         xml.push_str("          </ResourceList>\n");
-        let _ = writeln!(xml, "        </cc:{el}>");
+        let _ = writeln!(xml, "        </{prefix}:{el}>");
     }
 }
 
@@ -891,6 +953,8 @@ mod tests {
                 .to_xml()
                 .contains("<ScreenAspectRatio>2.39</ScreenAspectRatio>")
         );
+        let mut atmos_cpl = cpl.clone();
+        atmos_cpl.reels[0].aux_data = Some(atmos_aux_data());
 
         // annotated PKL/ASSETMAP: AnnotationText must validate in its post-Id slot.
         let mut pkl_annotated = pkl.clone();
@@ -913,6 +977,7 @@ mod tests {
                 pkl_annotated.to_xml(),
             ),
             ("CPL", "SMPTE-429-7-2006-CPL.xsd", cpl.to_xml()),
+            ("ATMOS_CPL", "SMPTE-429-7-2006-CPL.xsd", atmos_cpl.to_xml()),
             (
                 "INTEROP_CPL",
                 "PROTO-ASDCP-CPL-20040511.xsd",
@@ -1177,6 +1242,7 @@ mod tests {
                 sound_key_id: None,
                 picture_hash: Some("cGljdHVyZS1oYXNo".into()),
                 sound_hash: Some("c291bmQtaGFzaA==".into()),
+                aux_data: None,
             }],
         };
         let xml = cpl.to_xml();
@@ -1205,6 +1271,51 @@ mod tests {
         assert!(xml.contains("<Hash>cGljdHVyZS1oYXNo</Hash>"));
         assert!(xml.contains("<Hash>c291bmQtaGFzaA==</Hash>"));
         assert!(xml.find("<KeyId>").unwrap() < xml.find("<Hash>").unwrap());
+    }
+
+    fn atmos_aux_data() -> DcpAuxData {
+        DcpAuxData {
+            id: "99999999-7777-8888-9999-aaaaaaaaaaaa".into(),
+            edit_rate_num: 24,
+            edit_rate_den: 1,
+            duration: 240,
+            entry_point: 0,
+            key_id: Some("aaaaaaaa-7777-8888-9999-bbbbbbbbbbbb".into()),
+            data_type: ATMOS_DATA_TYPE_UL.into(),
+        }
+    }
+
+    #[test]
+    fn dcp_cpl_writes_aux_data_after_main_sound() {
+        let cpl = DcpCpl {
+            uuid: "cpl".into(),
+            namespace: ns::CPL_SMPTE.into(),
+            reels: vec![DcpCplReel {
+                reel_id: "reel".into(),
+                picture_id: "pic".into(),
+                picture_edit_rate_num: 24,
+                picture_edit_rate_den: 1,
+                picture_width: 1998,
+                picture_height: 1080,
+                sound_id: Some("snd".into()),
+                aux_data: Some(atmos_aux_data()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        let aux_data = "        <axd:AuxData xmlns:axd=\"http://www.dolby.com/schemas/2012/AD\">\n\
+                        \x20         <Id>urn:uuid:99999999-7777-8888-9999-aaaaaaaaaaaa</Id>\n\
+                        \x20         <EditRate>24 1</EditRate>\n\
+                        \x20         <IntrinsicDuration>240</IntrinsicDuration>\n\
+                        \x20         <EntryPoint>0</EntryPoint>\n\
+                        \x20         <Duration>240</Duration>\n\
+                        \x20         <KeyId>urn:uuid:aaaaaaaa-7777-8888-9999-bbbbbbbbbbbb</KeyId>\n\
+                        \x20         <axd:DataType>urn:smpte:ul:060e2b34.04010105.0e090604.00000000</axd:DataType>\n\
+                        \x20       </axd:AuxData>\n\
+                        \x20     </AssetList>\n";
+        assert!(xml.contains(aux_data), "{xml}");
+        assert!(xml.find("</MainSound>").unwrap() < xml.find("<axd:AuxData").unwrap());
     }
 
     #[test]
@@ -1490,6 +1601,50 @@ mod tests {
                  \x20   </Segment>\n\
                  \x20 </SegmentList>\n"
             )
+        );
+    }
+
+    #[test]
+    fn an_iab_sequence_follows_the_other_sequences_in_its_own_namespace() {
+        let cpl = ImfCpl {
+            uuid: "cpl".into(),
+            fps_num: 24,
+            fps_den: 1,
+            segments: vec![ImfSegment {
+                sequences: vec![
+                    ImfSequence::whole_track_file(
+                        ImfTrackKind::Iab,
+                        "iab".into(),
+                        240,
+                        Some("iab-desc".into()),
+                    ),
+                    ImfSequence::whole_track_file(ImfTrackKind::Subtitle, "sub".into(), 240, None),
+                    ImfSequence::whole_track_file(ImfTrackKind::Image, "pic".into(), 240, None),
+                ],
+            }],
+            ..Default::default()
+        };
+        let xml = cpl.to_xml();
+        let subtitles_end = xml.find("</cc:SubtitlesSequence>").unwrap();
+        let iab = &xml[subtitles_end..];
+        assert_eq!(
+            masked_ids(
+                &iab[iab.find('\n').unwrap() + 1..iab.find("      </SequenceList>").unwrap()]
+            ),
+            "        <iab:IABSequence xmlns:iab=\"http://www.smpte-ra.org/ns/2067-201/2019\">\n\
+             \x20         <Id>masked</Id>\n\
+             \x20         <TrackId>masked</TrackId>\n\
+             \x20         <ResourceList>\n\
+             \x20           <Resource xsi:type=\"TrackFileResourceType\">\n\
+             \x20             <Id>masked</Id>\n\
+             \x20             <EditRate>24 1</EditRate>\n\
+             \x20             <IntrinsicDuration>240</IntrinsicDuration>\n\
+             \x20             <SourceDuration>240</SourceDuration>\n\
+             \x20             <SourceEncoding>urn:uuid:iab-desc</SourceEncoding>\n\
+             \x20             <TrackFileId>urn:uuid:iab</TrackFileId>\n\
+             \x20           </Resource>\n\
+             \x20         </ResourceList>\n\
+             \x20       </iab:IABSequence>\n"
         );
     }
 
