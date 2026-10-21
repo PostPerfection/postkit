@@ -8,7 +8,7 @@ use crate::content_keys::decrypt_and_hmac_contexts_from_key;
 const SMALL_BUFFER_RESULT: i32 = -7;
 
 // ST 429-18:2023 7.2.4 Table 1, the largest frame in bytes for each edit rate in frames a second
-const LARGEST_FRAME_BYTES: [(i32, usize); 9] = [
+pub(super) const LARGEST_FRAME_BYTES: [(i32, usize); 9] = [
     (24, 781_250),
     (25, 750_000),
     (30, 625_000),

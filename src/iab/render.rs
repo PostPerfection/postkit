@@ -42,7 +42,7 @@ impl OutputLayout {
     }
 }
 
-const ALWAYS_USE: u8 = 0xFF;
+pub(super) const ALWAYS_USE: u8 = 0xFF;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnrenderedFeature {
@@ -524,7 +524,7 @@ fn check_unique_meta_ids<T>(elements: &[T], hierarchy: &Hierarchy<T>) -> Result<
     Ok(())
 }
 
-fn is_activated(use_case: Option<u8>, target: u8) -> bool {
+pub(super) fn is_activated(use_case: Option<u8>, target: u8) -> bool {
     match use_case {
         None => true,
         Some(code) => code == target || code == ALWAYS_USE,

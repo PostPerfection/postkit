@@ -9,13 +9,13 @@ use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-const VALIDATION_STREAM_COUNT: u32 = 148;
+pub(super) const VALIDATION_STREAM_COUNT: u32 = 148;
 
 pub(crate) fn fixture_directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/iab")
 }
 
-fn stream_name(number: u32) -> String {
+pub(super) fn stream_name(number: u32) -> String {
     format!("IABValidationStream_{number}")
 }
 
@@ -84,7 +84,7 @@ pub(crate) fn wrap_atmos_track(
     assert!(result.success, "{}", result.error);
 }
 
-fn read_verdict(path: &Path) -> serde_json::Value {
+pub(super) fn read_verdict(path: &Path) -> serde_json::Value {
     let text =
         std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     serde_json::from_str(&text).unwrap()
@@ -210,7 +210,7 @@ fn stream_mismatches(
     mismatches
 }
 
-fn committed_stream_numbers() -> Vec<u32> {
+pub(super) fn committed_stream_numbers() -> Vec<u32> {
     let mut numbers: Vec<u32> = std::fs::read_dir(fixture_directory())
         .unwrap()
         .filter_map(|entry| {

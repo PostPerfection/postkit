@@ -4,6 +4,7 @@ mod direct_speakers;
 mod dlc;
 mod panner;
 mod parse;
+pub mod qc;
 mod reader;
 mod render;
 
@@ -341,6 +342,8 @@ fn pcm_samples(sample_bytes: &[u8], bit_depth: BitDepth) -> Vec<i32> {
     }
 }
 
+#[cfg(test)]
+mod qc_tests;
 #[cfg(test)]
 mod render_tests;
 #[cfg(test)]
