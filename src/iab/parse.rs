@@ -135,6 +135,7 @@ fn parse_ia_frame(payload: &[u8]) -> Result<Frame, IabError> {
         pcm_audio: Vec::new(),
         authoring_tool_uris: Vec::new(),
         user_data: Vec::new(),
+        reserved_sub_element_count: 0,
     };
     let sub_element_count = reader.read_plex(8, "SubElementCount")?;
     for _ in 0..sub_element_count {
@@ -167,7 +168,8 @@ fn parse_ia_frame(payload: &[u8]) -> Result<Frame, IabError> {
             }
             USER_DATA => frame.user_data.push(parse_user_data(payload)?),
             // ST 2098-2 9.1: any other child is ignored
-            _ => {}
+            IA_FRAME | BED_REMAP | OBJECT_ZONE_DEFINITION_19 => {}
+            _ => frame.reserved_sub_element_count += 1,
         }
     }
     reader.expect_end("ElementSize")?;
@@ -227,6 +229,7 @@ fn parse_bed_definition(
 
     let mut child_beds = Vec::new();
     let mut remaps = Vec::new();
+    let mut ignored_sub_element_count = 0;
     let sub_element_count = reader.read_plex(8, "SubElementCount")?;
     for _ in 0..sub_element_count {
         let (element_id, payload) = read_element(&mut reader)?;
@@ -236,7 +239,7 @@ fn parse_bed_definition(
             }
             BED_REMAP => remaps.push(parse_bed_remap(payload, frame_rate)?),
             // ST 2098-2 9.2: any other child is ignored
-            _ => {}
+            _ => ignored_sub_element_count += 1,
         }
     }
     reader.expect_end("ElementSize")?;
@@ -248,6 +251,7 @@ fn parse_bed_definition(
         audio_description_text,
         child_beds,
         remaps,
+        ignored_sub_element_count,
     })
 }
 
@@ -275,11 +279,14 @@ fn parse_bed_remap(payload: &[u8], frame_rate: FrameRate) -> Result<BedRemap, Ia
     };
     let mut current = read_sub_block(&mut reader)?;
     let mut sub_blocks = vec![Arc::clone(&current)];
+    let mut remap_info_exists = vec![true];
     for _ in 1..frame_rate.pan_sub_block_count() {
-        if reader.read_flag("RemapInfoExists")? {
+        let info_exists = reader.read_flag("RemapInfoExists")?;
+        if info_exists {
             current = read_sub_block(&mut reader)?;
         }
         sub_blocks.push(Arc::clone(&current));
+        remap_info_exists.push(info_exists);
     }
     reader.align();
     reader.read_plex(8, "Reserved")?;
@@ -290,6 +297,7 @@ fn parse_bed_remap(payload: &[u8], frame_rate: FrameRate) -> Result<BedRemap, Ia
         source_channel_count,
         destination_channel_count,
         sub_blocks,
+        remap_info_exists,
     })
 }
 
@@ -312,17 +320,21 @@ fn parse_object_definition(
 
     let mut current = read_object_pan(&mut reader)?;
     let mut pan_sub_blocks = vec![current.clone()];
+    let mut pan_info_exists = vec![true];
     for _ in 1..frame_rate.pan_sub_block_count() {
-        if reader.read_flag("PanInfoExists")? {
+        let info_exists = reader.read_flag("PanInfoExists")?;
+        if info_exists {
             current = read_object_pan(&mut reader)?;
         }
         pan_sub_blocks.push(current.clone());
+        pan_info_exists.push(info_exists);
     }
     reader.align();
     let (audio_description, audio_description_text) = read_audio_description(&mut reader)?;
 
     let mut child_objects = Vec::new();
     let mut zone_definitions_19 = Vec::new();
+    let mut ignored_sub_element_count = 0;
     let sub_element_count = reader.read_plex(8, "SubElementCount")?;
     for _ in 0..sub_element_count {
         let (element_id, payload) = read_element(&mut reader)?;
@@ -334,7 +346,7 @@ fn parse_object_definition(
                 zone_definitions_19.push(parse_object_zone_definition_19(payload, frame_rate)?)
             }
             // ST 2098-2 9.4: any other child is ignored
-            _ => {}
+            _ => ignored_sub_element_count += 1,
         }
     }
     reader.expect_end("ElementSize")?;
@@ -343,10 +355,12 @@ fn parse_object_definition(
         audio_data_id,
         use_case,
         pan_sub_blocks,
+        pan_info_exists,
         audio_description,
         audio_description_text,
         child_objects,
         zone_definitions_19,
+        ignored_sub_element_count,
     })
 }
 

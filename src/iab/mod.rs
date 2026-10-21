@@ -146,6 +146,8 @@ pub struct Frame {
     pub pcm_audio: Vec<AudioDataPcm>,
     pub authoring_tool_uris: Vec<Vec<u8>>,
     pub user_data: Vec<UserData>,
+    // children with an ElementID that ST 2098-2 Table 14 reserves
+    pub reserved_sub_element_count: usize,
 }
 
 // ST 2098-2 Table 20, the reserved prefix still carries a gain code
@@ -184,6 +186,8 @@ pub struct BedDefinition {
     pub audio_description_text: Option<Vec<u8>>,
     pub child_beds: Vec<BedDefinition>,
     pub remaps: Vec<BedRemap>,
+    // children other than the two kinds ST 2098-2 9.2 supports
+    pub ignored_sub_element_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +206,8 @@ pub struct BedRemap {
     pub destination_channel_count: u32,
     // one per pan sub block, a sub block without an update repeats the one before
     pub sub_blocks: Vec<Arc<[RemapDestination]>>,
+    // one per pan sub block, true where the bitstream carries the sub block
+    pub remap_info_exists: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -217,10 +223,14 @@ pub struct ObjectDefinition {
     pub use_case: Option<u8>,
     // one per pan sub block, a sub block without an update repeats the one before
     pub pan_sub_blocks: Vec<ObjectPan>,
+    // one per pan sub block, true where the bitstream carries the sub block
+    pub pan_info_exists: Vec<bool>,
     pub audio_description: u8,
     pub audio_description_text: Option<Vec<u8>>,
     pub child_objects: Vec<ObjectDefinition>,
     pub zone_definitions_19: Vec<ObjectZoneDefinition19>,
+    // children other than the two kinds ST 2098-2 9.4 supports
+    pub ignored_sub_element_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]

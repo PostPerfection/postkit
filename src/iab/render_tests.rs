@@ -515,6 +515,7 @@ fn features_the_renderer_lacks_return_the_named_error() {
                 source_channel_count: 10,
                 destination_channel_count: 6,
                 sub_blocks: Vec::new(),
+                remap_info_exists: Vec::new(),
             })
         }
     };
