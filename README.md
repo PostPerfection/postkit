@@ -30,7 +30,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `grok` | Grok codec detection and configuration |
 | `grok_encoder` | Grok J2K encoder (FFI, multi-threaded, GPU-capable) |
 | `hash` | SHA-1 / SHA-256 file hashing |
-| `iab` | Immersive Audio Bitstream (ST 2098-2) frame parsing and DLC and PCM decode |
+| `iab` | Immersive Audio Bitstream (ST 2098-2) frame parsing, DLC and PCM decode, and the bitstream checks of ST 2098-2, ST 429-18, ST 2067-201 and RDD 57 Profile 1 |
 | `j2k` | JPEG 2000 codestream parsing, DCI validation, MXF frame extraction and bitrate analysis |
 | `job_queue` | The job queue every wizard process runs, with its jobs file |
 | `kdm_distribution` | A distributor's cinemas, screens, titles, bookings and issued KDMs: FLM import (ST 430-16 and 430-7), ISDCF Doc 5 certificate checks, formulation per screen, windows in the cinema's time zone, KDM and ZIP naming, SMTP delivery and resend, sqlite store, per-screen reissue after an edit or a certificate change, certificate and DKDM expiry against each booking, bookings about to end |
