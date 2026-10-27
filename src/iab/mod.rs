@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use decorrelation::{DIRECT_PATH_DELAY, FILTER_LENGTH};
-pub use parse::parse_frame;
+pub use parse::{parse_frame, split_frames};
 pub use reader::{AtmosReader, LARGEST_IMF_FRAME_BYTES, atmos_writer_info};
 pub use render::{OutputLayout, Renderer, UnrenderedFeature};
 

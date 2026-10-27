@@ -46,8 +46,7 @@ pub fn parse_frame(bytes: &[u8]) -> Result<Frame, IabError> {
 }
 
 // a .iab file is IABitstream frames back to back
-#[cfg(test)]
-pub(super) fn split_frames(stream: &[u8]) -> Result<Vec<&[u8]>, IabError> {
+pub fn split_frames(stream: &[u8]) -> Result<Vec<&[u8]>, IabError> {
     let mut reader = BitReader::new(stream, "IABitstream frame");
     let mut frames = Vec::new();
     while reader.remaining_bytes() > 0 {
