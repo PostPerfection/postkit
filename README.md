@@ -13,6 +13,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | Module | Purpose |
 |--------|---------|
 | `accessibility` | Accessibility heuristic scan (CVAA, EAA, AODA, Ofcom); keyword-based, not a certified verdict |
+| `audio_adjust` | Gain, fades and a loudness target applied to a finished sound |
 | `burnin` | Subtitle/watermark burn-in |
 | `certificate` | X.509 certificate generation and trust management |
 | `colour` | Colour conversion via ffmpeg (Rec.709, P3, Rec.2020); wide-gamut/log spaces need a LUT. Also the DCI X'Y'Z' → sRGB display transform (`XyzToSrgb`, inverse of the DCDM encode) and an optional monitor-ICC path (`XyzToIcc`, `icc` feature) |
@@ -35,7 +36,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `job_queue` | The job queue every wizard process runs, with its jobs file |
 | `kdm_distribution` | A distributor's cinemas, screens, titles, bookings and issued KDMs: FLM import (ST 430-16 and 430-7), ISDCF Doc 5 certificate checks, formulation per screen, windows in the cinema's time zone, KDM and ZIP naming, SMTP delivery and resend, sqlite store, per-screen reissue after an edit or a certificate change, certificate and DKDM expiry against each booking, bookings about to end |
 | `kdm_store` | A directory of KDMs, and which one a composition plays with on a given player and time |
-| `loudness` | Audio loudness measurement (EBU R128, Leq(m)) and gain adjustment |
+| `loudness` | Audio loudness measurement (EBU R128 with a short-term curve for the mix and for each channel, Leq(m)) and gain adjustment |
 | `mca` | SMPTE ST 377-4 Multi-Channel Audio label generation |
 | `metadata_edit` | CPL/OPL metadata editor |
 | `mid_side` | Mid-side stereo decode (M/S to L/R) in interleaved multi-channel buffers |
