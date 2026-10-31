@@ -42,6 +42,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `mid_side` | Mid-side stereo decode (M/S to L/R) in interleaved multi-channel buffers |
 | `mpv` | mpv IPC player integration for preview |
 | `mxf_wrap` | MXF track file wrapping (picture, stereoscopic 3D, audio, Atmos); optional AES-128 essence encryption, MCA labels, HDR/WCG metadata |
+| `atmos_sync` | the ST 430-14 sync signal on channel 14 of the main sound that a cinema processor locks an Atmos track to, written by the sound wrap and read back by `decode_atmos_sync_frame` |
 | `otioz_import` | OpenTimelineIO zip bundle import |
 | `package_library` | The DCPs under watched folders, read from their CPLs, with a stored verification verdict per package |
 | `packaging` | Shared DCP/IMF CPL, PKL and ASSETMAP XML writers |

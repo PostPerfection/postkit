@@ -8,6 +8,8 @@ pub enum EssenceType {
     J2k,
     /// PCM audio essence
     Pcm,
+    /// PCM audio essence with the Atmos sync signal written over channel 14
+    PcmWithAtmosSync,
     /// Timed text (subtitle) essence
     TimedText,
     /// Dolby Atmos (IAB) essence
@@ -178,7 +180,7 @@ impl MxfTrackFile {
 pub fn mxf_wrap(opts: &MxfWrapOptions) -> MxfTrackFile {
     match opts.essence_type {
         EssenceType::J2k => wrap_j2k(opts),
-        EssenceType::Pcm => wrap_pcm(opts),
+        EssenceType::Pcm | EssenceType::PcmWithAtmosSync => wrap_pcm(opts),
         EssenceType::TimedText => wrap_timed_text(opts),
         EssenceType::Atmos => wrap_atmos(opts),
     }
@@ -1072,6 +1074,29 @@ fn channel_format_for(channels: u32) -> asdcplib::pcm::ChannelFormat {
     }
 }
 
+fn atmos_sync_for(
+    opts: &MxfWrapOptions,
+    info: &asdcplib::WriterInfo,
+    wav: &WavFormat,
+) -> Result<Option<crate::atmos_sync::AtmosSyncSignal>, String> {
+    if opts.essence_type != EssenceType::PcmWithAtmosSync {
+        return Ok(None);
+    }
+    if opts.fps_den != 1 || wav.bits_per_sample != 24 {
+        return Err(format!(
+            "the Atmos sync signal needs 24-bit sound at a whole frame rate, and this is {}-bit at {}/{} fps",
+            wav.bits_per_sample, opts.fps_num, opts.fps_den
+        ));
+    }
+    crate::atmos_sync::AtmosSyncSignal::new(
+        info.asset_uuid,
+        opts.fps_num,
+        wav.sample_rate,
+        u32::from(wav.channels),
+    )
+    .map(Some)
+}
+
 fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
     use std::io::{Read, Seek};
 
@@ -1127,6 +1152,16 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
         channel_format: channel_format_for(channels),
     };
 
+    let mut atmos_sync = match atmos_sync_for(opts, &info, &wav) {
+        Ok(sync) => sync,
+        Err(error) => {
+            return MxfTrackFile {
+                error,
+                ..Default::default()
+            };
+        }
+    };
+
     let mut crypto = match setup_encryption(&mut info, &opts.encryption) {
         Ok(c) => c,
         Err(error) => {
@@ -1159,6 +1194,9 @@ fn wrap_pcm(opts: &MxfWrapOptions) -> MxfTrackFile {
                 error: format!("failed to read WAV: {e}"),
                 ..Default::default()
             };
+        }
+        if let Some(sync) = atmos_sync.as_mut() {
+            sync.write_frame(&mut frame);
         }
         if let Err(e) = writer.write_frame(&frame, &mut crypto) {
             return MxfTrackFile {

@@ -2,6 +2,7 @@ pub mod accessibility;
 pub mod assetmap;
 #[cfg(test)]
 mod atmos_fixture;
+pub mod atmos_sync;
 pub mod audio_adjust;
 pub mod audio_levels;
 pub mod audio_mix_matrix;
