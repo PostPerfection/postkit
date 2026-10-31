@@ -246,7 +246,7 @@ impl<C: QueueJob> JobQueue<C> {
         record(&self.jobs_file, state, message, job);
     }
 
-    /// Put a finished job in the history, under the lock `snapshot` holds.
+    /// Put a finished job in the history and the jobs file, under the lock `snapshot` holds.
     fn record_finished(&self, history: &mut Vec<JobInfo>, state: JobState, message: &str, job: &C) {
         history.push(finished_job_info(
             job.id(),
@@ -254,6 +254,8 @@ impl<C: QueueJob> JobQueue<C> {
             state,
             message.to_string(),
         ));
+        // written before the lock goes or a restart reads the job as still running
+        self.record(state, message, job);
     }
 
     /// The id the next job gets. Taken before the job config is built, so a
@@ -325,8 +327,6 @@ impl<C: QueueJob> JobQueue<C> {
             return false;
         };
         self.record_finished(&mut history, JobState::Cancelled, "", &job);
-        drop(history);
-        self.record(JobState::Cancelled, "", &job);
         true
     }
 
@@ -390,8 +390,6 @@ impl<C: QueueJob> JobQueue<C> {
         let mut history = self.history.lock().unwrap();
         self.record_finished(&mut history, state, message, job);
         *self.current_state.lock().unwrap() = state;
-        drop(history);
-        self.record(state, message, job);
     }
 
     pub fn set_progress(&self, percent: f64, message: &str) {
@@ -417,9 +415,6 @@ impl<C: QueueJob> JobQueue<C> {
             self.record_finished(&mut history, JobState::Cancelled, "", job);
         }
         drop(history);
-        for job in &queued {
-            self.record(JobState::Cancelled, "", job);
-        }
         self.cancel.store(true, Ordering::Relaxed);
 
         let (lock, idle) = &self.worker_idle;
