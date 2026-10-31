@@ -36,7 +36,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `job_queue` | The job queue every wizard process runs, with its jobs file |
 | `kdm_distribution` | A distributor's cinemas, screens, titles, bookings and issued KDMs: FLM import (ST 430-16 and 430-7), ISDCF Doc 5 certificate checks, formulation per screen, windows in the cinema's time zone, KDM and ZIP naming, SMTP delivery and resend, sqlite store, per-screen reissue after an edit or a certificate change, certificate and DKDM expiry against each booking, bookings about to end |
 | `kdm_store` | A directory of KDMs, and which one a composition plays with on a given player and time |
-| `loudness` | Audio loudness measurement (EBU R128 with a short-term curve for the mix and for each channel, Leq(m)) and gain adjustment |
+| `loudness` | Audio loudness measurement (EBU R128 with a short-term curve for the mix and for each channel, a true peak per 100 ms for each channel, Leq(m)) and gain adjustment |
 | `mca` | SMPTE ST 377-4 Multi-Channel Audio label generation |
 | `metadata_edit` | CPL/OPL metadata editor |
 | `mid_side` | Mid-side stereo decode (M/S to L/R) in interleaved multi-channel buffers |

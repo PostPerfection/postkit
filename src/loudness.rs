@@ -20,6 +20,8 @@ pub struct LoudnessResult {
     pub short_term_lufs: Vec<Option<f32>>,
     // each channel read alone as a mono signal, on the short_term_lufs clock
     pub channel_short_term_lufs: Vec<Vec<Option<f32>>>,
+    // each channel's true peak per 100 ms block from the start, None for a silent block
+    pub channel_true_peak_dbtp: Vec<Vec<Option<f32>>>,
     // end time of the window short_term_lufs[0] covers
     pub short_term_first_seconds: f64,
     pub short_term_step_seconds: f64,
@@ -40,6 +42,7 @@ pub fn measure_loudness(input: &Path) -> LoudnessResult {
             short_term_max_lufs: summary.short_term.max_lufs,
             short_term_lufs: summary.short_term.lufs,
             channel_short_term_lufs: true_peak.channel_short_term_lufs,
+            channel_true_peak_dbtp: true_peak.channel_true_peak_dbtp,
             short_term_first_seconds: SHORT_TERM_WINDOW_SUB_BLOCKS as f64
                 * SHORT_TERM_SUB_BLOCK_MILLISECONDS as f64
                 / MILLISECONDS_PER_SECOND as f64,
@@ -72,6 +75,7 @@ pub struct SoundLevels {
     pub short_term_max_lufs: f64,
     pub short_term_lufs: Vec<Option<f32>>,
     pub channel_short_term_lufs: Vec<Vec<Option<f32>>>,
+    pub channel_true_peak_dbtp: Vec<Vec<Option<f32>>>,
     pub short_term_first_seconds: f64,
     pub short_term_step_seconds: f64,
     pub true_peak_at_seconds: f64,
@@ -94,6 +98,7 @@ pub fn measure_sound_levels(sound: &Path) -> Result<SoundLevels, String> {
         short_term_max_lufs: loudness.short_term_max_lufs,
         short_term_lufs: loudness.short_term_lufs,
         channel_short_term_lufs: loudness.channel_short_term_lufs,
+        channel_true_peak_dbtp: loudness.channel_true_peak_dbtp,
         short_term_first_seconds: loudness.short_term_first_seconds,
         short_term_step_seconds: loudness.short_term_step_seconds,
         true_peak_at_seconds: loudness.true_peak_at_seconds,
@@ -290,6 +295,7 @@ struct TruePeak {
     dbtp: f64,
     at_seconds: f64,
     channel_short_term_lufs: Vec<Vec<Option<f32>>>,
+    channel_true_peak_dbtp: Vec<Vec<Option<f32>>>,
 }
 
 // linear peak and the first frame of the sub block that reached it
@@ -301,6 +307,12 @@ struct ChannelPeak {
 struct ChannelReading {
     peak: ChannelPeak,
     short_term: ShortTermSeries,
+    block_peaks: Vec<Option<f32>>,
+}
+
+// None for a block of digital silence
+fn peak_dbtp(linear: f64) -> Option<f32> {
+    (linear > 0.0).then(|| (20.0 * linear.log10()) as f32)
 }
 
 // per channel true peak and short term loudness, handing `also` the same interleaved blocks when it is there
@@ -334,22 +346,41 @@ fn stream_true_peak(
                         at_frame: 0,
                     };
                     let mut frames_seen = 0;
+                    let mut block_peaks = Vec::new();
+                    let mut block_peak: f64 = 0.0;
+                    let mut block_frames = 0;
                     while let Ok(plane) = receiver.recv() {
                         loudness.add(&plane)?;
-                        for chunk in plane.chunks(chunk_frames) {
+                        let mut rest = &plane[..];
+                        while !rest.is_empty() {
+                            // a block read from the file can end part way through a 100 ms block
+                            let (chunk, tail) =
+                                rest.split_at((chunk_frames - block_frames).min(rest.len()));
+                            rest = tail;
                             meter.add_frames_f32(chunk)?;
                             let chunk_peak = meter.prev_true_peak(0)?;
                             if chunk_peak > peak.linear {
                                 peak = ChannelPeak {
                                     linear: chunk_peak,
-                                    at_frame: frames_seen,
+                                    at_frame: frames_seen - block_frames,
                                 };
                             }
                             frames_seen += chunk.len();
+                            block_peak = block_peak.max(chunk_peak);
+                            block_frames += chunk.len();
+                            if block_frames == chunk_frames {
+                                block_peaks.push(peak_dbtp(block_peak));
+                                block_peak = 0.0;
+                                block_frames = 0;
+                            }
                         }
                     }
                     let (_, short_term) = loudness.finish()?;
-                    Ok(ChannelReading { peak, short_term })
+                    Ok(ChannelReading {
+                        peak,
+                        short_term,
+                        block_peaks,
+                    })
                 })
             })
             .collect();
@@ -380,18 +411,21 @@ fn stream_true_peak(
             at_frame: 0,
         };
         let mut channel_short_term_lufs = Vec::with_capacity(channels);
+        let mut channel_true_peak_dbtp = Vec::with_capacity(channels);
         for worker in workers {
             let reading = worker.join().expect("true peak worker panicked")?;
             if reading.peak.linear > peak.linear {
                 peak = reading.peak;
             }
             channel_short_term_lufs.push(reading.short_term.lufs);
+            channel_true_peak_dbtp.push(reading.block_peaks);
         }
         fed?;
         Ok(TruePeak {
             dbtp: 20.0 * peak.linear.log10(),
             at_seconds: peak.at_frame as f64 / spec.sample_rate as f64,
             channel_short_term_lufs,
+            channel_true_peak_dbtp,
         })
     })
 }
@@ -1694,6 +1728,52 @@ mod tests {
             "{} dBTP is the tone, not the spike",
             measured.true_peak_dbtp
         );
+    }
+
+    // 44.1 kHz so the one second reads end part way through a 100 ms block
+    #[test]
+    fn each_channel_has_a_true_peak_per_100_ms_block() {
+        const SECONDS: usize = 4;
+        const SPIKE_SECONDS: f64 = 2.57;
+        const TONE_AMPLITUDE: f32 = 0.25;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("spike_441.wav");
+        let spec = WavSpec {
+            sample_rate: 44_100,
+            ..int_spec(2, 24)
+        };
+        let rate = spec.sample_rate as usize;
+        let spike_frame = (SPIKE_SECONDS * rate as f64) as usize;
+        write_frames(&src, spec, SECONDS * rate, |frame, channel| {
+            if channel == 1 {
+                return 0.0;
+            }
+            if frame == spike_frame {
+                return 0.9;
+            }
+            TONE_AMPLITUDE * (2.0 * PI * 997.0 * frame as f32 / rate as f32).sin()
+        });
+
+        let measured = measure_loudness(&src);
+        assert!(measured.success, "{}", measured.error);
+        let [left, right] = &measured.channel_true_peak_dbtp[..] else {
+            panic!("{} channel series", measured.channel_true_peak_dbtp.len())
+        };
+        assert_eq!(left.len(), SECONDS * 10);
+        assert!(right.iter().all(Option::is_none), "{right:?}");
+        let spike_block = (SPIKE_SECONDS * 10.0) as usize;
+        let tone_dbtp = 20.0 * TONE_AMPLITUDE.log10();
+        for (block, peak) in left.iter().enumerate() {
+            let peak = peak.unwrap();
+            if block == spike_block {
+                assert!(peak > 20.0 * 0.85f32.log10(), "spike block at {peak} dBTP");
+            } else {
+                assert!(
+                    (peak - tone_dbtp).abs() < 0.5,
+                    "block {block} at {peak} dBTP"
+                );
+            }
+        }
     }
 
     #[test]
