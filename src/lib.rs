@@ -26,6 +26,7 @@ pub mod device_lease;
 pub mod dolby_compliance;
 pub mod dolby_vision;
 pub mod edl_import;
+pub mod embedded_sound;
 pub mod encode;
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg_decode;

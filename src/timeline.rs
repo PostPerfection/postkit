@@ -495,7 +495,7 @@ pub fn shared_channel_count(timeline: &Timeline) -> Result<Option<u16>, String> 
     for (index, clip) in timeline.clips.iter().enumerate() {
         let channels = match &clip.sound {
             ClipSound::None => continue,
-            ClipSound::Embedded => embedded_channel_count(&clip.picture),
+            ClipSound::Embedded => picture_sound(&clip.picture).map(|sound| sound.channels),
             ClipSound::File(path) => wav_channel_count(path),
         }
         .map_err(|e| format!("{}: {e}", clip_name(index, clip)))?;
@@ -515,26 +515,9 @@ pub fn shared_channel_count(timeline: &Timeline) -> Result<Option<u16>, String> 
     Ok(first.map(|(_, channels)| channels))
 }
 
-fn embedded_channel_count(picture: &Path) -> Result<u16, String> {
-    let output = Command::new("ffprobe")
-        .args(["-v", "error", "-select_streams", "a:0"])
-        .args(["-show_entries", "stream=channels", "-of", "csv=p=0"])
-        .arg(picture)
-        .output()
-        .map_err(|e| format!("cannot run ffprobe: {e}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "ffprobe cannot read it: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if text.is_empty() {
-        return Err("it has no sound to take: give the clip a WAV or no sound".to_string());
-    }
-    text.parse()
-        .map_err(|_| format!("ffprobe reads the channel count {text:?}"))
+fn picture_sound(picture: &Path) -> Result<crate::embedded_sound::EmbeddedSound, String> {
+    crate::embedded_sound::embedded_sound(picture)?
+        .ok_or_else(|| "it has no sound to take: give the clip a WAV or no sound".to_string())
 }
 
 fn open_wav(path: &Path) -> Result<WavReader, String> {
@@ -564,20 +547,12 @@ fn copy_embedded_sound(
         "aresample={SOUND_SAMPLE_RATE},atrim=start_sample={first_sample}:end_sample={}",
         first_sample + length
     );
+    let sound = picture_sound(picture)?;
     let mut child = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(picture)
-        .args([
-            "-map",
-            "0:a:0",
-            "-af",
-            &window,
-            "-c:a",
-            "pcm_s24le",
-            "-f",
-            "s24le",
-            "-",
-        ])
+        .args(sound.ffmpeg_arguments(&window))
+        .args(["-c:a", "pcm_s24le", "-f", "s24le", "-"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
