@@ -76,7 +76,7 @@ fn a_video_with_mono_tracks_gives_one_sound_with_a_channel_per_track() {
     let extracted = Command::new("ffmpeg")
         .args(["-v", "error", "-i"])
         .arg(&picture)
-        .args(sound.ffmpeg_arguments("aresample=48000"))
+        .args(sound.ffmpeg_arguments(&[]))
         .args(["-c:a", "pcm_s24le"])
         .arg(&wav)
         .status()
@@ -98,4 +98,22 @@ fn a_video_with_mono_tracks_gives_one_sound_with_a_channel_per_track() {
             first_frame[channel]
         );
     }
+}
+
+#[test]
+fn one_track_with_no_filters_maps_the_stream_itself() {
+    let sound = EmbeddedSound {
+        stream_indexes: vec![2],
+        channels: 6,
+    };
+    assert_eq!(sound.ffmpeg_arguments(&[]), ["-map", "0:2"]);
+    assert_eq!(
+        sound.ffmpeg_arguments(&["volume=0.5"]),
+        [
+            "-filter_complex",
+            "[0:2]volume=0.5[sound]",
+            "-map",
+            "[sound]"
+        ]
+    );
 }

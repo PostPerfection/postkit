@@ -551,7 +551,7 @@ fn copy_embedded_sound(
     let mut child = Command::new("ffmpeg")
         .args(["-v", "error", "-nostdin", "-i"])
         .arg(picture)
-        .args(sound.ffmpeg_arguments(&window))
+        .args(sound.ffmpeg_arguments(&[&window]))
         .args(["-c:a", "pcm_s24le", "-f", "s24le", "-"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

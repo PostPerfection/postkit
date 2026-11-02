@@ -77,19 +77,25 @@ fn sound_of_streams(streams: &[AudioStream]) -> Option<EmbeddedSound> {
 }
 
 impl EmbeddedSound {
-    pub fn ffmpeg_arguments(&self, filters: &str) -> [String; 4] {
+    pub fn ffmpeg_arguments(&self, filters: &[&str]) -> Vec<String> {
+        let count = self.stream_indexes.len();
+        let join = (count > 1).then(|| format!("amerge=inputs={count}"));
+        let chain: Vec<&str> = join
+            .as_deref()
+            .into_iter()
+            .chain(filters.iter().copied())
+            .collect();
+        if chain.is_empty() {
+            return vec!["-map".into(), format!("0:{}", self.stream_indexes[0])];
+        }
         let inputs: String = self
             .stream_indexes
             .iter()
             .map(|index| format!("[0:{index}]"))
             .collect();
-        let chain = match self.stream_indexes.len() {
-            1 => filters.to_string(),
-            count => format!("amerge=inputs={count},{filters}"),
-        };
-        [
+        vec![
             "-filter_complex".into(),
-            format!("{inputs}{chain}[sound]"),
+            format!("{inputs}{}[sound]", chain.join(",")),
             "-map".into(),
             "[sound]".into(),
         ]
