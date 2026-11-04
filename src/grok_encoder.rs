@@ -2319,6 +2319,54 @@ pub fn use_gpu_from_environment() -> Result<(), String> {
 }
 
 #[cfg(feature = "grok-ffi")]
+const GPU_PLUGIN_INIT_FAILURE_PREFIX: &str = "GPU plugin: init failed (code ";
+
+#[cfg(feature = "grok-ffi")]
+const GPU_PLUGIN_INIT_FAILURES: &[(&str, &str)] = &[
+    (
+        "1",
+        "the license server rejected this Grok license: it is unknown, revoked or expired",
+    ),
+    ("2", "the license server could not be reached"),
+    ("3", "this Grok license is in use on another machine"),
+    ("4", "the license server reported an error"),
+    ("5", "the license server sent an unrecognised answer"),
+    ("6", "no Grok license is set"),
+    (
+        "7",
+        "the license server's answer is not a valid license token",
+    ),
+    ("8", "the license token failed its signature check"),
+    ("9", "the license token was issued for another machine"),
+    ("10", "the license token does not match this request"),
+    (
+        "11",
+        "the license token has expired, or this machine's clock is wrong",
+    ),
+    ("12", "the registration URL is refused: it must use https"),
+    (
+        "13",
+        "this machine could not generate random bytes for the license request",
+    ),
+];
+
+#[cfg(feature = "grok-ffi")]
+fn gpu_plugin_failure_text(plugin_message: &str) -> String {
+    let failure = plugin_message
+        .strip_prefix(GPU_PLUGIN_INIT_FAILURE_PREFIX)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|code| {
+            GPU_PLUGIN_INIT_FAILURES
+                .iter()
+                .find(|(known, _)| *known == code)
+        });
+    match failure {
+        Some((code, text)) => format!("{text} (plugin code {code})"),
+        None => format!("grok's accelerator plugin refused to initialise: {plugin_message}"),
+    }
+}
+
+#[cfg(feature = "grok-ffi")]
 pub fn use_gpu_with_authentication(
     license: Option<&str>,
     registration_url: Option<&str>,
@@ -2361,10 +2409,11 @@ pub fn use_gpu_with_authentication(
                     .to_string(),
             );
         }
-        return Err(format!(
-            "grok's accelerator plugin refused to initialise: {}",
-            plugin_messages.join(". ")
-        ));
+        return Err(plugin_messages
+            .iter()
+            .map(|message| gpu_plugin_failure_text(message))
+            .collect::<Vec<_>>()
+            .join(". "));
     }
     unsafe { grokj2k_sys::grk_plugin_set_enabled(true) };
     ACCELERATOR_ENABLED.store(true, Ordering::Relaxed);
@@ -2492,6 +2541,23 @@ pub fn contiguous_encoded_frames(dir: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "grok-ffi")]
+    #[test]
+    fn plugin_init_failure_codes_read_as_their_cause() {
+        assert_eq!(
+            gpu_plugin_failure_text("GPU plugin: init failed (code 3)"),
+            "this Grok license is in use on another machine (plugin code 3)"
+        );
+        assert_eq!(
+            gpu_plugin_failure_text("GPU plugin: init failed (code 99)"),
+            "grok's accelerator plugin refused to initialise: GPU plugin: init failed (code 99)"
+        );
+        assert_eq!(
+            gpu_plugin_failure_text("the device is gone"),
+            "grok's accelerator plugin refused to initialise: the device is gone"
+        );
+    }
 
     #[cfg(feature = "grok-ffi")]
     fn packaged_gpu_plugin_path(
