@@ -1670,9 +1670,8 @@ struct BatchCollector {
     input_queue: Arc<BoundedQueue<RawFrame>>,
 }
 
-/// How many frames the plugin's batches have handed back, a codestream from an
-/// encode batch or decoded planes from the player's decode batch.
-/// `grk_plugin_accelerated_frames` counts only the per-call routed path.
+/// How many frames the player's decode batches have handed back, which
+/// `grk_plugin_accelerated_frames` leaves out.
 #[cfg(feature = "grok-ffi")]
 static BATCH_ACCELERATED_FRAMES: AtomicU64 = AtomicU64::new(0);
 
@@ -1717,7 +1716,6 @@ unsafe extern "C" fn batch_frame_callback(
             return;
         }
     };
-    count_batch_accelerated_frame();
     let _ = collector.writer_tx.send(EncodedFrame { data, index });
 }
 
@@ -2502,8 +2500,8 @@ pub(crate) fn plugin_enabled_for(params: &CompressParams) -> bool {
 }
 
 /// How many compress and decompress calls the device has run since the process
-/// started. grok counts the calls it routed one at a time and postkit counts
-/// the frames its batches got a codestream back for.
+/// started. grok counts every compress and the decompresses it routed one at a
+/// time, and postkit counts the frames the player's decode batches return.
 #[cfg(feature = "grok-ffi")]
 pub fn accelerated_frames() -> u64 {
     let routed = unsafe { grokj2k_sys::grk_plugin_accelerated_frames() };
