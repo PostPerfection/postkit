@@ -2424,24 +2424,39 @@ pub fn use_gpu_with_authentication(
 static CAPTURED_GROK_WARNINGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 #[cfg(feature = "grok-ffi")]
-unsafe extern "C" fn capture_grok_warning(
-    message: *const std::os::raw::c_char,
-    _: *mut std::ffi::c_void,
-) {
+unsafe fn grok_message_text(message: *const std::os::raw::c_char) -> Option<String> {
     if message.is_null() {
-        return;
+        return None;
     }
     let text = unsafe { std::ffi::CStr::from_ptr(message) }
         .to_string_lossy()
         .trim()
         .to_string();
-    if text.is_empty() {
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(feature = "grok-ffi")]
+unsafe extern "C" fn capture_grok_warning(
+    message: *const std::os::raw::c_char,
+    _: *mut std::ffi::c_void,
+) {
+    let Some(text) = (unsafe { grok_message_text(message) }) else {
         return;
-    }
+    };
     CAPTURED_GROK_WARNINGS
         .lock()
         .expect("grok warning capture lock")
         .push(text);
+}
+
+#[cfg(feature = "grok-ffi")]
+unsafe extern "C" fn print_grok_error(
+    message: *const std::os::raw::c_char,
+    _: *mut std::ffi::c_void,
+) {
+    if let Some(text) = unsafe { grok_message_text(message) } {
+        eprintln!("grok: {text}");
+    }
 }
 
 #[cfg(feature = "grok-ffi")]
@@ -2455,7 +2470,10 @@ fn capture_grok_warnings<T>(action: impl FnOnce() -> T) -> (T, Vec<String>) {
     handlers.error_callback = Some(capture_grok_warning);
     unsafe { grokj2k_sys::grk_set_msg_handlers(handlers) };
     let result = action();
-    unsafe { grokj2k_sys::grk_set_msg_handlers(std::mem::zeroed()) };
+    // grok prints nothing without a handler, the plugin's device errors included
+    let mut errors_to_stderr: grokj2k_sys::grk_msg_handlers = unsafe { std::mem::zeroed() };
+    errors_to_stderr.error_callback = Some(print_grok_error);
+    unsafe { grokj2k_sys::grk_set_msg_handlers(errors_to_stderr) };
     let messages = std::mem::take(
         &mut *CAPTURED_GROK_WARNINGS
             .lock()

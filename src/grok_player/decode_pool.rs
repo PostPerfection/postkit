@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -329,6 +330,7 @@ enum PlaybackDecoder {
     CpuWithGpuSettingOff,
     CpuAtReducedResolution,
     CpuWithNoAcceleratorPlugin,
+    CpuAfterTheDeviceStopped,
 }
 
 impl PlaybackDecoder {
@@ -343,6 +345,9 @@ impl PlaybackDecoder {
             }
             PlaybackDecoder::CpuWithNoAcceleratorPlugin => {
                 "grok player: decoding on the cpu, no accelerator plugin"
+            }
+            PlaybackDecoder::CpuAfterTheDeviceStopped => {
+                "grok player: decoding on the cpu, the device stopped returning frames"
             }
         }
     }
@@ -364,6 +369,7 @@ pub(super) struct DecodePool {
     device_queue: Option<Arc<JobQueue<DecodeJob>>>,
     workers: Vec<JoinHandle<()>>,
     device_thread: Option<JoinHandle<()>>,
+    device_stopped: Arc<AtomicBool>,
     cache: Arc<Mutex<FrameCache>>,
     capacity: Arc<Mutex<DecodeCapacity>>,
     last_logged_decoder: Mutex<Option<PlaybackDecoder>>,
@@ -387,12 +393,15 @@ impl DecodePool {
                 std::thread::spawn(move || run_worker(&queue, &cache, &capacity, &finished))
             })
             .collect();
-        let (device_queue, device_thread) = device::start(&cpu_queue, &cache, &capacity, &finished);
+        let device_stopped = Arc::new(AtomicBool::new(false));
+        let (device_queue, device_thread) =
+            device::start(&cpu_queue, &cache, &capacity, &finished, &device_stopped);
         DecodePool {
             cpu_queue,
             device_queue,
             workers,
             device_thread,
+            device_stopped,
             cache,
             capacity,
             last_logged_decoder: Mutex::new(None),
@@ -406,6 +415,11 @@ impl DecodePool {
 
     pub fn submit(&self, job: DecodeJob) {
         let device_switched_on = crate::grok_encoder::gpu_active();
+        if device_switched_on && self.device_stopped.load(Ordering::Acquire) {
+            self.log_decoder(PlaybackDecoder::CpuAfterTheDeviceStopped);
+            self.cpu_queue.push(job);
+            return;
+        }
         match (&self.device_queue, route(job.reduce, device_switched_on)) {
             (Some(device_queue), Route::Device) => {
                 self.log_decoder(PlaybackDecoder::Device);
@@ -669,12 +683,36 @@ mod device {
     // polls with frames inside the pipeline, nothing queued and no frame back before the
     // batch is drained: the pipeline holds a cluster of finished frames behind an empty pull
     const IDLE_POLLS_BEFORE_DRAIN: u32 = 5;
+    // polls with frames queued and none back before the device counts as stopped
+    const IDLE_POLLS_BEFORE_THE_DEVICE_STOPPED: u32 = 20;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum PipelineWait {
+        Working,
+        TailHeldBack,
+        DeviceStopped,
+    }
+
+    pub(super) fn pipeline_wait(
+        polls_without_a_frame_back: u32,
+        queue_empty: bool,
+    ) -> PipelineWait {
+        if queue_empty && polls_without_a_frame_back >= IDLE_POLLS_BEFORE_DRAIN {
+            PipelineWait::TailHeldBack
+        } else if !queue_empty && polls_without_a_frame_back >= IDLE_POLLS_BEFORE_THE_DEVICE_STOPPED
+        {
+            PipelineWait::DeviceStopped
+        } else {
+            PipelineWait::Working
+        }
+    }
 
     pub(super) fn start(
         cpu_queue: &Arc<JobQueue<DecodeJob>>,
         cache: &Arc<Mutex<FrameCache>>,
         capacity: &Arc<Mutex<DecodeCapacity>>,
         finished: &Sender<Command>,
+        device_stopped: &Arc<AtomicBool>,
     ) -> (Option<Arc<JobQueue<DecodeJob>>>, Option<JoinHandle<()>>) {
         let queue = JobQueue::new();
         let backend = Backend {
@@ -692,6 +730,7 @@ mod device {
                 returned: AtomicUsize::new(0),
             }),
             batch: None,
+            device_stopped: device_stopped.clone(),
             declined_generation: None,
             last_fallback: None,
             idle_polls: 0,
@@ -740,6 +779,7 @@ mod device {
     struct Backend {
         state: Box<CallbackState>,
         batch: Option<RunningBatch>,
+        device_stopped: Arc<AtomicBool>,
         // the plugin declined this generation's shape, its frames stay on the cpu
         declined_generation: Option<u64>,
         last_fallback: Option<CpuFallback>,
@@ -757,6 +797,7 @@ mod device {
     enum CpuFallback {
         EncodeHoldsTheDevice,
         DeviceDeclinedTheBatch,
+        DeviceStopped,
     }
 
     impl CpuFallback {
@@ -767,6 +808,9 @@ mod device {
                 }
                 CpuFallback::DeviceDeclinedTheBatch => {
                     "grok player: frames to the cpu, the device declined the batch"
+                }
+                CpuFallback::DeviceStopped => {
+                    "grok player: frames to the cpu, the device stopped returning frames"
                 }
             }
         }
@@ -806,19 +850,27 @@ mod device {
             }
             let in_flight = self.state.in_flight.load(Ordering::Acquire);
             let returned = self.state.returned.load(Ordering::Acquire);
-            let stalled = in_flight > 0
-                && self.state.queue.is_empty()
-                && returned == self.returned_at_last_poll;
+            let waiting = in_flight > 0 && returned == self.returned_at_last_poll;
             self.returned_at_last_poll = returned;
-            self.idle_polls = if stalled { self.idle_polls + 1 } else { 0 };
-            if self.idle_polls >= IDLE_POLLS_BEFORE_DRAIN {
-                self.end_batch();
+            self.idle_polls = if waiting { self.idle_polls + 1 } else { 0 };
+            match pipeline_wait(self.idle_polls, self.state.queue.is_empty()) {
+                PipelineWait::Working => {}
+                PipelineWait::TailHeldBack => self.end_batch(),
+                PipelineWait::DeviceStopped => {
+                    self.device_stopped.store(true, Ordering::Release);
+                    self.move_queued_jobs_to_cpu(CpuFallback::DeviceStopped);
+                    self.end_batch();
+                }
             }
         }
 
         // the first job of a batch is its shape; the plugin's workers pull it back out
         fn handle(&mut self, job: DecodeJob) {
             self.idle_polls = 0;
+            if self.device_stopped.load(Ordering::Acquire) {
+                self.queue_on_cpu(job, CpuFallback::DeviceStopped);
+                return;
+            }
             if DEVICE_LEASE.encode_wants_the_device() {
                 self.end_batch();
                 self.queue_on_cpu(job, CpuFallback::EncodeHoldsTheDevice);
@@ -943,15 +995,24 @@ mod device {
             self.state.pull_open.store(false, Ordering::Release);
             *self.state.batch_render.lock().unwrap() = None;
             self.state.queue.wake_all();
+            // the plugin hands back the frames of a device that stopped, then returns false
             if !unsafe { grokj2k_sys::grk_plugin_batch_decompress_memory_end() } {
-                tracing::warn!("grok's accelerator plugin failed to drain the decode batch");
+                self.device_stopped.store(true, Ordering::Release);
             }
             eprintln!("grok player: device batch closed");
-            if DEVICE_LEASE.encode_wants_the_device() {
-                let stranded = self.state.queue.drain();
-                for job in stranded {
-                    self.queue_on_cpu(job, CpuFallback::EncodeHoldsTheDevice);
-                }
+            let fallback = if self.device_stopped.load(Ordering::Acquire) {
+                CpuFallback::DeviceStopped
+            } else if DEVICE_LEASE.encode_wants_the_device() {
+                CpuFallback::EncodeHoldsTheDevice
+            } else {
+                return;
+            };
+            self.move_queued_jobs_to_cpu(fallback);
+        }
+
+        fn move_queued_jobs_to_cpu(&mut self, fallback: CpuFallback) {
+            for job in self.state.queue.drain() {
+                self.queue_on_cpu(job, fallback);
             }
         }
     }
@@ -1663,6 +1724,19 @@ mod tests {
             worst <= 1,
             "the device differs from the cpu by {worst} codes"
         );
+    }
+
+    #[test]
+    fn a_device_that_returns_nothing_while_frames_wait_counts_as_stopped() {
+        use device::{PipelineWait, pipeline_wait};
+        assert_eq!(pipeline_wait(4, true), PipelineWait::Working);
+        assert_eq!(pipeline_wait(5, true), PipelineWait::TailHeldBack);
+        assert_eq!(
+            pipeline_wait(19, false),
+            PipelineWait::Working,
+            "a queued frame keeps a slow device going"
+        );
+        assert_eq!(pipeline_wait(20, false), PipelineWait::DeviceStopped);
     }
 
     #[test]
