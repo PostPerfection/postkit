@@ -48,6 +48,7 @@ pub mod iab;
 #[cfg(test)]
 mod imp_fixture;
 pub mod j2k;
+pub mod job_log;
 pub mod job_queue;
 pub mod kdm_coverage;
 pub mod kdm_distribution;

@@ -33,6 +33,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `hash` | SHA-1 / SHA-256 file hashing |
 | `iab` | Immersive Audio Bitstream (ST 2098-2) frame parsing, DLC and PCM decode, and the bitstream checks of ST 2098-2, ST 429-18, ST 2067-201 and RDD 57 Profile 1 |
 | `j2k` | JPEG 2000 codestream parsing, DCI validation, MXF frame extraction and bitrate analysis |
+| `job_log` | Where a job's log sits, beside its package folder |
 | `job_queue` | The job queue every wizard process runs, with its jobs file |
 | `kdm_distribution` | A distributor's cinemas, screens, titles, bookings and issued KDMs: FLM import (ST 430-16 and 430-7), ISDCF Doc 5 certificate checks, formulation per screen, windows in the cinema's time zone, KDM and ZIP naming, SMTP delivery and resend, sqlite store, per-screen reissue after an edit or a certificate change, certificate and DKDM expiry against each booking, bookings about to end |
 | `kdm_store` | A directory of KDMs, and which one a composition plays with on a given player and time |
@@ -64,7 +65,7 @@ Written in Rust. MXF wrapping uses [asdcplib-rs](https://github.com/PostPerfecti
 | `transcode` | Cancellable ffmpeg runner and video to video transcode |
 | `upmix` | Stereo to 5.1 upmix (DoM upmixer A/B, windowed-sinc FIR) |
 | `version_tracker` | Content versioning database (delivery history) |
-| `watch` | Watch folder loop that hands each master to the caller once it stops changing |
+| `watch` | Watch folder loop that runs the wizard's `create` on each master once it stops changing, then moves it and its sidecars into `done/` or `failed/` |
 | `watermark` | Burns a visible text mark into each frame (not forensic/invisible) |
 | `wav_io` | WAV read/write to normalized interleaved f32 (shared DSP helper) |
 | `webhook` | HTTP webhook notifications on job completion/failure |

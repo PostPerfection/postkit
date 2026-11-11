@@ -3,7 +3,6 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const KDM_EXTENSION: &str = "xml";
-const NAME_CLASH_SEPARATOR: &str = "-";
 
 /// A KDM file in the store and the public metadata read from it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,26 +206,7 @@ impl KdmStore {
         if !has_kdm_extension(&name) {
             name.as_mut_os_string().push(format!(".{KDM_EXTENSION}"));
         }
-        let candidate = self.directory.join(&name);
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-        let stem = name
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let extension = name
-            .extension()
-            .map(|extension| extension.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let suffixed = (1..)
-            .map(|suffix| {
-                self.directory
-                    .join(format!("{stem}{NAME_CLASH_SEPARATOR}{suffix}.{extension}"))
-            })
-            .find(|candidate| !candidate.exists())
-            .expect("an unbounded range always has a free suffix");
-        Ok(suffixed)
+        Ok(crate::fs::unused_path(&self.directory, name.as_os_str()))
     }
 }
 

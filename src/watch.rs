@@ -1,7 +1,10 @@
 use crate::encode::InputType;
+use crate::webhook::{WebhookConfig, WebhookEvent};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 pub const DONE_DIRECTORY_NAME: &str = "done";
 pub const FAILED_DIRECTORY_NAME: &str = "failed";
@@ -124,34 +127,49 @@ fn find_masters(watch_dir: &Path) -> Vec<PathBuf> {
     masters
 }
 
-pub fn watch_directory<F>(
-    watch_dir: &Path,
-    interval: Duration,
-    should_stop: &dyn Fn() -> bool,
-    on_master_ready: F,
-) where
-    F: Fn(&Path),
-{
-    if !watch_dir.is_dir() {
-        tracing::error!("watch directory does not exist: {}", watch_dir.display());
-        return;
+pub struct WatchCommand<'a> {
+    pub watch_dir: &'a Path,
+    pub output_dir: &'a Path,
+    pub interval: Duration,
+    pub subtitle_extension: &'a str,
+    pub create_arguments: &'a [String],
+    pub webhook_url: Option<String>,
+    pub webhook_event_prefix: &'a str,
+}
+
+pub struct PackageTarget {
+    pub package_dir: PathBuf,
+    pub output_argument: PathBuf,
+}
+
+pub fn watch_directory(
+    command: &WatchCommand,
+    package_target: impl Fn(&str) -> Result<PackageTarget, String>,
+) -> Result<(), String> {
+    if !command.watch_dir.is_dir() {
+        return Err(format!(
+            "watch directory does not exist: {}",
+            command.watch_dir.display()
+        ));
     }
+    std::fs::create_dir_all(command.output_dir)
+        .map_err(|e| format!("cannot create {}: {e}", command.output_dir.display()))?;
+    let executable =
+        std::env::current_exe().map_err(|e| format!("cannot find the running binary: {e}"))?;
+    let webhook = command.webhook_url.clone().map(|url| WebhookConfig {
+        url,
+        ..Default::default()
+    });
 
     tracing::info!(
         "watching {} for masters, polling every {:?}",
-        watch_dir.display(),
-        interval
+        command.watch_dir.display(),
+        command.interval
     );
 
     let mut states = CandidateStates::default();
-
     loop {
-        if should_stop() {
-            tracing::info!("watch stopping");
-            return;
-        }
-
-        let masters = find_masters(watch_dir);
+        let masters = find_masters(command.watch_dir);
         states.retain_present(&masters);
 
         for master in &masters {
@@ -162,10 +180,211 @@ pub fn watch_directory<F>(
                 continue;
             }
             states.mark_built(master);
-            on_master_ready(master);
+            build_master(
+                command,
+                &executable,
+                webhook.as_ref(),
+                master,
+                &package_target,
+            );
         }
 
-        std::thread::sleep(interval);
+        std::thread::sleep(command.interval);
+    }
+}
+
+fn build_master(
+    command: &WatchCommand,
+    executable: &Path,
+    webhook: Option<&WebhookConfig>,
+    master: &Path,
+    package_target: &impl Fn(&str) -> Result<PackageTarget, String>,
+) {
+    let Some(stem) = master.file_stem().and_then(|s| s.to_str()) else {
+        tracing::error!("cannot read a file stem from {}", master.display());
+        return;
+    };
+    let target = match package_target(stem) {
+        Ok(target) => target,
+        Err(e) => {
+            tracing::error!("{e}");
+            return;
+        }
+    };
+    let log_path = match crate::job_log::job_log_path(&target.package_dir) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::error!("{e}");
+            return;
+        }
+    };
+    let sidecar = |extension: &str| {
+        let path = command.watch_dir.join(format!("{stem}.{extension}"));
+        path.is_file().then_some(path)
+    };
+    let audio = sidecar(AUDIO_SIDECAR_EXTENSION);
+    let subtitle = sidecar(command.subtitle_extension);
+
+    let mut arguments: Vec<OsString> = vec![
+        "create".into(),
+        "--title".into(),
+        stem.into(),
+        "--video".into(),
+        master.into(),
+        "--output".into(),
+        target.output_argument.as_os_str().into(),
+    ];
+    if let Some(audio) = audio.as_deref() {
+        arguments.push("--audio".into());
+        arguments.push(audio.into());
+    }
+    if let Some(subtitle) = subtitle.as_deref() {
+        arguments.push("--subtitle".into());
+        arguments.push(subtitle.into());
+    }
+    arguments.extend(command.create_arguments.iter().map(OsString::from));
+
+    // dcpwizard create truncates the job log as it starts
+    let captured_output = match tempfile::tempfile() {
+        Ok(file) => file,
+        Err(e) => {
+            tracing::error!("cannot create a file for the create output: {e}");
+            return;
+        }
+    };
+    let (captured_stdout, captured_stderr) =
+        match (captured_output.try_clone(), captured_output.try_clone()) {
+            (Ok(stdout), Ok(stderr)) => (stdout, stderr),
+            (Err(e), _) | (_, Err(e)) => {
+                tracing::error!("cannot create a file for the create output: {e}");
+                return;
+            }
+        };
+    if let Err(e) = std::fs::File::create(&log_path) {
+        tracing::error!("cannot write {}: {e}", log_path.display());
+        return;
+    }
+
+    tracing::info!(
+        "building {} from {}",
+        target.package_dir.display(),
+        master.display()
+    );
+    let started = Instant::now();
+    let outcome = Command::new(executable)
+        .args(&arguments)
+        .stdout(Stdio::from(captured_stdout))
+        .stderr(Stdio::from(captured_stderr))
+        .status();
+    let elapsed_seconds = started.elapsed().as_secs_f64();
+    append_captured_output(captured_output, &log_path);
+
+    let failure = match outcome {
+        Ok(status) if status.success() => None,
+        Ok(status) => Some(match status.code() {
+            Some(code) => format!("create exited {code}, log at {}", log_path.display()),
+            None => format!(
+                "create was killed by a signal, log at {}",
+                log_path.display()
+            ),
+        }),
+        Err(e) => Some(format!("could not run create: {e}")),
+    };
+    let sidecars: Vec<&Path> = [audio.as_deref(), subtitle.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    let prefix = command.webhook_event_prefix;
+
+    let Some(message) = failure else {
+        move_job_aside(
+            master,
+            &sidecars,
+            &command.watch_dir.join(DONE_DIRECTORY_NAME),
+        );
+        tracing::info!(
+            "built {} in {elapsed_seconds:.1} s",
+            target.package_dir.display()
+        );
+        post_event(
+            webhook,
+            &format!("{prefix}.created"),
+            stem,
+            crate::webhook::build_job_completed_payload(stem, &target.package_dir, elapsed_seconds),
+        );
+        return;
+    };
+
+    move_job_aside(
+        master,
+        &sidecars,
+        &command.watch_dir.join(FAILED_DIRECTORY_NAME),
+    );
+    tracing::error!("create failed for {stem}: see {}", log_path.display());
+    post_event(
+        webhook,
+        &format!("{prefix}.failed"),
+        stem,
+        crate::webhook::build_job_failed_payload(stem, &message),
+    );
+}
+
+fn append_captured_output(mut captured_output: std::fs::File, log_path: &Path) {
+    use std::io::Seek;
+    let appended = captured_output
+        .rewind()
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_path)
+        })
+        .and_then(|mut log| std::io::copy(&mut captured_output, &mut log));
+    if let Err(e) = appended {
+        tracing::error!("cannot write {}: {e}", log_path.display());
+    }
+}
+
+fn move_job_aside(master: &Path, sidecars: &[&Path], directory: &Path) {
+    if let Err(e) = std::fs::create_dir_all(directory) {
+        tracing::error!("cannot create {}: {e}", directory.display());
+        return;
+    }
+    // a master in done/ or failed/ means its sidecars are already there
+    for source in sidecars.iter().chain([&master]) {
+        let Some(file_name) = source.file_name() else {
+            tracing::error!("cannot read a file name from {}", source.display());
+            continue;
+        };
+        let destination = crate::fs::unused_path(directory, file_name);
+        if let Err(e) = std::fs::rename(source, &destination) {
+            tracing::error!(
+                "cannot move {} into {}: {e}",
+                source.display(),
+                directory.display()
+            );
+        }
+    }
+}
+
+fn post_event(
+    webhook: Option<&WebhookConfig>,
+    event_type: &str,
+    job_id: &str,
+    payload_json: String,
+) {
+    let Some(config) = webhook else {
+        return;
+    };
+    let event = WebhookEvent {
+        event_type: event_type.to_string(),
+        job_id: job_id.to_string(),
+        payload_json,
+        timestamp: String::new(),
+    };
+    let result = crate::webhook::send_webhook(config, &event);
+    if !result.success {
+        tracing::warn!("webhook delivery failed: {}", result.error);
     }
 }
 

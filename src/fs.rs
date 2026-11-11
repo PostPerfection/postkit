@@ -1,6 +1,7 @@
 //! Filesystem helpers packaging relies on.
 
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 /// Write bytes to `path` atomically: temp file in the same directory, then
 /// rename. A reader either sees the old file or the fully written new one,
@@ -23,6 +24,23 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+pub fn unused_path(directory: &Path, file_name: &OsStr) -> PathBuf {
+    let taken = directory.join(file_name);
+    if !taken.exists() {
+        return taken;
+    }
+    let name = Path::new(file_name);
+    let stem = name.file_stem().unwrap_or(file_name).to_string_lossy();
+    let extension = name.extension().map(OsStr::to_string_lossy);
+    (1..)
+        .map(|suffix| match &extension {
+            Some(extension) => directory.join(format!("{stem}-{suffix}.{extension}")),
+            None => directory.join(format!("{stem}-{suffix}")),
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("an unbounded range always has a free suffix")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -37,5 +55,28 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"world");
         let leftovers = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "only the file remains, no temp files");
+    }
+
+    #[test]
+    fn a_taken_name_gets_the_first_free_numbered_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = OsStr::new("feature.mp4");
+        assert_eq!(
+            unused_path(dir.path(), name),
+            dir.path().join("feature.mp4")
+        );
+
+        std::fs::write(dir.path().join("feature.mp4"), b"").unwrap();
+        std::fs::write(dir.path().join("feature-1.mp4"), b"").unwrap();
+        assert_eq!(
+            unused_path(dir.path(), name),
+            dir.path().join("feature-2.mp4")
+        );
+
+        std::fs::create_dir(dir.path().join("frames")).unwrap();
+        assert_eq!(
+            unused_path(dir.path(), OsStr::new("frames")),
+            dir.path().join("frames-1")
+        );
     }
 }
