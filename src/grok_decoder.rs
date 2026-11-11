@@ -113,20 +113,36 @@ fn to_twelve_bits(sample: i32, precision: u8) -> u16 {
 /// Takes the buffer by value because grok reads the stream in place.
 #[cfg(feature = "grok-ffi")]
 pub fn decode(codestream: Vec<u8>, reduce: u8) -> Result<DecodedFrame, String> {
-    decode_with_threads(codestream, reduce, 0)
+    let mut params: grokj2k_sys::grk_decompress_parameters = unsafe { std::mem::zeroed() };
+    params.core.reduce = reduce;
+    decompress(codestream, params)
 }
 
-/// [`decode`] on `num_threads` grok threads, 0 for the shared pool and 1 for
-/// the calling thread alone.
+/// [`decode`] on the CPU even with the accelerator plugin switched on, on
+/// `num_threads` grok threads, 0 for the shared pool and 1 for the calling
+/// thread alone.
 #[cfg(feature = "grok-ffi")]
-pub fn decode_with_threads(
-    mut codestream: Vec<u8>,
+pub fn decode_on_cpu(
+    codestream: Vec<u8>,
     reduce: u8,
     num_threads: u32,
 ) -> Result<DecodedFrame, String> {
+    let mut params: grokj2k_sys::grk_decompress_parameters = unsafe { std::mem::zeroed() };
+    params.core.reduce = reduce;
+    params.num_threads = num_threads;
+    // grok hands a full resolution decode to the plugin when one is switched on
+    params.cpu_only = true;
+    decompress(codestream, params)
+}
+
+#[cfg(feature = "grok-ffi")]
+fn decompress(
+    mut codestream: Vec<u8>,
+    mut params: grokj2k_sys::grk_decompress_parameters,
+) -> Result<DecodedFrame, String> {
     use grokj2k_sys::{
-        grk_decompress, grk_decompress_init, grk_decompress_parameters, grk_decompress_read_header,
-        grk_header_info, grk_image, grk_object_unref, grk_stream_params,
+        grk_decompress, grk_decompress_init, grk_decompress_read_header, grk_header_info,
+        grk_image, grk_object_unref, grk_stream_params,
     };
 
     if codestream.is_empty() {
@@ -145,10 +161,6 @@ pub fn decode_with_threads(
         let mut stream_params: grk_stream_params = std::mem::zeroed();
         stream_params.buf = codestream.as_mut_ptr();
         stream_params.buf_len = codestream.len();
-
-        let mut params: grk_decompress_parameters = std::mem::zeroed();
-        params.core.reduce = reduce;
-        params.num_threads = num_threads;
 
         let codec = grk_decompress_init(&mut stream_params, &mut params);
         if codec.is_null() {
@@ -359,11 +371,11 @@ unsafe fn extend_row(
 /// Refusal when postkit was built without the `grok-ffi` feature.
 #[cfg(not(feature = "grok-ffi"))]
 pub fn decode(codestream: Vec<u8>, reduce: u8) -> Result<DecodedFrame, String> {
-    decode_with_threads(codestream, reduce, 0)
+    decode_on_cpu(codestream, reduce, 0)
 }
 
 #[cfg(not(feature = "grok-ffi"))]
-pub fn decode_with_threads(
+pub fn decode_on_cpu(
     _codestream: Vec<u8>,
     _reduce: u8,
     _num_threads: u32,
@@ -393,8 +405,7 @@ mod tests {
     #[test]
     fn a_4k_fixture_decodes_on_one_thread() {
         crate::grok_encoder::initialize(0);
-        let frame =
-            decode_with_threads(CINEMA_4K_FIXTURE.to_vec(), 0, 1).expect("4K fixture decodes");
+        let frame = decode_on_cpu(CINEMA_4K_FIXTURE.to_vec(), 0, 1).expect("4K fixture decodes");
         assert_eq!((frame.width, frame.height), (4096, 2160));
     }
 

@@ -603,8 +603,7 @@ fn decode_job(
     display: &Display,
     deep_colour: bool,
 ) -> Result<RgbaFrame, String> {
-    let decoded =
-        crate::grok_decoder::decode_with_threads(codestream, reduce, SINGLE_DECODE_THREAD)?;
+    let decoded = crate::grok_decoder::decode_on_cpu(codestream, reduce, SINGLE_DECODE_THREAD)?;
     render_decoded(&decoded, render, mxf, display, deep_colour)
 }
 
@@ -1950,16 +1949,13 @@ mod tests {
         };
 
         milliseconds("decode, one grok thread", &mut || {
-            let decoded = crate::grok_decoder::decode_with_threads(
-                codestream.clone(),
-                0,
-                SINGLE_DECODE_THREAD,
-            )
-            .expect("decode");
+            let decoded =
+                crate::grok_decoder::decode_on_cpu(codestream.clone(), 0, SINGLE_DECODE_THREAD)
+                    .expect("decode");
             std::hint::black_box(decoded);
         });
         milliseconds("decode, grok's pool", &mut || {
-            let decoded = crate::grok_decoder::decode_with_threads(
+            let decoded = crate::grok_decoder::decode_on_cpu(
                 codestream.clone(),
                 0,
                 preview::GROK_SHARED_THREAD_POOL,
@@ -1968,7 +1964,7 @@ mod tests {
             std::hint::black_box(decoded);
         });
         let decoded =
-            crate::grok_decoder::decode_with_threads(codestream.clone(), 0, SINGLE_DECODE_THREAD)
+            crate::grok_decoder::decode_on_cpu(codestream.clone(), 0, SINGLE_DECODE_THREAD)
                 .expect("decode");
         milliseconds("pack to xyz12le", &mut || {
             std::hint::black_box(decoded.to_xyz12le().expect("pack"));
@@ -1989,22 +1985,13 @@ mod tests {
         match crate::grok_encoder::use_gpu_from_environment() {
             Ok(()) => {
                 let before = crate::grok_encoder::accelerated_frames();
-                milliseconds("decode on the device, one grok thread", &mut || {
-                    let decoded = crate::grok_decoder::decode_with_threads(
-                        codestream.clone(),
-                        0,
-                        SINGLE_DECODE_THREAD,
-                    )
-                    .expect("decode");
+                milliseconds("decode on the device", &mut || {
+                    let decoded =
+                        crate::grok_decoder::decode(codestream.clone(), 0).expect("decode");
                     std::hint::black_box(decoded);
                 });
                 let device_frames = crate::grok_encoder::accelerated_frames() - before;
                 println!("the device took {device_frames} of {RUNS} decodes");
-                milliseconds("decode_job on the device, decode and colour", &mut || {
-                    let frame = decode_job(codestream.clone(), 0, render, &mxf, &display, false)
-                        .expect("decode");
-                    std::hint::black_box(frame);
-                });
                 crate::grok_encoder::use_cpu();
             }
             Err(reason) => println!("no device numbers: {reason}"),
@@ -2061,6 +2048,32 @@ mod tests {
             "reduce 0 on grok's shared pool: {:.1} ms a frame",
             start.elapsed().as_secs_f64() * 1000.0 / f64::from(RUNS)
         );
+    }
+
+    // after a kernel fault every cuda call fails, so a frame sent back to the cpu crashed the app
+    #[cfg(feature = "grok-gpu")]
+    #[test]
+    fn a_cpu_pool_frame_stays_off_the_device_with_the_gpu_on() {
+        let _device = DEVICE_TESTS.lock().unwrap();
+        crate::grok_encoder::initialize(0);
+        if let Err(reason) = crate::grok_encoder::use_gpu_from_environment() {
+            panic!("{reason}");
+        }
+        let codestream = cinema_2k_codestream_of_frame(0);
+        let display = Display::Srgb(crate::colour::XyzToSrgb::new());
+        let before = crate::grok_encoder::accelerated_frames();
+        let decoded = decode_job(
+            codestream,
+            0,
+            DisplayRender::DcpXyz,
+            std::path::Path::new("frame.j2c"),
+            &display,
+            false,
+        );
+        let device_frames = crate::grok_encoder::accelerated_frames() - before;
+        crate::grok_encoder::use_cpu();
+        decoded.expect("the frame decodes");
+        assert_eq!(device_frames, 0, "the cpu pool decoded on the device");
     }
 
     // the app drops the pool on exit while frames are in flight, and the plugin's tail

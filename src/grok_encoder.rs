@@ -1186,7 +1186,7 @@ fn add_noise_up_to_minimum_cinema_size(
     params: &CompressParams,
 ) -> Result<Vec<u8>, String> {
     // the plugin's YUV frames cannot be compressed on the CPU
-    let decoded = crate::grok_decoder::decode_with_threads(codestream.clone(), 0, 1)?;
+    let decoded = crate::grok_decoder::decode_on_cpu(codestream.clone(), 0, 1)?;
     let (width, height, precision) = (decoded.width, decoded.height, decoded.precision);
     if rate_budget_bytes(width, height, params) < MINIMUM_CINEMA_CODESTREAM_BYTES as u64 {
         return Ok(codestream);

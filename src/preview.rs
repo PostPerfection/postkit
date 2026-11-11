@@ -899,7 +899,7 @@ pub(crate) fn display_frame_from_codestream(
     render: FrameRender<'_>,
     mxf: &Path,
 ) -> Result<Rgb8Frame, PreviewError> {
-    let decoded = crate::grok_decoder::decode_with_threads(codestream, reduce, decode_threads)
+    let decoded = crate::grok_decoder::decode_on_cpu(codestream, reduce, decode_threads)
         .map_err(PreviewError::Decode)?;
     display_frame_from_decoded(&decoded, render, mxf)
 }
