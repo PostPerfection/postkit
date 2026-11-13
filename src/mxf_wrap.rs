@@ -3418,18 +3418,27 @@ mod tests {
         for profile in ["debug", "release"] {
             let build = cargo_target_dir().join(profile).join("build");
             searched.push(build.join("asdcplib-sys-*").join("out/bin").join(&name));
-            let Ok(entries) = std::fs::read_dir(&build) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                if !entry
+            searched.push(build.join("asdcplib-sys/*").join("out/bin").join(&name));
+            let mut output_directories = Vec::new();
+            // cargo 1.100 writes build script output to build/<package>/<hash>, older cargo to build/<package>-<hash>
+            for entry in std::fs::read_dir(&build).into_iter().flatten().flatten() {
+                if entry
                     .file_name()
                     .to_string_lossy()
                     .starts_with("asdcplib-sys-")
                 {
-                    continue;
+                    output_directories.push(entry.path());
                 }
-                let tool = entry.path().join("out").join("bin").join(&name);
+            }
+            for entry in std::fs::read_dir(build.join("asdcplib-sys"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                output_directories.push(entry.path());
+            }
+            for directory in output_directories {
+                let tool = directory.join("out").join("bin").join(&name);
                 if tool.is_file() {
                     return tool;
                 }
