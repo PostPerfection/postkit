@@ -543,8 +543,10 @@ impl FrameBufferPool {
     }
 }
 
+pub const AUTOMATIC_ENCODE_THREADS: u32 = 0;
+
 pub fn encode_thread_count(encode_threads: u32) -> usize {
-    if encode_threads != 0 {
+    if encode_threads != AUTOMATIC_ENCODE_THREADS {
         return encode_threads as usize;
     }
     std::thread::available_parallelism()

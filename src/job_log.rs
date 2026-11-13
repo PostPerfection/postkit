@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 const LOG_EXTENSION: &str = "log";
+const LOG_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
 pub fn job_log_path(output: &Path) -> Result<PathBuf, String> {
     let Some(folder_name) = output.file_name() else {
@@ -14,6 +15,24 @@ pub fn job_log_path(output: &Path) -> Result<PathBuf, String> {
     log_name.push(LOG_EXTENSION);
     // dcpdoctor and photon flag any file inside the package that the ASSETMAP does not list
     Ok(output.with_file_name(log_name))
+}
+
+pub fn encode_threads_status(encode_threads: u32) -> String {
+    let count = crate::grok_encoder::encode_thread_count(encode_threads);
+    if encode_threads == crate::grok_encoder::AUTOMATIC_ENCODE_THREADS {
+        return format!("{count} (automatic)");
+    }
+    count.to_string()
+}
+
+pub fn picture_findings_status(detect_picture_findings: bool) -> &'static str {
+    if detect_picture_findings { "on" } else { "off" }
+}
+
+pub fn log_timestamp() -> String {
+    chrono::Local::now()
+        .format(LOG_TIMESTAMP_FORMAT)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -45,5 +64,13 @@ mod tests {
                 "the error does not name {output}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn the_thread_count_says_when_it_was_chosen_automatically() {
+        assert_eq!(encode_threads_status(2), "2");
+        let automatic = encode_threads_status(crate::grok_encoder::AUTOMATIC_ENCODE_THREADS);
+        assert!(automatic.ends_with(" (automatic)"), "{automatic}");
+        assert_ne!(automatic, "0 (automatic)");
     }
 }
