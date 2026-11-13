@@ -9,6 +9,7 @@ description = "Shared library for DCP Wizard, IMF Wizard, and DCP Doctor"
 aes = "0.9"
 allsorts = "0.17"
 ar-reshaper = "1.5"
+clap = { version = "4.6", features = ["derive"] }
 asdcplib = { git = "https://github.com/PostPerfection/asdcplib-rs.git", rev = "0a7bdb5a78d4bc7928012d73ecdd6f4273677a97" }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }

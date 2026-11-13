@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 pub const DONE_DIRECTORY_NAME: &str = "done";
 pub const FAILED_DIRECTORY_NAME: &str = "failed";
 pub const AUDIO_SIDECAR_EXTENSION: &str = "wav";
-pub const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
-pub const MINIMUM_POLL_INTERVAL_SECONDS: u64 = 1;
+const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
+const MINIMUM_POLL_INTERVAL_SECONDS: u64 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Measurement {
@@ -125,6 +125,53 @@ fn find_masters(watch_dir: &Path) -> Vec<PathBuf> {
     }
     masters.sort();
     masters
+}
+
+#[derive(clap::Args)]
+pub struct WatchArgs {
+    #[arg(help = "Directory to watch for masters")]
+    pub dir: PathBuf,
+    #[arg(
+        short,
+        long,
+        help = "Directory each package is written to, under the master's file stem"
+    )]
+    pub output: PathBuf,
+    #[arg(
+        long,
+        help = "POST a JSON notification to this URL when a package is built or fails"
+    )]
+    pub webhook_url: Option<String>,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_POLL_INTERVAL_SECONDS,
+        value_parser = clap::value_parser!(u64).range(MINIMUM_POLL_INTERVAL_SECONDS..),
+        help = "Seconds between polls"
+    )]
+    pub interval: u64,
+    #[arg(
+        last = true,
+        help = "Flags passed to `create` for every package, after a `--` separator"
+    )]
+    pub create_arguments: Vec<String>,
+}
+
+impl WatchArgs {
+    pub fn command<'a>(
+        &'a self,
+        subtitle_extension: &'a str,
+        webhook_event_prefix: &'a str,
+    ) -> WatchCommand<'a> {
+        WatchCommand {
+            watch_dir: &self.dir,
+            output_dir: &self.output,
+            interval: Duration::from_secs(self.interval),
+            subtitle_extension,
+            create_arguments: &self.create_arguments,
+            webhook_url: self.webhook_url.clone(),
+            webhook_event_prefix,
+        }
+    }
 }
 
 pub struct WatchCommand<'a> {
@@ -452,5 +499,22 @@ mod tests {
         assert!(!states.observe(path, file_measurement(10)));
         states.retain_present(&[]);
         assert!(!states.observe(path, file_measurement(10)));
+    }
+
+    #[derive(clap::Parser)]
+    struct WatchCli {
+        #[command(flatten)]
+        watch: WatchArgs,
+    }
+
+    #[test]
+    fn the_poll_interval_defaults_and_refuses_a_zero() {
+        use clap::Parser;
+        let parsed = WatchCli::try_parse_from(["watch", "in", "--output", "out"]).unwrap();
+        assert_eq!(parsed.watch.interval, DEFAULT_POLL_INTERVAL_SECONDS);
+        assert!(
+            WatchCli::try_parse_from(["watch", "in", "--output", "out", "--interval", "0"])
+                .is_err()
+        );
     }
 }
