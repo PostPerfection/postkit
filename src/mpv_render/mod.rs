@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub use ffi::mpv_get_proc_address_fn;
 
 use crate::audio_levels::ChannelLevel;
-use crate::mpv::pick_picture_mxf;
+use crate::mpv::package_source;
 
 /// Pixel format libmpv writes in software mode, and the one `render_software`
 /// promises its callers.
@@ -528,19 +528,9 @@ impl MpvRenderPlayer {
     /// in reel order, as one timeline. Falls back to a single picture MXF when
     /// the package names no composition this can resolve.
     pub fn load_package_dir(&self, dir_path: &str) -> Result<(), String> {
-        let directory = Path::new(dir_path);
-        if !directory.is_dir() {
-            return Err(format!("Not a directory: {dir_path}"));
-        }
-        let (source, title) = match crate::composition_timeline::mpv_source(directory) {
-            Some(composition) => (composition.uri, composition.title.unwrap_or_default()),
-            None => (
-                pick_picture_mxf(directory)?.display().to_string(),
-                String::new(),
-            ),
-        };
-        self.force_media_title(&title)?;
-        self.command(&["loadfile", &source])
+        let source = package_source(Path::new(dir_path))?;
+        self.force_media_title(source.title.as_deref().unwrap_or_default())?;
+        self.command(&["loadfile", &source.uri])
     }
 
     /// Name what plays in the transport bar. An empty title clears the one an

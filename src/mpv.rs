@@ -14,9 +14,11 @@
 //! Without a parent wid, mpv runs as a floating always-on-top window.
 
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::Mutex;
+
+use crate::composition_timeline::CompositionSource;
 
 /// Cross-platform mpv player with IPC control.
 pub struct MpvPlayer {
@@ -246,17 +248,10 @@ impl MpvPlayer {
     /// reel order, as one timeline. Falls back to a single picture MXF when the
     /// package names no composition this can resolve.
     pub fn load_package_dir(&self, dir_path: &str) -> Result<(), String> {
-        let dir = PathBuf::from(dir_path);
-        if !dir.is_dir() {
-            return Err(format!("Not a directory: {dir_path}"));
-        }
-        let (source, title) = match crate::composition_timeline::mpv_source(&dir) {
-            Some(composition) => (composition.uri, composition.title.unwrap_or_default()),
-            None => (pick_picture_mxf(&dir)?.display().to_string(), String::new()),
-        };
+        let source = package_source(Path::new(dir_path))?;
         self.ensure_running()?;
-        self.force_media_title(&title)?;
-        self.loadfile(&source)
+        self.force_media_title(source.title.as_deref().unwrap_or_default())?;
+        self.loadfile(&source.uri)
     }
 
     /// Hand mpv one source, which may be a path or an `edl://` timeline.
@@ -418,6 +413,19 @@ pub fn find_mxf_files(dir: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     results
+}
+
+pub fn package_source(directory: &Path) -> Result<CompositionSource, String> {
+    if !directory.is_dir() {
+        return Err(format!("Not a directory: {}", directory.display()));
+    }
+    if let Some(composition) = crate::composition_timeline::mpv_source(directory) {
+        return Ok(composition);
+    }
+    Ok(CompositionSource {
+        uri: pick_picture_mxf(directory)?.display().to_string(),
+        title: None,
+    })
 }
 
 /// The picture track of a package whose composition could not be resolved, by
