@@ -45,8 +45,8 @@ pub struct PipelineProgress {
     pub write_secs: f64,
 }
 
-impl PipelineProgress {
-    pub(crate) fn encoding(progress: crate::grok_encoder::EncodeProgress) -> Self {
+impl From<crate::grok_encoder::EncodeProgress> for PipelineProgress {
+    fn from(progress: crate::grok_encoder::EncodeProgress) -> Self {
         let frame = progress.frames_encoded;
         let total_frames = progress.total_frames;
         Self {
@@ -63,7 +63,9 @@ impl PipelineProgress {
             write_secs: progress.write_secs,
         }
     }
+}
 
+impl PipelineProgress {
     /// One line naming where the encode time went, in the `4m10s` shape the
     /// wizards print their timings in.
     pub fn phase_breakdown(&self) -> String {

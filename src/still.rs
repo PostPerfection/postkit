@@ -155,7 +155,7 @@ pub fn build_still_frames_with_fades(
     fades: StillFades,
     cancel: &Arc<AtomicBool>,
     pause: &AtomicBool,
-    on_progress: impl Fn(&crate::pipeline::PipelineProgress),
+    on_progress: impl Fn(crate::grok_encoder::EncodeProgress),
 ) -> Result<(), String> {
     use crate::grok_encoder::{self, CompressParams, RawFrame, SourcePreparation};
 
@@ -233,10 +233,10 @@ pub fn build_still_frames_with_fades(
             // package ends on black. Overlapping fades multiply.
             let opacity = fade_opacity(index, fade_in) * fade_opacity(frames - 1 - index, fade_out);
             if opacity < 1.0 {
-                for sample in frame.chunks_exact_mut(2) {
-                    let value = u16::from_be_bytes([sample[0], sample[1]]);
+                for sample in frame.as_chunks_mut::<2>().0 {
+                    let value = u16::from_be_bytes(*sample);
                     let scaled = (f64::from(value) * opacity).round() as u16;
-                    sample.copy_from_slice(&scaled.to_be_bytes());
+                    *sample = scaled.to_be_bytes();
                 }
             }
             Some(RawFrame::Packed {
@@ -248,7 +248,7 @@ pub fn build_still_frames_with_fades(
                 index,
             })
         },
-        |progress| on_progress(&crate::pipeline::PipelineProgress::encoding(progress)),
+        on_progress,
     );
     if !result.success {
         return Err(format!("still frame encode failed: {}", result.error));
