@@ -739,6 +739,11 @@ where
             &input_queue,
         ) {
             Ok(started) => batch = started,
+            // Native YUV needs the plugin's colour conversion.
+            Err(e) if !matches!(frame, RawFrame::PlanarYuv { .. }) => {
+                tracing::warn!("{e}; encoding this run on the CPU");
+                params.cpu_only = true;
+            }
             Err(e) => {
                 drop(writer_tx);
                 let _ = writer_handle.join();

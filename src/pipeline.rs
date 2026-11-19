@@ -46,6 +46,24 @@ pub struct PipelineProgress {
 }
 
 impl PipelineProgress {
+    pub(crate) fn encoding(progress: crate::grok_encoder::EncodeProgress) -> Self {
+        let frame = progress.frames_encoded;
+        let total_frames = progress.total_frames;
+        Self {
+            stage: "encode".into(),
+            message: format!("Frame {frame}/{total_frames}"),
+            frame,
+            total_frames,
+            fps: progress.fps,
+            elapsed_secs: progress.elapsed_secs,
+            percent: (frame as f64 * 100.0 / total_frames.max(1) as f64).min(99.0),
+            decode_wait_secs: progress.decode_wait_secs,
+            prepare_secs: progress.prepare_secs,
+            encode_secs: progress.encode_secs,
+            write_secs: progress.write_secs,
+        }
+    }
+
     /// One line naming where the encode time went, in the `4m10s` shape the
     /// wizards print their timings in.
     pub fn phase_breakdown(&self) -> String {

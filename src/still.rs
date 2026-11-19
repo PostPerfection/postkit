@@ -1,13 +1,13 @@
 //! A single image held for a duration, as a directory of J2K frames.
 //!
-//! The image is encoded once and the codestream linked for every frame of the
-//! hold: a frame-wrapped picture MXF may repeat one codestream, so a two-minute
-//! title card costs one encode instead of two thousand. A burnt-in subtitle
-//! breaks the repeat only where the cues change, so the hold still costs a
-//! handful of encodes.
+//! A frame-wrapped picture MXF can repeat a codestream, so a static title card
+//! needs one encode across the whole hold. A burnt-in subtitle
+//! breaks the repeat where the cues change. Picture fades encode each changing
+//! frame of the ramp and reuse the codestream through the steady part.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::encode::FrameRate;
 
@@ -115,6 +115,27 @@ pub struct StillHold<'a> {
     pub out_dir: &'a Path,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StillFades {
+    pub fade_in_seconds: Option<f64>,
+    pub fade_out_seconds: Option<f64>,
+}
+
+impl StillFades {
+    pub fn validate(self, frames: u64, fps: FrameRate) -> Result<(), String> {
+        let duration = frames as f64 / fps.as_f64();
+        for (name, seconds) in [
+            ("video fade-in", self.fade_in_seconds),
+            ("video fade-out", self.fade_out_seconds),
+        ] {
+            if let Some(seconds) = seconds {
+                crate::audio_adjust::check_fade(name, seconds, duration)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Encode the still and fill `out_dir` with one codestream per frame of the
 /// hold. `out_dir` is recreated empty: frames from an earlier longer run would
 /// otherwise ship as extra frames, since the MXF wrapper takes the whole
@@ -124,8 +145,19 @@ pub struct StillHold<'a> {
 /// the picture only changes where the cue set does, so the hold is cut into
 /// runs of frames sharing the same cues and each run costs one encode.
 pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
+    let idle = Arc::new(AtomicBool::new(false));
+    build_still_frames_with_fades(hold, StillFades::default(), &idle, &idle, |_| {})
+}
+
+/// Apply the picture fades before subtitle and watermark compositing.
+pub fn build_still_frames_with_fades(
+    hold: &StillHold,
+    fades: StillFades,
+    cancel: &Arc<AtomicBool>,
+    pause: &AtomicBool,
+    on_progress: impl Fn(&crate::pipeline::PipelineProgress),
+) -> Result<(), String> {
     use crate::grok_encoder::{self, CompressParams, RawFrame, SourcePreparation};
-    use std::sync::atomic::AtomicBool;
 
     let StillHold {
         image,
@@ -147,6 +179,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
     if frames == 0 {
         return Err("a still needs a hold of at least one frame".into());
     }
+    fades.validate(frames, fps)?;
     let data = decode_rgb48(image, width, height, filters, fps)?;
     if out_dir.exists() {
         std::fs::remove_dir_all(out_dir)
@@ -167,20 +200,47 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         },
         ..CompressParams::default()
     };
-    let encoded = distinct_frames(burn.as_deref(), 0..frames);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let fade_in = fades.fade_in_seconds.unwrap_or(0.0) * fps.as_f64();
+    let fade_out = fades.fade_out_seconds.unwrap_or(0.0) * fps.as_f64();
+    let mut encoded = distinct_frames(burn.as_deref(), 0..frames);
+    if fade_in > 0.0 || fade_out > 0.0 {
+        // Include the first fully bright frame after the fade-in so it can
+        // stand for the steady portion of the hold.
+        encoded.extend(0..(fade_in.ceil() as u64).saturating_add(1).min(frames));
+        encoded.extend(frames.saturating_sub(fade_out.ceil() as u64)..frames);
+        encoded.sort_unstable();
+        encoded.dedup();
+    }
     grok_encoder::initialize(*encode_threads);
     let mut next = encoded.iter().copied();
     let result = grok_encoder::encode_pipeline(
         out_dir,
         &params,
         encoded.len() as u64,
-        &cancel,
+        cancel,
         &Arc::new(grok_encoder::PhaseClocks::default()),
-        |_| {
+        |pool| {
             let index = next.next()?;
+            while pause.load(Ordering::Relaxed) && !cancel.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
+            let mut frame = pool.take(data.len());
+            frame.copy_from_slice(&data);
+            // Measure the fade-out from the last displayed frame so the
+            // package ends on black. Overlapping fades multiply.
+            let opacity = fade_opacity(index, fade_in) * fade_opacity(frames - 1 - index, fade_out);
+            if opacity < 1.0 {
+                for sample in frame.chunks_exact_mut(2) {
+                    let value = u16::from_be_bytes([sample[0], sample[1]]);
+                    let scaled = (f64::from(value) * opacity).round() as u16;
+                    sample.copy_from_slice(&scaled.to_be_bytes());
+                }
+            }
             Some(RawFrame::Packed {
-                data: data.clone(),
+                data: frame,
                 order: crate::grok_encoder::SampleOrder::Big,
                 width,
                 height,
@@ -188,7 +248,7 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
                 index,
             })
         },
-        |_p| {},
+        |progress| on_progress(&crate::pipeline::PipelineProgress::encoding(progress)),
     );
     if !result.success {
         return Err(format!("still frame encode failed: {}", result.error));
@@ -199,6 +259,9 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         let end = encoded.get(at + 1).copied().unwrap_or(frames);
         let source = out_dir.join(format!("frame_{start:08}.j2c"));
         for index in start + 1..end {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".into());
+            }
             let target = out_dir.join(format!("frame_{index:08}.j2c"));
             let _ = std::fs::remove_file(&target);
             if std::fs::hard_link(&source, &target).is_err() {
@@ -208,6 +271,14 @@ pub fn build_still_frames(hold: &StillHold) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn fade_opacity(distance: u64, fade_frames: f64) -> f64 {
+    if fade_frames > 0.0 {
+        (distance as f64 / fade_frames).min(1.0)
+    } else {
+        1.0
+    }
 }
 
 /// Frame indices that have to be encoded: the first frame, plus every frame
